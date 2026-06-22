@@ -424,11 +424,11 @@ fn hip23_stress_duplicate_tex_same_addr_two_bundles_unsigned_second() {
 }
 
 #[test]
-fn hip23_stress_asset_create_at_dev_minsri_serial_5() {
+fn hip23_stress_asset_create_minsri_serial_1025_at_alive_height() {
     init_setup();
     let main_acc = Account::create_by("hip23-stress-devserial-main").unwrap();
     let issuer = addr_of(&Account::create_by("hip23-stress-devserial-iss").unwrap());
-    // Below mainnet minsri but valid on dev height 0 path — use height ASSET_ALIVE_HEIGHT on mainnet chain 0.
+    // Minsri floor serial at ASSET_ALIVE_HEIGHT on mainnet chain 0.
     const SERIAL: u64 = 1025;
 
     let mut create = AssetCreate::new();

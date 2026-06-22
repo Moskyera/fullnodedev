@@ -159,7 +159,9 @@ fn hip23_chain_sequential_fail_then_success_isolated() {
         Box::new(ForkableMemState::default());
     seed_hac_chain(&mut state, &main, 500);
 
-    let _ = try_execute_tx_fork(TEST_HEIGHT + 50, false, bad_tx.as_read(), &mut state);
+    let bad_err =
+        try_execute_tx_fork(TEST_HEIGHT + 50, false, bad_tx.as_read(), &mut state).unwrap_err();
+    assert_err_contains(&bad_err, "submitted in height between");
     try_execute_tx_fork(TEST_HEIGHT + 5, false, good_tx.as_read(), &mut state).unwrap();
     assert_eq!(hac_mei_chain(&state, &recipient), 2);
     // Failed tx does not commit (no fee); successful tx commits once.

@@ -5,14 +5,14 @@ on:
     paths:
       - 'doc/HIP23*.md'
       - 'tests/hip23_*.rs'
-      - 'tests/common/hip23.rs'
+      - 'tests/common/**'
       - 'protocol/**'
       - 'Cargo.toml'
   pull_request:
     paths:
       - 'doc/HIP23*.md'
       - 'tests/hip23_*.rs'
-      - 'tests/common/hip23.rs'
+      - 'tests/common/**'
       - 'protocol/**'
       - 'Cargo.toml'
 

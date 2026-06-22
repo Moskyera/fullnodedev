@@ -5,7 +5,7 @@ use basis::component::Env;
 use std::sync::Arc;
 
 use basis::interface::{Action, Context, State, StateOperat, Transaction, TransactionRead, TxExec};
-use field::*;
+use field::{Parse, Serialize, *};
 use protocol::state::CoreState;
 use protocol::tex::*;
 use protocol::transaction::*;
@@ -251,7 +251,16 @@ where
     sta
 }
 
-/// Mirrors `chain/src/check.rs` per-tx fork/merge (failed txs do not commit).
+/// Round-trip a signed TEX bundle through wire bytes (same signature, new instance).
+pub fn clone_tex_wire(tex: &TexCellAct) -> TexCellAct {
+    let mut buf = Vec::new();
+    tex.serialize_to(&mut buf);
+    let mut out = TexCellAct::new();
+    out.parse(&buf).unwrap();
+    out
+}
+
+/// Per-tx state fork/merge semantics (success commits, failure discards).
 pub fn try_execute_tx_fork(
     height: u64,
     fast_sync: bool,
@@ -265,9 +274,10 @@ pub fn try_execute_tx_fork(
     env.block.height = height;
     env.tx = create_tx_info(tx);
     let mut ctx = make_ctx_with_state(env, sub, tx);
-    match tx.execute(&mut ctx) {
+    let exec_res = tx.execute(&mut ctx);
+    let (sta, _) = ctx.release();
+    match exec_res {
         Ok(()) => {
-            let (sta, _) = ctx.release();
             state.merge_sub(sta);
             Ok(())
         }

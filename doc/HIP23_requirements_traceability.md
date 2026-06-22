@@ -36,11 +36,12 @@ Legend: ✅ covered | ⚠️ doc-only | ❌ gap
 
 | ID | MUST/SHOULD | Test(s) | Status |
 |----|-------------|---------|--------|
-| P2-M1 | HeightScope before debit | `hip23_pattern_2_*`, `hip23_p2_transfer_before_guard_*` | ✅ |
+| P2-M1 | HeightScope before debit | `hip23_pattern_2_height_guarded_payment` | ✅ |
+| P2-M4 | Chain atomicity on fail | `hip23_chain_failed_tx_does_not_commit`, `hip23_p2_transfer_before_guard_*` | ✅ |
 | P2-M2 | start <= end (end≠0) | adversarial height tests | ✅ |
 | P2-M3 | Revert outside window | `hip23_p2_height_guard_above_end_reverts`, proptest height window | ✅ |
 | P2-S1 | Finite end for expiry | `hip23_p2_height_guard_boundary_inclusive` | ✅ |
-| P2-M4 | Chain atomicity on fail | `hip23_chain_failed_tx_does_not_commit` | ✅ |
+
 
 ---
 

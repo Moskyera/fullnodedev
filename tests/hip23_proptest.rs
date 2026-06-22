@@ -47,6 +47,36 @@ proptest! {
         prop_assert_eq!(hac_mei(&mut ctx, &get), zhu_mei);
     }
 
+    /// end = 0 means unbounded upper; heights above start succeed.
+    #[test]
+    fn hip23_proptest_height_scope_unlimited_end_zero(
+        above in 1u64..500u64,
+    ) {
+        init_setup();
+        let start = PROP_BASE;
+        let inside = start + above;
+        let main_acc = Account::create_by(&format!("hip23-prop-h0-{above}")).unwrap();
+        let main = addr_of(&main_acc);
+        let recipient = field::ADDRESS_TWOX.clone();
+
+        let mut guard = HeightScope::new();
+        guard.start = BlockHeight::from(start);
+        guard.end = BlockHeight::from(0);
+        let mut transfer = HacToTrs::new();
+        transfer.to = AddrOrPtr::from_addr(recipient.clone());
+        transfer.hacash = Amount::mei(1);
+
+        let tx = build_signed_type3(
+            &main_acc,
+            vec![Box::new(guard), Box::new(transfer)],
+            0,
+        );
+        let mut ctx = make_ctx(inside, tx.as_read());
+        seed_hac(&mut ctx, &main, 50);
+        tx.execute(&mut ctx).unwrap();
+        prop_assert_eq!(hac_mei(&mut ctx, &recipient), 1);
+    }
+
     /// Height inside [start, end] succeeds; outside reverts.
     #[test]
     fn hip23_proptest_height_scope_window(

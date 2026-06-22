@@ -21,17 +21,19 @@ fn hip23_tex_replay_same_bundle_different_main_succeeds() {
     let pay = addr_of(&pay_acc);
     let get = addr_of(&get_acc);
 
-    let (pay_tex_a, get_tex_a) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, 0, 0);
-    let (pay_tex_b, get_tex_b) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, 0, 0);
+    let (pay_tex, get_tex) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, 0, 0);
+    // Reuse wire-identical signed bundles (not re-signed) in a second composed tx.
+    let pay_replay = clone_tex_wire(&pay_tex);
+    let get_replay = clone_tex_wire(&get_tex);
 
     let tx_a = build_signed_type3(
         &main_a,
-        vec![Box::new(pay_tex_a), Box::new(get_tex_a)],
+        vec![Box::new(pay_tex), Box::new(get_tex)],
         0,
     );
     let tx_b = build_signed_type3(
         &main_b,
-        vec![Box::new(pay_tex_b), Box::new(get_tex_b)],
+        vec![Box::new(pay_replay), Box::new(get_replay)],
         0,
     );
 
