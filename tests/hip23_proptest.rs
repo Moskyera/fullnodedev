@@ -7,6 +7,7 @@ use basis::interface::{Action, Transaction, TxExec};
 use common::hip23::*;
 use field::*;
 use protocol::action::*;
+use protocol::tex::*;
 use proptest::prelude::*;
 use sys::Account;
 
@@ -107,6 +108,47 @@ proptest! {
         )
         .unwrap_err();
         prop_assert!(err.contains("all GUARD"), "{err}");
+    }
+
+    /// Imbalanced TEX always fails settlement.
+    #[test]
+    fn hip23_proptest_imbalanced_tex_always_fails(
+        pay_mei in 2u64..30u64,
+        get_mei in 1u64..30u64,
+    ) {
+        prop_assume!(pay_mei != get_mei);
+        init_setup();
+        let main_acc = Account::create_by(&format!("hip23-prop-imb-main-{pay_mei}-{get_mei}")).unwrap();
+        let pay_acc = Account::create_by(&format!("hip23-prop-imb-pay-{pay_mei}")).unwrap();
+        let get_acc = Account::create_by(&format!("hip23-prop-imb-get-{get_mei}")).unwrap();
+        let pay = addr_of(&pay_acc);
+
+        let (pay_tex, _) = build_balanced_tex_swap(
+            &pay_acc,
+            &get_acc,
+            pay_mei * 100_000_000,
+            0,
+            0,
+        );
+        let mut get_tex = TexCellAct::create_by(addr_of(&get_acc));
+        get_tex
+            .add_cell(Box::new(CellTrsZhuGet::new(
+                Fold64::from(get_mei * 100_000_000).unwrap(),
+            )))
+            .unwrap();
+        get_tex.do_sign(&get_acc).unwrap();
+
+        let tx = build_signed_type3(
+            &main_acc,
+            vec![Box::new(pay_tex), Box::new(get_tex)],
+            0,
+        );
+        let mut ctx = make_ctx(PROP_BASE, tx.as_read());
+        seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+        seed_hac(&mut ctx, &pay, pay_mei + 5);
+
+        let err = tx.execute(&mut ctx).unwrap_err();
+        prop_assert!(err.contains("settlement check failed"), "{err}");
     }
 
     /// Production path: balanced TEX also settles under fast_sync=false.

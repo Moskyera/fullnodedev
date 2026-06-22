@@ -22,6 +22,7 @@ Reference material:
 - AST control flow: `doc/ast-spec.md`
 - Guards: `protocol/src/action/chain.rs`
 - JSON templates: `doc/HIP23_templates.md`
+- Audit package: `doc/HIP23_threat_model.md`, `doc/HIP23_invariants.md`, `doc/HIP23_requirements_traceability.md`, `doc/HIP23_wallet_checklist.md`, `doc/HIP23_indexer_dictionary.md`, `doc/HIP23_audit_scope.md`, `doc/HIP23_audit_findings.md`
 
 ## 2. Scope
 
@@ -258,8 +259,8 @@ actions: [
 
 | Version | Contents |
 |---------|----------|
-| v1.0 (this draft) | Patterns P1–P5, JSON templates, regression + adversarial tests |
-| v1.1 (planned) | Wallet checklist, indexer field dictionary |
+| v1.0 | Patterns P1–P5, JSON templates, regression + adversarial tests |
+| v1.1 (this draft) | Wallet checklist, indexer dictionary, threat model, invariants, traceability, audit package |
 | v2.0 (future) | Optional HVM companion contracts per pattern |
 
 ## 11. Test matrix
@@ -310,7 +311,20 @@ Smoke tests with `fast_sync = false` (`make_ctx_strict` in `tests/common/hip23.r
 | Balanced HAC TEX settles | 64 | `fast_sync = true` |
 | HeightScope window (inside ok, outside fail) | 64 | `fast_sync = true` |
 | Guard-only always rejected at precheck | 64 | n/a |
+| Imbalanced TEX always fails | 64 | `fast_sync = true` |
 | Balanced TEX under strict path | 64 | `fast_sync = false` |
+
+### Audit strict (`hip23_audit_strict.rs`)
+
+Adversarial cases under `fast_sync = false`: imbalanced TEX, tampered TEX sig, height guard, wrong `protocol_cost`, main sig tamper, guard-only precheck.
+
+### Chain integration (`hip23_chain_integration.rs`)
+
+Per-tx fork/merge semantics (`chain/src/check.rs`): failed tx rollback, P4 Tx A→B sequencing, fail-then-success isolation.
+
+### TEX replay (`hip23_tex_replay.rs`)
+
+TEX signature scope: replay across different `main`, tamper after sign, extra unbalanced party.
 
 Run all:
 

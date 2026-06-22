@@ -1,0 +1,26 @@
+name: HIP-23 Tests
+
+on:
+  push:
+    paths:
+      - 'doc/HIP23*.md'
+      - 'tests/hip23_*.rs'
+      - 'tests/common/hip23.rs'
+      - 'protocol/**'
+      - 'Cargo.toml'
+  pull_request:
+    paths:
+      - 'doc/HIP23*.md'
+      - 'tests/hip23_*.rs'
+      - 'tests/common/hip23.rs'
+      - 'protocol/**'
+      - 'Cargo.toml'
+
+jobs:
+  hip23:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run HIP-23 test suite
+        run: cargo test hip23_ -- --nocapture

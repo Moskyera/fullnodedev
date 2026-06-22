@@ -2,7 +2,9 @@
 #![allow(dead_code)]
 
 use basis::component::Env;
-use basis::interface::{Action, Context, Transaction, TransactionRead};
+use std::sync::Arc;
+
+use basis::interface::{Action, Context, State, StateOperat, Transaction, TransactionRead, TxExec};
 use field::*;
 use protocol::state::CoreState;
 use protocol::tex::*;
@@ -234,4 +236,41 @@ pub fn assert_err_contains(err: &str, needle: &str) {
         err.contains(needle),
         "expected '{needle}' in error: {err}"
     );
+}
+
+/// Run a closure against persisted chain state (for seeding / balance reads).
+pub fn with_persisted_state<F>(height: u64, state: Box<dyn State>, f: F) -> Box<dyn State>
+where
+    F: FnOnce(&mut dyn Context),
+{
+    let main_acc = Account::create_by("hip23-state-helper").unwrap();
+    let tx = build_signed_type3(&main_acc, vec![], 0);
+    let mut ctx = make_ctx_persisted(height, state, tx.as_read());
+    f(&mut ctx);
+    let (sta, _) = ctx.release();
+    sta
+}
+
+/// Mirrors `chain/src/check.rs` per-tx fork/merge (failed txs do not commit).
+pub fn try_execute_tx_fork(
+    height: u64,
+    fast_sync: bool,
+    tx: &dyn TransactionRead,
+    state: &mut Box<dyn State>,
+) -> Result<(), String> {
+    let parent: Arc<Box<dyn State>> = state.clone_state().into();
+    let sub = parent.fork_sub(Arc::downgrade(&parent));
+    let mut env = Env::default();
+    env.chain.fast_sync = fast_sync;
+    env.block.height = height;
+    env.tx = create_tx_info(tx);
+    let mut ctx = make_ctx_with_state(env, sub, tx);
+    match tx.execute(&mut ctx) {
+        Ok(()) => {
+            let (sta, _) = ctx.release();
+            state.merge_sub(sta);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
