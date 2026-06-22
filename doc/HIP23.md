@@ -285,6 +285,15 @@ actions: [
 | P5 AST | condition fault, else-branch transfer, zero gas rejected |
 | Topology | guard-only rejected (precheck + execute), height+floor+transfer combo (pass + fail), height+TEX combo (pass + fail) |
 
+### Stress (`hip23_pattern_stress.rs`)
+
+| Area | Tests |
+|------|-------|
+| Guards | triple ChainAllow+Height+Floor, height 0..0, far-future start |
+| TEX | three-party zero-sum, serial mismatch, empty/unsigned bundles, duplicate addr |
+| P3/P4/P5 | multi-debit floor, minsri serial + chained TEX, BalanceFloor AST cond, low gas |
+| HIP20 | serial 1025 @ alive height, serial below minsri fault |
+
 Run all:
 
 ```bash
