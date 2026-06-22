@@ -294,13 +294,37 @@ actions: [
 | P3/P4/P5 | multi-debit floor, minsri serial + chained TEX, BalanceFloor AST cond, low gas |
 | HIP20 | serial 1025 @ alive height, serial below minsri fault |
 
+### Production path (`hip23_production_path.rs`)
+
+Smoke tests with `fast_sync = false` (`make_ctx_strict` in `tests/common/hip23.rs`):
+
+| Area | Tests |
+|------|-------|
+| P1–P5 happy path | `hip23_production_p1_tex_swap_succeeds` … `hip23_production_p5_ast_conditional_settlement` |
+| Mempool policy | `hip23_production_duplicate_tx_rejected`, `hip23_production_tampered_main_signature_rejected` |
+
+### Property-based (`hip23_proptest.rs`)
+
+| Property | Cases | Harness |
+|----------|-------|---------|
+| Balanced HAC TEX settles | 64 | `fast_sync = true` |
+| HeightScope window (inside ok, outside fail) | 64 | `fast_sync = true` |
+| Guard-only always rejected at precheck | 64 | n/a |
+| Balanced TEX under strict path | 64 | `fast_sync = false` |
+
 Run all:
 
 ```bash
 cargo test hip23_ -- --nocapture
 ```
 
-**Note:** HIP-23 tests use `fast_sync = true` in the harness (`tests/common/hip23.rs`) to skip
-signature verification, duplicate-tx checks, and fee-address validation. Pattern semantics
-(guards, TEX settlement, topology) still match mainnet rules; production integrators MUST
-validate signatures and mempool policy separately.
+Run production + proptest only:
+
+```bash
+cargo test hip23_pro -- --nocapture
+```
+
+**Note:** Regression, adversarial, and stress suites use `fast_sync = true` to focus on pattern
+semantics (guards, TEX settlement, topology). Production-path and strict proptest suites use
+`fast_sync = false` to exercise signature verification and duplicate-tx rejection. Integrators
+should run both before shipping wallet or indexer integrations.

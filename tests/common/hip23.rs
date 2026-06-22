@@ -2,14 +2,14 @@
 #![allow(dead_code)]
 
 use basis::component::Env;
-use basis::interface::{Action, Context, StateOperat, Transaction, TransactionRead};
+use basis::interface::{Action, Context, Transaction, TransactionRead};
 use field::*;
 use protocol::state::CoreState;
 use protocol::tex::*;
 use protocol::transaction::*;
 use sys::Account;
 use testkit::sim::context::make_ctx_with_state;
-use testkit::sim::integration::enable_mint_setup;
+use testkit::sim::integration::ensure_standard_protocol_setup_for_tests;
 use testkit::sim::state::ForkableMemState;
 
 pub const TEST_HEIGHT: u64 = protocol::upgrade::ONLINE_OPEN_HEIGHT + 10_000;
@@ -17,7 +17,7 @@ pub const TEST_HEIGHT: u64 = protocol::upgrade::ONLINE_OPEN_HEIGHT + 10_000;
 pub const TX_FEE_MEI: u64 = 1;
 
 pub fn init_setup() {
-    enable_mint_setup();
+    ensure_standard_protocol_setup_for_tests(x16rs::block_hash, false);
 }
 
 pub fn addr_of(acc: &Account) -> Address {
@@ -42,6 +42,30 @@ pub fn make_ctx_persisted<'a>(
     tx: &'a dyn TransactionRead,
 ) -> protocol::context::ContextInst<'a> {
     make_ctx_with_opts(height, 0, true, tx, state)
+}
+
+/// Production-like path: signature verification, duplicate-tx check, fee-address rules.
+pub fn make_ctx_strict<'a>(
+    height: u64,
+    tx: &'a dyn TransactionRead,
+) -> protocol::context::ContextInst<'a> {
+    make_ctx_strict_chain(height, 0, tx)
+}
+
+pub fn make_ctx_strict_chain<'a>(
+    height: u64,
+    chain_id: u32,
+    tx: &'a dyn TransactionRead,
+) -> protocol::context::ContextInst<'a> {
+    make_ctx_with_opts(height, chain_id, false, tx, Box::new(ForkableMemState::default()))
+}
+
+pub fn make_ctx_strict_persisted<'a>(
+    height: u64,
+    state: Box<dyn basis::interface::State>,
+    tx: &'a dyn TransactionRead,
+) -> protocol::context::ContextInst<'a> {
+    make_ctx_with_opts(height, 0, false, tx, state)
 }
 
 fn make_ctx_with_opts<'a>(
