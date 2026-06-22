@@ -35,6 +35,8 @@ Audience: explorer, indexer, analytics engineers
 
 ## 3. Normalized error strings (v1)
 
+Reference implementation: `tests/common/hip23_errors.rs` (`classify_error`, `error_code_name`).
+
 Indexers SHOULD map raw errors to these buckets:
 
 | Bucket | Substring(s) | `guard_outcome` |

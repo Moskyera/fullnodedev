@@ -1,0 +1,20 @@
+[package]
+name = "hacash-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+field = { path = "../field" }
+protocol = { path = "../protocol" }
+
+[[bin]]
+name = "tex_cell_act_parse"
+path = "fuzz_targets/tex_cell_act_parse.rs"
+test = false
+doc = false
+bench = false

@@ -42,6 +42,15 @@ Include:
 
 Integrators MUST validate against production-like mode before mainnet use.
 
+## Fuzzing (optional)
+
+```bash
+cargo install cargo-fuzz
+cd fuzz && cargo fuzz run tex_cell_act_parse -- -max_total_time=30
+```
+
+Proptest also covers random TEX wire parse (`hip23_proptest_tex_wire_parse_never_panics`).
+
 ## Dependency audit
 
 Periodically run:

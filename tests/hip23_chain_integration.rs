@@ -168,6 +168,25 @@ fn hip23_chain_sequential_fail_then_success_isolated() {
     assert_eq!(hac_mei_chain(&state, &main), 500 - 2 - TX_FEE_MEI);
 }
 
+#[test]
+fn hip23_chain_duplicate_tx_rejected() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-chain-dup-main").unwrap();
+    let main = addr_of(&main_acc);
+    let mut transfer = HacToTrs::new();
+    transfer.to = AddrOrPtr::from_addr(field::ADDRESS_TWOX.clone());
+    transfer.hacash = Amount::mei(1);
+
+    let tx = build_signed_type3(&main_acc, vec![Box::new(transfer)], 0);
+    let mut state: Box<dyn basis::interface::State> =
+        Box::new(ForkableMemState::default());
+    seed_hac_chain(&mut state, &main, 100);
+
+    try_execute_tx_fork(TEST_HEIGHT, false, tx.as_read(), &mut state).unwrap();
+    let err = try_execute_tx_fork(TEST_HEIGHT, false, tx.as_read(), &mut state).unwrap_err();
+    assert_err_contains(&err, "already exists");
+}
+
 fn seed_hac_chain(state: &mut Box<dyn basis::interface::State>, addr: &Address, mei: u64) {
     let taken = std::mem::replace(state, Box::new(ForkableMemState::default()));
     *state = with_persisted_state(TEST_HEIGHT, taken, |ctx| seed_hac(ctx, addr, mei));

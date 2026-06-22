@@ -12,7 +12,7 @@ Method: internal audit per `HIP23_audit_scope.md`
 |----------|------|-------|----------|
 | High | 0 | 2 | 1 |
 | Medium | 0 | 3 | 2 |
-| Low | 1 | 2 | 0 |
+| Low | 0 | 3 | 0 |
 | Informational | 2 | 0 | 3 |
 
 No critical consensus issues (expected — HIP-23 is application-layer).
@@ -123,11 +123,11 @@ No critical consensus issues (expected — HIP-23 is application-layer).
 |-------|-------|
 | Severity | **Low** |
 | Pattern | P2, P3, P5 |
-| Status | Open (v1 limitation) |
+| Status | **Mitigated** (v1 classifier) |
 
-**Description:** Indexers must parse error strings.
+**Description:** On-chain errors remain strings; no consensus enum in v1.
 
-**Remediation:** `HIP23_indexer_dictionary.md` §3; future protocol enum out of HIP-23 v1 scope.
+**Remediation:** `tests/common/hip23_errors.rs` + `hip23_guard_error_codes.rs` lock stable indexer codes; `HIP23_indexer_dictionary.md` §3.
 
 ---
 
@@ -174,10 +174,10 @@ No critical consensus issues (expected — HIP-23 is application-layer).
 | ID | Recommendation | Priority |
 |----|----------------|----------|
 | R-01 | External third-party audit before mainnet wallet launch | High |
-| R-02 | Add `cargo-fuzz` on TEX JSON parse | Medium |
-| R-03 | CI gate on `cargo test hip23_` | Medium (added `.github/workflows/hip23.yml`) |
-| R-04 | Expand proptest to P4/P5 properties | Low |
-| R-05 | Cross-implementation test vectors file | Low |
+| R-02 | Add `cargo-fuzz` on TEX parse | Medium (**done**: `fuzz/` + proptest parse property) |
+| R-03 | CI gate on `cargo test hip23_` | Medium (**done**: `.github/workflows/hip23.yml`) |
+| R-04 | Expand proptest to P4/P5 properties | Low (**done**) |
+| R-05 | Cross-implementation test vectors file | Low (**done**: `tests/fixtures/hip23_test_vectors.json`) |
 
 ---
 

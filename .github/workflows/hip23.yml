@@ -6,15 +6,19 @@ on:
       - 'doc/HIP23*.md'
       - 'tests/hip23_*.rs'
       - 'tests/common/**'
+      - 'tests/fixtures/**'
       - 'protocol/**'
       - 'Cargo.toml'
+      - '.github/workflows/hip23.yml'
   pull_request:
     paths:
       - 'doc/HIP23*.md'
       - 'tests/hip23_*.rs'
       - 'tests/common/**'
+      - 'tests/fixtures/**'
       - 'protocol/**'
       - 'Cargo.toml'
+      - '.github/workflows/hip23.yml'
 
 jobs:
   hip23:
@@ -24,3 +28,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run HIP-23 test suite
         run: cargo test hip23_ -- --nocapture
+      - name: Run workspace tests
+        run: cargo test --workspace -- --nocapture

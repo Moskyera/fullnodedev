@@ -91,8 +91,11 @@ Application-layer integration standard audit — **no consensus fork**. Validate
 - [x] Chain + replay integration tests
 - [x] Strict-path adversarial mirror
 - [x] `SECURITY.md`
-- [ ] External third-party audit (future)
-- [ ] `cargo-fuzz` targets (optional v1.2)
+- [x] External audit brief (`HIP23_external_audit_brief.md`)
+- [x] Stable error classifier (`tests/common/hip23_errors.rs`)
+- [x] Cross-implementation test vectors (`tests/fixtures/hip23_test_vectors.json`)
+- [x] `cargo-fuzz` target (`fuzz/fuzz_targets/tex_cell_act_parse.rs`)
+- [ ] External third-party audit engagement (process only)
 
 ---
 

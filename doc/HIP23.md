@@ -1,6 +1,6 @@
 # HIP-23: Istanbul DeFi Application Patterns
 
-**Status:** Draft (branch `hip-23-draft`)  
+**Status:** v1.1 Ready (branch `hip-23-draft`)  
 **Type:** Application / integration standard — **no consensus fork**  
 **Activation:** Istanbul capabilities @ mainnet height `765432` (`ONLINE_OPEN_HEIGHT`)  
 **Depends on:** Type3 transactions, ActionGuard, TEX, AST, HIP20 (`AssetCreate`), HVM (optional)
@@ -22,7 +22,9 @@ Reference material:
 - AST control flow: `doc/ast-spec.md`
 - Guards: `protocol/src/action/chain.rs`
 - JSON templates: `doc/HIP23_templates.md`
-- Audit package: `doc/HIP23_threat_model.md`, `doc/HIP23_invariants.md`, `doc/HIP23_requirements_traceability.md`, `doc/HIP23_wallet_checklist.md`, `doc/HIP23_indexer_dictionary.md`, `doc/HIP23_audit_scope.md`, `doc/HIP23_audit_findings.md`
+- Audit package: `doc/HIP23_threat_model.md`, `doc/HIP23_invariants.md`, `doc/HIP23_requirements_traceability.md`, `doc/HIP23_wallet_checklist.md`, `doc/HIP23_indexer_dictionary.md`, `doc/HIP23_audit_scope.md`, `doc/HIP23_audit_findings.md`, `doc/HIP23_external_audit_brief.md`
+- Error classifier: `tests/common/hip23_errors.rs`
+- Test vectors: `tests/fixtures/hip23_test_vectors.json`
 
 ## 2. Scope
 
@@ -314,6 +316,17 @@ Smoke tests with `fast_sync = false` (`make_ctx_strict` in `tests/common/hip23.r
 | Guard-only always rejected at precheck | 64 | n/a |
 | Imbalanced TEX always fails | 64 | `fast_sync = true` |
 | Balanced TEX under strict path | 64 | `fast_sync = false` |
+| Wrong `protocol_cost` always fails (P4) | 64 | `fast_sync = true` |
+| P5 else on height revert | 64 | `fast_sync = true` |
+| TEX wire parse never panics | 64 | fuzz-adjacent |
+
+### Guard error codes (`hip23_guard_error_codes.rs`)
+
+Stable string → code mapping for indexers (F-007 mitigation).
+
+### Test vectors (`hip23_test_vectors.rs` + `tests/fixtures/hip23_test_vectors.json`)
+
+Cross-implementation acceptance registry (12+ vectors).
 
 ### Audit strict (`hip23_audit_strict.rs`)
 

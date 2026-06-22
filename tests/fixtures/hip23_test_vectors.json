@@ -1,0 +1,90 @@
+{
+  "version": "1.0",
+  "spec": "HIP-23",
+  "height_baseline": 775432,
+  "description": "Cross-implementation acceptance vectors. Wallets/indexers SHOULD reproduce outcomes at TEST_HEIGHT with funded fixtures.",
+  "vectors": [
+    {
+      "id": "P1-balanced-hac-tex",
+      "pattern": "P1",
+      "test": "hip23_pattern_1_atomic_tex_swap",
+      "expect": "success",
+      "invariants": ["tex_zhu_zero_sum", "get_receives_1_mei"]
+    },
+    {
+      "id": "P1-imbalanced-tex",
+      "pattern": "P1",
+      "test": "hip23_p1_tex_imbalanced_hac_amount_fails",
+      "expect": "fault",
+      "error_code": "tex_settlement_imbalance"
+    },
+    {
+      "id": "P2-height-inside",
+      "pattern": "P2",
+      "test": "hip23_pattern_2_height_guarded_payment",
+      "expect": "success",
+      "guard": "height_inside_window"
+    },
+    {
+      "id": "P2-height-outside",
+      "pattern": "P2",
+      "test": "hip23_p2_height_guard_above_end_reverts",
+      "expect": "revert_whole_tx",
+      "error_code": "height_outside_window"
+    },
+    {
+      "id": "P3-floor-after-debit",
+      "pattern": "P3",
+      "test": "hip23_pattern_3_balance_floor_protected_transfer",
+      "expect": "success"
+    },
+    {
+      "id": "P3-floor-before-debit-bypass",
+      "pattern": "P3",
+      "test": "hip23_p3_floor_before_transfer_checks_pre_debit_state",
+      "expect": "success_without_protection",
+      "wallet_must": "enforce_debit_then_floor"
+    },
+    {
+      "id": "P4-two-tx-issuance-then-tex",
+      "pattern": "P4",
+      "test": "hip23_pattern_4_asset_create_plus_tex",
+      "expect": "success_after_asset_exists"
+    },
+    {
+      "id": "P4-wrong-protocol-cost",
+      "pattern": "P4",
+      "test": "hip23_p4_wrong_protocol_cost_rejected",
+      "expect": "fault",
+      "error_code": "protocol_fee_mismatch"
+    },
+    {
+      "id": "P5-else-on-cond-revert",
+      "pattern": "P5",
+      "test": "hip23_p5_ast_else_branch_executes_transfer",
+      "expect": "success",
+      "indexer_fields": { "ast_branch": "else", "cond_outcome": "revert" }
+    },
+    {
+      "id": "TEX-replay-wire-identical",
+      "pattern": "P1",
+      "test": "hip23_tex_replay_same_bundle_different_main_succeeds",
+      "expect": "success_both_txs",
+      "integrator_must": "pin_full_composed_tx_before_co_sign"
+    },
+    {
+      "id": "chain-fork-no-partial-commit",
+      "pattern": "P2",
+      "test": "hip23_chain_failed_tx_does_not_commit",
+      "expect": "state_unchanged_on_fail"
+    },
+    {
+      "id": "production-duplicate-tx",
+      "pattern": "all",
+      "test": "hip23_production_duplicate_tx_rejected",
+      "expect": "fault",
+      "error_code": "duplicate_tx",
+      "harness": "fast_sync_false"
+    }
+  ]
+}

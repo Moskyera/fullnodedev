@@ -6,6 +6,8 @@ mod common;
 use basis::interface::{Action, Transaction, TxExec};
 use common::hip23::*;
 use field::*;
+use common::hip23_errors::{classify_error, Hip23ErrorCode};
+use mint::action::AssetCreate;
 use protocol::action::*;
 use protocol::tex::*;
 use proptest::prelude::*;
@@ -207,5 +209,77 @@ proptest! {
 
         tx.execute(&mut ctx).unwrap();
         prop_assert_eq!(hac_mei(&mut ctx, &get), zhu_mei);
+    }
+
+    /// Wrong protocol_cost always faults (P4).
+    #[test]
+    fn hip23_proptest_wrong_protocol_cost_always_fails(
+        bad_mei in 1u64..100u64,
+        serial in 9000u64..9999u64,
+    ) {
+        init_setup();
+        let main_acc = Account::create_by(&format!("hip23-prop-p4-main-{serial}")).unwrap();
+        let issuer = addr_of(&Account::create_by(&format!("hip23-prop-p4-iss-{serial}")).unwrap());
+
+        let mut create = AssetCreate::new();
+        create.metadata = AssetSmelt {
+            serial: Fold64::from(serial).unwrap(),
+            supply: Fold64::from(100).unwrap(),
+            decimal: Uint1::from(0),
+            issuer,
+            ticket: BytesW1::from_str("P4").unwrap(),
+            name: BytesW1::from_str("P4").unwrap(),
+        };
+        create.protocol_cost = Amount::mei(bad_mei);
+
+        let tx = build_signed_type3(&main_acc, vec![Box::new(create)], 0);
+        let mut ctx = make_ctx(PROP_BASE, tx.as_read());
+        seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+        let err = tx.execute(&mut ctx).unwrap_err();
+        prop_assert_eq!(classify_error(&err), Hip23ErrorCode::ProtocolFeeMismatch);
+    }
+
+    /// P5: height cond revert selects else branch and succeeds.
+    #[test]
+    fn hip23_proptest_p5_else_on_height_revert(
+        outside in 2u64..200u64,
+    ) {
+        init_setup();
+        let main_acc = Account::create_by(&format!("hip23-prop-p5-{outside}")).unwrap();
+        let main = addr_of(&main_acc);
+        let recipient = field::ADDRESS_TWOX.clone();
+        let start = PROP_BASE;
+        let end = start + 50;
+        let height = end + outside;
+
+        let mut cond_guard = HeightScope::new();
+        cond_guard.start = BlockHeight::from(start);
+        cond_guard.end = BlockHeight::from(end);
+        let cond = AstSelect::create_by(1, 1, vec![Box::new(cond_guard)]);
+        let br_if = AstSelect::create_list(vec![Box::new(HacToTrs::create_by(
+            recipient.clone(),
+            Amount::mei(9),
+        ))]);
+        let br_else = AstSelect::create_list(vec![Box::new(HacToTrs::create_by(
+            recipient.clone(),
+            Amount::mei(2),
+        ))]);
+        let act = AstIf::create_by(cond, br_if, br_else);
+
+        let tx = build_signed_type3(&main_acc, vec![Box::new(act)], 17);
+        let mut ctx = make_ctx(height, tx.as_read());
+        seed_hac(&mut ctx, &main, 200);
+        tx.execute(&mut ctx).unwrap();
+        prop_assert_eq!(hac_mei(&mut ctx, &recipient), 2);
+    }
+
+    /// Random bytes on TEX wire must not panic (fuzz-adjacent).
+    #[test]
+    fn hip23_proptest_tex_wire_parse_never_panics(
+        data in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        init_setup();
+        let mut tex = TexCellAct::new();
+        let _ = tex.parse(&data);
     }
 }
