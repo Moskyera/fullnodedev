@@ -31,7 +31,7 @@ No critical consensus issues (expected — HIP-23 is application-layer).
 
 **Description:** `TexCellAct` signs `addr + cells` only. The same valid bundle may appear in multiple composed Type3 txs if counterparties co-sign without pinning the full tx.
 
-**Proof:** `hip23_tex_replay_same_bundle_different_main_succeeds`
+**Proof:** `hip23_tex_replay_same_bundle_different_main_succeeds` (wire replay via `clone_tex_wire`)
 
 **Remediation:** Wallet checklist §co-signing; `HIP23_threat_model.md` T-P1-2. Not a protocol bug.
 

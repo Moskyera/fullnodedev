@@ -309,6 +309,7 @@ Smoke tests with `fast_sync = false` (`make_ctx_strict` in `tests/common/hip23.r
 | Property | Cases | Harness |
 |----------|-------|---------|
 | Balanced HAC TEX settles | 64 | `fast_sync = true` |
+| HeightScope `end=0` unbounded above | 64 | `fast_sync = true` |
 | HeightScope window (inside ok, outside fail) | 64 | `fast_sync = true` |
 | Guard-only always rejected at precheck | 64 | n/a |
 | Imbalanced TEX always fails | 64 | `fast_sync = true` |

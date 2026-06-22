@@ -552,8 +552,6 @@ fn hip23_p3_floor_satoshi_dimension_blocks_overspend() {
     init_setup();
     let main_acc = Account::create_by("hip23-p3c-main").unwrap();
     let main = addr_of(&main_acc);
-    let recipient = field::ADDRESS_TWOX.clone();
-
     let mut pay_tex = TexCellAct::create_by(main);
     pay_tex
         .add_cell(Box::new(CellTrsSatPay::new(Fold64::from(4).unwrap())))
@@ -566,7 +564,7 @@ fn hip23_p3_floor_satoshi_dimension_blocks_overspend() {
     get_tex
         .add_cell(Box::new(CellTrsSatGet::new(Fold64::from(4).unwrap())))
         .unwrap();
-    get_tex.do_sign(&cp_acc);
+    get_tex.do_sign(&cp_acc).unwrap();
 
     let mut floor = BalanceFloor::new();
     floor.addr = AddrOrPtr::from_addr(main);

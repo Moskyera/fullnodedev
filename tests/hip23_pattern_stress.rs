@@ -3,7 +3,7 @@
 
 mod common;
 
-use basis::interface::{Action, StateOperat, Transaction, TxExec};
+use basis::interface::{StateOperat, Transaction, TxExec};
 use common::hip23::*;
 use field::*;
 use mint::action::AssetCreate;
