@@ -8,6 +8,7 @@ use common::hip23::*;
 use field::*;
 use common::hip23_errors::{classify_error, Hip23ErrorCode};
 use mint::action::AssetCreate;
+use mint::genesis;
 use protocol::action::*;
 use protocol::tex::*;
 use proptest::prelude::*;
@@ -217,6 +218,8 @@ proptest! {
         bad_mei in 1u64..100u64,
         serial in 9000u64..9999u64,
     ) {
+        let correct_mei = genesis::block_reward_number(PROP_BASE) as u64;
+        prop_assume!(bad_mei != correct_mei);
         init_setup();
         let main_acc = Account::create_by(&format!("hip23-prop-p4-main-{serial}")).unwrap();
         let issuer = addr_of(&Account::create_by(&format!("hip23-prop-p4-iss-{serial}")).unwrap());
