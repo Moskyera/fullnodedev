@@ -1,99 +1,18 @@
-//! HIP-23 application-pattern regression tests.
-//! See doc/HIP23.md and doc/HIP23_templates.md.
+//! HIP-23 happy-path regression tests.
+//! See doc/HIP23.md. Adversarial cases: hip23_pattern_adversarial.rs
 
-use basis::component::Env;
-use basis::interface::{
-    Action, Context, StateOperat, Transaction, TransactionRead, TxExec,
-};
+mod common;
+
+use basis::interface::{StateOperat, Transaction, TxExec};
+use common::hip23::*;
 use field::*;
 use mint::action::AssetCreate;
 use mint::genesis;
 use protocol::action::*;
-use protocol::state::CoreState;
 use protocol::tex::*;
-use protocol::transaction::*;
+use protocol::transaction::create_tx_info;
 use sys::Account;
 use testkit::sim::context::make_ctx_with_state;
-use testkit::sim::integration::enable_mint_setup;
-
-const TEST_HEIGHT: u64 = protocol::upgrade::ONLINE_OPEN_HEIGHT + 10_000;
-const TX_FEE_MEI: u64 = 1;
-
-fn init_setup_once() {
-    enable_mint_setup();
-}
-
-fn addr_of(acc: &Account) -> Address {
-    Address::from(acc.address().clone())
-}
-
-fn make_ctx<'a>(height: u64, tx: &'a dyn TransactionRead) -> protocol::context::ContextInst<'a> {
-    let mut env = Env::default();
-    env.chain.fast_sync = true;
-    env.block.height = height;
-    env.tx = create_tx_info(tx);
-    make_ctx_with_state(env, Box::new(testkit::sim::state::ForkableMemState::default()), tx)
-}
-
-fn seed_hac(ctx: &mut dyn Context, addr: &Address, mei: u64) {
-    let mut state = CoreState::wrap(ctx.state());
-    let mut bls = state.balance(addr).unwrap_or_default();
-    bls.hacash = Amount::mei(mei);
-    state.balance_set(addr, &bls);
-}
-
-fn seed_asset(ctx: &mut dyn Context, owner: &Address, serial: u64, amount: u64) {
-    let mut state = CoreState::wrap(ctx.state());
-    let serial_f = Fold64::from(serial).unwrap();
-    state.asset_set(
-        &serial_f,
-        &AssetSmelt {
-            serial: serial_f,
-            supply: Fold64::from(1_000_000).unwrap(),
-            decimal: Uint1::from(2),
-            issuer: *owner,
-            ticket: BytesW1::from_str("HIP23").unwrap(),
-            name: BytesW1::from_str("HIP23 Asset").unwrap(),
-        },
-    );
-    let mut bls = state.balance(owner).unwrap_or_default();
-    bls.asset_set(AssetAmt::from(serial, amount).unwrap())
-        .unwrap();
-    state.balance_set(owner, &bls);
-}
-
-fn hac_mei(ctx: &mut dyn Context, addr: &Address) -> u64 {
-    CoreState::wrap(ctx.state())
-        .balance(addr)
-        .unwrap_or_default()
-        .hacash
-        .to_mei_u64()
-        .unwrap()
-}
-
-fn asset_amt(ctx: &mut dyn Context, addr: &Address, serial: u64) -> u64 {
-    CoreState::wrap(ctx.state())
-        .balance(addr)
-        .unwrap_or_default()
-        .asset(Fold64::from(serial).unwrap())
-        .map(|a| a.amount.uint())
-        .unwrap_or(0)
-}
-
-fn build_signed_type3(
-    main_acc: &Account,
-    actions: Vec<Box<dyn Action>>,
-    gas_max: u8,
-) -> TransactionType3 {
-    let main = addr_of(main_acc);
-    let mut tx = TransactionType3::new_by(main, Amount::unit238(1_000_000), 1_730_000_000);
-    tx.gas_max = Uint1::from(gas_max);
-    for act in actions {
-        tx.actions.push(act).unwrap();
-    }
-    tx.fill_sign(main_acc).unwrap();
-    tx
-}
 
 #[test]
 fn hip23_pattern_1_atomic_tex_swap() {
@@ -106,32 +25,7 @@ fn hip23_pattern_1_atomic_tex_swap() {
     let get = addr_of(&get_acc);
     const SERIAL: u64 = 2301;
 
-    let mut pay_tex = TexCellAct::create_by(pay);
-    pay_tex
-        .add_cell(Box::new(CellTrsZhuPay::new(
-            Fold64::from(100_000_000).unwrap(),
-        )))
-        .unwrap();
-    pay_tex
-        .add_cell(Box::new(CellTrsAssetPay::new(
-            AssetAmt::from(SERIAL, 50).unwrap(),
-        )))
-        .unwrap();
-    pay_tex.do_sign(&pay_acc).unwrap();
-
-    let mut get_tex = TexCellAct::create_by(get);
-    get_tex
-        .add_cell(Box::new(CellTrsZhuGet::new(
-            Fold64::from(100_000_000).unwrap(),
-        )))
-        .unwrap();
-    get_tex
-        .add_cell(Box::new(CellTrsAssetGet::new(
-            AssetAmt::from(SERIAL, 50).unwrap(),
-        )))
-        .unwrap();
-    get_tex.do_sign(&get_acc).unwrap();
-
+    let (pay_tex, get_tex) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, SERIAL, 50);
     let tx = build_signed_type3(
         &main_acc,
         vec![Box::new(pay_tex), Box::new(get_tex)],
@@ -141,7 +35,6 @@ fn hip23_pattern_1_atomic_tex_swap() {
     let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
     seed_hac(&mut ctx, &main, 1_000_000);
     seed_hac(&mut ctx, &pay, 1_000);
-    seed_hac(&mut ctx, &get, 0);
     seed_asset(&mut ctx, &pay, SERIAL, 50);
 
     tx.execute(&mut ctx).unwrap();
@@ -178,7 +71,7 @@ fn hip23_pattern_2_height_guarded_payment() {
     let mut fail_ctx = make_ctx(window_start - 1, tx.as_read());
     seed_hac(&mut fail_ctx, &main, 1_000);
     let err = tx.execute(&mut fail_ctx).unwrap_err();
-    assert!(err.contains("submitted in height between"), "{err}");
+    assert_err_contains(&err, "submitted in height between");
 
     let mut ok_ctx = make_ctx(window_start + 100, tx.as_read());
     seed_hac(&mut ok_ctx, &main, 1_000);
@@ -211,7 +104,7 @@ fn hip23_pattern_3_balance_floor_protected_transfer() {
     let mut fail_ctx = make_ctx(TEST_HEIGHT, tx.as_read());
     seed_hac(&mut fail_ctx, &main, 1_000);
     let err = tx.execute(&mut fail_ctx).unwrap_err();
-    assert!(err.contains("lower than floor"), "{err}");
+    assert_err_contains(&err, "lower than floor");
 
     let mut ok_transfer = HacToTrs::new();
     ok_transfer.to = AddrOrPtr::from_addr(recipient);
@@ -280,14 +173,13 @@ fn hip23_pattern_4_asset_create_plus_tex() {
 
     let mut ctx = make_ctx(TEST_HEIGHT, tx_create.as_read());
     seed_hac(&mut ctx, &main, 1_000_000);
-    seed_hac(&mut ctx, &issuer, 10);
     tx_create.execute(&mut ctx).unwrap();
     assert_eq!(asset_amt(&mut ctx, &issuer, SERIAL), 10_000);
 
     let persisted = ctx.state().clone_state();
     let mut tex_ctx = make_ctx_with_state(
         {
-            let mut env = Env::default();
+            let mut env = basis::component::Env::default();
             env.chain.fast_sync = true;
             env.block.height = TEST_HEIGHT;
             env.tx = create_tx_info(tx_tex.as_read());

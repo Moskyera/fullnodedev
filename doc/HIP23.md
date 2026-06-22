@@ -112,10 +112,17 @@ actions: [
 
 ### 5.3 Rules
 
-- MUST: `HeightScope` execute before the debit action (lower action index runs first).
+- MUST: List `HeightScope` **before** the debit action (lower action index runs first).
 - MUST: `start <= end` when `end != 0`.
 - MUST: Revert (not fault) when current height is outside `[start, end]`.
 - SHOULD: Set `end` to a finite deadline for offer expiry.
+
+### 5.4 Wallet pitfall (ordering)
+
+Actions run sequentially. If a debit is listed before `HeightScope` and the guard later
+reverts, the **transaction still fails**, but step-by-step simulators may already show the
+debit as executed. Wallets MUST NOT present partial action progress as final settlement.
+Always validate the full tx atomically (`hip23_p2_transfer_before_guard_still_reverts_outside_window`).
 
 ### 5.4 Wallet display
 
@@ -219,6 +226,8 @@ actions: [
 
 ## 11. Test matrix
 
+### Happy path (`hip23_pattern_regression.rs`)
+
 | Pattern | Test |
 |---------|------|
 | P1 | `hip23_pattern_1_atomic_tex_swap` |
@@ -227,8 +236,19 @@ actions: [
 | P4 | `hip23_pattern_4_asset_create_plus_tex` |
 | P5 | `hip23_pattern_5_ast_conditional_settlement` |
 
-Run:
+### Adversarial (`hip23_pattern_adversarial.rs`)
+
+| Area | Tests |
+|------|-------|
+| P1 TEX | imbalanced settlement, tampered sign, insufficient balance, gas required, HAC+SAT swap, height condition cell |
+| P2 Guard | boundary inclusive, unlimited end, ChainAllow, wrong debit/guard order |
+| P3 Floor | asset dimension, pre-debit vs post-debit placement |
+| P4 HIP20 | duplicate serial, missing asset, issuer insufficient |
+| P5 AST | condition fault, else-branch transfer |
+| Topology | guard-only tx rejected, height+floor+transfer combo, height+TEX combo |
+
+Run all:
 
 ```bash
-cargo test hip23_pattern -- --nocapture
+cargo test hip23_ -- --nocapture
 ```
