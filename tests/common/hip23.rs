@@ -1,4 +1,5 @@
 //! Shared helpers for HIP-23 integration tests.
+#![allow(dead_code)]
 
 use basis::component::Env;
 use basis::interface::{Action, Context, Transaction, TransactionRead};
@@ -13,12 +14,12 @@ use testkit::sim::integration::enable_mint_setup;
 pub const TEST_HEIGHT: u64 = protocol::upgrade::ONLINE_OPEN_HEIGHT + 10_000;
 pub const TX_FEE_MEI: u64 = 1;
 
-pub fn init_setup_once() {
+pub fn init_setup() {
     enable_mint_setup();
 }
 
 pub fn addr_of(acc: &Account) -> Address {
-    Address::from(acc.address().clone())
+    Address::from(*acc.address())
 }
 
 pub fn make_ctx<'a>(height: u64, tx: &'a dyn TransactionRead) -> protocol::context::ContextInst<'a> {
@@ -31,6 +32,7 @@ pub fn make_ctx_chain<'a>(
     tx: &'a dyn TransactionRead,
 ) -> protocol::context::ContextInst<'a> {
     let mut env = Env::default();
+    // fast_sync skips sig/duplicate-tx/fee checks; see HIP23.md §11.
     env.chain.fast_sync = true;
     env.chain.id = chain_id;
     env.block.height = height;

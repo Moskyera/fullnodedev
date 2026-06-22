@@ -16,7 +16,7 @@ use testkit::sim::context::make_ctx_with_state;
 
 #[test]
 fn hip23_pattern_1_atomic_tex_swap() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1-get").unwrap();
@@ -46,7 +46,7 @@ fn hip23_pattern_1_atomic_tex_swap() {
 
 #[test]
 fn hip23_pattern_2_height_guarded_payment() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p2-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -82,7 +82,7 @@ fn hip23_pattern_2_height_guarded_payment() {
 
 #[test]
 fn hip23_pattern_3_balance_floor_protected_transfer() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p3-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -128,7 +128,7 @@ fn hip23_pattern_3_balance_floor_protected_transfer() {
 
 #[test]
 fn hip23_pattern_4_asset_create_plus_tex() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p4-main").unwrap();
     let issuer_acc = Account::create_by("hip23-p4-issuer").unwrap();
     let buyer_acc = Account::create_by("hip23-p4-buyer").unwrap();
@@ -196,7 +196,7 @@ fn hip23_pattern_4_asset_create_plus_tex() {
 
 #[test]
 fn hip23_pattern_5_ast_conditional_settlement() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p5-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();

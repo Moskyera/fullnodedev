@@ -20,7 +20,7 @@ use sys::Account;
 
 #[test]
 fn hip23_p1_tex_imbalanced_hac_amount_fails() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1a-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1a-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1a-get").unwrap();
@@ -50,7 +50,7 @@ fn hip23_p1_tex_imbalanced_hac_amount_fails() {
 
 #[test]
 fn hip23_p1_tex_tampered_signature_fails() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1b-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1b-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1b-get").unwrap();
@@ -76,7 +76,7 @@ fn hip23_p1_tex_tampered_signature_fails() {
 
 #[test]
 fn hip23_p1_tex_insufficient_hac_balance_fails() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1c-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1c-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1c-get").unwrap();
@@ -98,7 +98,7 @@ fn hip23_p1_tex_insufficient_hac_balance_fails() {
 
 #[test]
 fn hip23_p1_tex_asset_cells_require_gas() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1d-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1d-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1d-get").unwrap();
@@ -121,7 +121,7 @@ fn hip23_p1_tex_asset_cells_require_gas() {
 
 #[test]
 fn hip23_p1_tex_hac_and_sat_dual_swap_succeeds() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1e-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1e-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1e-get").unwrap();
@@ -162,7 +162,7 @@ fn hip23_p1_tex_hac_and_sat_dual_swap_succeeds() {
 
 #[test]
 fn hip23_p1_tex_height_condition_in_bundle() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p1f-main").unwrap();
     let pay_acc = Account::create_by("hip23-p1f-pay").unwrap();
     let get_acc = Account::create_by("hip23-p1f-get").unwrap();
@@ -207,7 +207,7 @@ fn hip23_p1_tex_height_condition_in_bundle() {
 
 #[test]
 fn hip23_p2_height_guard_boundary_inclusive() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p2a-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -258,7 +258,7 @@ fn hip23_p2_height_guard_boundary_inclusive() {
 
 #[test]
 fn hip23_p2_height_guard_unlimited_end_zero() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p2b-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -284,7 +284,7 @@ fn hip23_p2_height_guard_unlimited_end_zero() {
 
 #[test]
 fn hip23_p2_chain_allow_rejects_wrong_chain() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p2c-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -309,7 +309,7 @@ fn hip23_p2_chain_allow_rejects_wrong_chain() {
 
 #[test]
 fn hip23_p2_transfer_before_guard_still_reverts_outside_window() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p2d-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -345,7 +345,7 @@ fn hip23_p2_transfer_before_guard_still_reverts_outside_window() {
 
 #[test]
 fn hip23_p3_floor_asset_dimension_blocks_overspend() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p3a-main").unwrap();
     let cp_acc = Account::create_by("hip23-p3a-cp").unwrap();
     let main = addr_of(&main_acc);
@@ -390,7 +390,7 @@ fn hip23_p3_floor_asset_dimension_blocks_overspend() {
 
 #[test]
 fn hip23_p3_floor_before_transfer_checks_pre_debit_state() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p3b-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -420,8 +420,46 @@ fn hip23_p3_floor_before_transfer_checks_pre_debit_state() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn hip23_p4_asset_create_with_tex_same_tx_rejected() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p4-topo-main").unwrap();
+    let issuer = addr_of(&Account::create_by("hip23-p4-topo-issuer").unwrap());
+    const SERIAL: u64 = 2339;
+
+    let mut create = AssetCreate::new();
+    create.metadata = AssetSmelt {
+        serial: Fold64::from(SERIAL).unwrap(),
+        supply: Fold64::from(1000).unwrap(),
+        decimal: Uint1::from(0),
+        issuer,
+        ticket: BytesW1::from_str("TOPO").unwrap(),
+        name: BytesW1::from_str("Topo").unwrap(),
+    };
+    create.protocol_cost = genesis::block_reward(TEST_HEIGHT);
+
+    let issuer_acc = Account::create_by("hip23-p4-topo-issuer").unwrap();
+    let buyer_acc = Account::create_by("hip23-p4-topo-buyer").unwrap();
+    let (pay_tex, get_tex) = build_balanced_tex_swap(&issuer_acc, &buyer_acc, 0, SERIAL, 1);
+
+    let actions: Vec<Box<dyn Action>> = vec![
+        Box::new(create),
+        Box::new(pay_tex),
+        Box::new(get_tex),
+    ];
+    let err =
+        protocol::action::precheck_tx_actions(TransactionType3::TYPE, &actions).unwrap_err();
+    assert_err_contains(&err, "TOP_ONLY");
+
+    let tx = build_signed_type3(&main_acc, actions, 99);
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    let exec_err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&exec_err, "TOP_ONLY");
+}
+
+#[test]
 fn hip23_p4_duplicate_serial_rejected() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p4a-main").unwrap();
     let issuer = addr_of(&Account::create_by("hip23-p4a-issuer").unwrap());
     const SERIAL: u64 = 2340;
@@ -473,7 +511,7 @@ fn hip23_p4_duplicate_serial_rejected() {
 
 #[test]
 fn hip23_p4_tex_on_missing_asset_fails() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p4b-main").unwrap();
     let pay_acc = Account::create_by("hip23-p4b-pay").unwrap();
     let get_acc = Account::create_by("hip23-p4b-get").unwrap();
@@ -494,7 +532,7 @@ fn hip23_p4_tex_on_missing_asset_fails() {
 
 #[test]
 fn hip23_p4_issuer_insufficient_asset_for_tex_pay() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p4c-main").unwrap();
     let pay_acc = Account::create_by("hip23-p4c-pay").unwrap();
     let get_acc = Account::create_by("hip23-p4c-get").unwrap();
@@ -522,7 +560,7 @@ fn hip23_p4_issuer_insufficient_asset_for_tex_pay() {
 
 #[test]
 fn hip23_p5_ast_if_condition_fault_aborts_whole_node() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p5a-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -552,7 +590,7 @@ fn hip23_p5_ast_if_condition_fault_aborts_whole_node() {
 
 #[test]
 fn hip23_p5_ast_else_branch_executes_transfer() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-p5b-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -585,7 +623,7 @@ fn hip23_p5_ast_else_branch_executes_transfer() {
 
 #[test]
 fn hip23_topology_guard_only_tx_rejected() {
-    init_setup_once();
+    init_setup();
     let actions: Vec<Box<dyn Action>> = vec![Box::new(HeightScope::new())];
     let err = protocol::action::precheck_tx_actions(TransactionType3::TYPE, &actions).unwrap_err();
     assert_err_contains(&err, "all GUARD");
@@ -593,7 +631,7 @@ fn hip23_topology_guard_only_tx_rejected() {
 
 #[test]
 fn hip23_combined_height_scope_balance_floor_and_transfer() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-combo-main").unwrap();
     let main = addr_of(&main_acc);
     let recipient = field::ADDRESS_TWOX.clone();
@@ -625,7 +663,7 @@ fn hip23_combined_height_scope_balance_floor_and_transfer() {
 
 #[test]
 fn hip23_height_guard_plus_tex_swap_in_one_tx() {
-    init_setup_once();
+    init_setup();
     let main_acc = Account::create_by("hip23-combo-tex-main").unwrap();
     let pay_acc = Account::create_by("hip23-combo-tex-pay").unwrap();
     let get_acc = Account::create_by("hip23-combo-tex-get").unwrap();

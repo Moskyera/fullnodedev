@@ -62,7 +62,9 @@ Indexers SHOULD:
 
 - Index `TexCellAct` by signer `addr` and settled asset/diamond deltas.
 - Record guard failures as revert reason codes for failed transactions.
-- Treat `AssetCreate` + TEX in the same tx as an atomic issuance+distribution event.
+- Correlate issuance (Tx A) and TEX distribution (Tx B) by asset serial, issuer, and block
+  position; index them as a coordinated two-tx event (same block or later), not a single-tx
+  atomic mint+distribute.
 
 ## 4. Pattern P1 — Atomic multi-asset TEX swap
 
@@ -75,7 +77,8 @@ Two or more parties atomically exchange HAC, SAT, diamonds, and/or HIP20 assets 
 1. Party A publishes `TexCellAct_A` with pay cells (`cellid` 1/3/5/7) and/or get cells (`2/4/6/8`).
 2. Party B publishes `TexCellAct_B` with the mirrored get/pay cells.
 3. A coordinator (or either party) combines both signed bundles in one Type3 transaction.
-4. Optional funding actions (e.g. `HacToTrs`, `AssetCreate`) MAY precede TEX actions in the same tx.
+4. Optional funding actions (e.g. `HacToTrs`) MAY precede TEX actions in the same tx.
+   `AssetCreate` is `TOP_ONLY` and MUST use the two-tx P4 flow (§7).
 
 ### 4.3 Rules
 
@@ -124,7 +127,12 @@ reverts, the **transaction still fails**, but step-by-step simulators may alread
 debit as executed. Wallets MUST NOT present partial action progress as final settlement.
 Always validate the full tx atomically (`hip23_p2_transfer_before_guard_still_reverts_outside_window`).
 
-### 5.4 Wallet display
+On a full node, `try_execute_tx_by` forks state per transaction and merges only on success
+(`chain/src/check.rs`); failed txs do not commit partial mutations. Direct `tx.execute()`
+calls in tests or wallet simulators can still observe in-tx partial progress that would not
+persist on-chain.
+
+### 5.5 Wallet display
 
 Wallets SHOULD show: “Valid heights: `start` … `end` (inclusive)”.
 
@@ -156,7 +164,7 @@ actions: [
 
 ### 7.1 Intent
 
-Mint a HIP20 asset and atomically distribute units to counterparties via TEX in the same transaction.
+Mint a HIP20 asset in Tx A, then distribute units to counterparties via TEX in Tx B (same block or later).
 
 ### 7.2 Structure
 
@@ -243,7 +251,7 @@ actions: [
 | P1 TEX | imbalanced settlement, tampered sign, insufficient balance, gas required, HAC+SAT swap, height condition cell |
 | P2 Guard | boundary inclusive, unlimited end, ChainAllow, wrong debit/guard order |
 | P3 Floor | asset dimension, pre-debit vs post-debit placement |
-| P4 HIP20 | duplicate serial, missing asset, issuer insufficient |
+| P4 HIP20 | duplicate serial, missing asset, issuer insufficient, `AssetCreate`+TEX same-tx rejected |
 | P5 AST | condition fault, else-branch transfer |
 | Topology | guard-only tx rejected, height+floor+transfer combo, height+TEX combo |
 
@@ -252,3 +260,8 @@ Run all:
 ```bash
 cargo test hip23_ -- --nocapture
 ```
+
+**Note:** HIP-23 tests use `fast_sync = true` in the harness (`tests/common/hip23.rs`) to skip
+signature verification, duplicate-tx checks, and fee-address validation. Pattern semantics
+(guards, TEX settlement, topology) still match mainnet rules; production integrators MUST
+validate signatures and mempool policy separately.
