@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use basis::component::Env;
-use basis::interface::{Action, Context, Transaction, TransactionRead};
+use basis::interface::{Action, Context, StateOperat, Transaction, TransactionRead};
 use field::*;
 use protocol::state::CoreState;
 use protocol::tex::*;
@@ -10,8 +10,10 @@ use protocol::transaction::*;
 use sys::Account;
 use testkit::sim::context::make_ctx_with_state;
 use testkit::sim::integration::enable_mint_setup;
+use testkit::sim::state::ForkableMemState;
 
 pub const TEST_HEIGHT: u64 = protocol::upgrade::ONLINE_OPEN_HEIGHT + 10_000;
+/// Fee deducted from main on successful Type3 execute (matches `build_signed_type3` wire fee).
 pub const TX_FEE_MEI: u64 = 1;
 
 pub fn init_setup() {
@@ -31,13 +33,31 @@ pub fn make_ctx_chain<'a>(
     chain_id: u32,
     tx: &'a dyn TransactionRead,
 ) -> protocol::context::ContextInst<'a> {
+    make_ctx_with_opts(height, chain_id, true, tx, Box::new(ForkableMemState::default()))
+}
+
+pub fn make_ctx_persisted<'a>(
+    height: u64,
+    state: Box<dyn basis::interface::State>,
+    tx: &'a dyn TransactionRead,
+) -> protocol::context::ContextInst<'a> {
+    make_ctx_with_opts(height, 0, true, tx, state)
+}
+
+fn make_ctx_with_opts<'a>(
+    height: u64,
+    chain_id: u32,
+    fast_sync: bool,
+    tx: &'a dyn TransactionRead,
+    state: Box<dyn basis::interface::State>,
+) -> protocol::context::ContextInst<'a> {
     let mut env = Env::default();
     // fast_sync skips sig/duplicate-tx/fee checks; see HIP23.md §11.
-    env.chain.fast_sync = true;
+    env.chain.fast_sync = fast_sync;
     env.chain.id = chain_id;
     env.block.height = height;
     env.tx = create_tx_info(tx);
-    make_ctx_with_state(env, Box::new(testkit::sim::state::ForkableMemState::default()), tx)
+    make_ctx_with_state(env, state, tx)
 }
 
 pub fn seed_hac(ctx: &mut dyn Context, addr: &Address, mei: u64) {
@@ -52,6 +72,22 @@ pub fn seed_sat(ctx: &mut dyn Context, addr: &Address, sat: u64) {
     let mut bls = state.balance(addr).unwrap_or_default();
     bls.satoshi = SatoshiAuto::from_satoshi(&Satoshi::from(sat));
     state.balance_set(addr, &bls);
+}
+
+pub fn seed_diamond_owned(ctx: &mut dyn Context, name: &DiamondName, owner: &Address) {
+    let mut state = CoreState::wrap(ctx.state());
+    let mut dia = DiamondSto::new();
+    dia.status = DIAMOND_STATUS_NORMAL;
+    dia.address = *owner;
+    state.diamond_set(name, &dia);
+    let mut bls = state.balance(owner).unwrap_or_default();
+    let cur = bls
+        .diamond
+        .to_diamond()
+        .map(|d| d.uint())
+        .unwrap_or(0);
+    bls.diamond = DiamondNumberAuto::from_diamond(&DiamondNumber::from(cur + 1));
+    state.balance_set(owner, &bls);
 }
 
 pub fn seed_asset(ctx: &mut dyn Context, owner: &Address, serial: u64, amount: u64) {
@@ -90,6 +126,16 @@ pub fn sat_amount(ctx: &mut dyn Context, addr: &Address) -> u64 {
         .satoshi
         .to_satoshi()
         .uint()
+}
+
+pub fn diamond_count(ctx: &mut dyn Context, addr: &Address) -> u32 {
+    CoreState::wrap(ctx.state())
+        .balance(addr)
+        .unwrap_or_default()
+        .diamond
+        .to_diamond()
+        .map(|d| d.uint())
+        .unwrap_or(0)
 }
 
 pub fn asset_amt(ctx: &mut dyn Context, addr: &Address, serial: u64) -> u64 {

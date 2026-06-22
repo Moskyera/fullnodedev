@@ -6,7 +6,7 @@ mod common;
 use basis::interface::{Action, StateOperat, Transaction, TxExec};
 use common::hip23::*;
 use field::*;
-use testkit::sim::context::make_ctx_with_state;
+
 use mint::action::AssetCreate;
 use mint::genesis;
 use protocol::action::*;
@@ -44,7 +44,7 @@ fn hip23_p1_tex_imbalanced_hac_amount_fails() {
     seed_hac(&mut ctx, &pay, 1_000);
 
     let err = tx.execute(&mut ctx).unwrap_err();
-    assert_err_contains(&err, "settlement check failed");
+    assert_err_contains(&err, "coin settlement check failed");
     assert_eq!(hac_mei(&mut ctx, &get), 0);
 }
 
@@ -130,7 +130,7 @@ fn hip23_p1_tex_hac_and_sat_dual_swap_succeeds() {
 
     let mut pay_tex = TexCellAct::create_by(pay);
     pay_tex
-        .add_cell(Box::new(CellTrsZhuPay::new(Fold64::from(50_000_000).unwrap())))
+        .add_cell(Box::new(CellTrsZhuPay::new(Fold64::from(100_000_000).unwrap())))
         .unwrap();
     pay_tex
         .add_cell(Box::new(CellTrsSatPay::new(Fold64::from(3).unwrap())))
@@ -139,7 +139,7 @@ fn hip23_p1_tex_hac_and_sat_dual_swap_succeeds() {
 
     let mut get_tex = TexCellAct::create_by(get);
     get_tex
-        .add_cell(Box::new(CellTrsZhuGet::new(Fold64::from(50_000_000).unwrap())))
+        .add_cell(Box::new(CellTrsZhuGet::new(Fold64::from(100_000_000).unwrap())))
         .unwrap();
     get_tex
         .add_cell(Box::new(CellTrsSatGet::new(Fold64::from(3).unwrap())))
@@ -157,7 +157,109 @@ fn hip23_p1_tex_hac_and_sat_dual_swap_succeeds() {
     seed_sat(&mut ctx, &pay, 3);
 
     tx.execute(&mut ctx).unwrap();
+    assert_eq!(hac_mei(&mut ctx, &get), 1);
     assert_eq!(sat_amount(&mut ctx, &get), 3);
+}
+
+#[test]
+fn hip23_p1_tex_imbalanced_sat_fails() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p1g-main").unwrap();
+    let pay_acc = Account::create_by("hip23-p1g-pay").unwrap();
+    let get_acc = Account::create_by("hip23-p1g-get").unwrap();
+    let pay = addr_of(&pay_acc);
+
+    let mut pay_tex = TexCellAct::create_by(pay);
+    pay_tex
+        .add_cell(Box::new(CellTrsSatPay::new(Fold64::from(5).unwrap())))
+        .unwrap();
+    pay_tex.do_sign(&pay_acc).unwrap();
+
+    let mut get_tex = TexCellAct::create_by(addr_of(&get_acc));
+    get_tex
+        .add_cell(Box::new(CellTrsSatGet::new(Fold64::from(2).unwrap())))
+        .unwrap();
+    get_tex.do_sign(&get_acc).unwrap();
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(pay_tex), Box::new(get_tex)],
+        0,
+    );
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    seed_sat(&mut ctx, &pay, 5);
+
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "coin settlement check failed");
+}
+
+#[test]
+fn hip23_p1_tex_with_hac_to_trs_prelude_succeeds() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p1h-main").unwrap();
+    let pay_acc = Account::create_by("hip23-p1h-pay").unwrap();
+    let get_acc = Account::create_by("hip23-p1h-get").unwrap();
+    let pay = addr_of(&pay_acc);
+    let get = addr_of(&get_acc);
+
+    let fund = HacToTrs::create_by(pay, Amount::mei(5));
+    let (pay_tex, get_tex) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, 0, 0);
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(fund), Box::new(pay_tex), Box::new(get_tex)],
+        0,
+    );
+
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    seed_hac(&mut ctx, &pay, 0);
+
+    tx.execute(&mut ctx).unwrap();
+    assert_eq!(hac_mei(&mut ctx, &get), 1);
+    assert_eq!(hac_mei(&mut ctx, &pay), 4);
+}
+
+#[test]
+fn hip23_p1_tex_diamond_count_swap_succeeds() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p1i-main").unwrap();
+    let pay_acc = Account::create_by("hip23-p1i-pay").unwrap();
+    let get_acc = Account::create_by("hip23-p1i-get").unwrap();
+    let pay = addr_of(&pay_acc);
+    let get = addr_of(&get_acc);
+
+    let dia_a = DiamondName::from_readable(b"KKKKVA").unwrap();
+    let dia_b = DiamondName::from_readable(b"HYXYHY").unwrap();
+    let (pay_tex, get_tex) = {
+        let mut pay_tex = TexCellAct::create_by(pay);
+        pay_tex
+            .add_cell(Box::new(CellTrsDiaPay::new(
+                DiamondNameListMax200::from_list_checked(vec![dia_a.clone(), dia_b.clone()]).unwrap(),
+            )))
+            .unwrap();
+        pay_tex.do_sign(&pay_acc).unwrap();
+
+        let mut get_tex = TexCellAct::create_by(get);
+        get_tex
+            .add_cell(Box::new(CellTrsDiaGet::new(DiamondNumber::from(2))))
+            .unwrap();
+        get_tex.do_sign(&get_acc).unwrap();
+        (pay_tex, get_tex)
+    };
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(pay_tex), Box::new(get_tex)],
+        0,
+    );
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    seed_diamond_owned(&mut ctx, &dia_a, &pay);
+    seed_diamond_owned(&mut ctx, &dia_b, &pay);
+
+    tx.execute(&mut ctx).unwrap();
+    assert_eq!(diamond_count(&mut ctx, &get), 2);
 }
 
 #[test]
@@ -254,6 +356,36 @@ fn hip23_p2_height_guard_boundary_inclusive() {
     seed_hac(&mut ctx_end, &main, 100);
     tx_end.execute(&mut ctx_end).unwrap();
     assert_eq!(hac_mei(&mut ctx_end, &recipient), 1);
+}
+
+#[test]
+fn hip23_p2_height_guard_above_end_reverts() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p2e-main").unwrap();
+    let main = addr_of(&main_acc);
+    let recipient = field::ADDRESS_TWOX.clone();
+    let start = TEST_HEIGHT;
+    let end = TEST_HEIGHT + 10;
+
+    let mut guard = HeightScope::new();
+    guard.start = BlockHeight::from(start);
+    guard.end = BlockHeight::from(end);
+    let mut transfer = HacToTrs::new();
+    transfer.to = AddrOrPtr::from_addr(recipient.clone());
+    transfer.hacash = Amount::mei(4);
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(guard), Box::new(transfer)],
+        0,
+    );
+
+    let mut ctx = make_ctx(end + 1, tx.as_read());
+    seed_hac(&mut ctx, &main, 100);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "submitted in height between");
+    assert_eq!(hac_mei(&mut ctx, &recipient), 0);
+    assert_eq!(hac_mei(&mut ctx, &main), 100);
 }
 
 #[test]
@@ -415,6 +547,45 @@ fn hip23_p3_floor_before_transfer_checks_pre_debit_state() {
     assert_eq!(hac_mei(&mut ctx, &main), 900 - TX_FEE_MEI);
 }
 
+#[test]
+fn hip23_p3_floor_satoshi_dimension_blocks_overspend() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p3c-main").unwrap();
+    let main = addr_of(&main_acc);
+    let recipient = field::ADDRESS_TWOX.clone();
+
+    let mut pay_tex = TexCellAct::create_by(main);
+    pay_tex
+        .add_cell(Box::new(CellTrsSatPay::new(Fold64::from(4).unwrap())))
+        .unwrap();
+    pay_tex.do_sign(&main_acc).unwrap();
+
+    let cp_acc = Account::create_by("hip23-p3c-cp").unwrap();
+    let counterparty = addr_of(&cp_acc);
+    let mut get_tex = TexCellAct::create_by(counterparty);
+    get_tex
+        .add_cell(Box::new(CellTrsSatGet::new(Fold64::from(4).unwrap())))
+        .unwrap();
+    get_tex.do_sign(&cp_acc);
+
+    let mut floor = BalanceFloor::new();
+    floor.addr = AddrOrPtr::from_addr(main);
+    floor.satoshi = Satoshi::from(8);
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(pay_tex), Box::new(get_tex), Box::new(floor)],
+        0,
+    );
+
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &main, 1_000_000);
+    seed_sat(&mut ctx, &main, 10);
+
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "lower than floor");
+}
+
 // ---------------------------------------------------------------------------
 // P4 — HIP20 + TEX adversarial
 // ---------------------------------------------------------------------------
@@ -493,17 +664,7 @@ fn hip23_p4_duplicate_serial_rejected() {
 
     let persisted = ctx.state().clone_state();
     let tx_dup = build_signed_type3(&main_acc, vec![Box::new(create_dup)], 0);
-    let mut ctx2 = make_ctx_with_state(
-        {
-            let mut env = basis::component::Env::default();
-            env.chain.fast_sync = true;
-            env.block.height = TEST_HEIGHT + 1;
-            env.tx = protocol::transaction::create_tx_info(tx_dup.as_read());
-            env
-        },
-        persisted,
-        tx_dup.as_read(),
-    );
+    let mut ctx2 = make_ctx_persisted(TEST_HEIGHT + 1, persisted, tx_dup.as_read());
     seed_hac(&mut ctx2, &addr_of(&main_acc), 1_000_000);
     let err = tx_dup.execute(&mut ctx2).unwrap_err();
     assert_err_contains(&err, "already exists");
@@ -552,6 +713,31 @@ fn hip23_p4_issuer_insufficient_asset_for_tex_pay() {
 
     let err = tx.execute(&mut ctx).unwrap_err();
     assert!(err.contains("insufficient") || err.contains("overflow"), "{err}");
+}
+
+#[test]
+fn hip23_p4_wrong_protocol_cost_rejected() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p4d-main").unwrap();
+    let issuer = addr_of(&Account::create_by("hip23-p4d-issuer").unwrap());
+    const SERIAL: u64 = 2343;
+
+    let mut create = AssetCreate::new();
+    create.metadata = AssetSmelt {
+        serial: Fold64::from(SERIAL).unwrap(),
+        supply: Fold64::from(1000).unwrap(),
+        decimal: Uint1::from(0),
+        issuer,
+        ticket: BytesW1::from_str("FEE").unwrap(),
+        name: BytesW1::from_str("Fee").unwrap(),
+    };
+    create.protocol_cost = Amount::mei(1);
+
+    let tx = build_signed_type3(&main_acc, vec![Box::new(create)], 0);
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "Protocol fee must be");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +803,30 @@ fn hip23_p5_ast_else_branch_executes_transfer() {
     assert_eq!(hac_mei(&mut ctx, &recipient), 3);
 }
 
+#[test]
+fn hip23_p5_ast_requires_nonzero_gas() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-p5c-main").unwrap();
+    let main = addr_of(&main_acc);
+    let recipient = field::ADDRESS_TWOX.clone();
+
+    let mut cond_guard = HeightScope::new();
+    cond_guard.start = BlockHeight::from(TEST_HEIGHT);
+    cond_guard.end = BlockHeight::from(TEST_HEIGHT + 100);
+    let cond = AstSelect::create_by(1, 1, vec![Box::new(cond_guard)]);
+    let br_if = AstSelect::create_list(vec![Box::new(HacToTrs::create_by(
+        recipient,
+        Amount::mei(1),
+    ))]);
+    let act = AstIf::create_by(cond, br_if, AstSelect::nop());
+
+    let tx = build_signed_type3(&main_acc, vec![Box::new(act)], 0);
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &main, 1_000);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "gas not initialized");
+}
+
 // ---------------------------------------------------------------------------
 // Topology / composition
 // ---------------------------------------------------------------------------
@@ -626,6 +836,17 @@ fn hip23_topology_guard_only_tx_rejected() {
     init_setup();
     let actions: Vec<Box<dyn Action>> = vec![Box::new(HeightScope::new())];
     let err = protocol::action::precheck_tx_actions(TransactionType3::TYPE, &actions).unwrap_err();
+    assert_err_contains(&err, "all GUARD");
+}
+
+#[test]
+fn hip23_topology_guard_only_execute_rejected() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-topo-exec-main").unwrap();
+    let tx = build_signed_type3(&main_acc, vec![Box::new(HeightScope::new())], 0);
+    let mut ctx = make_ctx(TEST_HEIGHT, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 100);
+    let err = tx.execute(&mut ctx).unwrap_err();
     assert_err_contains(&err, "all GUARD");
 }
 
@@ -662,6 +883,72 @@ fn hip23_combined_height_scope_balance_floor_and_transfer() {
 }
 
 #[test]
+fn hip23_combined_height_floor_transfer_outside_height_fails() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-combo-fail-h-main").unwrap();
+    let main = addr_of(&main_acc);
+    let recipient = field::ADDRESS_TWOX.clone();
+
+    let mut height = HeightScope::new();
+    height.start = BlockHeight::from(TEST_HEIGHT);
+    height.end = BlockHeight::from(TEST_HEIGHT + 100);
+
+    let mut transfer = HacToTrs::new();
+    transfer.to = AddrOrPtr::from_addr(recipient.clone());
+    transfer.hacash = Amount::mei(40);
+
+    let mut floor = BalanceFloor::new();
+    floor.addr = AddrOrPtr::from_addr(main);
+    floor.hacash = Amount::mei(900);
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(height), Box::new(transfer), Box::new(floor)],
+        0,
+    );
+
+    let mut ctx = make_ctx(TEST_HEIGHT - 1, tx.as_read());
+    seed_hac(&mut ctx, &main, 1_000);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "submitted in height between");
+    assert_eq!(hac_mei(&mut ctx, &recipient), 0);
+}
+
+#[test]
+fn hip23_combined_height_floor_transfer_below_floor_fails() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-combo-fail-f-main").unwrap();
+    let main = addr_of(&main_acc);
+    let recipient = field::ADDRESS_TWOX.clone();
+
+    let mut height = HeightScope::new();
+    height.start = BlockHeight::from(TEST_HEIGHT);
+    height.end = BlockHeight::from(TEST_HEIGHT + 100);
+
+    let mut transfer = HacToTrs::new();
+    transfer.to = AddrOrPtr::from_addr(recipient.clone());
+    transfer.hacash = Amount::mei(150);
+
+    let mut floor = BalanceFloor::new();
+    floor.addr = AddrOrPtr::from_addr(main);
+    floor.hacash = Amount::mei(900);
+
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(height), Box::new(transfer), Box::new(floor)],
+        0,
+    );
+
+    let mut ctx = make_ctx(TEST_HEIGHT + 50, tx.as_read());
+    seed_hac(&mut ctx, &main, 1_000);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "lower than floor");
+    // Debit ran before failing floor; in-tx simulator shows partial progress (see HIP23.md §6.4).
+    assert_eq!(hac_mei(&mut ctx, &recipient), 150);
+    assert_eq!(hac_mei(&mut ctx, &main), 850);
+}
+
+#[test]
 fn hip23_height_guard_plus_tex_swap_in_one_tx() {
     init_setup();
     let main_acc = Account::create_by("hip23-combo-tex-main").unwrap();
@@ -685,4 +972,32 @@ fn hip23_height_guard_plus_tex_swap_in_one_tx() {
     seed_hac(&mut ctx, &pay, 100);
     tx.execute(&mut ctx).unwrap();
     assert_eq!(hac_mei(&mut ctx, &addr_of(&get_acc)), 1);
+}
+
+#[test]
+fn hip23_height_guard_plus_tex_outside_window_fails() {
+    init_setup();
+    let main_acc = Account::create_by("hip23-combo-tex-fail-main").unwrap();
+    let pay_acc = Account::create_by("hip23-combo-tex-fail-pay").unwrap();
+    let get_acc = Account::create_by("hip23-combo-tex-fail-get").unwrap();
+    let pay = addr_of(&pay_acc);
+    let get = addr_of(&get_acc);
+
+    let mut guard = HeightScope::new();
+    guard.start = BlockHeight::from(TEST_HEIGHT);
+    guard.end = BlockHeight::from(TEST_HEIGHT + 500);
+
+    let (pay_tex, get_tex) = build_balanced_tex_swap(&pay_acc, &get_acc, 100_000_000, 0, 0);
+    let tx = build_signed_type3(
+        &main_acc,
+        vec![Box::new(guard), Box::new(pay_tex), Box::new(get_tex)],
+        0,
+    );
+
+    let mut ctx = make_ctx(TEST_HEIGHT + 501, tx.as_read());
+    seed_hac(&mut ctx, &addr_of(&main_acc), 1_000_000);
+    seed_hac(&mut ctx, &pay, 100);
+    let err = tx.execute(&mut ctx).unwrap_err();
+    assert_err_contains(&err, "submitted in height between");
+    assert_eq!(hac_mei(&mut ctx, &get), 0);
 }

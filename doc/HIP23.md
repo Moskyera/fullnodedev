@@ -17,10 +17,11 @@ Goals:
 
 Reference material:
 
-- Istanbul capability model: `istanbul_upgrade_tech.md` (community tech note)
+- Height gates and Istanbul action registry: `protocol/src/upgrade.rs`
 - TEX settlement: `protocol/src/tex/*`, `tests/tex.rs` (`trs1`)
 - AST control flow: `doc/ast-spec.md`
 - Guards: `protocol/src/action/chain.rs`
+- JSON templates: `doc/HIP23_templates.md`
 
 ## 2. Scope
 
@@ -45,26 +46,27 @@ Reference material:
 
 All patterns MUST satisfy:
 
-1. **Transaction type:** `type >= 3` when AST, TEX asset cells, or gas metering are used.
-2. **Height gate:** On mainnet (`chain_id = 0`), Istanbul actions MUST only be submitted at `height >= 765432`, except dev/regtest windows documented in `protocol/src/upgrade.rs`.
-3. **TEX settlement:** Any transaction containing `TexCellAct` MUST leave the TEX ledger zero-sum; the node calls `do_settlement()` after top-level actions (`protocol/src/transaction/type3.rs`).
-4. **TEX signatures:** Each `TexCellAct` MUST be signed over `addr + cells` only (replayable across transactions).
-5. **Guard topology:** Bare `GUARD` actions MAY appear at top level alongside other top actions. Transactions MUST NOT be guard-only (`protocol/src/action/level.rs`).
-6. **Asset TEX gas:** Transactions with asset transfer TEX cells (`cellid` 7 or 8) MUST set `gas_max > 0` and initialize gas (`extra9` path).
+1. **Transaction type:** Use `type >= 3` when submitting `TexCellAct`, AST nodes, or other Istanbul-gated actions that require Type3.
+2. **Gas budget:** Set `gas_max > 0` when AST depth > 0 or when asset TEX cells (`cellid` 7 or 8) are present. Plain HAC/SAT/diamond TEX without asset cells MAY use `gas_max = 0` (see P2).
+3. **Height gate:** On mainnet (`chain_id = 0`), Istanbul actions MUST only be submitted at `height >= 765432`, except dev/regtest windows documented in `protocol/src/upgrade.rs`. On non-mainnet chains (`chain_id != 0`), `check_gated_*` bypasses these gates — testnets MUST document their own policy.
+4. **TEX settlement:** Type3 execution always calls `do_settlement()` after top-level actions (`protocol/src/transaction/type3.rs`). If any TEX transfer cells ran, zhu/sat/dia/asset ledger totals MUST be zero-sum before settlement succeeds.
+5. **TEX signatures:** Each `TexCellAct` MUST be signed over `addr + cells` only (replayable across transactions).
+6. **Guard topology:** Bare `GUARD` actions MAY appear at top level alongside other top actions. Transactions MUST NOT be guard-only (`protocol/src/action/level.rs`).
+7. **Asset TEX gas:** Transactions with asset transfer TEX cells (`cellid` 7 or 8) MUST set `gas_max > 0` and initialize gas (`extra9` path).
 
 Wallets SHOULD:
 
 - Pre-validate TEX zero-sum pairing off-chain before co-signing counterparty bundles.
+- Before signing a TEX bundle, verify its cells appear in the **agreed composed Type3 transaction** (structural equality or tx hash), not only that signer `addr` matches.
 - Display guard windows (height, chain, balance floor) in human-readable form.
 - Reject co-signed TEX bundles whose `addr` does not match the expected counterparty.
 
 Indexers SHOULD:
 
 - Index `TexCellAct` by signer `addr` and settled asset/diamond deltas.
-- Record guard failures as revert reason codes for failed transactions.
-- Correlate issuance (Tx A) and TEX distribution (Tx B) by asset serial, issuer, and block
-  position; index them as a coordinated two-tx event (same block or later), not a single-tx
-  atomic mint+distribute.
+- Classify guard outcomes as **Revert** vs **Fault** and store normalized error text (e.g. `"submitted in height between"`, `"lower than floor"`). There is no stable on-chain guard reason-code enum in v1.
+- Correlate issuance (Tx A) and TEX distribution (Tx B) by asset serial, issuer, and block position; index them as a coordinated two-tx event (same block or later), not a single-tx atomic mint+distribute.
+- For P5 AST txs, record `ast_branch: if|else` and `cond_outcome: success|revert|fault` on successful transactions (condition revert with else success is not a failed tx).
 
 ## 4. Pattern P1 — Atomic multi-asset TEX swap
 
@@ -77,8 +79,7 @@ Two or more parties atomically exchange HAC, SAT, diamonds, and/or HIP20 assets 
 1. Party A publishes `TexCellAct_A` with pay cells (`cellid` 1/3/5/7) and/or get cells (`2/4/6/8`).
 2. Party B publishes `TexCellAct_B` with the mirrored get/pay cells.
 3. A coordinator (or either party) combines both signed bundles in one Type3 transaction.
-4. Optional funding actions (e.g. `HacToTrs`) MAY precede TEX actions in the same tx.
-   `AssetCreate` is `TOP_ONLY` and MUST use the two-tx P4 flow (§7).
+4. Optional funding actions (e.g. `HacToTrs`) MAY precede TEX actions in the same tx. `AssetCreate` is `TOP_ONLY` and MUST use the two-tx P4 flow (§7).
 
 ### 4.3 Rules
 
@@ -91,7 +92,7 @@ Two or more parties atomically exchange HAC, SAT, diamonds, and/or HIP20 assets 
 
 | Failure | Result |
 |---------|--------|
-| Imbalanced pay/get | Fault at settlement |
+| Imbalanced pay/get | Fault at settlement (`coin` / `asset <n>` / `diamonds settlement check failed`) |
 | Bad signature | Fault on `TexCellAct` execute |
 | Missing asset / insufficient balance | Fault during cell execute |
 | Asset cells without gas | Fault (`gas not initialized`) |
@@ -116,8 +117,8 @@ actions: [
 ### 5.3 Rules
 
 - MUST: List `HeightScope` **before** the debit action (lower action index runs first).
-- MUST: `start <= end` when `end != 0`.
-- MUST: Revert (not fault) when current height is outside `[start, end]`.
+- MUST: `start <= end` when `end != 0` (otherwise **fault**, not revert).
+- MUST: Revert (not fault) when current height is outside `[start, end]` (inclusive).
 - SHOULD: Set `end` to a finite deadline for offer expiry.
 
 ### 5.4 Wallet pitfall (ordering)
@@ -136,6 +137,14 @@ persist on-chain.
 
 Wallets SHOULD show: “Valid heights: `start` … `end` (inclusive)”.
 
+### 5.6 P2 vs P5
+
+| Aspect | P2 (top-level guard) | P5 (`AstIf` + guard condition) |
+|--------|----------------------|----------------------------------|
+| Guard revert outside window | **Whole tx fails** | **`br_else` runs**; tx may succeed |
+| Use when | Payment must not settle unless in window | Fallback branch or no-op else is desired |
+| Wallet display | “Expired — tx failed” | “Condition false — else branch taken” |
+
 ## 6. Pattern P3 — BalanceFloor protected transfer
 
 ### 6.1 Intent
@@ -151,14 +160,21 @@ actions: [
 ]
 ```
 
-`BalanceFloor` intentionally inspects **in-transaction state at the guard position**, not pre-tx chain state.
+`BalanceFloor` intentionally inspects **in-transaction state at the guard position**, not pre-tx chain state. Type3 **fee is debited after all actions** — floors do not see post-fee balances unless the integrator models fee in the floor value.
 
 ### 6.3 Rules
 
 - MUST: Place `BalanceFloor` **after** debits that should be protected.
 - MUST: Specify at least one non-zero floor field (`hacash`, `satoshi`, `diamond`, or `assets`).
 - MUST: Revert when any checked dimension is below floor.
-- SHOULD: Floor values include expected post-transfer dust retention.
+- SHOULD: Floor values include expected post-transfer dust retention **and** tx `fee` (and gas-paid HAC if applicable) when minimum **final** on-chain balance is intended.
+- SHOULD: Only set non-zero fields for dimensions being protected; zero `hacash` does not guard HAC.
+
+### 6.4 Wallet pitfall (ordering)
+
+If `BalanceFloor` is listed **before** a debit, the guard reads **pre-debit** balances and protection is bypassed while the tx may still succeed (`hip23_p3_floor_before_transfer_checks_pre_debit_state`). Wallets MUST enforce debit-then-floor ordering for P3.
+
+Step-by-step simulators may show debits before a failing floor; the full tx still reverts atomically on-chain (see §5.4).
 
 ## 7. Pattern P4 — HIP20 issuance + TEX distribution
 
@@ -168,7 +184,7 @@ Mint a HIP20 asset in Tx A, then distribute units to counterparties via TEX in T
 
 ### 7.2 Structure
 
-`AssetCreate` is `TOP_ONLY` — it MUST be the only non-guard top-level action in its transaction.  
+`AssetCreate` is `TOP_ONLY` — it MUST be the **sole** top-level action in Tx A (no guards, no TEX, no other actions).  
 Distribution therefore uses **two coordinated transactions**:
 
 ```
@@ -186,9 +202,10 @@ Tx B (distribution, after Tx A confirms or in a later pass):
 
 - MUST: Keep `AssetCreate` alone at top level (`TOP_ONLY` topology).
 - MUST: Run TEX distribution only after the asset exists on-chain (same block ordering or later block).
-- MUST: `issuer` in metadata receives minted supply and MUST sign issuer `AssetPay` TEX cells.
+- MUST: `issuer` in metadata receives minted supply; issuer SHOULD sign issuer `AssetPay` TEX cells (protocol does not bind `TexCellAct.addr` to `metadata.issuer`).
 - MUST: Set `gas_max > 0` on Type3 txs with asset TEX cells.
-- MUST: Pay `protocol_cost` per `AssetCreate` rules @ `ASSET_ALIVE_HEIGHT` (`765432`).
+- MUST: Pay `protocol_cost` **exactly equal** to `genesis::block_reward(height)` at inclusion height; debited from **`tx.main`**, not `metadata.issuer`.
+- MUST: On mainnet, asset serial `>= 1025` at `ASSET_ALIVE_HEIGHT` (`765432`); serial ceiling grows with height (see `mint/src/action/asset.rs`).
 - SHOULD: Pre-sign TEX bundles for Tx B before broadcasting Tx A.
 
 ## 8. Pattern P5 — AST conditional settlement
@@ -215,20 +232,33 @@ actions: [
 - MUST: Condition `AstSelect` use `exe_min = exe_max = 1` for single guard predicates.
 - MUST: Guard-only `AstSelect` / `AstIf` nodes are invalid at tx topology precheck.
 - MUST: Condition guard `Revert` selects `br_else`; condition `Fault` aborts entire `AstIf`.
+- SHOULD: Condition `AstSelect` contain guard-only actions (no balance mutations in `cond`).
 - SHOULD: Keep branch actions simple (single transfer or TEX bundle) for wallet simulation.
+
+### 8.4 Wallet display
+
+- Show which branch executed: `if` vs `else`.
+- Distinguish **condition fault** (invalid range → whole tx fails) from **condition revert** (outside window → else branch).
+- Budget gas for **both** condition attempt and branch attempt; AST try costs are not refunded on revert (`doc/ast-spec.md` §6).
+
+### 8.5 Signatures and gas
+
+- `AstIf` collects signatures from `cond`, `br_if`, and `br_else` in the serialized tree — signers for **both** branches MAY be required at broadcast even if only one branch runs.
+- Minimum `gas_max` for simple HAC `br_if` + `HeightScope` cond: **17** (template default). TEX or VM branches need higher budgets.
 
 ## 9. Security considerations
 
-- **TEX replay:** Signed TEX bundles are replayable; never treat a signature alone as a one-time authorization.
+- **TEX replay:** Signed TEX bundles are replayable; never treat a signature alone as a one-time authorization. Pin the full composed tx before co-signing.
 - **Ordering:** Guards only see state mutations from earlier actions in the same transaction.
 - **Co-signing:** Verify counterparty TEX cells match your quote before signing.
 - **Gas:** AST and asset TEX paths consume gas; under-budgeted txs fail after partial snapshot work.
+- **P2 vs P5:** Do not use P5 when a failed guard must abort the entire payment (use P2).
 
 ## 10. Versioning
 
 | Version | Contents |
 |---------|----------|
-| v1.0 (this draft) | Patterns P1–P5, JSON templates, regression tests |
+| v1.0 (this draft) | Patterns P1–P5, JSON templates, regression + adversarial tests |
 | v1.1 (planned) | Wallet checklist, indexer field dictionary |
 | v2.0 (future) | Optional HVM companion contracts per pattern |
 
@@ -248,12 +278,12 @@ actions: [
 
 | Area | Tests |
 |------|-------|
-| P1 TEX | imbalanced settlement, tampered sign, insufficient balance, gas required, HAC+SAT swap, height condition cell |
-| P2 Guard | boundary inclusive, unlimited end, ChainAllow, wrong debit/guard order |
-| P3 Floor | asset dimension, pre-debit vs post-debit placement |
-| P4 HIP20 | duplicate serial, missing asset, issuer insufficient, `AssetCreate`+TEX same-tx rejected |
-| P5 AST | condition fault, else-branch transfer |
-| Topology | guard-only tx rejected, height+floor+transfer combo, height+TEX combo |
+| P1 TEX | imbalanced HAC/SAT, tampered sign, insufficient balance, gas required, HAC+SAT swap, height condition cell, HAC prelude + TEX |
+| P2 Guard | boundary inclusive, above-end reject, unlimited end, ChainAllow, wrong debit/guard order |
+| P3 Floor | asset dimension, satoshi dimension, pre-debit vs post-debit placement |
+| P4 HIP20 | duplicate serial, missing asset, issuer insufficient, wrong protocol_cost, `AssetCreate`+TEX same-tx rejected |
+| P5 AST | condition fault, else-branch transfer, zero gas rejected |
+| Topology | guard-only rejected (precheck + execute), height+floor+transfer combo (pass + fail), height+TEX combo (pass + fail) |
 
 Run all:
 

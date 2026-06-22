@@ -10,9 +10,7 @@ use mint::action::AssetCreate;
 use mint::genesis;
 use protocol::action::*;
 use protocol::tex::*;
-use protocol::transaction::create_tx_info;
 use sys::Account;
-use testkit::sim::context::make_ctx_with_state;
 
 #[test]
 fn hip23_pattern_1_atomic_tex_swap() {
@@ -40,6 +38,7 @@ fn hip23_pattern_1_atomic_tex_swap() {
     tx.execute(&mut ctx).unwrap();
 
     assert_eq!(hac_mei(&mut ctx, &get), 1);
+    assert_eq!(hac_mei(&mut ctx, &pay), 999);
     assert_eq!(asset_amt(&mut ctx, &get, SERIAL), 50);
     assert_eq!(asset_amt(&mut ctx, &pay, SERIAL), 0);
 }
@@ -72,6 +71,8 @@ fn hip23_pattern_2_height_guarded_payment() {
     seed_hac(&mut fail_ctx, &main, 1_000);
     let err = tx.execute(&mut fail_ctx).unwrap_err();
     assert_err_contains(&err, "submitted in height between");
+    assert_eq!(hac_mei(&mut fail_ctx, &main), 1_000);
+    assert_eq!(hac_mei(&mut fail_ctx, &recipient), 0);
 
     let mut ok_ctx = make_ctx(window_start + 100, tx.as_read());
     seed_hac(&mut ok_ctx, &main, 1_000);
@@ -177,17 +178,7 @@ fn hip23_pattern_4_asset_create_plus_tex() {
     assert_eq!(asset_amt(&mut ctx, &issuer, SERIAL), 10_000);
 
     let persisted = ctx.state().clone_state();
-    let mut tex_ctx = make_ctx_with_state(
-        {
-            let mut env = basis::component::Env::default();
-            env.chain.fast_sync = true;
-            env.block.height = TEST_HEIGHT;
-            env.tx = create_tx_info(tx_tex.as_read());
-            env
-        },
-        persisted,
-        tx_tex.as_read(),
-    );
+    let mut tex_ctx = make_ctx_persisted(TEST_HEIGHT, persisted, tx_tex.as_read());
     tx_tex.execute(&mut tex_ctx).unwrap();
 
     assert_eq!(asset_amt(&mut tex_ctx, &buyer, SERIAL), 500);
