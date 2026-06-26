@@ -14,7 +14,9 @@ fn impl_packing_next_block(
         newdifn = Uint4::from(LOWEST_DIFFICULTY);
     }
     let nexthei = oldblk.height().uint() + 1;
-    let nextts = curtimes();
+    let prev_ts = oldblk.timestamp().uint();
+    // Release chain rejects blk_time <= prev_ts; always strictly increase.
+    let nextts = std::cmp::max(curtimes(), prev_ts.saturating_add(1));
     if this.difficulty.is_upgrade_height(nexthei) || nexthei % mtcnf.difficulty_adjust_blocks == 0 {
         let sto = engine.store();
         let src = StoreBlockIntroSource::new(sto.as_ref());

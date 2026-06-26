@@ -51,8 +51,8 @@ pub fn hac_transfer(ctx: &mut dyn Context, from: &Address, to: &Address, amt: &A
     check_transfer_recipient_allowed(to)?;
     // is to self
     if from == to {
-        if !from.is_privakey() {
-            return xerrf!("non-privakey address cannot transfer HAC to self")
+        if !from.is_user_signing_address() {
+            return xerrf!("non-signing address cannot transfer HAC to self")
         }
         // historical compatibility: legacy blocks (<200000) allow self-transfer fast path
         if ctx.env().block.height >= 20_0000 {

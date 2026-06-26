@@ -8,7 +8,13 @@ fn routes() -> Vec<ApiRoute> {
         R::get("/query/block/datas", block_datas),
         R::get("/query/fee/average", fee_average),
         R::get("/query/transaction", transaction_exist),
+        R::get("/query/metrics", query_metrics),
+        // Type 2/3/4 transaction builder (tx_type=4 requires v6/v7 main_address)
         R::post("/create/transaction", transaction_build),
+        // Legacy Type 2 transfer (main_prikey); Type 4 via tx_type=4 query param
+        R::post("/create/coin/transfer", create_coin_transfer),
+        // Dedicated Type 4 PQC/hybrid transfer (hybrid_keystore + keystore_pass required)
+        R::post("/create/coin/transfer/v4", create_coin_transfer_v4),
         R::post("/submit/transaction", submit_transaction),
         R::post("/submit/block", submit_block),
         R::debug_get("block/txs", debug_block_txs),
@@ -17,7 +23,10 @@ fn routes() -> Vec<ApiRoute> {
         R::debug_post("submit/transaction", debug_submit_transaction),
         R::post("/operate/fee/raise", fee_raise),
         R::post("/util/transaction/check", transaction_check),
+        // Legacy sign (prikey) + auto Type 4 branch when body is ty=4 and hybrid_keystore set
         R::post("/util/transaction/sign", transaction_sign),
+        // Type 4 only: requires hybrid_keystore + keystore_pass (no prikey path)
+        R::post("/util/transaction/sign/v4", transaction_sign_v4),
         R::get("/query/hashrate", hashrate),
         R::get("/query/hashrate/logs", hashrate_logs),
         R::get("/query/balance", balance),

@@ -15,6 +15,8 @@ use wasm_bindgen::prelude::*;
 
 include! {"param.rs"}
 include! {"util.rs"}
+include! {"keystore.rs"}
+include! {"hybrid.rs"}
 include! {"account.rs"}
 include! {"coin.rs"}
 include! {"sign.rs"}
