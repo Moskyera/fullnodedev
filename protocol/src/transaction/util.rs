@@ -1,3 +1,12 @@
+/// Effective mempool / RPC wire-size cap for a transaction type.
+#[inline]
+pub fn effective_max_tx_wire_size(engine_max_tx_size: usize, tx_type: u8) -> usize {
+    if tx_type == TransactionType4::TYPE {
+        engine_max_tx_size.min(TransactionType4::MAX_WIRE_SIZE)
+    } else {
+        engine_max_tx_size
+    }
+}
 
 pub fn create_tx_info(tx: &dyn TransactionRead) -> TxInfo {
     TxInfo {

@@ -160,3 +160,60 @@ pub fn create_coin_transfer(param: CoinTransferParam) -> Ret<CoinTransferResult>
         timestamp: ts,
     })
 }
+
+#[derive(Default)]
+#[wasm_bindgen(getter_with_clone, inspectable)]
+pub struct CoinTransferV4Param {
+    pub main_keystore: String,
+    pub keystore_pass: String,
+    pub fee: String,
+    pub to_address: String,
+    pub timestamp: u64,
+    pub hacash: String,
+    pub gas_max: u8,
+}
+
+#[wasm_bindgen]
+impl CoinTransferV4Param {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[wasm_bindgen]
+pub fn create_coin_transfer_v4(param: CoinTransferV4Param) -> Ret<CoinTransferResult> {
+    use basis::interface::{Transaction, TransactionRead};
+    use protocol::action::HacToTrs;
+    use protocol::transaction::TransactionType4;
+
+    let main = q_hybrid_acc!(param.main_keystore, param.keystore_pass);
+    let mainaddr = Address::from(*main.address());
+    if !mainaddr.is_pqckey() && !mainaddr.is_hybrid() {
+        return errf!("type 4 transfer main address must be pqckey or hybrid");
+    }
+    let fee = q_amt!(param.fee);
+    let toaddr = q_adr!(param.to_address);
+    let ts = if param.timestamp == 0 {
+        curtimes()
+    } else {
+        param.timestamp
+    };
+
+    let mut tx = TransactionType4::new_by(mainaddr, fee, ts);
+    tx.gas_max = Uint1::from(param.gas_max);
+
+    if param.hacash.is_empty() {
+        return errf!("hacash amount required for type 4 transfer");
+    }
+    let hac = Amount::from(&param.hacash).map_err(|e| format!("hacash invalid: {e}"))?;
+    tx.push_action(Box::new(HacToTrs::create_by(toaddr, hac)))?;
+    tx.fill_hybrid_sign(&main)?;
+
+    Ok(CoinTransferResult {
+        hash: tx.hash().to_hex(),
+        hash_with_fee: tx.hash_with_fee().to_hex(),
+        body: tx.serialize().to_hex(),
+        timestamp: ts,
+    })
+}

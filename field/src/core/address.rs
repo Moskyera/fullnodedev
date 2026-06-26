@@ -189,6 +189,8 @@ address_version_define!{
     PRIVAKEY : privakey, 0 // leading symbol: 1
     CONTRACT : contract, 1 // leading symbol: Q-Z, a-k, m-o
     SCRIPTMH : scriptmh, 5 // leading symbol: 3
+    PQCKEY   : pqckey, 6 // post-quantum ML-DSA-65 key hash
+    HYBRID   : hybrid, 7 // secp256k1 + ML-DSA-65 hybrid key hash
 }
 
 
@@ -213,6 +215,11 @@ impl Address {
     ///   - ADDRESS_ZERO  (value 0)  — blackhole
     ///   - ADDRESS_ONEX  (value 1)  — TEX settlement escrow
     ///   - ADDRESS_TWOX  (value 2)  — reserved
+    /// User-controlled signing address: legacy privakey, PQC-only, or hybrid.
+    pub fn is_user_signing_address(&self) -> bool {
+        self.is_privakey() || self.is_pqckey() || self.is_hybrid()
+    }
+
     pub fn is_privakey_unknown(&self) -> bool {
         let b = self.as_ref(); // 21 bytes
         // Value < u32::MAX  →  top 17 bytes must be 0.

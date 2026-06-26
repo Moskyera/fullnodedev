@@ -334,11 +334,23 @@ pub(crate) async fn handle_new_tx(
             engcnf.lowest_fee_purity
         );
     }
-    if txpkg.data().len() > engcnf.max_tx_size {
+    let txpr = txpkg.tx_read();
+    let max_wire = protocol::transaction::effective_max_tx_wire_size(
+        engcnf.max_tx_size,
+        txpr.ty(),
+    );
+    if txpkg.data().len() > max_wire {
+        if txpr.ty() == protocol::transaction::TransactionType4::TYPE {
+            protocol::metrics::emit(protocol::metrics::PqcMetricEvent::Type4MempoolRejected);
+            println!(
+                "[p2p] type4 tx rejected: wire size {} > cap {}",
+                txpkg.data().len(),
+                max_wire
+            );
+        }
         return errf!("tx size exceeds max_tx_size");
     }
     let txdatas = txpkg.data().to_vec();
-    let txpr = txpkg.tx_read();
     hdl.engine.try_execute_tx(txpr)?;
     minter.tx_submit(hdl.engine.as_read(), &txpkg)?;
     hdl.txpool

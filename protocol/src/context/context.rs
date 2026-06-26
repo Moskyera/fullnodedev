@@ -148,8 +148,21 @@ impl<'a> ContextInst<'a> {
                 adr
             );
         }
-        adr.must_privakey()?;
-        let isok = verify_target_signature(adr, self.txr);
+        let isok = if self.txr.ty() == crate::transaction::TransactionType4::TYPE {
+            if !adr.is_user_signing_address() {
+                return errf!("address {} is not a user signing address", adr);
+            }
+            let res = crate::transaction::verify_target_hybrid_signature(adr, self.txr);
+            if res.as_ref().ok().copied() == Some(true) {
+                crate::metrics::emit(crate::metrics::PqcMetricEvent::Type4SignVerified {
+                    hybrid: adr.is_hybrid(),
+                });
+            }
+            res
+        } else {
+            adr.must_privakey()?;
+            verify_target_signature(adr, self.txr)
+        };
         self.check_sign_cache.insert(*adr, isok.clone());
         isok.map(|_| ())
     }

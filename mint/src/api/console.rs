@@ -33,6 +33,13 @@ fn console(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
         *n
     };
 
+    let pqc_lines = ctx.hnoder.pqc_metrics_prometheus();
+    let pqc_summary = if pqc_lines.is_empty() {
+        "PQC metrics: n/a".to_owned()
+    } else {
+        pqc_lines.join(" | ")
+    };
+
     api_html(format!(
         r#"<html><head><title>Hacash node console</title></head><body>
         <h3>Hacash console</h3>
@@ -41,6 +48,8 @@ fn console(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
         <p>P2P peers: {}</p>
         <p>{}</p>
         <p>Miner worker notice connected: {}</p>
+        <p>{}</p>
+        <p><a href="/query/metrics">/query/metrics</a> | <a href="/query/metrics?format=prometheus">prometheus</a></p>
     </body></html>"#,
         latest.height().uint(),
         timeshow(latest.timestamp().uint()),
@@ -48,5 +57,6 @@ fn console(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
         ctx.hnoder.all_peer_prints().join(", "),
         ctx.hnoder.txpool().print(),
         poworkers,
+        pqc_summary,
     ))
 }

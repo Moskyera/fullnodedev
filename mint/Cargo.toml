@@ -14,5 +14,7 @@ num-bigint = "0.4.6"
 num-traits = "0.2.19"
 concat-idents = "1.1.5"
 serde_json = "1.0"
-getrandom = "0.3.2"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+argon2 = "0.5.3"
+aes-gcm = "0.10.3"
 tokio = { version = "1.49.0", features = ["time"] }

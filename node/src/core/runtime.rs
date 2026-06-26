@@ -10,6 +10,7 @@ pub struct NodeRuntime {
     pub(super) transport: TransportAdapter,
     pub(super) tasks: Arc<TaskGroup>,
     pub(super) metrics: Arc<StdMutex<RuntimeMetrics>>,
+    pub(super) pqc_metrics: Arc<StdMutex<PqcMetrics>>,
     pub(super) exited: AtomicBool,
 }
 
@@ -21,6 +22,9 @@ impl NodeRuntime {
         msghdl.set_p2p_mng(Box::new(PeerMngInst::new(p2p.clone())));
         let protocol = ProtocolAdapter::new(msghdl.clone());
         let transport = TransportAdapter::new(&cnf, p2p.clone());
+        let pqc_metrics = Arc::new(StdMutex::new(PqcMetrics::default()));
+        install_global_pqc_metrics(pqc_metrics.clone());
+        install_pqc_metrics_hook();
         Self {
             engine,
             txpool,
@@ -29,8 +33,16 @@ impl NodeRuntime {
             transport,
             tasks: TaskGroup::new(),
             metrics: Arc::new(StdMutex::new(RuntimeMetrics::default())),
+            pqc_metrics,
             exited: AtomicBool::new(false),
         }
+    }
+
+    pub fn pqc_metrics_snapshot(&self) -> PqcMetrics {
+        self.pqc_metrics
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     pub fn start(&self, worker: Worker) {

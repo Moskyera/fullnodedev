@@ -46,6 +46,10 @@ impl HNoder for HacashNode {
         self.runtime.all_peer_prints()
     }
 
+    fn pqc_metrics_prometheus(&self) -> Vec<String> {
+        self.runtime.pqc_metrics_snapshot().prometheus_lines()
+    }
+
     fn exit(&self) {
         self.runtime.exit()
     }

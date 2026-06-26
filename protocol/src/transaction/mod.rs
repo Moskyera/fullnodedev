@@ -14,6 +14,8 @@ use super::*;
 include! {"util.rs"}
 include! {"macro.rs"}
 include! {"type3.rs"}
+include! {"hybrid_util.rs"}
+include! {"type4.rs"}
 include! {"prelude.rs"}
 include! {"create.rs"}
 include! {"store.rs"}
@@ -68,6 +70,17 @@ fn decode_tx_type3(json: &str) -> Ret<Box<dyn Transaction>> {
     Ok(Box::new(tx))
 }
 
+fn create_tx_type4(buf: &[u8]) -> Ret<(Box<dyn Transaction>, usize)> {
+    let (tx, sk) = TransactionType4::create(buf)?;
+    Ok((Box::new(tx), sk))
+}
+
+fn decode_tx_type4(json: &str) -> Ret<Box<dyn Transaction>> {
+    let mut tx = TransactionType4::default();
+    tx.from_json(json)?;
+    Ok(Box::new(tx))
+}
+
 pub fn register(setup: &mut crate::setup::ProtocolSetup) {
     setup.tx_codec(
         DefaultPreludeTx::TYPE,
@@ -77,6 +90,7 @@ pub fn register(setup: &mut crate::setup::ProtocolSetup) {
     setup.tx_codec(TransactionType1::TYPE, create_tx_type1, decode_tx_type1);
     setup.tx_codec(TransactionType2::TYPE, create_tx_type2, decode_tx_type2);
     setup.tx_codec(TransactionType3::TYPE, create_tx_type3, decode_tx_type3);
+    setup.tx_codec(TransactionType4::TYPE, create_tx_type4, decode_tx_type4);
 }
 
 /*

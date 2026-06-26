@@ -1,4 +1,5 @@
 static TX_NIL_SIGNS: OnceLock<Vec<Sign>> = OnceLock::new();
+static TX_NIL_HYBRID_SIGNS: OnceLock<Vec<HybridSign>> = OnceLock::new();
 static TX_NIL_ACTIS: OnceLock<Vec<Box<dyn Action>>> = OnceLock::new();
 
 pub trait TxExec {
@@ -69,6 +70,9 @@ pub trait TransactionRead: Serialize + TxExec + Send + Sync + DynClone + std::fm
     fn signs(&self) -> &Vec<Sign> {
         TX_NIL_SIGNS.get_or_init(|| vec![])
     }
+    fn hybrid_signs(&self) -> &Vec<HybridSign> {
+        TX_NIL_HYBRID_SIGNS.get_or_init(|| vec![])
+    }
 
     fn req_sign(&self) -> Ret<HashSet<Address>> {
         errf!("cannot request signature")
@@ -89,6 +93,12 @@ pub trait Transaction: TransactionRead + Field + Send + Sync {
         errf!("never")
     }
     fn push_sign(&mut self, _: Sign) -> Rerr {
+        errf!("never")
+    }
+    fn fill_hybrid_sign(&mut self, _: &sys::HybridAccount) -> Ret<HybridSign> {
+        errf!("never")
+    }
+    fn push_hybrid_sign(&mut self, _: HybridSign) -> Rerr {
         errf!("never")
     }
     fn push_action(&mut self, _: Box<dyn Action>) -> Rerr {
