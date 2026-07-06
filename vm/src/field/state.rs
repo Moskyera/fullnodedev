@@ -10,6 +10,15 @@ inst_state_define! { VMState,
 
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageDebug {
+    pub value: Value,
+    pub live_blocks: u64,
+    pub recover_blocks: u64,
+    pub active: bool,
+    pub recoverable: bool,
+}
+
 /* state storage */
 #[allow(dead_code)]
 impl VMState<'_> {
@@ -405,7 +414,7 @@ impl VMStateRead<'_> {
         curhei: u64,
         cadr: &Address,
         k: &Value,
-    ) -> VmrtRes<Option<(Value, u64, u64, bool, bool)>> {
+    ) -> VmrtRes<Option<StorageDebug>> {
         let sk = VMState::skey(cadr, k, cap.kv_key_size)?;
         let Some(mut v) = self.ctrtkvdb(&sk) else {
             return Ok(None);
@@ -416,13 +425,13 @@ impl VMStateRead<'_> {
         }
         let live = v.live_rest_blocks(gst)?;
         let recover = v.recover_rest_blocks(gst)?;
-        Ok(Some((
-            v.data.clone(),
-            live,
-            recover,
-            v.is_active(),
-            v.is_recoverable(),
-        )))
+        Ok(Some(StorageDebug {
+            value: v.data.clone(),
+            live_blocks: live,
+            recover_blocks: recover,
+            active: v.is_active(),
+            recoverable: v.is_recoverable(),
+        }))
     }
 
     pub fn debug_status_get(&self, cap: &SpaceCap, cadr: &Address, k: &Value) -> VmrtRes<Value> {

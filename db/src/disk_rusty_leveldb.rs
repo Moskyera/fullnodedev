@@ -61,6 +61,10 @@ impl DiskDB for DiskKV {
     }
     */
 
+    fn flush(&self) -> Rerr {
+        self.ldb.lock().unwrap().flush().map_err(|e| e.to_string())
+    }
+
     fn for_each(&self, each: &mut dyn FnMut(&[u8], &[u8])->bool) -> Rerr{
         // Collect first, then call callback outside the DB lock to avoid re-entrant deadlock.
         let rows: Vec<(Vec<u8>, Vec<u8>)> = {

@@ -1,12 +1,3 @@
-/// Effective mempool / RPC wire-size cap for a transaction type.
-#[inline]
-pub fn effective_max_tx_wire_size(engine_max_tx_size: usize, tx_type: u8) -> usize {
-    if tx_type == TransactionType4::TYPE {
-        engine_max_tx_size.min(TransactionType4::MAX_WIRE_SIZE)
-    } else {
-        engine_max_tx_size
-    }
-}
 
 pub fn create_tx_info(tx: &dyn TransactionRead) -> TxInfo {
     TxInfo {
@@ -15,6 +6,68 @@ pub fn create_tx_info(tx: &dyn TransactionRead) -> TxInfo {
         addrs: tx.addrs(),
         fee: tx.fee_pay(),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxSignatureReport {
+    pub required: Vec<Address>,
+    pub present: Vec<Address>,
+    pub valid: Vec<Address>,
+    pub missing: Vec<Address>,
+    pub invalid: Vec<Address>,
+}
+
+fn sort_addresses(addrs: &mut Vec<Address>) {
+    addrs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    addrs.dedup();
+}
+
+fn signature_present_for(addr: &Address, signs: &[Sign]) -> bool {
+    signs.iter().any(|sig| {
+        Address::from(Account::get_address_by_public_key(*sig.publickey)) == *addr
+    })
+}
+
+pub fn signature_report(tx: &dyn TransactionRead) -> Ret<TxSignatureReport> {
+    let mut required: Vec<_> = tx.req_sign()?.into_iter().collect();
+    sort_addresses(&mut required);
+    let mut present: Vec<_> = tx
+        .signs()
+        .iter()
+        .map(|sig| Address::from(Account::get_address_by_public_key(*sig.publickey)))
+        .collect();
+    sort_addresses(&mut present);
+
+    let hx = tx.hash();
+    let hxwf = tx.hash_with_fee();
+    let main_addr = tx.main();
+    let txty = tx.ty();
+    let signs = tx.signs();
+    let mut valid = Vec::new();
+    let mut missing = Vec::new();
+    let mut invalid = Vec::new();
+    for adr in &required {
+        let mut ckhx = &hx;
+        if *adr == main_addr && txty != TransactionType1::TYPE {
+            ckhx = &hxwf;
+        }
+        match verify_one_sign(ckhx, adr, signs) {
+            Ok(true) => valid.push(*adr),
+            Ok(false) => invalid.push(*adr),
+            Err(_) if !signature_present_for(adr, signs) => missing.push(*adr),
+            Err(_) => invalid.push(*adr),
+        }
+    }
+    sort_addresses(&mut valid);
+    sort_addresses(&mut missing);
+    sort_addresses(&mut invalid);
+    Ok(TxSignatureReport {
+        required,
+        present,
+        valid,
+        missing,
+        invalid,
+    })
 }
 
 

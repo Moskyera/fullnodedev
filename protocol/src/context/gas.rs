@@ -94,6 +94,16 @@ struct GasCounter {
     max_charge: Amount,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GasDiag {
+    pub running: bool,
+    pub remaining: i64,
+    pub used: i64,
+    pub rebated: i64,
+    pub used_net: i64,
+    pub max_charge: Amount,
+}
+
 impl Default for GasCounter {
     fn default() -> Self {
         Self::new()
@@ -138,6 +148,17 @@ impl GasCounter {
 
     fn remaining(&self) -> i64 {
         self.remaining
+    }
+
+    fn diag(&self) -> GasDiag {
+        GasDiag {
+            running: self.running,
+            remaining: self.remaining,
+            used: self.used,
+            rebated: self.rebated,
+            used_net: self.used_net(),
+            max_charge: self.max_charge.clone(),
+        }
     }
 
     fn rebated_checkpoint(&self) -> i64 {

@@ -33,6 +33,55 @@ pub struct ScriptmhCalc {
     pub sha3_path: Vec<Hash>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2shEntryPayload {
+    pub state_addr: Address,
+    pub libs: ContractAddressW1,
+    pub codes: BytesW2,
+}
+
+impl P2shEntryPayload {
+    pub fn parse(payload: &[u8]) -> Ret<Self> {
+        let (state_addr, mv1) = Address::create(payload)?;
+        state_addr.must_scriptmh()?;
+        let (libs, mv2) = ContractAddressW1::create(&payload[mv1..])?;
+        let mv = mv1 + mv2;
+        let codes = BytesW2::from(payload[mv..].to_vec())?;
+        Ok(Self {
+            state_addr,
+            libs,
+            codes,
+        })
+    }
+
+    pub fn build(state_addr: Address, libs: ContractAddressW1, codes: BytesW2) -> Ret<Vec<u8>> {
+        state_addr.must_scriptmh()?;
+        let mut out = state_addr.as_bytes().to_vec();
+        out.extend_from_slice(&libs.serialize());
+        out.extend_from_slice(codes.as_vec());
+        Ok(out)
+    }
+
+    pub fn verify_unlock_inputs(
+        &self,
+        block_height: u64,
+        gst: &GasExtra,
+        cap: &SpaceCap,
+        codeconf: CodeConf,
+        witness: &BytesW2,
+    ) -> Ret<()> {
+        P2SHScriptProve::verify_unlock_inputs(
+            block_height,
+            gst,
+            cap,
+            &self.libs,
+            codeconf,
+            &self.codes,
+            witness,
+        )
+    }
+}
+
 /* pay to script hash */
 action_define! { P2SHScriptProve, 46,
     ActScope::TOP, 3, false, [],

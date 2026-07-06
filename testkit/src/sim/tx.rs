@@ -53,6 +53,7 @@ impl TransactionRead for DummyTx {
 #[derive(Clone, Debug)]
 pub struct StubTx {
     pub ty: u8,
+    pub hash: Hash,
     pub main: Address,
     pub addrs: Vec<Address>,
     pub fee: Amount,
@@ -65,6 +66,7 @@ impl Default for StubTx {
     fn default() -> Self {
         Self {
             ty: 3,
+            hash: Hash::default(),
             main: Address::default(),
             addrs: vec![Address::default()],
             fee: Amount::unit238(10_000_000),
@@ -93,11 +95,11 @@ impl TransactionRead for StubTx {
     }
 
     fn hash(&self) -> Hash {
-        Hash::default()
+        self.hash
     }
 
     fn hash_with_fee(&self) -> Hash {
-        Hash::default()
+        self.hash
     }
 
     fn main(&self) -> Address {
@@ -140,6 +142,11 @@ impl StubTxBuilder {
 
     pub fn ty(mut self, ty: u8) -> Self {
         self.tx.ty = ty;
+        self
+    }
+
+    pub fn hash(mut self, hash: Hash) -> Self {
+        self.tx.hash = hash;
         self
     }
 

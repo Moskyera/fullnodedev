@@ -121,3 +121,35 @@ impl EngineRead for ChainEngine {
         (ttn / avgfs.len() as u128) as u64
     }
 }
+
+impl ChainEngine {
+    pub fn try_execute_tx_report(&self, tx: &dyn TransactionRead) -> TxExecutionReport {
+        let height = self.latest_block().height().uint() + 1;
+        let mut sub_state = self.fork_sub_state();
+        self.try_execute_tx_report_by(tx, height, &mut sub_state)
+    }
+
+    pub fn try_execute_tx_report_by(
+        &self,
+        tx: &dyn TransactionRead,
+        pd_hei: u64,
+        sub_state: &mut Box<dyn State>,
+    ) -> TxExecutionReport {
+        self.try_execute_tx_report_by_author(
+            tx,
+            pd_hei,
+            sub_state,
+            self.cnf.external_exec_author(),
+        )
+    }
+
+    pub fn try_execute_tx_report_by_author(
+        &self,
+        tx: &dyn TransactionRead,
+        pd_hei: u64,
+        sub_state: &mut Box<dyn State>,
+        author: Address,
+    ) -> TxExecutionReport {
+        try_execute_tx_report_by_author(self, tx, pd_hei, sub_state, author)
+    }
+}

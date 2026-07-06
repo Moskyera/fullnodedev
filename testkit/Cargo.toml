@@ -9,6 +9,7 @@ sys            = {path = "../sys"}
 field          = {path = "../field"}
 basis          = {path = "../basis"}
 protocol       = {path = "../protocol"}
+chain          = {path = "../chain"}
 mint           = {path = "../mint"}
 vm             = {path = "../vm"}
 x16rs          = {path = "../x16rs"}

@@ -55,6 +55,10 @@ impl DiskDB for DiskKV {
     }
     */
 
+    fn flush(&self) -> Rerr {
+        self.rdb.flush().map_err(|e| e.to_string())
+    }
+
     fn for_each(&self, each: &mut dyn FnMut(&[u8], &[u8])->bool) -> Rerr{
         let rdbiter = self.rdb.iterator(rocksdb::IteratorMode::Start);
         for item in rdbiter {

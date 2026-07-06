@@ -5,6 +5,27 @@ macro_rules! vmsto { ($ctx: expr) => {
     VMState::wrap($ctx.state())
 }}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractStoreAnalysis {
+    pub address: ContractAddress,
+    pub contract_size: usize,
+    pub inherit_count: usize,
+    pub library_count: usize,
+    pub has_construct: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractUpdateAnalysis {
+    pub address: ContractAddress,
+    pub old_contract_size: usize,
+    pub new_contract_size: usize,
+    pub edit_size: usize,
+    pub did_structural_change: bool,
+    pub did_effective_lookup_change: bool,
+    pub update_hook: AbstCall,
+    pub required_protocol_cost: Amount,
+}
+
 
 action_define! { ContractDeploy, 40,
     ActScope::TOP_ONLY_CAN_WITH_GUARD, 3, false, [],
@@ -212,6 +233,15 @@ fn precheck_contract_store(
     gst: &GasExtra,
     ctx: &mut dyn Context,
 ) -> Ret<bool> {
+    Ok(analyze_contract_store(ctx, root_addr, root_contract, gst)?.has_construct)
+}
+
+pub fn analyze_contract_store(
+    ctx: &mut dyn Context,
+    root_addr: &ContractAddress,
+    root_contract: &ContractSto,
+    gst: &GasExtra,
+) -> Ret<ContractStoreAnalysis> {
     check_contract_self_reference(root_addr, root_contract)?;
     let mut vmsta = VMState::wrap(ctx.state());
     check_link_contracts_exist(&mut vmsta, root_addr, root_contract)?;
@@ -223,7 +253,54 @@ fn precheck_contract_store(
         AbstCall::Construct,
     )?;
     check_static_call_targets(&mut vmsta, root_addr, root_contract, gst)?;
-    Ok(has_construct)
+    Ok(ContractStoreAnalysis {
+        address: root_addr.clone(),
+        contract_size: root_contract.size(),
+        inherit_count: root_contract.inherit.length(),
+        library_count: root_contract.library.length(),
+        has_construct,
+    })
+}
+
+pub fn analyze_contract_update(
+    ctx: &mut dyn Context,
+    address: &ContractAddress,
+    edit: &ContractEdit,
+) -> Ret<ContractUpdateAnalysis> {
+    use AbstCall::*;
+    let hei = ctx.env().block.height;
+    let (gst, cap) = peek_vm_runtime_limits(ctx, hei);
+    let Some(contract) = VMState::wrap(ctx.state()).contract(address) else {
+        return errf!("contract {} does not exist", address.to_readable())
+    };
+    let mut new_contract = contract.clone();
+    let did_structural_change = new_contract.apply_edit(edit, hei, &cap, &gst)?;
+    let _ = analyze_contract_store(ctx, address, &new_contract, &gst)?;
+    if new_contract.size() == 0 {
+        return errf!("contract content cannot be empty");
+    }
+    let did_effective_lookup_change = effective_userfn_lookup_changed(
+        &mut VMState::wrap(ctx.state()),
+        address,
+        &contract,
+        &new_contract,
+    )?;
+    let is_change = did_structural_change || did_effective_lookup_change;
+    let edit_size = edit.size();
+    Ok(ContractUpdateAnalysis {
+        address: address.clone(),
+        old_contract_size: contract.size(),
+        new_contract_size: new_contract.size(),
+        edit_size,
+        did_structural_change,
+        did_effective_lookup_change,
+        update_hook: maybe!(is_change, Change, Append),
+        required_protocol_cost: calc_contract_protocol_cost_min_with_periods(
+            ctx,
+            edit_size,
+            protocol::params::CONTRACT_STORE_PERM_PERIODS,
+        )?,
+    })
 }
 
 fn load_contract_for_check(

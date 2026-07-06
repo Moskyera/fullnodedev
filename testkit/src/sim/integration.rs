@@ -76,19 +76,25 @@ pub fn ensure_standard_protocol_setup_for_tests(
 ) {
     static GLOBAL_SETUP_ONCE: Once = Once::new();
     GLOBAL_SETUP_ONCE.call_once(|| {
-        let mut setup = protocol::setup::new_standard_protocol_setup(block_hasher);
-        mint::setup::register_protocol_extensions(&mut setup);
-        if include_vm_extensions {
-            vm::setup::register_protocol_extensions(&mut setup);
-        }
+        let setup = if include_vm_extensions {
+            vm::setup::new_full_protocol_setup(block_hasher)
+        } else {
+            let mut setup = protocol::setup::new_standard_protocol_setup(block_hasher);
+            mint::setup::register_protocol_extensions(&mut setup);
+            setup
+        };
         protocol::setup::install_once(setup);
     });
 
-    let mut scoped = protocol::setup::new_standard_protocol_setup(block_hasher);
-    mint::setup::register_protocol_extensions(&mut scoped);
-    if include_vm_extensions {
-        vm::setup::register_protocol_extensions(&mut scoped);
-    }
+    let scoped = if include_vm_extensions {
+        vm::setup::new_full_protocol_setup(block_hasher)
+    } else {
+        let mut scoped = protocol::setup::new_standard_protocol_setup(block_hasher);
+        mint::setup::register_protocol_extensions(&mut scoped);
+        scoped
+    };
+    debug_assert!(scoped.has_tx_type(protocol::transaction::TransactionType3::TYPE));
+    debug_assert_eq!(scoped.has_vm_assigner(), include_vm_extensions);
     set_scoped_setup_guard(protocol::setup::install_test_scope(scoped));
 }
 

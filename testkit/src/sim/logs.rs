@@ -18,6 +18,12 @@ impl MemLogs {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Append all entries from `other` onto `self` (used by `MemChain` to
+    /// carry per-tx logs back into the persistent chain).
+    pub fn extend_from(&mut self, other: &MemLogs) {
+        self.entries.extend(other.entries.iter().cloned());
+    }
 }
 
 impl Logs for MemLogs {

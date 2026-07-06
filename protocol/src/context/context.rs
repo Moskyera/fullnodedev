@@ -12,6 +12,14 @@ pub struct ContextInst<'a> {
     vm: Option<Box<dyn VM>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDiag {
+    pub exec_from: ExecFrom,
+    pub p2sh_count: usize,
+    pub gas: GasDiag,
+    pub vm_initialized: bool,
+}
+
 impl<'a> ContextInst<'a> {
     pub fn new(
         env: Env,
@@ -55,6 +63,19 @@ impl<'a> ContextInst<'a> {
 
     pub fn test_set_vm(&mut self, vm: Box<dyn VM>) {
         self.vm = Some(vm);
+    }
+
+    pub fn gas_diag(&self) -> GasDiag {
+        self.gas.diag()
+    }
+
+    pub fn diag(&self) -> ContextDiag {
+        ContextDiag {
+            exec_from: self.exec_from,
+            p2sh_count: self.psh.len(),
+            gas: self.gas_diag(),
+            vm_initialized: self.vm.is_some(),
+        }
     }
 
     fn vm_unavailable_error(&self) -> String {

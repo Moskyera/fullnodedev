@@ -60,6 +60,10 @@ impl DiskDB for DiskKV {
     }
     */
 
+    fn flush(&self) -> Rerr {
+        self.ldb.flush().map(|_| ()).map_err(|e| e.to_string())
+    }
+
     fn for_each(&self, each: &mut dyn FnMut(&[u8], &[u8])->bool) -> Rerr {
         for item in self.ldb.iter() {
             let (k, v) = item.map_err(|e| e.to_string())?;
