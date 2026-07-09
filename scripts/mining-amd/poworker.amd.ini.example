@@ -1,0 +1,39 @@
+; HAC block miner — AMD GPU + Ryzen hybrid (efficiency tuned)
+; Copy via INSTALL-CONFIGS.bat or CONFIGURE-MINING.bat
+
+connect = 127.0.0.1:8080
+supervene = 6
+nonce_max = 4294967295
+notice_wait = 45
+
+[efficiency]
+; mode: eco | profit | max  (profit = best HAC per kWh, default)
+mode = profit
+power_cost_kwh = 0.15
+gpu_watts = 0
+cpu_watts_per_thread = 8
+hac_price = 0
+dynamic_supervene = true
+supervene_min = 2
+supervene_max = 0
+oom_fallback = true
+max_temp_c = 0
+throttle_work_groups = 1024
+thermal_file =
+idle_start_hour = 255
+idle_end_hour = 255
+pause_if_unprofitable = false
+benchmark_seconds = 0
+
+[gpu]
+use_opencl = true
+cpu_assist = true
+; Presets: amd_eco | amd_profit | amd_balanced | amd_performance | amd_max
+gpu_profile = amd_profit
+platform_id = 0
+device_ids = 0
+opencl_dir = ../../x16rs/opencl/
+work_groups = 1536
+local_size = 256
+unit_size = 96
+debug = 0

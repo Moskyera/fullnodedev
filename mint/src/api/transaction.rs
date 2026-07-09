@@ -17,6 +17,46 @@ fn transaction_sign(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
         return resp;
     }
 
+    if tx.ty() == TransactionType4::TYPE {
+        let keystore = hybrid_keystore_from_req(&req);
+        let pass = q_string(&req, "keystore_pass", "");
+        if keystore.is_empty() {
+            return api_error("type 4 transaction requires hybrid_keystore (query param or JSON body)");
+        }
+        let Ok(blob) = sdk_unlock_hybrid_keystore_blob(&keystore, &pass) else {
+            return api_error("hybrid keystore unlock failed");
+        };
+        let Ok(hybrid) = HybridAccount::from_key_blob(&blob) else {
+            return api_error("hybrid key material invalid");
+        };
+        use basis::interface::Transaction;
+        if let Err(e) = tx.fill_hybrid_sign(&hybrid) {
+            return api_error(&format!("fill hybrid sign failed: {}", e));
+        }
+        let address = Address::from(*hybrid.address());
+        let mut data = render_tx_info(
+            tx.as_read(),
+            None,
+            lasthei,
+            &unit,
+            true,
+            signature,
+            false,
+            description,
+        );
+        let signs = tx.as_read().hybrid_signs();
+        let signobj = signs.last().cloned().unwrap_or_default();
+        data.insert(
+            "sign_data".to_owned(),
+            json!({
+                "address": address.to_readable(),
+                "alg": signobj.alg_id(),
+                "body": signobj.body.to_hex(),
+            }),
+        );
+        return api_data(data);
+    }
+
     let (address, signobj) = if prikey.len() == 64 {
         let Ok(prik) = hex::decode(&prikey) else {
             return api_error("prikey format invalid");
@@ -70,6 +110,27 @@ fn transaction_sign(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
         }),
     );
     api_data(data)
+}
+
+fn transaction_sign_v4(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
+    let keystore = hybrid_keystore_from_req(&req);
+    let pass = q_string(&req, "keystore_pass", "");
+    if keystore.is_empty() {
+        return api_error("type 4 sign requires hybrid_keystore (query param or JSON body)");
+    }
+    if pass.is_empty() {
+        return api_error("type 4 sign requires keystore_pass");
+    }
+    let Ok(txdts) = body_data_may_hex(&req) else {
+        return api_error("transaction body invalid");
+    };
+    let Ok((tx, _)) = protocol::transaction::transaction_create(&txdts) else {
+        return api_error("transaction body invalid");
+    };
+    if tx.ty() != TransactionType4::TYPE {
+        return api_error("transaction_sign_v4 requires transaction type 4");
+    }
+    transaction_sign(ctx, req)
 }
 
 fn create_transaction_error_response(
@@ -187,10 +248,35 @@ fn transaction_build_inner(req: &ApiRequest) -> ApiResponse {
             tx.gas_max = Uint1::from(gas_max as u8);
             Box::new(tx)
         }
+        v if v == TransactionType4::TYPE as u64 => {
+            if !main_addr.is_pqckey() && !main_addr.is_hybrid() {
+                return create_transaction_error_response(
+                    "create_transaction_invalid_main_address",
+                    "type 4 main_address must be pqckey (v6) or hybrid (v7)",
+                    "parse_main_address",
+                    vec![("field", json!("main_address"))],
+                );
+            }
+            let gas_max = jsonv["gas_max"].as_u64().unwrap_or(0);
+            if gas_max > protocol::context::TX_GAS_BUDGET_CAP_BYTE as u64 {
+                return create_transaction_error_response(
+                    "create_transaction_invalid_gas_max",
+                    "gas_max exceeds the current Type4 cap",
+                    "parse_gas_max",
+                    vec![
+                        ("field", json!("gas_max")),
+                        ("max", json!(protocol::context::TX_GAS_BUDGET_CAP_BYTE)),
+                    ],
+                );
+            }
+            let mut tx = TransactionType4::new_by(main_addr, fee, timestamp);
+            tx.gas_max = Uint1::from(gas_max as u8);
+            Box::new(tx)
+        }
         _ => {
             return create_transaction_error_response(
                 "create_transaction_invalid_type",
-                "transaction type must be 2 or 3",
+                "transaction type must be 2, 3, or 4",
                 "parse_type",
                 vec![("field", json!("tx_type"))],
             );
@@ -503,6 +589,48 @@ fn transaction_exist(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
     ))
 }
 
+fn hybrid_sign_alg_name(alg: u8) -> &'static str {
+    use field::sign_alg;
+    match alg {
+        sign_alg::LEGACY_SECP => "LEGACY_SECP",
+        sign_alg::MLDSA65 => "MLDSA65",
+        sign_alg::HYBRID_SECP_MLDSA65 => "HYBRID_SECP_MLDSA65",
+        _ => "UNKNOWN",
+    }
+}
+
+fn address_kind_label(addr: &Address) -> &'static str {
+    if addr.is_hybrid() {
+        "hybrid"
+    } else if addr.is_pqckey() {
+        "pqckey"
+    } else if addr.is_privakey() {
+        "privakey"
+    } else if addr.is_contract() {
+        "contract"
+    } else {
+        "other"
+    }
+}
+
+fn append_type4_rpc_fields(data: &mut serde_json::Map<String, Value>, tx: &dyn TransactionRead) {
+    if tx.ty() != TransactionType4::TYPE {
+        return;
+    }
+    let main = tx.main();
+    data.insert("tx_type".to_owned(), json!(tx.ty()));
+    data.insert("address_version".to_owned(), json!(main.version()));
+    data.insert("address_kind".to_owned(), json!(address_kind_label(&main)));
+    data.insert("wire_size".to_owned(), json!(tx.size()));
+    if let Some(sign) = tx.hybrid_signs().first() {
+        data.insert("sign_alg".to_owned(), json!(sign.alg_id()));
+        data.insert(
+            "sign_alg_name".to_owned(),
+            json!(hybrid_sign_alg_name(sign.alg_id())),
+        );
+    }
+}
+
 fn render_tx_info(
     tx: &dyn TransactionRead,
     blblk: Option<&dyn BlockRead>,
@@ -514,11 +642,13 @@ fn render_tx_info(
     description: bool,
 ) -> serde_json::Map<String, Value> {
     let fee_str = tx.fee().to_unit_string(unit);
-    let main_addr = tx.main().to_readable();
+    let main = tx.main();
+    let main_addr = main.to_readable();
     let mut data = serde_json::Map::new();
     data.insert("hash".to_owned(), json!(tx.hash().to_hex()));
     data.insert("hash_with_fee".to_owned(), json!(tx.hash_with_fee().to_hex()));
     data.insert("type".to_owned(), json!(tx.ty()));
+    data.insert("tx_type".to_owned(), json!(tx.ty()));
     data.insert("timestamp".to_owned(), json!(tx.timestamp().uint()));
     data.insert("fee".to_owned(), json!(fee_str));
     data.insert("fee_got".to_owned(), json!(tx.fee_got().to_unit_string(unit)));
@@ -526,7 +656,10 @@ fn render_tx_info(
         data.insert("gas_max".to_owned(), json!(gas_max));
     }
     data.insert("main_address".to_owned(), json!(main_addr.clone()));
+    data.insert("address_version".to_owned(), json!(main.version()));
+    data.insert("address_kind".to_owned(), json!(address_kind_label(&main)));
     data.insert("action".to_owned(), json!(tx.action_count()));
+    append_type4_rpc_fields(&mut data, tx);
 
     if body {
         data.insert("body".to_owned(), json!(tx.serialize().to_hex()));
@@ -562,15 +695,124 @@ fn render_tx_info(
 }
 
 fn check_signature(data: &mut serde_json::Map<String, Value>, tx: &dyn TransactionRead) {
-    let Ok(sigstats) = check_tx_signature(tx) else {
+    let sigstats = if tx.ty() == TransactionType4::TYPE {
+        protocol::transaction::check_tx_hybrid_signature(tx).ok()
+    } else {
+        check_tx_signature(tx).ok()
+    };
+    let Some(sigstats) = sigstats else {
         return;
     };
     let mut sigchs = vec![];
-    for (adr, sg) in sigstats {
+    for (adr, sg) in &sigstats {
         sigchs.push(json!({
             "address": adr.to_readable(),
+            "address_version": adr.version(),
+            "address_kind": address_kind_label(adr),
             "complete": sg,
         }));
     }
     data.insert("signatures".to_owned(), json!(sigchs));
+    if tx.ty() == TransactionType4::TYPE {
+        let mut hybrid_sigs = vec![];
+        for sign in tx.hybrid_signs() {
+            let alg = sign.alg_id();
+            let addr_ok = basis::method::hybrid_sign_address(sign)
+                .map(|a| a.to_readable())
+                .unwrap_or_default();
+            let addr_ver = basis::method::hybrid_sign_address(sign)
+                .map(|a| a.version())
+                .unwrap_or(0);
+            let complete = basis::method::hybrid_sign_address(sign)
+                .ok()
+                .and_then(|a| sigstats.get(&a).copied())
+                .unwrap_or(false);
+            hybrid_sigs.push(json!({
+                "alg": alg,
+                "sign_alg": alg,
+                "sign_alg_name": hybrid_sign_alg_name(alg),
+                "address": addr_ok,
+                "address_version": addr_ver,
+                "body_len": sign.body.length(),
+                "complete": complete,
+            }));
+        }
+        data.insert("hybrid_signatures".to_owned(), json!(hybrid_sigs));
+        if let Some(first) = tx.hybrid_signs().first() {
+            data.insert("sign_alg".to_owned(), json!(first.alg_id()));
+            data.insert(
+                "sign_alg_name".to_owned(),
+                json!(hybrid_sign_alg_name(first.alg_id())),
+            );
+        }
+    }
+}
+
+fn sdk_unlock_hybrid_keystore_blob(json: &str, pass: &str) -> Ret<HybridKeyBlob> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e: serde_json::Error| e.to_string())?;
+    if v["version"].as_u64() != Some(3) {
+        return errf!("keystore version must be 3");
+    }
+    let salt = hex::decode(v["kdf_salt"].as_str().unwrap_or(""))
+        .map_err(|e: hex::FromHexError| e.to_string())?;
+    let nonce = hex::decode(v["cipher_nonce"].as_str().unwrap_or(""))
+        .map_err(|e: hex::FromHexError| e.to_string())?;
+    let ciphertext = hex::decode(v["ciphertext"].as_str().unwrap_or(""))
+        .map_err(|e: hex::FromHexError| e.to_string())?;
+    let m_cost = v["kdf_m_cost_kb"].as_u64().unwrap_or(19456) as u32;
+    let t_cost = v["kdf_t_cost"].as_u64().unwrap_or(2) as u32;
+    let p_cost = v["kdf_p_cost"].as_u64().unwrap_or(1) as u32;
+    mint_unlock_keystore(pass, &salt, m_cost, t_cost, p_cost, &nonce, &ciphertext, &v)
+}
+
+fn mint_unlock_keystore(
+    pass: &str,
+    salt: &[u8],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+    nonce: &[u8],
+    ciphertext: &[u8],
+    v: &serde_json::Value,
+) -> Ret<HybridKeyBlob> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(m_cost, t_cost, p_cost, Some(32))
+        .map_err(|e: argon2::Error| e.to_string())?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(pass.as_bytes(), salt, &mut key)
+        .map_err(|e: argon2::Error| e.to_string())?;
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| "keystore decrypt failed".to_string())?;
+    let kind = match v["kind"].as_str() {
+        Some("pqckey") => 1u8,
+        Some("hybrid") => 3u8,
+        _ => return errf!("keystore kind invalid"),
+    };
+    let sk_len = sys::mldsa65_secret_key_size();
+    if plain.len() < 1 + sk_len {
+        return errf!("keystore plaintext too short");
+    }
+    let mldsa_sk = plain[1..1 + sk_len].to_vec();
+    let secp_sk = if kind == 3 {
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&plain[1 + sk_len..1 + sk_len + 32]);
+        Some(sk)
+    } else {
+        None
+    };
+    let mldsa_pk = hex::decode(v["mldsa_pk"].as_str().unwrap_or(""))
+        .map_err(|e: hex::FromHexError| e.to_string())?;
+    Ok(HybridKeyBlob {
+        kind,
+        mldsa_sk,
+        secp_sk,
+        mldsa_pk,
+    })
 }

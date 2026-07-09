@@ -20,20 +20,7 @@ fn poworker_cpu_mining_submit_success_with_sim_miner_api() {
     let sim = MinerApiSim::start(MinerPendingStuff::easy_for_test(1));
     let stop = Arc::new(AtomicBool::new(false));
 
-    let cnf = PoWorkConf {
-        rpcaddr: sim.rpcaddr().to_string(),
-        supervene: 1,
-        noncemax: 2048,
-        noticewait: 1,
-        useopencl: false,
-        workgroups: 1,
-        localsize: 256,
-        unitsize: 64,
-        opencldir: "x16rs/opencl/".to_string(),
-        debug: 0,
-        platformid: 0,
-        deviceids: String::new(),
-    };
+    let cnf = PoWorkConf::test_defaults(sim.rpcaddr().to_string(), 1, 2048);
 
     let stop2 = stop.clone();
     let worker = thread::spawn(move || {

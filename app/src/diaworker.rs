@@ -1,4 +1,3 @@
-#[cfg(feature = "ocl")]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering::*};
 use std::sync::{RwLock, mpsc};
@@ -8,6 +7,8 @@ use std::time::*;
 
 use reqwest::blocking::Client as HttpClient;
 use serde_json::Value as JV;
+
+use crate::efficiency::*;
 
 use basis::difficulty::*;
 use field::*;
@@ -37,25 +38,38 @@ pub struct DiaWorkConf {
     pub debug: u32,        // enable debug mode
     pub platformid: u32,   // opencl platform id
     pub deviceids: String, // opencl device id list
+    pub cpu_assist: bool,
+    pub gpu_profile: String,
+    pub efficiency: EfficiencyConf,
+    pub runtime: Arc<MiningRuntimeState>,
 }
 
 impl DiaWorkConf {
     pub fn new(ini: &IniObj) -> DiaWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let sec_gpu = &ini_section(ini, "gpu");
+        let efficiency = EfficiencyConf::from_ini(ini);
+        let tuning = resolve_gpu_tuning(sec_gpu, &efficiency);
+        let configured_supervene = ini_must_u64(sec, "supervene", 2) as u32;
+        let active = efficiency.initial_active_supervene(configured_supervene);
+        let runtime = MiningRuntimeState::new(tuning.workgroups, active);
         let cnf = DiaWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
-            supervene: ini_must_u64(sec, "supervene", 2) as u32,
+            supervene: configured_supervene,
             bidaddr: Address::default(),
             rewardaddr: Address::default(),
             useopencl: ini_must_bool(sec_gpu, "use_opencl", false) as bool,
-            workgroups: ini_must_u64(sec_gpu, "work_groups", 1024) as u32,
+            workgroups: tuning.workgroups,
             localsize: ini_must_u64(sec_gpu, "local_size", 256) as u32,
-            unitsize: ini_must_u64(sec_gpu, "unit_size", 128) as u32,
+            unitsize: tuning.unitsize,
             opencldir: ini_must(sec_gpu, "opencl_dir", "opencl/"),
             debug: ini_must_u64(sec_gpu, "debug", 0) as u32,
             platformid: ini_must_u64(sec_gpu, "platform_id", 0) as u32,
             deviceids: ini_must(sec_gpu, "device_ids", ""),
+            cpu_assist: ini_must_bool(sec_gpu, "cpu_assist", true) as bool,
+            gpu_profile: tuning.profile,
+            efficiency,
+            runtime,
         };
         cnf
     }
@@ -84,16 +98,21 @@ struct DiamondMiningResult {
     dia_str: [u8; 16],
     is_success: Option<DiamondMint>,
     use_secs: f64,
+    is_gpu: bool,
+    gpu_batch_ok: bool,
 }
 
 /*
 * Diamond worker
 */
 pub fn diaworker() {
-    // config
     let cnfp = "./diaworker.config.ini".to_string();
-    let inicnf = sys::load_config(cnfp);
+    let inicnf = sys::load_config(cnfp.clone());
     let mut cnf = DiaWorkConf::new(&inicnf);
+    if cnf.efficiency.benchmark_seconds > 0 {
+        run_diamond_mining_benchmark(&cnf, &cnfp);
+        return;
+    }
 
     // test start
     // cnf.supervene = 1;
@@ -123,9 +142,14 @@ pub fn diaworker() {
     // Calculate device/cpu quantity
     #[cfg(feature = "ocl")]
     let vene: u32 = if cnf.useopencl {
-        opencl_resources.len() as u32
+        let gpu = opencl_resources.len() as u32;
+        if cnf.cpu_assist {
+            gpu.saturating_add(cnf.efficiency.spawn_supervene(cnf.supervene))
+        } else {
+            gpu
+        }
     } else {
-        cnf.supervene
+        cnf.efficiency.clamp_supervene(cnf.supervene)
     };
     #[cfg(not(feature = "ocl"))]
     let vene: u32 = cnf.supervene;
@@ -170,7 +194,7 @@ pub fn diaworker() {
             println!(
                 "[Warning] use_opencl=true but app built without feature 'ocl'; fallback to CPU mining."
             );
-            let thrnum = cnf.supervene as usize;
+            let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene) as usize;
             println!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
             for thrid in 0..thrnum {
                 let cnf2 = cnf.clone();
@@ -183,8 +207,29 @@ pub fn diaworker() {
                 });
             }
         }
+
+        if cnf.cpu_assist && cnf.supervene > 0 {
+            #[cfg(feature = "ocl")]
+            {
+                let thrnum = cnf.efficiency.spawn_supervene(cnf.supervene) as usize;
+                println!(
+                    "\n[Start] Create #{} Ryzen CPU assist threads for diamonds (hybrid).",
+                    thrnum
+                );
+                for thrid in 0..thrnum {
+                    let cnf2 = cnf.clone();
+                    let rstx = res_tx.clone();
+                    spawn(move || {
+                        loop {
+                            run_diamond_worker_thread(&cnf2, thrid, rstx.clone());
+                            delay_continue_ms!(9);
+                        }
+                    });
+                }
+            }
+        }
     } else {
-        let thrnum = cnf.supervene as usize;
+        let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene) as usize;
         println!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
         for thrid in 0..thrnum {
             let cnf2 = cnf.clone();
@@ -200,6 +245,23 @@ pub fn diaworker() {
 
     // pull loop
     loop {
+        if !is_within_idle_schedule(
+            cnf.efficiency.idle_start_hour,
+            cnf.efficiency.idle_end_hour,
+        ) {
+            delay_continue!(5);
+            continue;
+        }
+        if cnf.runtime.paused_unprofitable.load(Relaxed) {
+            delay_continue!(3);
+            continue;
+        }
+        cnf.runtime.apply_thermal_throttle(
+            cnf.efficiency.max_temp_c,
+            cnf.efficiency.throttle_workgroups,
+            &cnf.efficiency.thermal_file,
+            cnf.efficiency.thermal_gpu_index,
+        );
         pull_and_push_diamond(&cnf);
         delay_continue!(MINING_INTERVAL as u64);
     }
@@ -215,11 +277,18 @@ fn deal_diamond_mining_results(
     let mut most = DiamondMiningResult::default();
     most.dia_str = [b'w'; 16];
     let mut total_nonce_space = 0u64;
+    let mut gpu_nonce_space = 0u64;
+    let mut cpu_nonce_space = 0u64;
     let mut total_use_secs = 0.0;
     let mut recv_count = 0;
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_number = res.number;
         total_nonce_space += res.nonce_space as u64;
+        if res.is_gpu {
+            gpu_nonce_space += res.nonce_space as u64;
+        } else {
+            cpu_nonce_space += res.nonce_space as u64;
+        }
         total_use_secs += res.use_secs;
         if diamond_more_power(&res.dia_str, &most.dia_str) {
             most = res.clone();
@@ -249,16 +318,39 @@ fn deal_diamond_mining_results(
     } else {
         0.0
     };
+    let active_cpu = cnf.runtime.active_cpu_assist.load(Relaxed);
+    cnf.runtime.maybe_adjust_supervene(&cnf.efficiency, gpu_nonce_space, cpu_nonce_space);
+    if should_pause_for_diamond_profit(&cnf.efficiency, &cnf.gpu_profile, active_cpu) {
+        cnf.runtime.paused_unprofitable.store(true, Relaxed);
+        println!(
+            "\n[efficiency] HACD mining paused — daily power cost exceeds configured revenue target (hac_price)."
+        );
+    } else {
+        cnf.runtime.paused_unprofitable.store(false, Relaxed);
+    }
+    let paused = cnf.runtime.paused_unprofitable.load(Relaxed);
+    let gpu_w = cnf.efficiency.estimate_gpu_watts(&cnf.gpu_profile);
+    let watts = gpu_w + active_cpu as f64 * cnf.efficiency.cpu_watts_per_thread;
     let hashrate_show = rates_to_show(nonce_rates);
     flush!(
-        "[{}] {} {}, {} {}, {}.        \r",
+        "[{}] {} | {}W | {} | {} -> {}.        \r",
         deal_number,
-        most.nonce_start,
-        total_nonce_space,
+        hashrate_show,
+        watts as u32,
         diastr,
         most_diastr,
-        hashrate_show
+        cnf.gpu_profile
     );
+    let stats = build_diamond_mining_stats(
+        nonce_rates,
+        &cnf.efficiency,
+        &cnf.gpu_profile,
+        active_cpu,
+        deal_number,
+        &most_diastr,
+        paused,
+    );
+    write_mining_stats(&cnf.efficiency.stats_file, &stats);
 
     // print next
     may_print_turn_to_nex_diamond_mining(deal_number, Some(most_dia_str));
@@ -283,12 +375,24 @@ fn may_print_turn_to_nex_diamond_mining(curr_number: u32, most_dia_str: Option<&
 //
 fn run_diamond_worker_thread(
     cnf: &DiaWorkConf,
-    _thrid: usize,
+    thrid: usize,
     result_ch_tx: mpsc::Sender<DiamondMiningResult>,
 ) {
+    if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
+        delay_return_ms!(2000);
+        return;
+    }
     let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
+    }
+    #[cfg(feature = "ocl")]
+    if cnf.useopencl && cnf.cpu_assist {
+        let active = cnf.runtime.active_cpu_assist.load(Relaxed);
+        if (thrid as u32) >= active {
+            delay_return_ms!(400);
+            return;
+        }
     }
 
     let rwd_addr = cnf.rewardaddr.clone();
@@ -321,6 +425,8 @@ fn run_diamond_worker_thread(
         // println!("do_diamond_group_mining: {:?}", &result);
         let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
         result.use_secs = use_secs;
+        result.is_gpu = false;
+        result.gpu_batch_ok = true;
         result_ch_tx.send(result).unwrap(); // channel send
         let ns = nonce_start.checked_add(nonce_space);
         if let None = ns {
@@ -346,13 +452,16 @@ fn run_diamond_worker_thread_opencl(
     result_ch_tx: mpsc::Sender<DiamondMiningResult>,
     opencl: Arc<OpenCLResources>,
 ) {
+    if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
+        delay_return_ms!(2000);
+        return;
+    }
     let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
     }
 
     let rwd_addr = cnf.rewardaddr.clone();
-    let nonce_space: u64 = (cnf.workgroups * cnf.localsize * cnf.unitsize) as u64;
     let current_mining_number: u32 = cmdn;
     let current_mining_block_hash: Hash = { MINING_DIAMOND_STUFF.read().unwrap().clone() };
 
@@ -362,6 +471,12 @@ fn run_diamond_worker_thread_opencl(
     let mut nonce_start = 0;
 
     loop {
+        let wg_eff = cnf
+            .runtime
+            .workgroups(opencl.workgroups.min(cnf.workgroups));
+        let gpu_nonce_space = (wg_eff as u64)
+            .saturating_mul(cnf.localsize as u64)
+            .saturating_mul(cnf.unitsize as u64);
         let ctn = Instant::now();
         let mut result = do_diamond_group_mining_opencl(
             &opencl,
@@ -370,16 +485,27 @@ fn run_diamond_worker_thread_opencl(
             &rwd_addr,
             &custom_nonce,
             nonce_start,
-            nonce_space,
-            cnf.workgroups,
+            gpu_nonce_space,
+            wg_eff,
             cnf.localsize,
             cnf.unitsize,
         );
+        result.is_gpu = true;
+        result.nonce_space = gpu_nonce_space;
         let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
         result.use_secs = use_secs;
+        if !result.gpu_batch_ok {
+            let wg_cap = cnf
+                .runtime
+                .workgroups(opencl.workgroups.min(cnf.workgroups));
+            cnf.runtime
+                .record_gpu_error(wg_cap, cnf.efficiency.oom_fallback);
+            delay_return_ms!(50);
+            return;
+        }
         result_ch_tx.send(result).unwrap();
 
-        let ns = nonce_start.checked_add(nonce_space);
+        let ns = nonce_start.checked_add(gpu_nonce_space);
         if let None = ns {
             break;
         }
@@ -416,6 +542,8 @@ fn do_diamond_group_mining(
         dia_str: [b'W'; 16],
         is_success: None,
         use_secs: 0.0,
+        is_gpu: false,
+        gpu_batch_ok: true,
     };
     let mut most_firhx = [0u8; HASH_WIDTH];
     let mut most_resxh = [0u8; HASH_WIDTH];
@@ -601,4 +729,99 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
         *success.d.number,
         tx_hash
     );
+}
+
+fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
+    #[cfg(not(feature = "ocl"))]
+    {
+        let _ = (cnf, config_path);
+        println!("[benchmark] Rebuild diaworker with --features ocl");
+        return;
+    }
+    #[cfg(feature = "ocl")]
+    {
+        if !cnf.useopencl {
+            println!("[benchmark] Set use_opencl=true in [gpu]");
+            return;
+        }
+        println!("[benchmark] HACD: GPU tuning uses same profiles as HAC — run poworker benchmark or share ini.");
+        let opencl_resources = initialize_opencl(
+            true,
+            &cnf.opencldir,
+            &cnf.platformid,
+            &cnf.deviceids,
+            &cnf.workgroups,
+            &cnf.localsize,
+            &cnf.unitsize,
+        );
+        if opencl_resources.is_empty() {
+            return;
+        }
+        let opencl = &opencl_resources[0];
+        let profiles = benchmark_profiles_for_vendor(opencl.vendor);
+        let per = (cnf.efficiency.benchmark_seconds.max(15) as u64 / profiles.len() as u64).max(4);
+        let mut best_hps = 0.0f64;
+        let mut best_profit = 0.0f64;
+        let mut best_hps_profile = profiles[0];
+        let mut best_profit_profile = profiles[0];
+        let prev = Hash::default();
+        let addr = cnf.rewardaddr.clone();
+        let msg = Hash::default();
+        for profile in profiles {
+            let (wg, us) = profile_tuning(profile);
+            let wg_eff = cnf.runtime.workgroups(opencl.workgroups.min(wg));
+            let batch = wg_eff as u64 * cnf.localsize as u64 * us as u64;
+            let deadline = Instant::now() + Duration::from_secs(per);
+            let mut total = 0u64;
+            let mut secs = 0.0f64;
+            let mut nonce = 0u64;
+            while Instant::now() < deadline {
+                let ctn = Instant::now();
+                let res = do_diamond_group_mining_opencl(
+                    opencl,
+                    1,
+                    &prev,
+                    &addr,
+                    &msg,
+                    nonce,
+                    batch,
+                    wg_eff,
+                    cnf.localsize,
+                    us,
+                );
+                if res.gpu_batch_ok {
+                    total += batch;
+                }
+                secs += ctn.elapsed().as_secs_f64();
+                nonce = nonce.wrapping_add(batch);
+            }
+            let hps = if secs > 0.0 { total as f64 / secs } else { 0.0 };
+            let watts = cnf.efficiency.estimate_gpu_watts(profile);
+            let kh_per_j = if watts > 0.0 {
+                hps / watts / 1000.0
+            } else {
+                0.0
+            };
+            println!(
+                "[benchmark] HACD {}: {} ({:.1} kH/J)",
+                profile,
+                rates_to_show(hps),
+                kh_per_j
+            );
+            if hps > best_hps {
+                best_hps = hps;
+                best_hps_profile = profile;
+            }
+            if kh_per_j > best_profit {
+                best_profit = kh_per_j;
+                best_profit_profile = profile;
+            }
+        }
+        let best_profile = match cnf.efficiency.mode {
+            EfficiencyMode::Max => best_hps_profile,
+            _ => best_profit_profile,
+        };
+        let pick = BenchmarkPick::from_profile(best_profile);
+        let _ = apply_benchmark_pick(config_path, &pick);
+    }
 }

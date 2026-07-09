@@ -1,6 +1,7 @@
 pub mod action;
 pub mod block;
 pub mod context;
+pub mod metrics;
 pub mod operate;
 pub mod setup;
 pub mod state;

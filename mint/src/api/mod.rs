@@ -42,3 +42,5 @@ include!("miner_pending.rs");
 include!("miner_success.rs");
 include!("diamondminer_init.rs");
 include!("diamondminer_success.rs");
+include!("create_transfer.rs");
+include!("metrics.rs");

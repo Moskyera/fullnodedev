@@ -77,8 +77,13 @@ __kernel void x16rs_diamond(
     block_diamond_t base_stuff = input_stuff[0];
     
     const ulong global_offset = nonce_start + (get_global_id(0) * unit_size);
+    X16RS_PRAGMA_UNROLL_8
     for (unsigned int i = 0; i < unit_size; i++) {
+#ifdef NVIDIA_GPU
+        const ulong nonce = global_offset + i;
+#else
         volatile const ulong nonce = global_offset + i;
+#endif
         if(false) {
             // Insert Nonce
             write_nonce_to_bytes(79, base_stuff.h1, nonce);

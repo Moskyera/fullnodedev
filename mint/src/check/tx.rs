@@ -1,7 +1,17 @@
+/// Minimum sane wire size for a signed Type 4 tx (~5 KB signatures + header).
+const TYPE4_MEMPOOL_MIN_BYTES: usize = 512;
+/// Typical signed Type 4 wire size is ~5–6 KB; log when larger for observability.
+const TYPE4_MEMPOOL_WARN_BYTES: usize = 8 * 1024;
+
 fn impl_tx_submit(this: &HacashMinter, engine: &dyn EngineRead, txp: &TxPkg) -> Rerr {
     let txr = txp.tx_read();
     let curr_hei = engine.latest_block().height().uint();
     let next_hei = curr_hei + 1;
+
+    if txr.ty() == TransactionType4::TYPE {
+        check_type4_mempool_submit(engine, txp, next_hei)?;
+    }
+
     let Some(diamintact) = action::pickout_diamond_mint_action(txr) else {
         return Ok(()) // other normal tx
     };
@@ -11,6 +21,83 @@ fn impl_tx_submit(this: &HacashMinter, engine: &dyn EngineRead, txp: &TxPkg) -> 
     check_diamond_mint_minimum_bidding_fee(next_hei, txr, &diamintact)?;
     let mut biddings = this.bidding_prove.lock().unwrap();
     biddings.record(curr_hei, txp, &diamintact);
+    Ok(())
+}
+
+fn check_type4_mempool_submit(
+    engine: &dyn EngineRead,
+    txp: &TxPkg,
+    next_hei: u64,
+) -> Rerr {
+    use protocol::metrics::PqcMetricEvent;
+    use protocol::transaction::effective_max_tx_wire_size;
+
+    let txr = txp.tx_read();
+    let engcnf = engine.config();
+    let wire_len = txp.data().len();
+    let max_allowed = effective_max_tx_wire_size(engcnf.max_tx_size, txr.ty());
+
+    if wire_len < TYPE4_MEMPOOL_MIN_BYTES {
+        protocol::metrics::emit(PqcMetricEvent::Type4MempoolRejected);
+        return errf!(
+            "type 4 tx wire size {} below mempool minimum {}",
+            wire_len,
+            TYPE4_MEMPOOL_MIN_BYTES
+        );
+    }
+    if wire_len > max_allowed {
+        protocol::metrics::emit(PqcMetricEvent::Type4MempoolRejected);
+        return errf!(
+            "type 4 tx wire size {} exceeds mempool cap {} (engine max {})",
+            wire_len,
+            max_allowed,
+            engcnf.max_tx_size
+        );
+    }
+
+    protocol::upgrade::check_gated_tx(engcnf.chain_id, next_hei, txr.ty())?;
+
+    let main = txr.main();
+    if !main.is_pqckey() && !main.is_hybrid() {
+        protocol::metrics::emit(PqcMetricEvent::Type4MempoolRejected);
+        return errf!("type 4 mempool: main address must be PQCKEY (v6) or HYBRID (v7)");
+    }
+    if main.is_privakey_unknown() {
+        protocol::metrics::emit(PqcMetricEvent::Type4MempoolRejected);
+        return errf!(
+            "type 4 mempool: main address {} has unknown system private key",
+            main
+        );
+    }
+
+    for sign in txr.hybrid_signs() {
+        if let Err(e) = sign.check_wire() {
+            protocol::metrics::emit(PqcMetricEvent::Type4MempoolRejected);
+            return errf!("type 4 hybrid sign wire invalid: {}", e);
+        }
+    }
+
+    if wire_len > TYPE4_MEMPOOL_WARN_BYTES {
+        println!(
+            "[mempool] type4 tx wire size {} bytes (>{} warn threshold)",
+            wire_len, TYPE4_MEMPOOL_WARN_BYTES
+        );
+    }
+
+    let hybrid = main.is_hybrid();
+    let alg = txr
+        .hybrid_signs()
+        .first()
+        .map(|s| s.alg_id())
+        .unwrap_or(0);
+    println!(
+        "[mempool] type4 accepted size={} main={} version={} sign_alg={}",
+        wire_len,
+        main.to_readable(),
+        main.version(),
+        alg
+    );
+    protocol::metrics::emit(PqcMetricEvent::Type4MempoolAccepted { hybrid });
     Ok(())
 }
 
@@ -50,9 +137,9 @@ fn impl_tx_pool_refresh(
 fn clean_invalid_normal_txs(eng: &dyn EngineRead, txpool: &dyn TxPool, blkhei: u64) {
     let pdhei = blkhei + 1;
     let mut sub_state = eng.fork_sub_state();
-    let mut keep_rest_after_uncertain_type3 = false;
+    let mut keep_rest_after_uncertain = false;
     let _ = txpool.retain_at(TXGID_NORMAL, &mut |a: &TxPkg| {
-        if keep_rest_after_uncertain_type3 {
+        if keep_rest_after_uncertain {
             return true;
         }
         let txr = a.tx_read();
@@ -60,8 +147,9 @@ fn clean_invalid_normal_txs(eng: &dyn EngineRead, txpool: &dyn TxPool, blkhei: u
         if exec.is_ok() {
             return true;
         }
+        // Keep Type 3+ (incl. Type 4 ~5–6 KB PQC txs) when deterministic precheck is uncertain.
         if txr.ty() >= TransactionType3::TYPE {
-            keep_rest_after_uncertain_type3 = true;
+            keep_rest_after_uncertain = true;
             return true;
         }
         false // delete legacy txs that still fail under deterministic precheck

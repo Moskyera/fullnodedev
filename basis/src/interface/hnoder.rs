@@ -20,6 +20,9 @@ pub trait HNoder: Send + Sync {
 
     fn all_peer_prints(&self) -> Vec<String> { never!() }
 
+    /// Prometheus-style lines for post-quantum metrics (empty when unsupported).
+    fn pqc_metrics_prometheus(&self) -> Vec<String> { Vec::new() }
+
     fn exit(&self) {}
     
 }

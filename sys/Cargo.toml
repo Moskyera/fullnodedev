@@ -14,5 +14,6 @@ sha3 = "0.10.1"
 blake2 = "0.10.6"
 ripemd = "0.1.1"
 libsecp256k1 = { version = "0.7.2",  features = ["hmac", "static-context"], default-features = false }
-# getrandom = { version = "0.3.2", features = ["wasm_js"] }
+ml-dsa = { version = "0.1.1", features = ["getrandom", "rand_core", "alloc"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 async-broadcast = "0.7.2"

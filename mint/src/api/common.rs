@@ -59,6 +59,18 @@ fn q_string(req: &ApiRequest, key: &str, dv: &str) -> String {
         .map_or_else(|| dv.to_owned(), |s| s.to_owned())
 }
 
+/// Type 4 keystore: query `hybrid_keystore` or raw JSON POST body (browser/wallet friendly).
+fn hybrid_keystore_from_req(req: &ApiRequest) -> String {
+    let from_query = q_string(req, "hybrid_keystore", "");
+    if !from_query.is_empty() {
+        return from_query;
+    }
+    if req.body.is_empty() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&req.body).trim().to_string()
+}
+
 fn q_u32(req: &ApiRequest, key: &str, dv: u32) -> u32 {
     req.query(key)
         .and_then(|v| v.parse::<u32>().ok())

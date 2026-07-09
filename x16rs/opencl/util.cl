@@ -1,6 +1,14 @@
 #ifndef X16RX_UTIL_CL
 #define X16RX_UTIL_CL
 
+#ifdef NVIDIA_GPU
+  #define X16RS_PRAGMA_UNROLL_8 _Pragma("clang unroll(8)")
+  #define X16RS_PRAGMA_UNROLL_4 _Pragma("clang unroll(4)")
+#else
+  #define X16RS_PRAGMA_UNROLL_8
+  #define X16RS_PRAGMA_UNROLL_4
+#endif
+
 #define ALIGN8 __attribute__((aligned(8)))
 #define ALIGN __attribute__((aligned(16)))
 #define ALIGN32 __attribute__((aligned(32)))

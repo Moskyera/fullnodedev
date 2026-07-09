@@ -82,3 +82,5 @@ fn diamond_more_power(dst: &[u8], src: &[u8]) -> bool {
     false
 }
 
+
+

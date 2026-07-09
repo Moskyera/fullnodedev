@@ -38,7 +38,9 @@ typedef int sph_s32;
 #define SPH_SMALL_FOOTPRINT_HAMSI 0
 #define SPH_HAMSI_SHORT 1
 #define SPH_HAMSI_EXPAND_BIG 1
+#ifndef NO_AMD_OPS
 #define NO_AMD_OPS 1
+#endif
 #define SPH_COMPACT_BLAKE_64 0
 #define SPH_SIMD_NOCOPY 0
 #define SPH_SMALL_FOOTPRINT_JH 1
@@ -148,6 +150,7 @@ typedef union ALIGN {
             (offset)[(local_id)] = 0; \
         } \
         barrier(CLK_LOCAL_MEM_FENCE); \
+        X16RS_PRAGMA_UNROLL_8 \
         for (unsigned int h = 0; h < (unit_size); h++) { \
             unsigned char mod = (local_hashes)[(index) + h].h4[7] % 16; \
             atomic_inc(&(histogram)[mod]); \
@@ -160,12 +163,14 @@ typedef union ALIGN {
             } \
         } \
         barrier(CLK_LOCAL_MEM_FENCE); \
+        X16RS_PRAGMA_UNROLL_8 \
         for (unsigned int h = 0; h < (unit_size); h++) { \
             unsigned int mod = (local_hashes)[(index) + h].h4[7] % 16; \
             unsigned int pos = (starting_index)[mod] + atomic_inc(&(offset)[mod]); \
             (local_order)[pos] = (index) + h; \
         } \
         barrier(CLK_LOCAL_MEM_FENCE); \
+        X16RS_PRAGMA_UNROLL_4 \
         for (unsigned int h = 0; h < (unit_size); h++) { \
             const unsigned int* hash_pos = &(local_order)[((local_size) * h) + (local_id)]; \
             switch ((local_hashes)[hash_pos[0]].h4[7] % 16) { \

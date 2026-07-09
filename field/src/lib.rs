@@ -57,6 +57,7 @@ include! {"core/asset.rs"}
 
 // component
 include! {"component/sign.rs"}
+include! {"component/hybrid_sign.rs"}
 include! {"component/asset.rs"}
 include! {"component/balance.rs"}
 include! {"component/total.rs"}

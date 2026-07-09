@@ -30,6 +30,15 @@ macro_rules! q_adr {
     })
 }
 
+macro_rules! q_hybrid_acc {
+    ($keystore: expr, $pass: expr) => {{
+        match hybrid_account_from_keystore(&$keystore, &$pass) {
+            Err(e) => return errf!("hybrid keystore unlock failed: {}", e),
+            Ok(a) => a,
+        }
+    }};
+}
+
 
 
 

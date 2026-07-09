@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-app:
+    name: Tests (app crate)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run app tests
+        run: cargo test -p app --lib
+
+  build-miner-panel:
+    name: Build miner-panel (no OpenCL link)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build GUI
+        run: cargo build --release -p miner-panel

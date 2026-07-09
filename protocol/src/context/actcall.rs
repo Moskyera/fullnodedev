@@ -22,7 +22,7 @@ fn ctx_action_call(this: &mut dyn Context, k: u16, b: Vec<u8>) -> XRet<(u32, Vec
         if !seen.insert(adr) {
             continue;
         }
-        if adr.is_privakey() {
+        if adr.is_user_signing_address() {
             this.check_sign(&adr)?;
         }
     }

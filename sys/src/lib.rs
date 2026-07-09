@@ -22,5 +22,6 @@ include! {"hash.rs"}
 include! {"ini.rs"}
 include! {"time.rs"}
 include! {"account.rs"}
+include! {"pqc.rs"}
 include! {"config.rs"}
 include! {"exiter.rs"}

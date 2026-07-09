@@ -6,6 +6,8 @@ pub const DEV_OPEN_MAX_HEIGHT: u64 = 65_432;
 
 // Set the real mainnet activation height before rollout.
 pub const ONLINE_OPEN_HEIGHT: u64 = 765_432;
+// Post-quantum Type4 transaction activation height (soft-fork).
+pub const PQC_TYPE4_OPEN_HEIGHT: u64 = 876_543;
 pub const MAINNET_CHAIN_ID: u32 = 0;
 
 // One-time pre-upgrade allowlist.
@@ -15,6 +17,16 @@ pub const MAINNET_CHAIN_ID: u32 = 0;
 #[inline]
 fn is_pre_upgrade_allowed_tx_type(tx_type: u8) -> bool {
     matches!(tx_type, 1 | 2)
+}
+
+#[inline]
+fn is_pqc_tx_type(tx_type: u8) -> bool {
+    tx_type == 4
+}
+
+#[inline]
+pub fn is_pqc_type4_open(height: u64) -> bool {
+    height >= PQC_TYPE4_OPEN_HEIGHT
 }
 
 #[inline]
@@ -43,6 +55,17 @@ fn is_dev_upgrade_open(height: u64) -> bool {
 pub fn check_gated_tx(chain_id: u32, height: u64, tx_type: u8) -> Rerr {
     if chain_id != MAINNET_CHAIN_ID {
         return Ok(());
+    }
+    if is_pqc_tx_type(tx_type) {
+        if is_pqc_type4_open(height) || is_dev_upgrade_open(height) {
+            return Ok(());
+        }
+        return errf!(
+            "tx type {} not enabled at height {}, allowed when height >= {}",
+            tx_type,
+            height,
+            PQC_TYPE4_OPEN_HEIGHT
+        );
     }
     if is_online_upgrade_open(height)
         || is_dev_upgrade_open(height)
@@ -179,5 +202,22 @@ mod tests {
         let height = DEV_OPEN_MAX_HEIGHT.saturating_add(1);
         assert!(check_gated_tx(sidechain_id, height, 3).is_ok());
         assert!(check_gated_action(sidechain_id, height, 25).is_ok());
+    }
+
+    #[test]
+    fn tx_type4_is_gated_in_middle_closed_interval() {
+        let height = DEV_OPEN_MAX_HEIGHT.saturating_add(1);
+        assert!(check_gated_tx(MAINNET_CHAIN_ID, height, 4).is_err());
+    }
+
+    #[test]
+    fn tx_type4_is_open_at_pqc_activation_height() {
+        assert!(is_pqc_type4_open(PQC_TYPE4_OPEN_HEIGHT));
+        assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
+    }
+
+    #[test]
+    fn tx_type4_is_open_in_dev_window() {
+        assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_ok());
     }
 }
