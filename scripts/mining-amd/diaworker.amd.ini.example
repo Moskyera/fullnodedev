@@ -1,0 +1,16 @@
+; HACD diamond miner — AMD GPU (OpenCL) + Ryzen CPU
+; Requires [diamondminer] enable = true in hacash.config.ini
+; Copy to target/debug/diaworker.config.ini (see INSTALL-CONFIGS.bat)
+
+connect = 127.0.0.1:8080
+supervene = 2
+
+[gpu]
+use_opencl = true
+platform_id = 0
+device_ids = 0
+opencl_dir = ../../x16rs/opencl/
+work_groups = 1024
+local_size = 256
+unit_size = 128
+debug = 0

@@ -11,8 +11,8 @@ if not exist "%DEBUG_DIR%" mkdir "%DEBUG_DIR%"
 for %%D in (debug release) do (
     set "OUT=%REPO_ROOT%\target\%%D"
     if exist "!OUT!" (
-        copy /Y "%SCRIPT_DIR%poworker.amd.ini" "!OUT!\poworker.config.ini" >nul
-        copy /Y "%SCRIPT_DIR%diaworker.amd.ini" "!OUT!\diaworker.config.ini" >nul
+        copy /Y "%SCRIPT_DIR%poworker.amd.ini.example" "!OUT!\poworker.config.ini" >nul
+        copy /Y "%SCRIPT_DIR%diaworker.amd.ini.example" "!OUT!\diaworker.config.ini" >nul
         echo Installed configs in !OUT!
     )
 )
