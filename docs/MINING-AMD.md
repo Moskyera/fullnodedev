@@ -13,6 +13,13 @@ Community miners that only support NVIDIA CUDA are **separate projects** — thi
 
 ## Quick start (Windows)
 
+**End users (GitHub Releases):**
+
+- **`hacash-miner-full-windows-x64.zip`** — clean PC: fullnode + miners + panel → run `SETUP.bat`
+- **`hacash-miner-only-windows-x64.zip`** — you already have fullnode → run `SETUP-MINER.bat`
+
+**Maintainers:** `git tag v0.4.0 && git push origin v0.4.0` triggers `.github/workflows/release.yml`. Manual build: **Actions → Release (Windows miner) → Run workflow** (artifact only, no Release page).
+
 1. Install **AMD Adrenalin** drivers (includes OpenCL runtime) or ROCm OpenCL on Linux.
 2. Build miners with OpenCL:
    ```bat
@@ -74,11 +81,36 @@ unit_size = 96
 
 | Profile | work_groups | unit_size | Use when |
 |---------|-------------|-----------|----------|
+| `amd_eco` | 768 | 128 | Lowest power / 8GB VRAM |
 | `amd_balanced` | 1024 | 128 | Default / 8GB VRAM |
-| `amd_performance` | 2048 | 96 | RX 6000/7000 — recommended |
+| `amd_profit` | 1536 | 96 | **Default** — best HAC per kWh |
+| `amd_performance` | 2048 | 96 | RX 6000/7000 — max stable H/s |
 | `amd_max` | 4096 | 128 | 12GB+ VRAM, watch GPU temp |
 
-Run `scripts/mining-amd/TUNE-AMD-EFFICIENCY.bat` to set `supervene` from your Ryzen core count.
+### Cost-aware mining (`[efficiency]`)
+
+```ini
+[efficiency]
+mode = profit              ; eco | profit | max
+power_cost_kwh = 0.15
+gpu_watts = 0              ; 0 = estimate from profile
+hac_price = 0              ; set for net EUR/day in console
+dynamic_supervene = true   ; auto CPU assist tuning
+supervene_min = 2
+supervene_max = 10
+oom_fallback = true        ; reduce work_groups on GPU errors
+max_temp_c = 0             ; throttle if temp exceeded (WMI/file)
+idle_start_hour = 255      ; 22 + idle_end_hour 6 = mine nights only
+benchmark_seconds = 0      ; set 45 + run poworker for autotune
+```
+
+Console shows: `MH/s | Watts | kH/J | HAC/day | cost or net EUR/day`.
+
+Scripts:
+- `CONFIGURE-MINING.bat` — pick CPU + GPU
+- `BENCHMARK-AMD.bat` — recommend `gpu_profile`
+
+Run `scripts/mining-amd/TUNE-AMD-EFFICIENCY.bat` for basic `supervene` (or use CONFIGURE-MINING presets).
 
 ### Hybrid mining
 

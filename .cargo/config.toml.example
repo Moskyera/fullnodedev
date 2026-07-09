@@ -1,0 +1,9 @@
+# Copy to config.toml and set your OpenCL.lib path (Windows MSVC build).
+# CI uses RUSTFLAGS instead; this file is for local dev builds.
+#
+#   copy .cargo\config.toml.example .cargo\config.toml
+#
+# Or run: scripts\mining-amd\INSTALL-OPENCL-SDK.bat
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Clink-arg=/LIBPATH:C:\\path\\to\\vcpkg\\installed\\x64-windows\\lib"]

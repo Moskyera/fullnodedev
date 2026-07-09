@@ -8,6 +8,7 @@ edition = "2024"
 resolver = "2"
 members = [
     ".",
+    "miner-panel",
     "app",
     "node",
     "chain",

@@ -1,0 +1,95 @@
+name: Release (Windows miner)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-windows:
+    name: Build & package (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-windows-ocl"
+
+      - name: Install OpenCL.lib (vcpkg)
+        shell: pwsh
+        run: |
+          $vcpkgRoot = "$env:GITHUB_WORKSPACE\vcpkg-ci"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          & "$vcpkgRoot\vcpkg.exe" install opencl:x64-windows
+          $lib = "$vcpkgRoot\installed\x64-windows\lib"
+          "LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTFLAGS=-Clink-arg=/LIBPATH:$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build miners + fullnode (OpenCL)
+        run: cargo build --release --features ocl
+
+      - name: Build miner-panel (GUI)
+        run: cargo build --release -p miner-panel
+
+      - name: Package release ZIPs (full + miner-only)
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ($version -eq "${{ github.ref }}") { $version = "manual" }
+          & "$env:GITHUB_WORKSPACE\scripts\pack-release.ps1" -Version $version
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hacash-miner-windows-x64
+          path: dist/*.zip
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            ## HAC Miner — Windows x64 · By Mosky
+
+            Choose the package that fits your PC:
+
+            | Download | When to use |
+            |----------|-------------|
+            | **`hacash-miner-full-*.zip`** | **Clean PC** — fullnode + miners + GUI + `SETUP.bat` |
+            | **`hacash-miner-only-*.zip`** | You **already have** `hacash.exe` + `hacash.config.ini` |
+
+            ### Full package (recommended for new users)
+            1. Extract `hacash-miner-full-*.zip`
+            2. Run **`SETUP.bat`**
+            3. Open **`miner-panel.exe`** → Settings → wallet → Start
+
+            ### Miner only (existing fullnode)
+            1. Extract `hacash-miner-only-*.zip` next to your fullnode **or** any folder
+            2. Run **`SETUP-MINER.bat`**
+            3. Ensure fullnode RPC is on `127.0.0.1:8080`
+            4. Open **`miner-panel.exe`**
+
+            ### Requirements
+            - Windows 10/11 x64
+            - AMD Adrenalin or NVIDIA drivers (GPU / OpenCL)
+            - Visual C++ Redistributable 2015–2022 x64 (setup scripts can install)
+
+            [docs/MINING-AMD.md](docs/MINING-AMD.md)
