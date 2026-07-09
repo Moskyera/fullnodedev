@@ -38,7 +38,9 @@ typedef int sph_s32;
 #define SPH_SMALL_FOOTPRINT_HAMSI 0
 #define SPH_HAMSI_SHORT 1
 #define SPH_HAMSI_EXPAND_BIG 1
+#ifndef NO_AMD_OPS
 #define NO_AMD_OPS 1
+#endif
 #define SPH_COMPACT_BLAKE_64 0
 #define SPH_SIMD_NOCOPY 0
 #define SPH_SMALL_FOOTPRINT_JH 1

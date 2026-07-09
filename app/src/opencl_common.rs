@@ -95,7 +95,16 @@ fn initialize_opencl(
         }
 
         let device_name = device.name().expect("Can't get device name");
-        let binary_file = format!(r"{}{}_{}{}.bin", opencldir, device_name, cnf_devices[idx], if diamond_mining { "_diamonds" } else { "" });
+        let amd_fast = device_prefers_amd_ops(&device);
+        if amd_fast {
+            println!("AMD fast-path: enabling OpenCL amd_bfe optimizations for this device");
+        }
+        let amd_tag = if amd_fast { "_amd" } else { "" };
+        let diamond_tag = if diamond_mining { "_diamonds" } else { "" };
+        let binary_file = format!(
+            r"{}{}_{}{}{}.bin",
+            opencldir, device_name, cnf_devices[idx], amd_tag, diamond_tag
+        );
         let binary_path = Path::new(&binary_file);
 
         // Check if kernel was changed since last time (and need recompile)
@@ -130,7 +139,14 @@ fn initialize_opencl(
         } else {
             println!("Compiling...");
             // Compile from source
-            compile_program_from_source(&context, &device, &kernel_path, &binary_path, opencldir.clone())
+            compile_program_from_source(
+                &context,
+                &device,
+                &kernel_path,
+                &binary_path,
+                opencldir.clone(),
+                amd_fast,
+            )
         };
         
         // Create new queue
@@ -176,19 +192,30 @@ fn initialize_opencl(
     opencl_resource_devices
 }
 
+fn device_prefers_amd_ops(device: &Device) -> bool {
+    let vendor = device.vendor().unwrap_or_default().to_lowercase();
+    let name = device.name().unwrap_or_default().to_lowercase();
+    vendor.contains("amd")
+        || vendor.contains("advanced micro devices")
+        || name.contains("radeon")
+        || name.contains("gfx")
+}
+
 fn compile_program_from_source(
     context: &Context,
     device: &Device,
     kernel_path: &Path,
     binary_path: &Path,
     opencldir: String,
+    amd_fast: bool,
 ) -> Program {
     // Create program from source files
     let kernel_src = fs::read_to_string(kernel_path)
         .expect("Can't find kernel file");
 
     // Compile
-    let compile_options = format!(r"-cl-std=CL2.0 -I {}", opencldir);
+    let amd_define = if amd_fast { " -DNO_AMD_OPS=0" } else { "" };
+    let compile_options = format!(r"-cl-std=CL2.0 -I {}{}", opencldir, amd_define);
     let program_build = Program::builder()
         .src(&kernel_src)
         .devices(device)
