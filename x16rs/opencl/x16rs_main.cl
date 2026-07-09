@@ -43,9 +43,14 @@ __kernel void x16rs_main(
     block_t base_stuff = input_stuff_89[0];
     
     const unsigned int global_offset = nonce_start + (get_global_id(0) * unit_size);
+    X16RS_PRAGMA_UNROLL_8
     for (unsigned int i = 0; i < unit_size; i++) {
         // Insert Nonce
+#ifdef NVIDIA_GPU
+        const unsigned int nonce = global_offset + i;
+#else
         volatile const unsigned int nonce = global_offset + i;
+#endif
         write_nonce_to_bytes(79, base_stuff.h1, nonce);
         // Hash Block
         sha3_256_hash(base_stuff.h8, local_hashes[index + i].h8);
@@ -64,6 +69,7 @@ __kernel void x16rs_main(
     );
     
     unsigned int best_hash = 0;
+    X16RS_PRAGMA_UNROLL_8
     for (unsigned int i = 1; i < unit_size; i++) {
         if (diff_big_hash(&local_hashes[best_hash], &local_hashes[index + i]) == 1) {
             best_hash = index + i;

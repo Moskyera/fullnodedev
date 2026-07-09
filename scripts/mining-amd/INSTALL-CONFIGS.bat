@@ -18,8 +18,10 @@ for %%D in (debug release) do (
 )
 
 echo.
-echo  Tune [gpu] platform_id and device_ids after LIST-OPENCL-DEVICES.bat
-echo  Tune supervene to Ryzen logical cores you want for CPU mining
+echo  Easiest: CONFIGURE-MINING.bat — type your CPU and GPU (e.g. 9950x + 7900xtx)
+echo  Or: PICK-PRESET.bat — pick from numbered list (PRESETS-INDEX.txt)
+echo.
+echo  Then: LIST-OPENCL-DEVICES.bat — set platform_id / device_ids
 echo.
 pause
 exit /b 0

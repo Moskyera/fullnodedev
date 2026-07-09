@@ -388,7 +388,11 @@ static const sph_u32 AES3_C[256] = {
 	AESx(0x7BCBB0B0), AESx(0xA8FC5454), AESx(0x6DD6BBBB), AESx(0x2C3A1616)
 };
 
-#define BYTE(x, y)	(amd_bfe((x), (y) << 3U, 8U))
+#ifdef NO_AMD_OPS
+#define BYTE(x, y)  (((x) >> ((y) << 3U)) & 0xFFU)
+#else
+#define BYTE(x, y)  (amd_bfe((x), (y) << 3U, 8U))
+#endif
 
 uint4 AES_Round(const __local uint *AES0, const __local uint *AES1, const __local uint *AES2, const __local uint *AES3, const uint4 X, uint4 key)
 {

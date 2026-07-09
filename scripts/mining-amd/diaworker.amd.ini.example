@@ -4,6 +4,13 @@
 connect = 127.0.0.1:8080
 supervene = 4
 
+[efficiency]
+mode = profit
+power_cost_kwh = 0.15
+dynamic_supervene = true
+supervene_min = 2
+supervene_max = 0
+
 [gpu]
 use_opencl = true
 cpu_assist = true

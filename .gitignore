@@ -10,6 +10,32 @@ vscode-*/
 vendor/
 
 dist/
+.cargo/config.toml
+.tools/
+vcpkg-ci/
+
+# Local dev / test noise
+*.log
+*.err
+*.err.log
+*.out.log
+build*.txt
+*_output.txt
+*_out.txt
+*_err.txt
+pw*.log
+pw*.err
+target2/
+*.vbs
+x16rs/opencl/*.bin
+demo_*.txt
+test*.txt
+lib_out.txt
+rebuild_output.txt
+cargo_build_output.txt
+build-miner-panel.log
+build-panel.log
+miner-panel-build.log
 
 *.geany
 *.config.ini

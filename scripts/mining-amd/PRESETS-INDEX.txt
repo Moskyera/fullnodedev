@@ -1,0 +1,126 @@
+HAC / HACD AMD mining presets — find your CPU + GPU combo
+Ετοιμες ρυθμισεις mining — βρες τον συνδυασμο CPU + GPU σου
+================================================================
+
+Για αρχαριους: τρεξε  CONFIGURE-MINING.bat  και γραψε CPU + GPU (π.χ. 9950x, 7900xtx)
+For beginners: run  CONFIGURE-MINING.bat  and type your CPU + GPU names.
+Or numbered list:  PICK-PRESET.bat
+
+Manual copy: presets\poworker\  and  presets\diaworker\
+After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
+
+[01] ryzen5-rx6600
+     CPU: Ryzen 5 (5600X, 7600X, 6 cores / 12 threads)
+     GPU: RX 6600 / 6600 XT (8 GB VRAM)
+     supervene=4  gpu_profile=amd_balanced
+
+[02] ryzen5-rx7600
+     CPU: Ryzen 5 (5600X, 7600X, 6 cores / 12 threads)
+     GPU: RX 7600 (8 GB VRAM)
+     supervene=4  gpu_profile=amd_balanced
+
+[03] ryzen7-rx6700xt
+     CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
+     GPU: RX 6700 XT (12 GB VRAM)
+     supervene=6  gpu_profile=amd_performance
+
+[04] ryzen7-rx6800xt
+     CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
+     GPU: RX 6800 / 6800 XT (16 GB VRAM)
+     supervene=6  gpu_profile=amd_performance
+
+[05] ryzen7-rx7900xt
+     CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
+     GPU: RX 7900 XT (20 GB VRAM)
+     supervene=6  gpu_profile=amd_performance
+
+[06] ryzen7-rx7900xtx
+     CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=6  gpu_profile=amd_max
+
+[07] ryzen7-rx9070xt
+     CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=6  gpu_profile=amd_performance
+
+[08] ryzen9-rx6800xt
+     CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
+     GPU: RX 6800 / 6800 XT (16 GB VRAM)
+     supervene=8  gpu_profile=amd_performance
+
+[09] ryzen9-rx7900xt
+     CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
+     GPU: RX 7900 XT (20 GB VRAM)
+     supervene=8  gpu_profile=amd_performance
+
+[10] ryzen9-rx7900xtx
+     CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=8  gpu_profile=amd_max
+
+[11] ryzen9-rx9070xt
+     CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=8  gpu_profile=amd_performance
+
+[12] ryzen9-9950x-rx7900xt
+     CPU: Ryzen 9 9950X (16 cores / 32 threads)
+     GPU: RX 7900 XT (20 GB VRAM)
+     supervene=10  gpu_profile=amd_performance
+
+[13] ryzen9-9950x-rx7900xtx
+     CPU: Ryzen 9 9950X (16 cores / 32 threads)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=10  gpu_profile=amd_max
+
+[14] ryzen9-9950x-rx9070xt
+     CPU: Ryzen 9 9950X (16 cores / 32 threads)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=10  gpu_profile=amd_performance
+
+[15] tr-7960x-rx7900xtx
+     CPU: Threadripper 7960X (24 cores / 48 threads)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=14  gpu_profile=amd_max
+
+[16] tr-7960x-rx9070xt
+     CPU: Threadripper 7960X (24 cores / 48 threads)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=14  gpu_profile=amd_performance
+
+[17] tr-7970x-rx7900xtx
+     CPU: Threadripper 7970X (32 cores / 64 threads)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=18  gpu_profile=amd_max
+
+[18] tr-7970x-rx9070xt
+     CPU: Threadripper 7970X (32 cores / 64 threads)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=18  gpu_profile=amd_performance
+
+[19] tr-7980x-rx7900xtx
+     CPU: Threadripper 7980X / 9980WX (64+ cores)
+     GPU: RX 7900 XTX (24 GB VRAM)
+     supervene=22  gpu_profile=amd_max
+
+[20] tr-7980x-rx9070xt
+     CPU: Threadripper 7980X / 9980WX (64+ cores)
+     GPU: RX 9070 XT (16 GB VRAM, RDNA4)
+     supervene=22  gpu_profile=amd_performance
+
+[21] cpu-only-ryzen5
+     CPU: Ryzen 5 CPU only (no AMD GPU / OpenCL off)
+     GPU: (none)
+     supervene=10  gpu_profile=cpu-only
+
+[22] cpu-only-ryzen7
+     CPU: Ryzen 7 CPU only (no AMD GPU / OpenCL off)
+     GPU: (none)
+     supervene=14  gpu_profile=cpu-only
+
+[23] cpu-only-ryzen9
+     CPU: Ryzen 9 / 9950X CPU only (no AMD GPU)
+     GPU: (none)
+     supervene=20  gpu_profile=cpu-only
+
