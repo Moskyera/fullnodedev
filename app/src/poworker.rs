@@ -45,26 +45,38 @@ pub struct PoWorkConf {
     pub debug: u32,        // enable debug mode
     pub platformid: u32,   // opencl platform id
     pub deviceids: String, // opencl device id list
+    /// When OpenCL is on, also run Ryzen CPU miner threads (hybrid).
+    pub cpu_assist: bool,
 }
 
 impl PoWorkConf {
     pub fn new(ini: &IniObj) -> PoWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let sec_gpu = &ini_section(ini, "gpu");
+        let (workgroups, unitsize) = resolve_gpu_tuning(sec_gpu);
         let cnf = PoWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             supervene: ini_must_u64(sec, "supervene", 2) as u32,
             noncemax: ini_must_u64(sec, "nonce_max", u32::MAX as u64) as u32,
             noticewait: ini_must_u64(sec, "notice_wait", 45),
             useopencl: ini_must_bool(sec_gpu, "use_opencl", false) as bool,
-            workgroups: ini_must_u64(sec_gpu, "work_groups", 1024) as u32,
+            workgroups,
             localsize: ini_must_u64(sec_gpu, "local_size", 256) as u32,
-            unitsize: ini_must_u64(sec_gpu, "unit_size", 128) as u32,
+            unitsize,
             opencldir: ini_must(sec_gpu, "opencl_dir", "opencl/"),
             debug: ini_must_u64(sec_gpu, "debug", 0) as u32,
             platformid: ini_must_u64(sec_gpu, "platform_id", 0) as u32,
             deviceids: ini_must(sec_gpu, "device_ids", ""),
+            cpu_assist: ini_must_bool(sec_gpu, "cpu_assist", true) as bool,
         };
+        if !ini_must(sec_gpu, "gpu_profile", "").is_empty() {
+            println!(
+                "[gpu] profile={} work_groups={} unit_size={}",
+                ini_must(sec_gpu, "gpu_profile", ""),
+                cnf.workgroups,
+                cnf.unitsize
+            );
+        }
         cnf
     }
 }
@@ -214,6 +226,17 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
                 "\n[Warn] use_opencl=true but app built without `ocl` feature, fallback to CPU miner."
             );
         }
+
+        if cnf.cpu_assist && cnf.supervene > 0 && !backends.is_empty() {
+            let thrnum = cnf.supervene as usize;
+            println!(
+                "\n[Start] Create #{} Ryzen CPU assist threads (hybrid GPU+CPU).",
+                thrnum
+            );
+            for _ in 0..thrnum {
+                backends.push(MinerBackend::Cpu);
+            }
+        }
     }
 
     if backends.is_empty() {
@@ -334,10 +357,8 @@ fn run_block_mining_item(
         };
         result_ch_tx.send(mlres.into()).unwrap();
 
-        if matches!(backend, MinerBackend::Cpu) {
-            if use_secs > 0.0 {
-                nonce_space = (current_nonce_space as f64 * MINING_INTERVAL / use_secs) as u32;
-            }
+        if use_secs > 0.0 {
+            nonce_space = (current_nonce_space as f64 * MINING_INTERVAL / use_secs) as u32;
             nonce_space = nonce_space.max(1);
         }
 

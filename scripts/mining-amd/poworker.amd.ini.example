@@ -1,20 +1,21 @@
-; HAC block miner — AMD GPU (OpenCL) + Ryzen CPU threads
-; Copy to target/debug/poworker.config.ini (see INSTALL-CONFIGS.bat)
+; HAC block miner — AMD GPU + Ryzen hybrid (efficiency tuned)
+; Copy via INSTALL-CONFIGS.bat to target/debug or target/release
 
 connect = 127.0.0.1:8080
-; Ryzen CPU mining threads (used alongside GPU or as fallback if OpenCL unavailable)
-supervene = 4
+; Ryzen CPU threads while GPU mines (hybrid). Set 0 to disable.
+supervene = 6
 nonce_max = 4294967295
 notice_wait = 45
 
 [gpu]
 use_opencl = true
-; Run scripts/LIST-OPENCL-DEVICES.bat to find your platform_id and device_ids
+cpu_assist = true
+; Presets: amd_balanced | amd_performance | amd_max (overrides work_groups/unit_size)
+gpu_profile = amd_performance
 platform_id = 0
 device_ids = 0
-; Path relative to target/debug when binaries run from there
 opencl_dir = ../../x16rs/opencl/
-work_groups = 1024
+work_groups = 2048
 local_size = 256
-unit_size = 128
+unit_size = 96
 debug = 0

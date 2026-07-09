@@ -37,25 +37,28 @@ pub struct DiaWorkConf {
     pub debug: u32,        // enable debug mode
     pub platformid: u32,   // opencl platform id
     pub deviceids: String, // opencl device id list
+    pub cpu_assist: bool,
 }
 
 impl DiaWorkConf {
     pub fn new(ini: &IniObj) -> DiaWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let sec_gpu = &ini_section(ini, "gpu");
+        let (workgroups, unitsize) = resolve_gpu_tuning(sec_gpu);
         let cnf = DiaWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             supervene: ini_must_u64(sec, "supervene", 2) as u32,
             bidaddr: Address::default(),
             rewardaddr: Address::default(),
             useopencl: ini_must_bool(sec_gpu, "use_opencl", false) as bool,
-            workgroups: ini_must_u64(sec_gpu, "work_groups", 1024) as u32,
+            workgroups,
             localsize: ini_must_u64(sec_gpu, "local_size", 256) as u32,
-            unitsize: ini_must_u64(sec_gpu, "unit_size", 128) as u32,
+            unitsize,
             opencldir: ini_must(sec_gpu, "opencl_dir", "opencl/"),
             debug: ini_must_u64(sec_gpu, "debug", 0) as u32,
             platformid: ini_must_u64(sec_gpu, "platform_id", 0) as u32,
             deviceids: ini_must(sec_gpu, "device_ids", ""),
+            cpu_assist: ini_must_bool(sec_gpu, "cpu_assist", true) as bool,
         };
         cnf
     }
@@ -123,7 +126,12 @@ pub fn diaworker() {
     // Calculate device/cpu quantity
     #[cfg(feature = "ocl")]
     let vene: u32 = if cnf.useopencl {
-        opencl_resources.len() as u32
+        let gpu = opencl_resources.len() as u32;
+        if cnf.cpu_assist {
+            gpu.saturating_add(cnf.supervene)
+        } else {
+            gpu
+        }
     } else {
         cnf.supervene
     };
@@ -181,6 +189,27 @@ pub fn diaworker() {
                         delay_continue_ms!(9);
                     }
                 });
+            }
+        }
+
+        if cnf.cpu_assist && cnf.supervene > 0 {
+            #[cfg(feature = "ocl")]
+            {
+                let thrnum = cnf.supervene as usize;
+                println!(
+                    "\n[Start] Create #{} Ryzen CPU assist threads for diamonds (hybrid).",
+                    thrnum
+                );
+                for thrid in 0..thrnum {
+                    let cnf2 = cnf.clone();
+                    let rstx = res_tx.clone();
+                    spawn(move || {
+                        loop {
+                            run_diamond_worker_thread(&cnf2, thrid, rstx.clone());
+                            delay_continue_ms!(9);
+                        }
+                    });
+                }
             }
         }
     } else {

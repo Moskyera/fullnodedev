@@ -6,6 +6,21 @@ use ocl::enums::{ProgramInfoResult, ProgramInfo};
 use ocl::{Buffer, Context, Device, EventList, Kernel, Platform, Program, Queue};
 
 #[allow(dead_code)]
+const STUFF_BUFFER_CAP: usize = 512;
+
+fn write_stuff_to_gpu(opencl: &OpenCLResources, data: &[u8]) {
+    if data.len() > STUFF_BUFFER_CAP {
+        panic!("OpenCL stuff buffer overflow ({} > {})", data.len(), STUFF_BUFFER_CAP);
+    }
+    let mut padded = vec![0u8; STUFF_BUFFER_CAP];
+    padded[..data.len()].copy_from_slice(data);
+    opencl
+        .buffer_stuff
+        .write(&padded)
+        .enq()
+        .expect("Can't upload stuff buffer");
+}
+
 struct OpenCLResources {
     program: Program,
     queue: Queue,
@@ -14,6 +29,8 @@ struct OpenCLResources {
     buffer_global_hashes: Buffer::<u8>,
     buffer_global_order: Buffer::<u32>,
     buffer_best_hashes: Buffer::<u8>,
+    /// Reused input buffer — avoids per-kernel GPU allocation.
+    buffer_stuff: Buffer::<u8>,
 }
 
 fn initialize_opencl(
@@ -185,7 +202,13 @@ fn initialize_opencl(
                 .flags(ocl::core::MEM_WRITE_ONLY)
                 .len(HASH_WIDTH * *workgroups as usize )
                 .build()
-                .expect("Can't create buffer_best_hashes")
+                .expect("Can't create buffer_best_hashes"),
+            buffer_stuff: Buffer::<u8>::builder()
+                .queue(queue.clone())
+                .flags(ocl::core::MEM_READ_ONLY)
+                .len(STUFF_BUFFER_CAP)
+                .build()
+                .expect("Can't create buffer_stuff"),
         });
     }
 
@@ -215,7 +238,10 @@ fn compile_program_from_source(
 
     // Compile
     let amd_define = if amd_fast { " -DNO_AMD_OPS=0" } else { "" };
-    let compile_options = format!(r"-cl-std=CL2.0 -I {}{}", opencldir, amd_define);
+    let compile_options = format!(
+        r"-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -cl-uniform-work-group-size -I {}{}",
+        opencldir, amd_define
+    );
     let program_build = Program::builder()
         .src(&kernel_src)
         .devices(device)
