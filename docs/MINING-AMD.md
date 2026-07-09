@@ -60,13 +60,29 @@ reward = <your address>
 ```ini
 [gpu]
 use_opencl = true
+cpu_assist = true          ; Ryzen CPU threads + GPU (hybrid)
+gpu_profile = amd_performance  ; amd_balanced | amd_performance | amd_max
 platform_id = 0
 device_ids = 0
 opencl_dir = ../../x16rs/opencl/
-work_groups = 1024
+work_groups = 2048
 local_size = 256    ; must stay 256 (kernel requirement)
-unit_size = 128
+unit_size = 96
 ```
+
+### Efficiency presets (`gpu_profile`)
+
+| Profile | work_groups | unit_size | Use when |
+|---------|-------------|-----------|----------|
+| `amd_balanced` | 1024 | 128 | Default / 8GB VRAM |
+| `amd_performance` | 2048 | 96 | RX 6000/7000 — recommended |
+| `amd_max` | 4096 | 128 | 12GB+ VRAM, watch GPU temp |
+
+Run `scripts/mining-amd/TUNE-AMD-EFFICIENCY.bat` to set `supervene` from your Ryzen core count.
+
+### Hybrid mining
+
+With `cpu_assist = true`, the GPU runs OpenCL and Ryzen threads mine on CPU **in parallel** — better total hashrate than GPU-only.
 
 ## AMD optimizations
 

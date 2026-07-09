@@ -12,13 +12,7 @@ fn do_group_block_mining_opencl(
     let global_work_size = num_work_groups * local_work_size;
     let repeat = x16rs::block_hash_repeat(height) as u32;
 
-    let buffer_block_intro = Buffer::<u8>::builder()
-        .queue(opencl.queue.clone())
-        .flags(ocl::core::MEM_READ_ONLY)
-        .len(block_intro.len())
-        .copy_host_slice(&block_intro)
-        .build()
-        .expect("Unable to create buffer_block_intro");
+    write_stuff_to_gpu(opencl, &block_intro);
 
     let kernel = Kernel::builder()
         .program(&opencl.program)
@@ -26,7 +20,7 @@ fn do_group_block_mining_opencl(
         .queue(opencl.queue.clone())
         .global_work_size(global_work_size)
         .local_work_size(local_work_size)
-        .arg(&buffer_block_intro)
+        .arg(&opencl.buffer_stuff)
         .arg(nonce_start)
         .arg(repeat)
         .arg(unit_size)

@@ -82,3 +82,25 @@ fn diamond_more_power(dst: &[u8], src: &[u8]) -> bool {
     false
 }
 
+fn resolve_gpu_tuning(sec_gpu: &std::collections::HashMap<String, Option<String>>) -> (u32, u32) {
+    let profile = ini_must(sec_gpu, "gpu_profile", "");
+    let mut workgroups = ini_must_u64(sec_gpu, "work_groups", 1024) as u32;
+    let mut unitsize = ini_must_u64(sec_gpu, "unit_size", 128) as u32;
+    match profile.as_str() {
+        "amd_balanced" => {
+            workgroups = 1024;
+            unitsize = 128;
+        }
+        "amd_performance" => {
+            workgroups = 2048;
+            unitsize = 96;
+        }
+        "amd_max" => {
+            workgroups = 4096;
+            unitsize = 128;
+        }
+        _ => {}
+    }
+    (workgroups, unitsize)
+}
+
