@@ -5,11 +5,11 @@ Hacash fullnode + **OpenCL miners** (AMD / NVIDIA) + **GUI panel** for easy setu
 
 ### Download (no GitHub knowledge needed)
 
-## ⛏️ **[https://moskyera.github.io](https://moskyera.github.io)** — two buttons: Full or Miner only
+## ⛏️ **[https://moskyera.github.io](https://moskyera.github.io)** two buttons: Full or Miner only
 
 | Package | Use when |
 |---------|----------|
-| **Full** | Clean PC — `hacash.exe` + workers + panel + `SETUP.bat` |
+| **Full** | Clean PC `hacash.exe` + workers + panel + `SETUP.bat` |
 | **Miner only** | You already run the fullnode |
 
 After extract: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`**
