@@ -1290,4 +1290,22 @@ mod amount_tests {
             assert!(back.equal(&a));
         }
     }
+
+    #[test]
+    fn mined_balance_send_and_fee_sub() {
+        let mut bal = Amount::zero();
+        for _ in 0..105 {
+            bal = bal.add_mode_u128(&Amount::small_mei(1)).expect("add reward");
+        }
+        // Wallet wire "45:0" is parsed as fin(value:unit) -> unit 0, causing 10^248 overflow vs mei balance.
+        assert!(bal.sub_mode_u128(&Amount::from("45:0").unwrap()).is_err());
+        // Dot mei strings align units correctly.
+        let send = Amount::from("45.0").unwrap();
+        let fee = Amount::from("1.244").unwrap();
+        bal.sub_mode_u128(&send).expect("sub send");
+        bal.sub_mode_u128(&send)
+            .unwrap()
+            .sub_mode_u128(&fee)
+            .expect("sub fee");
+    }
 }
