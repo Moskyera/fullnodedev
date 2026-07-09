@@ -26,7 +26,7 @@ Community miners that only support NVIDIA CUDA are **separate projects** — thi
    ```bat
    scripts\mining-amd\LIST-OPENCL-DEVICES.bat
    ```
-5. Edit `target\release\poworker.config.ini` and `diaworker.config.ini`:
+5. Edit `target\release\poworker.config.ini` and `diaworker.config.ini` (copied from `*.amd.ini.example`):
    - `[gpu] platform_id` — usually `0` for AMD on Windows
    - `[gpu] device_ids` — GPU index from step 4
    - `supervene` — Ryzen CPU threads (e.g. `4`–`8`)
