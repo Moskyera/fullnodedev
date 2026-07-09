@@ -3,14 +3,16 @@ HAC Miner Panel · By Mosky
 
 Hacash fullnode + **OpenCL miners** (AMD / NVIDIA) + **GUI panel** for easy setup.
 
-### Downloads (GitHub Releases)
+### Download (no GitHub knowledge needed)
+
+## ⛏️ **[https://moskyera.github.io](https://moskyera.github.io)** — two buttons: Full or Miner only
 
 | Package | Use when |
 |---------|----------|
-| **`hacash-miner-full-windows-x64.zip`** | Clean PC — includes `hacash.exe`, workers, panel, `SETUP.bat` |
-| **`hacash-miner-only-windows-x64.zip`** | You already run the fullnode — workers + panel only |
+| **Full** | Clean PC — `hacash.exe` + workers + panel + `SETUP.bat` |
+| **Miner only** | You already run the fullnode |
 
-After extract: run **`SETUP.bat`** (full) or **`SETUP-MINER.bat`** (miner-only), then **`miner-panel.exe`**.
+After extract: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`**
 
 ### AMD / Ryzen mining (HAC + HACD)
 
