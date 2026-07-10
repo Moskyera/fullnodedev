@@ -1,5 +1,14 @@
 # CUDA miner — RTX tester handoff / Παράδοση σε RTX
 
+> **Work in progress — NOT production ready**
+>
+> | Item | Status |
+> |------|--------|
+> | Kernels compile on Windows (CUDA 12.x/13.x + MSVC) | Done |
+> | GPU runtime validated locally | **No** — no NVIDIA GPU on dev machine |
+> | Genesis GPU test (`TEST-CUDA-GPU.bat`) | **Needs RTX tester** |
+> | End-to-end mining vs fullnode | **Needs RTX tester** |
+
 **Status:** Kernels compile on Windows (CUDA 12.x/13.x). **GPU runtime not tested here** — needs an NVIDIA RTX machine.
 
 ---

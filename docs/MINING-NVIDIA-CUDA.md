@@ -2,6 +2,8 @@
 
 Native CUDA block miner for Hacash, integrated with the existing `poworker` + fullnode RPC stack (same protocol as OpenCL/CPU miners).
 
+> **Work in progress — NOT production ready.** Kernels compile on Windows (CUDA 12.x/13.x + MSVC Build Tools), but **GPU runtime has not been validated** on this dev machine (no local NVIDIA GPU). Genesis test and end-to-end mining require an **RTX tester** — see [HANDOFF-RTX.md](../scripts/mining-nvidia/HANDOFF-RTX.md).
+
 **Status:** Kernels compile on Windows (CUDA 12.x/13.x + MSVC Build Tools). GPU runtime validation requires an NVIDIA RTX machine.
 
 **RTX handoff:** [scripts/mining-nvidia/HANDOFF-RTX.md](../scripts/mining-nvidia/HANDOFF-RTX.md) (Greek + English checklist for testers).
