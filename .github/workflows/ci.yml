@@ -18,7 +18,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run app unit tests (no OpenCL link on Windows)
-        run: cargo test -p app --lib gpu_
+        run: |
+          cargo test -p app --lib gpu_
+          cargo test -p app --lib panel_tuning
 
   build-miner-panel:
     name: Build miner-panel (no OpenCL link)
