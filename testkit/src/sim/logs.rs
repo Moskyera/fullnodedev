@@ -19,6 +19,14 @@ impl MemLogs {
         self.entries.is_empty()
     }
 
+    pub fn get(&self, idx: usize) -> Option<Vec<u8>> {
+        self.entries.get(idx).cloned()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Append all entries from `other` onto `self` (used by `MemChain` to
     /// carry per-tx logs back into the persistent chain).
     pub fn extend_from(&mut self, other: &MemLogs) {

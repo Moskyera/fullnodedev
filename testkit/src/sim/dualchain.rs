@@ -7,8 +7,8 @@ use sys::{Account, Ret};
 
 use crate::sim::integration::test_guard;
 use crate::sim::memchain::{
-    BlockReceipt, ConfirmedBlockReceipt, ContractAddress, ContractEdit, ContractSto, MemChain,
-    SandboxResult, SandboxSpec, TxOutput, TxReceipt, Value,
+    BlockReceipt, ConfirmedBlockReceipt, ConfirmedEmptyBlockBatchReceipt, ContractAddress,
+    ContractEdit, ContractSto, MemChain, SandboxResult, SandboxSpec, TxOutput, TxReceipt, Value,
 };
 use crate::sim::state::StateBackendKind;
 
@@ -162,6 +162,21 @@ impl DualMemChain {
     pub fn fund_diamond(&mut self, addr: &Address, diamond: DiamondName) {
         self.independent.fund_diamond(addr, diamond);
         self.production.fund_diamond(addr, diamond);
+        self.diamond_owner(&diamond);
+        self.assert_state_entries_match();
+    }
+
+    pub fn fund_diamond_with_smelt(
+        &mut self,
+        addr: &Address,
+        diamond: DiamondName,
+        number: u32,
+        average_bid_burn_mei: u16,
+    ) {
+        self.independent
+            .fund_diamond_with_smelt(addr, diamond, number, average_bid_burn_mei);
+        self.production
+            .fund_diamond_with_smelt(addr, diamond, number, average_bid_burn_mei);
         self.diamond_owner(&diamond);
         self.assert_state_entries_match();
     }
@@ -464,7 +479,7 @@ impl DualMemChain {
         let right = self
             .production
             .sandbox_main_call_fitsh(main, addrs, src, gas_max);
-        assert_same("sandbox_main_call_fitsh", &left, &right);
+        assert_same_value_result("sandbox_main_call_fitsh", &left, &right);
         left
     }
 
@@ -583,6 +598,52 @@ impl DualMemChain {
         left
     }
 
+    pub fn confirm_empty_formal_block(&mut self, miner: Address) -> Ret<ConfirmedBlockReceipt> {
+        let left = self.independent.confirm_empty_formal_block(miner);
+        let right = self.production.confirm_empty_formal_block(miner);
+        assert_same_result("confirm_empty_formal_block", &left, &right);
+        if left.is_ok() {
+            self.assert_state_entries_match();
+        }
+        left
+    }
+
+    pub fn confirm_empty_formal_blocks(
+        &mut self,
+        miner: Address,
+        blocks: u64,
+    ) -> Ret<ConfirmedEmptyBlockBatchReceipt> {
+        let left = self.independent.confirm_empty_formal_blocks(miner, blocks);
+        let right = self.production.confirm_empty_formal_blocks(miner, blocks);
+        assert_same_batch_result("confirm_empty_formal_blocks", &left, &right);
+        if left.is_ok() {
+            self.height();
+            self.last_block_hash();
+            self.assert_state_entries_match();
+        }
+        left
+    }
+
+    pub fn confirm_empty_formal_blocks_to_height(
+        &mut self,
+        miner: Address,
+        target_height: u64,
+    ) -> Ret<ConfirmedEmptyBlockBatchReceipt> {
+        let left = self
+            .independent
+            .confirm_empty_formal_blocks_to_height(miner, target_height);
+        let right = self
+            .production
+            .confirm_empty_formal_blocks_to_height(miner, target_height);
+        assert_same_batch_result("confirm_empty_formal_blocks_to_height", &left, &right);
+        if left.is_ok() {
+            self.height();
+            self.last_block_hash();
+            self.assert_state_entries_match();
+        }
+        left
+    }
+
     pub fn confirm_formal_block_observing_failures(
         &mut self,
         miner: Address,
@@ -618,7 +679,7 @@ impl DualMemChain {
     ) -> Ret<SandboxResult> {
         let left = self.independent.call_func(addr.clone(), func, args.clone());
         let right = self.production.call_func(addr, func, args);
-        assert_same("call_func", &left, &right);
+        assert_same_sandbox_result("call_func", &left, &right);
         left
     }
 
@@ -633,22 +694,42 @@ impl DualMemChain {
             .independent
             .call_func_from(caller, addr.clone(), func, args.clone());
         let right = self.production.call_func_from(caller, addr, func, args);
-        assert_same("call_func_from", &left, &right);
+        assert_same_sandbox_result("call_func_from", &left, &right);
         left
     }
 
     pub fn sandbox(&mut self, spec: SandboxSpec) -> Ret<SandboxResult> {
         let left = self.independent.sandbox(spec.clone());
         let right = self.production.sandbox(spec);
-        assert_same("sandbox", &left, &right);
+        assert_same_sandbox_result("sandbox", &left, &right);
         left
     }
 
     pub fn storage(&self, addr: &ContractAddress, key: &Value) -> Value {
         let left = self.independent.storage(addr, key);
         let right = self.production.storage(addr, key);
-        assert_same("storage", &left, &right);
+        assert_same_value("storage", &left, &right);
         left
+    }
+
+    pub fn log_count(&self) -> usize {
+        let left = self.independent.log_count();
+        let right = self.production.log_count();
+        assert_same("log_count", &left, &right);
+        left
+    }
+
+    pub fn log_raw(&self, index: usize) -> Option<Vec<u8>> {
+        let left = self.independent.log_raw(index);
+        let right = self.production.log_raw(index);
+        assert_same("log_raw", &left, &right);
+        left
+    }
+
+    pub fn clear_logs(&mut self) {
+        self.independent.clear_logs();
+        self.production.clear_logs();
+        self.log_count();
     }
 }
 
@@ -669,10 +750,44 @@ where
     match (independent, production) {
         (Ok(left), Ok(right)) => assert_same(label, left, right),
         (Err(left), Err(right)) if left == right => {}
-        (Err(left), Err(right))
-            if normalize_dual_error(left) == normalize_dual_error(right) => {}
+        (Err(left), Err(right)) if normalize_dual_error(left) == normalize_dual_error(right) => {}
         _ => assert_same(label, independent, production),
     }
+}
+
+fn assert_same_value(label: &str, independent: &Value, production: &Value) {
+    assert!(
+        value_semantic_eq(independent, production),
+        "dual backend mismatch during {label}: independent={independent:?}, production={production:?}"
+    );
+}
+
+fn assert_same_value_result(label: &str, independent: &Ret<Value>, production: &Ret<Value>) {
+    match (independent, production) {
+        (Ok(left), Ok(right)) => assert_same_value(label, left, right),
+        (Err(left), Err(right)) if left == right => {}
+        (Err(left), Err(right)) if normalize_dual_error(left) == normalize_dual_error(right) => {}
+        _ => assert_same(label, independent, production),
+    }
+}
+
+fn assert_same_sandbox_result(
+    label: &str,
+    independent: &Ret<SandboxResult>,
+    production: &Ret<SandboxResult>,
+) {
+    match (independent, production) {
+        (Ok(left), Ok(right)) if sandbox_results_match(left, right) => {}
+        (Err(left), Err(right)) if left == right => {}
+        (Err(left), Err(right)) if normalize_dual_error(left) == normalize_dual_error(right) => {}
+        _ => assert_same(label, independent, production),
+    }
+}
+
+fn sandbox_results_match(independent: &SandboxResult, production: &SandboxResult) -> bool {
+    independent.use_gas == production.use_gas
+        && independent.gas_use == production.gas_use
+        && value_semantic_eq(&independent.ret_val, &production.ret_val)
 }
 
 fn assert_same_block_result(
@@ -683,6 +798,39 @@ fn assert_same_block_result(
     match (independent, production) {
         (Ok(left), Ok(right)) if blocks_match_with_normalized_errors(left, right) => {}
         _ => assert_same_result(label, independent, production),
+    }
+}
+
+fn assert_same_batch_result(
+    label: &str,
+    independent: &Ret<ConfirmedEmptyBlockBatchReceipt>,
+    production: &Ret<ConfirmedEmptyBlockBatchReceipt>,
+) {
+    match (independent, production) {
+        (Ok(left), Ok(right)) if empty_block_batches_match(left, right) => {}
+        _ => assert_same_result(label, independent, production),
+    }
+}
+
+fn empty_block_batches_match(
+    independent: &ConfirmedEmptyBlockBatchReceipt,
+    production: &ConfirmedEmptyBlockBatchReceipt,
+) -> bool {
+    independent.start_height == production.start_height
+        && independent.end_height == production.end_height
+        && independent.count == production.count
+        && optional_blocks_match(&independent.first_block, &production.first_block)
+        && optional_blocks_match(&independent.last_block, &production.last_block)
+}
+
+fn optional_blocks_match(
+    independent: &Option<ConfirmedBlockReceipt>,
+    production: &Option<ConfirmedBlockReceipt>,
+) -> bool {
+    match (independent, production) {
+        (Some(left), Some(right)) => blocks_match_with_normalized_errors(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -711,15 +859,40 @@ fn receipt_matches_with_normalized_error(independent: &TxReceipt, production: &T
     independent.tx_hash == production.tx_hash
         && independent.height == production.height
         && independent.success == production.success
-        && independent.output == production.output
+        && tx_outputs_match(&independent.output, &production.output)
         && independent.log_count == production.log_count
         && independent.gas_used == production.gas_used
         && normalized_error_matches(&independent.error, &production.error)
 }
 
+fn tx_outputs_match(independent: &TxOutput, production: &TxOutput) -> bool {
+    match (independent, production) {
+        (TxOutput::None, TxOutput::None) => true,
+        (TxOutput::ContractAddress(left), TxOutput::ContractAddress(right)) => left == right,
+        (TxOutput::Value(left), TxOutput::Value(right)) => value_semantic_eq(left, right),
+        _ => false,
+    }
+}
+
+fn value_semantic_eq(independent: &Value, production: &Value) -> bool {
+    if independent == production {
+        return true;
+    }
+    if independent.is_uint() && production.is_uint() {
+        return independent.extract_u128().ok() == production.extract_u128().ok();
+    }
+    match (independent, production) {
+        (Value::Tuple(left), Value::Tuple(right)) => left.content_eq(right).unwrap_or(false),
+        (Value::Compo(left), Value::Compo(right)) => left.content_eq(right).unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn normalized_error_matches(independent: &Option<String>, production: &Option<String>) -> bool {
     match (independent, production) {
-        (Some(left), Some(right)) => left == right || normalize_dual_error(left) == normalize_dual_error(right),
+        (Some(left), Some(right)) => {
+            left == right || normalize_dual_error(left) == normalize_dual_error(right)
+        }
         (None, None) => true,
         _ => false,
     }

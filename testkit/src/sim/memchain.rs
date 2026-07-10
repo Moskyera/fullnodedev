@@ -19,8 +19,8 @@ use basis::interface::{
 };
 use field::{
     AddrOrList, Address, Amount, AssetAmt, AssetSmelt, BlockHeight, BytesW1, DIAMOND_STATUS_NORMAL,
-    DiamondName, DiamondNumber, DiamondSto, Field, Fixed16, Fold64, Hash, Satoshi, Serialize,
-    Timestamp, Uint1, Uint4,
+    DiamondName, DiamondNumber, DiamondSmelt, DiamondSto, Field, Fixed8, Fixed16, Fold64, Hash,
+    Satoshi, Serialize, Timestamp, Uint1, Uint2, Uint4,
 };
 use protocol::block::BlockV1;
 use protocol::context::{ContextInst, TX_GAS_BUDGET_CAP_BYTE, decode_gas_budget};
@@ -353,6 +353,34 @@ impl ConfirmedBlockReceipt {
 
     pub fn user_tx_count(&self) -> usize {
         self.report.tx_count.saturating_sub(1)
+    }
+}
+
+/// Summary for a long run of empty formal blocks.
+///
+/// Each block is still confirmed through [`BlockV1::execute_with_report`];
+/// this type just keeps callers from having to store thousands of identical
+/// no-user-tx receipts when a test only needs to move the chain clock forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedEmptyBlockBatchReceipt {
+    pub start_height: u64,
+    pub end_height: u64,
+    pub count: u64,
+    pub first_block: Option<ConfirmedBlockReceipt>,
+    pub last_block: Option<ConfirmedBlockReceipt>,
+}
+
+impl ConfirmedEmptyBlockBatchReceipt {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn first_height(&self) -> Option<u64> {
+        self.first_block.as_ref().map(|block| block.height)
+    }
+
+    pub fn last_height(&self) -> Option<u64> {
+        self.last_block.as_ref().map(|block| block.height)
     }
 }
 
@@ -860,6 +888,123 @@ impl MemChain {
         })
     }
 
+    /// Confirm one formal block with only the prelude/coinbase transaction.
+    ///
+    /// This keeps long-range height advancement on the real block execution
+    /// path without manufacturing unrelated user transfers. Pending user
+    /// transactions must be confirmed or dropped first so tests do not skip
+    /// work accidentally.
+    pub fn confirm_empty_formal_block(&mut self, miner: Address) -> Ret<ConfirmedBlockReceipt> {
+        if !self.pending.is_empty() {
+            return Err(format!(
+                "confirm_empty_formal_block requires empty pending pool, got {} txs",
+                self.pending.len()
+            ));
+        }
+
+        let next_height = self.height.saturating_add(1);
+        let mut block = BlockV1::new();
+        block.intro.head.height = BlockHeight::from(next_height);
+        block.intro.head.timestamp = Timestamp::from(FORMAL_TX_TIMESTAMP_BASE + next_height);
+        block.intro.head.prevhash = self.last_block_hash;
+
+        let mut prelude = DefaultPreludeTx::default();
+        prelude.address = miner;
+        prelude.message = Fixed16::default();
+        block.push_transaction(Box::new(prelude))?;
+        block.update_mrklroot();
+        let block_hash = block.hash();
+
+        let tx_state = self.state.fork_for_tx();
+        let logs_box: Box<dyn Logs> = Box::new(self.logs.clone());
+        let old_log_len = logs_box.snapshot_len();
+        let executed = block.execute_with_report(
+            ChainInfo {
+                id: 0,
+                fast_sync: false,
+                diamond_form: false,
+            },
+            tx_state.state,
+            logs_box,
+        )?;
+        let report = executed.report.clone();
+        assert_eq!(
+            report.tx_count, 1,
+            "empty confirmed block report tx count mismatch"
+        );
+
+        let new_logs = collect_new_logs(executed.logs.as_ref(), old_log_len);
+        self.state.commit(executed.state);
+        self.logs.extend_from(&new_logs);
+        self.height = next_height;
+        self.last_block_hash = block_hash;
+
+        Ok(ConfirmedBlockReceipt {
+            height: self.height,
+            block_hash,
+            receipts: Vec::new(),
+            report,
+        })
+    }
+
+    /// Confirm `blocks` empty formal blocks.
+    ///
+    /// This is a batch convenience over [`MemChain::confirm_empty_formal_block`]:
+    /// it keeps the real formal block execution/report path, requires an empty
+    /// pending pool, and returns only the first and last block receipts.
+    pub fn confirm_empty_formal_blocks(
+        &mut self,
+        miner: Address,
+        blocks: u64,
+    ) -> Ret<ConfirmedEmptyBlockBatchReceipt> {
+        let start_height = self.height;
+        if blocks == 0 {
+            return Ok(ConfirmedEmptyBlockBatchReceipt {
+                start_height,
+                end_height: self.height,
+                count: 0,
+                first_block: None,
+                last_block: None,
+            });
+        }
+        if !self.pending.is_empty() {
+            return Err(format!(
+                "confirm_empty_formal_blocks requires empty pending pool, got {} txs",
+                self.pending.len()
+            ));
+        }
+
+        let mut first_block = None;
+        let mut last_block = None;
+        for idx in 0..blocks {
+            let block = self.confirm_empty_formal_block(miner)?;
+            if idx == 0 {
+                first_block = Some(block.clone());
+            }
+            last_block = Some(block);
+        }
+
+        Ok(ConfirmedEmptyBlockBatchReceipt {
+            start_height,
+            end_height: self.height,
+            count: blocks,
+            first_block,
+            last_block,
+        })
+    }
+
+    /// Confirm empty formal blocks until the chain reaches `target_height`.
+    ///
+    /// If the chain is already at or above `target_height`, this is a no-op.
+    pub fn confirm_empty_formal_blocks_to_height(
+        &mut self,
+        miner: Address,
+        target_height: u64,
+    ) -> Ret<ConfirmedEmptyBlockBatchReceipt> {
+        let blocks = target_height.saturating_sub(self.height);
+        self.confirm_empty_formal_blocks(miner, blocks)
+    }
+
     /// Confirm all pending formal transactions while preserving a receipt for
     /// transactions that fail during execution.
     ///
@@ -1009,8 +1154,25 @@ impl MemChain {
 
     /// Seed one HACD diamond as owned by `addr`.
     pub fn fund_diamond(&mut self, addr: &Address, diamond: DiamondName) {
+        self.fund_diamond_with_smelt(addr, diamond, 1, 1);
+    }
+
+    /// Seed one HACD diamond plus its smelt metadata as owned by `addr`.
+    ///
+    /// Production-mined diamonds always have both `DiamondSto` and
+    /// `DiamondSmelt`. VM tests that exercise inscription protocol costs need
+    /// the smelt side too, otherwise the real action path fails before it can
+    /// validate ownership/content/cooldown semantics.
+    pub fn fund_diamond_with_smelt(
+        &mut self,
+        addr: &Address,
+        diamond: DiamondName,
+        number: u32,
+        average_bid_burn_mei: u16,
+    ) {
         let tx = StubTxBuilder::new().ty(3).main(*addr).gas_max(0).build();
         let height = self.height;
+        let prev_hash = self.last_block_hash;
         let outcome = self.run_with(&tx, |ctx| {
             let mut state = protocol::state::CoreState::wrap(ctx.state());
             state.diamond_set(
@@ -1020,6 +1182,21 @@ impl MemChain {
                     address: *addr,
                     prev_engraved_height: BlockHeight::from(height),
                     inscripts: Default::default(),
+                },
+            );
+            state.diamond_smelt_set(
+                &diamond,
+                &DiamondSmelt {
+                    diamond,
+                    number: DiamondNumber::from(number),
+                    born_height: BlockHeight::from(height),
+                    born_hash: Hash::default(),
+                    prev_hash,
+                    miner_address: *addr,
+                    bid_fee: Amount::zero(),
+                    nonce: Fixed8::default(),
+                    average_bid_burn: Uint2::from(average_bid_burn_mei),
+                    life_gene: Hash::default(),
                 },
             );
             protocol::operate::hacd_add(&mut state, addr, &DiamondNumber::from(1u32))?;
@@ -1398,6 +1575,16 @@ impl MemChain {
     /// Number of log entries accumulated so far.
     pub fn log_count(&self) -> usize {
         self.logs.snapshot_len()
+    }
+
+    /// Read one raw VM log entry from the in-memory log backend.
+    pub fn log_raw(&self, idx: usize) -> Option<Vec<u8>> {
+        self.logs.get(idx)
+    }
+
+    /// Clear all VM logs in the in-memory log backend.
+    pub fn clear_logs(&mut self) {
+        self.logs.clear();
     }
 
     // ────────────────────────── snapshot ────────────────────────────
