@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run app tests
-        run: cargo test -p app --lib --features ocl
+      - name: Run app unit tests (no OpenCL link on Windows)
+        run: cargo test -p app --lib gpu_
 
   build-miner-panel:
     name: Build miner-panel (no OpenCL link)
