@@ -1,7 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering::*};
+use std::sync::Arc;
 
-use std::thread::*;
 use std::time::*;
 
 use reqwest::blocking::Client as HttpClient;
@@ -10,30 +9,19 @@ use serde_json::Value as JV;
 use crate::efficiency::*;
 
 use basis::difficulty::*;
-use basis::interface::*;
 use field::*;
-use mint::TransactionCoinbase;
-use mint::genesis::*;
 use protocol::block::*;
 use sys::*;
 
-include! {"util.rs"}
-
 #[cfg(feature = "ocl")]
-include! {"opencl_common.rs"}
+use crate::opencl_gpu::block::do_group_block_mining_opencl;
 #[cfg(feature = "ocl")]
-include! {"opencl_pow.rs"}
+use crate::opencl_gpu::initialize_opencl;
 #[cfg(feature = "cuda")]
 include! {"cuda_pow.rs"}
 
-#[derive(Clone)]
-enum MinerBackend {
-    Cpu { assist_idx: Option<u32> },
-    #[cfg(feature = "ocl")]
-    Opencl(Arc<OpenCLResources>),
-    #[cfg(feature = "cuda")]
-    Cuda(Arc<CudaMiningResources>),
-}
+#[path = "block_mining_runtime.rs"]
+mod block_mining_runtime;
 
 /*****************************************/
 
@@ -114,51 +102,9 @@ impl PoWorkConf {
 
 /*****************************************/
 
-const HASH_WIDTH: usize = 32;
-const MINING_INTERVAL: f64 = 3.0; // 3 secs
-const TARGET_BLOCK_TIME: f64 = 300.0; // 5 mins
-const ONEDAY_BLOCK_NUM: f64 = 288.0; // one day block
-
-// current mining diamond number
-static MINING_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(0);
-
 use std::sync::LazyLock;
 static HTTP_CLIENT: LazyLock<HttpClient> =
     LazyLock::new(|| HttpClient::builder().no_proxy().build().unwrap());
-static MINING_BLOCK_STUFF: LazyLock<RwLock<Arc<BlockMiningStuff>>> =
-    LazyLock::new(|| RwLock::default());
-
-#[derive(Clone, Default)]
-struct BlockMiningStuff {
-    height: u64,
-    target_hash: Hash,
-    block_intro: BlockIntro,
-    coinbase_tx: TransactionCoinbase,
-    mkrl_list: Vec<Hash>,
-}
-
-#[derive(Clone, Default)]
-struct BlockMiningResult {
-    height: u64,
-    nonce_start: u32,
-    nonce_space: u32,
-    gpu_nonce_space: u32,
-    cpu_nonce_space: u32,
-    head_nonce: u32,
-    coinbase_nonce: Vec<u8>,
-    result_hash: Vec<u8>,
-    target_hash: Vec<u8>,
-    use_secs: f64,
-    is_gpu: bool,
-}
-
-impl BlockMiningResult {
-    fn new() -> BlockMiningResult {
-        let mut res = BlockMiningResult::default();
-        res.result_hash = vec![255u8; 32];
-        res
-    }
-}
 
 pub fn poworker() {
     let cnfp = "./poworker.config.ini".to_string();
@@ -176,40 +122,7 @@ pub fn poworker_with_conf(cnf: PoWorkConf) {
 }
 
 pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
-    let (res_tx, res_rx) = mpsc::channel();
-
-    let miner_backends = build_miner_backends(&cnf);
-
-    // deal results
-    let cnf1 = cnf.clone();
-    let worker_qty = miner_backends.len();
-    let stop_flag_res = stop_flag.clone();
-    spawn(move || {
-        let mut most_hash = vec![255u8; 32];
-        let mut rstx = res_rx;
-        loop {
-            if should_stop(&stop_flag_res) {
-                return;
-            }
-            deal_block_mining_results(&cnf1, &mut most_hash, &mut rstx, worker_qty);
-            delay_continue_ms!(123);
-        }
-    });
-
-    for (thrid, backend) in miner_backends.into_iter().enumerate() {
-        let cnf2 = cnf.clone();
-        let rstx = res_tx.clone();
-        let stop_flag_miner = stop_flag.clone();
-        spawn(move || {
-            loop {
-                if should_stop(&stop_flag_miner) {
-                    return;
-                }
-                run_block_mining_item(&cnf2, thrid, rstx.clone(), backend.clone());
-                delay_continue_ms!(9);
-            }
-        });
-    }
+    block_mining_runtime::start_block_mining_workers(&cnf, stop_flag.clone());
 
     // loop
     loop {
@@ -242,542 +155,11 @@ fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
     stop_flag.as_ref().map(|f| f.load(Relaxed)).unwrap_or(false)
 }
 
-fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
-    let mut backends = Vec::new();
-
-    if cnf.usecuda {
-        #[cfg(feature = "cuda")]
-        {
-            let cuda_resources = initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize);
-            if !cuda_resources.is_empty() {
-                println!(
-                    "\n[Start] Create CUDA block miner worker #{}.",
-                    cuda_resources.len()
-                );
-                for resource in cuda_resources {
-                    backends.push(MinerBackend::Cuda(resource));
-                }
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            println!(
-                "\n[Warn] use_cuda=true but app built without `cuda` feature, fallback to CPU miner."
-            );
-        }
-    } else if cnf.useopencl {
-        #[cfg(feature = "ocl")]
-        {
-            let opencl_resources = initialize_opencl(
-                false,
-                &cnf.opencldir,
-                &cnf.platformid,
-                &cnf.deviceids,
-                &cnf.workgroups,
-                &cnf.localsize,
-                &cnf.unitsize,
-            );
-            if !opencl_resources.is_empty() {
-                println!(
-                    "\n[Start] Create GPU block miner worker #{}.",
-                    opencl_resources.len()
-                );
-                for resource in opencl_resources {
-                    backends.push(MinerBackend::Opencl(Arc::new(resource)));
-                }
-            }
-        }
-
-        #[cfg(not(feature = "ocl"))]
-        {
-            println!(
-                "\n[Warn] use_opencl=true but app built without `ocl` feature, fallback to CPU miner."
-            );
-        }
-
-        if cnf.cpu_assist && cnf.supervene > 0 && !backends.is_empty() {
-            let thrnum = cnf.efficiency.spawn_supervene(cnf.supervene) as usize;
-            println!(
-                "\n[Start] Create #{} Ryzen CPU assist threads (hybrid GPU+CPU, active={}).",
-                thrnum,
-                cnf.runtime.active_cpu_assist.load(Relaxed)
-            );
-            for i in 0..thrnum {
-                backends.push(MinerBackend::Cpu {
-                    assist_idx: Some(i as u32),
-                });
-            }
-        }
-    }
-
-    if backends.is_empty() {
-        let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene.max(1)) as usize;
-        println!(
-            "\n[Start] Create #{} CPU block miner worker thread.",
-            thrnum
-        );
-        for _ in 0..thrnum {
-            backends.push(MinerBackend::Cpu { assist_idx: None });
-        }
-    }
-
-    backends
-}
-
-fn run_block_mining_item(
-    _cnf: &PoWorkConf,
-    _thrid: usize,
-    result_ch_tx: mpsc::Sender<Arc<BlockMiningResult>>,
-    backend: MinerBackend,
-) {
-    if mining_is_gated(&_cnf.runtime, &_cnf.efficiency) {
-        delay_return_ms!(2000);
-        return;
-    }
-
-    let mining_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-    if mining_hei == 0 {
-        delay_return_ms!(111); // not yet
-    }
-
-    let mut coinbase_nonce = [0u8; HASH_WIDTH];
-    getrandom::fill(&mut coinbase_nonce).unwrap();
-    let coinbase_nonce = Hash::from(coinbase_nonce);
-    // Note: All threads starting from nonce_start = 0 here is not a bug:
-    // each thread/task has been assigned a random coinbase_nonce above,
-    // so block_intro (block header hash) differs; even with the same nonce_start,
-    // the actual search hash space is disjoint and no hashrate conflict occurs.
-    if let MinerBackend::Cpu { assist_idx: Some(idx) } = &backend {
-        let active = _cnf.runtime.active_cpu_assist.load(Relaxed);
-        if *idx >= active {
-            delay_return_ms!(400);
-            return;
-        }
-    }
-
-    let mut nonce_start: u32 = 0;
-    let nonce_limit = _cnf.noncemax.max(1);
-    let mut nonce_space: u32 = match &backend {
-        MinerBackend::Cpu { .. } => 100000,
-        #[cfg(feature = "ocl")]
-        MinerBackend::Opencl(res) => {
-            let wg = _cnf
-                .runtime
-                .workgroups(res.workgroups.min(_cnf.workgroups));
-            wg * _cnf.localsize * _cnf.unitsize
-        }
-        #[cfg(feature = "cuda")]
-        MinerBackend::Cuda(res) => {
-            let wg = _cnf.runtime.workgroups(res.workgroups.min(_cnf.workgroups));
-            wg * x16rs_cuda::DEFAULT_LOCAL_SIZE * res.unit_size
-        }
-    };
-    let is_gpu_backend = match &backend {
-        #[cfg(feature = "ocl")]
-        MinerBackend::Opencl(_) => true,
-        #[cfg(feature = "cuda")]
-        MinerBackend::Cuda(_) => true,
-        _ => false,
-    };
-    // stuff data
-    let stuff = { MINING_BLOCK_STUFF.read().unwrap().clone() };
-    let height = stuff.height;
-    let mut coinbase_tx = stuff.coinbase_tx.clone();
-    coinbase_tx.set_nonce(coinbase_nonce);
-    let mut block_intro = stuff.block_intro.clone();
-    block_intro.set_mrklroot(calculate_mrkl_prelude_update(
-        coinbase_tx.hash(),
-        &stuff.mkrl_list,
-    ));
-    loop {
-        if nonce_start >= nonce_limit {
-            return;
-        }
-
-        let remain = nonce_limit.saturating_sub(nonce_start);
-        let current_nonce_space = nonce_space.min(remain).max(1);
-        let ctn = Instant::now();
-        let block_intro_bin = block_intro.serialize();
-
-        let (head_nonce, result_hash, gpu_ns, cpu_ns) = match &backend {
-            MinerBackend::Cpu { .. } => {
-                let (hn, rh) =
-                    do_group_block_mining(height, block_intro_bin, nonce_start, current_nonce_space);
-                (hn, rh, 0u32, current_nonce_space)
-            }
-            #[cfg(feature = "cuda")]
-            MinerBackend::Cuda(cuda) => {
-                let wg_cap = _cnf
-                    .runtime
-                    .workgroups(cuda.workgroups.min(_cnf.workgroups));
-                let unit_batch =
-                    (x16rs_cuda::DEFAULT_LOCAL_SIZE as u64) * (cuda.unit_size as u64);
-                if wg_cap == 0 || unit_batch == 0 {
-                    let (hn, rh) = do_group_block_mining(
-                        height,
-                        block_intro_bin,
-                        nonce_start,
-                        current_nonce_space,
-                    );
-                    (hn, rh, 0u32, current_nonce_space)
-                } else {
-                    let workgroups_by_space = (current_nonce_space as u64 / unit_batch) as u32;
-                    let workgroups_eff = workgroups_by_space.min(wg_cap);
-                    let gpu_nonce_space = workgroups_eff
-                        .saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
-                        .saturating_mul(cuda.unit_size);
-
-                    if workgroups_eff == 0 {
-                        let (hn, rh) = do_group_block_mining(
-                            height,
-                            block_intro_bin,
-                            nonce_start,
-                            current_nonce_space,
-                        );
-                        (hn, rh, 0u32, current_nonce_space)
-                    } else {
-                        match do_group_block_mining_cuda(
-                            cuda,
-                            height,
-                            block_intro_bin.clone(),
-                            nonce_start,
-                            workgroups_eff,
-                        ) {
-                            Err(e) => {
-                                eprintln!("[CUDA] batch failed: {e}");
-                                _cnf.runtime.record_gpu_error(
-                                    wg_cap,
-                                    _cnf.efficiency.oom_fallback,
-                                );
-                                let (hn, rh) = do_group_block_mining(
-                                    height,
-                                    block_intro_bin,
-                                    nonce_start,
-                                    current_nonce_space,
-                                );
-                                (hn, rh, 0u32, current_nonce_space)
-                            }
-                            Ok(mut best) => {
-                                let tail_space =
-                                    current_nonce_space.saturating_sub(gpu_nonce_space);
-                                if tail_space > 0 {
-                                    let tail_start = nonce_start.saturating_add(gpu_nonce_space);
-                                    let cpu_tail = do_group_block_mining(
-                                        height,
-                                        block_intro_bin,
-                                        tail_start,
-                                        tail_space,
-                                    );
-                                    if hash_more_power(&cpu_tail.1, &best.1) {
-                                        best = cpu_tail;
-                                    }
-                                }
-                                (best.0, best.1, gpu_nonce_space, tail_space)
-                            }
-                        }
-                    }
-                }
-            }
-            #[cfg(feature = "ocl")]
-            MinerBackend::Opencl(opencl) => {
-                let wg_cap = _cnf
-                    .runtime
-                    .workgroups(opencl.workgroups.min(_cnf.workgroups));
-                let unit_batch = (_cnf.localsize as u64) * (_cnf.unitsize as u64);
-                if wg_cap == 0 || unit_batch == 0 {
-                    let (hn, rh) = do_group_block_mining(
-                        height,
-                        block_intro_bin,
-                        nonce_start,
-                        current_nonce_space,
-                    );
-                    (hn, rh, 0u32, current_nonce_space)
-                } else {
-                    let workgroups_by_space = (current_nonce_space as u64 / unit_batch) as u32;
-                    let workgroups_eff = workgroups_by_space.min(wg_cap);
-                    let gpu_nonce_space = workgroups_eff
-                        .saturating_mul(_cnf.localsize)
-                        .saturating_mul(_cnf.unitsize);
-
-                    if workgroups_eff == 0 {
-                        let (hn, rh) = do_group_block_mining(
-                            height,
-                            block_intro_bin,
-                            nonce_start,
-                            current_nonce_space,
-                        );
-                        (hn, rh, 0u32, current_nonce_space)
-                    } else {
-                        match do_group_block_mining_opencl(
-                            opencl,
-                            height,
-                            block_intro_bin.clone(),
-                            nonce_start,
-                            workgroups_eff,
-                            _cnf.localsize,
-                            _cnf.unitsize,
-                        ) {
-                            Err(e) => {
-                                eprintln!("[efficiency] GPU batch failed: {}", e);
-                                _cnf.runtime.record_gpu_error(
-                                    wg_cap,
-                                    _cnf.efficiency.oom_fallback,
-                                );
-                                let (hn, rh) = do_group_block_mining(
-                                    height,
-                                    block_intro_bin,
-                                    nonce_start,
-                                    current_nonce_space,
-                                );
-                                (hn, rh, 0u32, current_nonce_space)
-                            }
-                            Ok(mut best) => {
-                                let tail_space =
-                                    current_nonce_space.saturating_sub(gpu_nonce_space);
-                                if tail_space > 0 {
-                                    let tail_start = nonce_start.saturating_add(gpu_nonce_space);
-                                    let cpu_tail = do_group_block_mining(
-                                        height,
-                                        block_intro_bin,
-                                        tail_start,
-                                        tail_space,
-                                    );
-                                    if hash_more_power(&cpu_tail.1, &best.1) {
-                                        best = cpu_tail;
-                                    }
-                                }
-                                (best.0, best.1, gpu_nonce_space, tail_space)
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
-        let mlres = BlockMiningResult {
-            height,
-            nonce_start,
-            nonce_space: current_nonce_space,
-            gpu_nonce_space: gpu_ns,
-            cpu_nonce_space: cpu_ns,
-            head_nonce,
-            coinbase_nonce: coinbase_nonce.to_vec(),
-            result_hash: result_hash.to_vec(),
-            target_hash: stuff.target_hash.to_vec(),
-            use_secs,
-            is_gpu: is_gpu_backend,
-        };
-        result_ch_tx.send(mlres.into()).unwrap();
-
-        if use_secs > 0.0 {
-            nonce_space = (current_nonce_space as f64 * MINING_INTERVAL / use_secs) as u32;
-            nonce_space = nonce_space.max(1);
-        }
-
-        let Some(nst) = nonce_start.checked_add(current_nonce_space) else {
-            return;
-        };
-        nonce_start = nst;
-
-        // check next height
-        let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-        if check_hei > mining_hei {
-            return; // turn to next height
-        }
-        // continue nonce space
-    }
-}
-
-// return: nonce, hash
-fn do_group_block_mining(
-    height: u64,
-    mut block_intro: Vec<u8>,
-    nonce_start: u32,
-    nonce_space: u32,
-) -> (u32, [u8; 32]) {
-    let mut most_nonce = 0u32;
-    let mut most_hash = [255u8; 32];
-    let nonce_end = nonce_start.checked_add(nonce_space).unwrap_or(u32::MAX);
-    for nonce in nonce_start..nonce_end {
-        // std::thread::sleep(std::time::Duration::from_millis(1)); // test
-        block_intro[79..83].copy_from_slice(&nonce.to_be_bytes());
-        let reshx = x16rs::block_hash(height, &block_intro);
-        if hash_more_power(&reshx, &most_hash) {
-            most_hash = reshx;
-            most_nonce = nonce;
-        }
-    }
-    // end
-    (most_nonce, most_hash)
-}
-
-fn deal_block_mining_results(
-    cnf: &PoWorkConf,
-    most_hash: &mut Vec<u8>,
-    result_ch_rx: &mut mpsc::Receiver<Arc<BlockMiningResult>>,
-    worker_qty: usize,
-) {
-    let vene = worker_qty.max(1) as u32;
-    // deal
-    let mut deal_hei = 0u64;
-    let mut most = Arc::new(BlockMiningResult::new());
-    let mut total_nonce_space = 0u64;
-    let mut gpu_nonce_space = 0u64;
-    let mut cpu_nonce_space = 0u64;
-    let mut total_use_secs = 0.0;
-    let mut recv_count = 0;
-    while let Ok(res) = result_ch_rx.try_recv() {
-        deal_hei = res.height;
-        total_nonce_space += res.nonce_space as u64;
-        if res.gpu_nonce_space > 0 || res.cpu_nonce_space > 0 {
-            gpu_nonce_space += res.gpu_nonce_space as u64;
-            cpu_nonce_space += res.cpu_nonce_space as u64;
-        } else if res.is_gpu {
-            gpu_nonce_space += res.nonce_space as u64;
-        } else {
-            cpu_nonce_space += res.nonce_space as u64;
-        }
-        total_use_secs += res.use_secs; // Accumulated total time
-        if hash_more_power(&res.result_hash, &most.result_hash) {
-            most = res.clone();
-        }
-        recv_count += 1;
-        if recv_count >= vene as usize * 4 {
-            break;
-        } // prevent infinite loop
-    }
-    if recv_count == 0 {
-        return;
-    }
-    // total most
-    if hash_more_power(&most.result_hash, most_hash) {
-        *most_hash = most.result_hash.clone();
-    }
-    // print hashrate
-    let tarhx: [u8; HASH_WIDTH] = most.target_hash.clone().try_into().unwrap();
-    let target_rates = hash_to_rates(&tarhx, TARGET_BLOCK_TIME);
-    let avg_use_secs = total_use_secs / recv_count as f64;
-    let nonce_rates = if avg_use_secs.is_finite() && avg_use_secs > 0.0 {
-        total_nonce_space as f64 / avg_use_secs
-    } else {
-        0.0
-    };
-    let mut mnper = if target_rates.is_finite() && target_rates > 0.0 {
-        nonce_rates / target_rates
-    } else {
-        0.0
-    };
-    if !mnper.is_finite() || mnper < 0.0 {
-        mnper = 0.0;
-    } else if mnper > 1.0 {
-        mnper = 1.0;
-    }
-    let hac1day = mnper * ONEDAY_BLOCK_NUM * block_reward_number(deal_hei) as f64;
-    let active_cpu = cnf.runtime.active_cpu_assist.load(Relaxed);
-    cnf.runtime.maybe_adjust_supervene(&cnf.efficiency, gpu_nonce_space, cpu_nonce_space);
-    if should_pause_for_profit(&cnf.efficiency, hac1day, &cnf.gpu_profile, active_cpu) {
-        cnf.runtime.paused_unprofitable.store(true, Relaxed);
-        println!(
-            "\n[efficiency] Mining paused — estimated cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw."
-        );
-    } else {
-        cnf.runtime.paused_unprofitable.store(false, Relaxed);
-    }
-    let eff_line = format_efficiency_line(
-        nonce_rates,
-        hac1day,
-        mnper * 100.0,
-        &cnf.efficiency,
-        &cnf.gpu_profile,
-        active_cpu,
-    );
-    flush!(
-        "{} {} | {} | best {}.        \r",
-        most.nonce_start,
-        total_nonce_space,
-        eff_line,
-        hex::encode(hash_left_zero_pad3(&most_hash))
-    );
-    let paused = cnf.runtime.paused_unprofitable.load(Relaxed);
-    let stats = build_mining_stats(
-        nonce_rates,
-        hac1day,
-        mnper * 100.0,
-        &cnf.efficiency,
-        &cnf.gpu_profile,
-        active_cpu,
-        deal_hei,
-        paused,
-    );
-    write_mining_stats(&cnf.efficiency.stats_file, &stats);
-    // check success
-    if cnf.debug == 1 || hash_more_power(&most.result_hash, &most.target_hash) {
-        push_block_mining_success(cnf, &most);
-    }
-    // print next height
-    may_print_turn_to_nex_block_mining(deal_hei, Some(most_hash));
-}
-
-fn may_print_turn_to_nex_block_mining(curr_hei: u64, most_hash: Option<&mut Vec<u8>>) {
-    let mining_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-    if curr_hei >= mining_hei {
-        return; // not turn
-    }
-    if let Some(most_hash) = most_hash {
-        *most_hash = vec![255u8; 32]; // reset 
-    }
-    let stuff = MINING_BLOCK_STUFF.read().unwrap();
-    let tarhx = hash_left_zero_pad3(&stuff.target_hash.as_bytes()).to_hex();
-
-    println!(
-        "\n[{}] req height {} target {} to mining ... ",
-        &ctshow()[5..],
-        mining_hei,
-        tarhx
-    );
-}
-
-fn set_pending_block_stuff(height: u64, res: serde_json::Value) {
-    let jstr = |k: &str| res[k].as_str().unwrap_or("");
-    let _jnum = |k: &str| res[k].as_u64().unwrap_or(0);
-    // data
-    // println!("{:?}", &res);
-    let target_hash = Hash::from(
-        hex::decode(jstr("target_hash"))
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
-    let block_intro = BlockIntro::must(&hex::decode(jstr("block_intro")).unwrap());
-    let coinbase_tx = TransactionCoinbase::must(&hex::decode(jstr("coinbase_body")).unwrap());
-    let mut mkrl_list = Vec::new();
-    if let JV::Array(ref lists) = res["mkrl_modify_list"] {
-        for li in lists {
-            mkrl_list.push(Hash::from(
-                hex::decode(li.as_str().unwrap_or(""))
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            ));
-        }
-    }
-    // set pending stuff
-    let new_stuff = BlockMiningStuff {
-        height,
-        target_hash,
-        block_intro,
-        coinbase_tx,
-        mkrl_list,
-    };
-    *MINING_BLOCK_STUFF.write().unwrap() = new_stuff.into();
-    MINING_BLOCK_HEIGHT.store(height, Relaxed);
-}
 
 ///////////////////////////////
 
 fn pull_pending_block_stuff(cnf: &PoWorkConf) {
-    let curr_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
+    let curr_hei = block_mining_runtime::current_mining_height();
 
     // query pending
     let urlapi_pending = format!(
@@ -815,9 +197,9 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
 
     // set pending block stuff
     if pending_height > curr_hei {
-        set_pending_block_stuff(pending_height, res);
+        block_mining_runtime::set_pending_block_stuff(pending_height, res);
         if curr_hei == 0 {
-            may_print_turn_to_nex_block_mining(curr_hei, None); // print first
+            block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
         }
     }
 
@@ -860,7 +242,10 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
     }
 }
 
-fn push_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) {
+fn push_block_mining_success(
+    cnf: &PoWorkConf,
+    success: &block_mining_runtime::BlockMiningResult,
+) {
     let urlapi_success = format!(
         "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}",
         &cnf.rpcaddr,
@@ -885,7 +270,7 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) {
 
 #[cfg(feature = "ocl")]
 fn bench_block_hps(
-    opencl: &OpenCLResources,
+    opencl: &crate::opencl_gpu::OpenCLResources,
     cnf: &PoWorkConf,
     wg_eff: u32,
     us: u32,
@@ -897,10 +282,12 @@ fn bench_block_hps(
     let deadline = Instant::now() + Duration::from_secs(seconds.max(3));
     let mut total_hashes = 0u64;
     let mut total_secs = 0.0f64;
+    let mut success_batches = 0u32;
+    let mut first_err: Option<String> = None;
     let mut nonce = 0u32;
     while Instant::now() < deadline {
         let ctn = Instant::now();
-        if do_group_block_mining_opencl(
+        match do_group_block_mining_opencl(
             opencl,
             height,
             block_intro.clone(),
@@ -908,10 +295,16 @@ fn bench_block_hps(
             wg_eff,
             cnf.localsize,
             us,
-        )
-        .is_ok()
-        {
-            total_hashes += batch as u64;
+        ) {
+            Ok(_) => {
+                success_batches += 1;
+                total_hashes += batch as u64;
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.display());
+                }
+            }
         }
         let used = ctn.elapsed().as_secs_f64();
         if used > 0.0 {
@@ -919,10 +312,60 @@ fn bench_block_hps(
         }
         nonce = nonce.wrapping_add(batch);
     }
-    if total_secs > 0.0 {
-        total_hashes as f64 / total_secs
-    } else {
+    if success_batches == 0 || total_secs <= 0.0 {
+        if let Some(e) = first_err {
+            eprintln!(
+                "[benchmark] GPU error at wg={} unit_size={}: {}",
+                wg_eff, us, e
+            );
+        }
         0.0
+    } else {
+        total_hashes as f64 / total_secs
+    }
+}
+
+#[cfg(feature = "ocl")]
+struct ProfileBenchResult {
+    profile: &'static str,
+    hps: f64,
+    kh_per_j: f64,
+}
+
+#[cfg(feature = "ocl")]
+fn pick_benchmark_profile(
+    results: &[ProfileBenchResult],
+    mode: EfficiencyMode,
+    vendor: crate::gpu_arch::GpuVendor,
+    min_tier: i8,
+) -> &'static str {
+    let viable: Vec<&ProfileBenchResult> = results
+        .iter()
+        .filter(|r| r.hps > 0.0 && profile_tier(r.profile) >= min_tier)
+        .collect();
+    let pool: Vec<&ProfileBenchResult> = if viable.is_empty() {
+        results.iter().filter(|r| r.hps > 0.0).collect()
+    } else {
+        viable
+    };
+    if pool.is_empty() {
+        return tier_profile_for_vendor(vendor, min_tier);
+    }
+    match mode {
+        EfficiencyMode::Max => pool
+            .iter()
+            .max_by(|a, b| a.hps.partial_cmp(&b.hps).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|r| r.profile)
+            .unwrap_or(tier_profile_for_vendor(vendor, min_tier)),
+        _ => pool
+            .iter()
+            .max_by(|a, b| {
+                a.kh_per_j
+                    .partial_cmp(&b.kh_per_j)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|r| r.profile)
+            .unwrap_or(tier_profile_for_vendor(vendor, min_tier)),
     }
 }
 
@@ -952,11 +395,9 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             0
         };
 
-        let init_unitsize = if fine {
-            cnf.unitsize.max(128)
-        } else {
-            cnf.unitsize
-        };
+        // Allocate GPU buffers for the largest profile unit_size (amd_max uses 128).
+        let init_unitsize = cnf.unitsize.max(128);
+        let scan = crate::opencl_diag::scan_opencl();
         let opencl_resources = initialize_opencl(
             false,
             &cnf.opencldir,
@@ -965,6 +406,8 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             &cnf.workgroups,
             &cnf.localsize,
             &init_unitsize,
+            Some(&scan),
+            false,
         );
         if opencl_resources.is_empty() {
             println!("[benchmark] No OpenCL devices");
@@ -982,14 +425,12 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                 if fine { " + fine sweep" } else { "" }
             );
 
-            let mut best_hps = 0.0f64;
-            let mut best_profit = 0.0f64;
-            let mut best_hps_profile = profiles[0];
-            let mut best_profit_profile = profiles[0];
+            let min_tier = min_profile_tier_for_mode(cnf.efficiency.mode);
+            let mut bench_results: Vec<ProfileBenchResult> = Vec::new();
 
             for profile in profiles {
                 let (wg, us) = profile_tuning(profile);
-                let wg_eff = cnf.runtime.workgroups(opencl.workgroups.min(wg));
+                let wg_eff = opencl.workgroups.min(wg);
                 let hps = bench_block_hps(opencl, cnf, wg_eff, us, per);
                 let watts = cnf.efficiency.estimate_gpu_watts(profile);
                 let kh_per_j = if watts > 0.0 {
@@ -997,6 +438,13 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                 } else {
                     0.0
                 };
+                if hps <= 0.0 {
+                    println!(
+                        "[benchmark] dev{} {}: SKIPPED (OOM/failed, wg={})",
+                        dev_i, profile, wg_eff
+                    );
+                    continue;
+                }
                 println!(
                     "[benchmark] dev{} {}: {} ({:.1} kH/J, wg={})",
                     dev_i,
@@ -1005,20 +453,15 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                     kh_per_j,
                     wg_eff
                 );
-                if hps > best_hps {
-                    best_hps = hps;
-                    best_hps_profile = profile;
-                }
-                if kh_per_j > best_profit {
-                    best_profit = kh_per_j;
-                    best_profit_profile = profile;
-                }
+                bench_results.push(ProfileBenchResult {
+                    profile,
+                    hps,
+                    kh_per_j,
+                });
             }
 
-            let base_profile = match cnf.efficiency.mode {
-                EfficiencyMode::Max => best_hps_profile,
-                _ => best_profit_profile,
-            };
+            let base_profile =
+                pick_benchmark_profile(&bench_results, cnf.efficiency.mode, opencl.vendor, min_tier);
             let (base_wg, us) = profile_tuning(base_profile);
             let mut pick = BenchmarkPick::from_profile(base_profile);
 
@@ -1037,7 +480,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                     per_wg
                 );
                 for wg_try in candidates {
-                    let wg_eff = cnf.runtime.workgroups(opencl.workgroups.min(wg_try));
+                    let wg_eff = opencl.workgroups.min(wg_try);
                     let hps = bench_block_hps(opencl, cnf, wg_eff, us, per_wg);
                     println!(
                         "[benchmark] dev{} wg={}: {}",
@@ -1045,12 +488,14 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                         wg_eff,
                         rates_to_show(hps)
                     );
-                    if hps > best_sweep_hps {
+                    if hps > 0.0 && hps > best_sweep_hps {
                         best_sweep_hps = hps;
                         best_sweep_wg = wg_eff;
                     }
                 }
-                pick.workgroups = best_sweep_wg;
+                if best_sweep_hps > 0.0 {
+                    pick.workgroups = best_sweep_wg;
+                }
 
                 let us_candidates =
                     sweep_unitsize_candidates(pick.unitsize, opencl.allocated_unitsize);
@@ -1071,12 +516,14 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                         us_try,
                         rates_to_show(hps)
                     );
-                    if hps > best_us_hps {
+                    if hps > 0.0 && hps > best_us_hps {
                         best_us_hps = hps;
                         best_us = us_try;
                     }
                 }
-                pick.unitsize = best_us;
+                if best_us_hps > 0.0 {
+                    pick.unitsize = best_us;
+                }
             }
 
             println!(
@@ -1089,11 +536,17 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             );
 
             if dev_i == 0 {
-                match apply_benchmark_pick(config_path, &pick) {
-                    Ok(()) => {
-                        println!("[benchmark] Config updated — restart mining with the new tuning.")
+                if bench_results.iter().any(|r| r.hps > 0.0) {
+                    match apply_benchmark_pick(config_path, &pick) {
+                        Ok(()) => {
+                            println!("[benchmark] Config updated — restart mining with the new tuning.")
+                        }
+                        Err(e) => println!("[benchmark] Could not patch ini: {}", e),
                     }
-                    Err(e) => println!("[benchmark] Could not patch ini: {}", e),
+                } else {
+                    println!(
+                        "[benchmark] No successful profiles — config unchanged (check OpenCL driver / work_groups cap)."
+                    );
                 }
             }
         }
@@ -1111,8 +564,12 @@ mod tests {
         let nonce_start = 11u32;
         let nonce_space = 256u32;
 
-        let (best_nonce, best_hash) =
-            do_group_block_mining(height, block_intro.clone(), nonce_start, nonce_space);
+        let (best_nonce, best_hash) = block_mining_runtime::do_group_block_mining(
+            height,
+            block_intro.clone(),
+            nonce_start,
+            nonce_space,
+        );
 
         let mut manual_nonce = 0u32;
         let mut manual_hash = [255u8; 32];
@@ -1120,7 +577,7 @@ mod tests {
         for nonce in nonce_start..nonce_start + nonce_space {
             intro[79..83].copy_from_slice(&nonce.to_be_bytes());
             let hx = x16rs::block_hash(height, &intro);
-            if hash_more_power(&hx, &manual_hash) {
+            if crate::hash_util::hash_more_power(&hx, &manual_hash) {
                 manual_hash = hx;
                 manual_nonce = nonce;
             }

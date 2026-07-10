@@ -1,6 +1,19 @@
-use x16rs::diamond_hash;
+//! OpenCL diamond mining kernel path (submodule of diaworker).
 
-fn do_diamond_group_mining_opencl(
+use field::{Address, DiamondName, DiamondNumber, Fixed8, Hash};
+use mint::action::DiamondMint;
+use mint::action::DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE;
+use x16rs::diamond_hash;
+use x16rs::calculate_hash;
+
+use crate::hash_util::diamond_more_power;
+use crate::opencl_gpu::{
+    enqueue_diamond_kernel, read_diamond_gpu_results, write_stuff_to_gpu, OpenCLResources,
+};
+
+use super::{check_diamer_success, DiamondMiningResult, HASH_WIDTH};
+
+pub(crate) fn do_diamond_group_mining_opencl(
     opencl: &OpenCLResources,
     number: u32,
     prevblockhash: &Hash,
@@ -60,7 +73,7 @@ fn do_diamond_group_mining_opencl(
     ) {
         Ok(ev) => ev,
         Err(e) => {
-            eprintln!("[OpenCL] diamond kernel failed: {}", e);
+            eprintln!("[OpenCL] diamond kernel failed: {}", e.display());
             most.gpu_batch_ok = false;
             return most;
         }
@@ -75,7 +88,7 @@ fn do_diamond_group_mining_opencl(
 
     for i in 0..num_work_groups as usize {
         let hash_bytes = &hashes[i * 32..(i * 32) + 32].try_into().unwrap();
-        let dia_str = diamond_hash(&hash_bytes);
+        let dia_str = diamond_hash(hash_bytes);
         let nonce_bytes = nonces[i].to_be_bytes();
         let stuff = [
             prevblockhash.as_slice(),
@@ -104,6 +117,15 @@ fn do_diamond_group_mining_opencl(
             most.u64_nonce = nonces[i];
         }
     }
+
+    if opencl.needs_queue_finish {
+        if let Err(e) = opencl.queue.finish() {
+            eprintln!("[OpenCL] diamond queue finish: {}", e);
+            most.gpu_batch_ok = false;
+            return most;
+        }
+    }
+
     most.gpu_batch_ok = true;
     most
 }

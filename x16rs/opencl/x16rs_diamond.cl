@@ -95,6 +95,18 @@ __kernel void x16rs_diamond(
     }          
     barrier(CLK_LOCAL_MEM_FENCE);
 
+#ifdef AMD_GFX_GFX1201
+    X16RS_RUN_REPEAT_LOOP(
+        local_id, local_size, unit_size, x16rs_repeat,
+        local_hashes, index, local_order,
+        histogram, starting_index, offset,
+        H_blake,
+        T0_G, T0_G, T0_G, T0_G,
+        AES0_C, AES1_C, AES2_C, AES3_C,
+        plain_T0, plain_T1, plain_T2, plain_T3, plain_T4, plain_T5, plain_T6, plain_T7,
+        mixtab0_c, mixtab1_c, mixtab2_c, mixtab3_c
+    );
+#else
     X16RS_RUN_REPEAT_LOOP(
         local_id, local_size, unit_size, x16rs_repeat,
         local_hashes, index, local_order,
@@ -105,6 +117,7 @@ __kernel void x16rs_diamond(
         LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7,
         mixtab0, mixtab1, mixtab2, mixtab3
     );
+#endif
     
     unsigned int best_hash = 0;
     diamond_t best_name;

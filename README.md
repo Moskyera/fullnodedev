@@ -18,7 +18,7 @@ After extract: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`*
 
 Official miners use **OpenCL** (AMD Radeon + Ryzen CPU).
 
-See **[docs/MINING-AMD.md](docs/MINING-AMD.md)** and `scripts/mining-amd/` for build scripts, GPU configs, and `list_opencl` device discovery.
+See **[docs/MINING-AMD.md](docs/MINING-AMD.md)** (Windows) and **[docs/MINING-LINUX.md](docs/MINING-LINUX.md)** (Linux) — `scripts/mining-amd/` build scripts, GPU configs, `list_opencl` device discovery.
 
 ### NVIDIA CUDA mining (experimental)
 

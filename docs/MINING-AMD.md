@@ -11,6 +11,18 @@ Community miners that only support NVIDIA CUDA are **separate projects** — thi
 | **HAC** (blocks) | `poworker` | SHA3-256 + x16rs PoW |
 | **HACD** (diamonds) | `diaworker` | SHA3-256 + x16rs + diamond filter |
 
+## Quick start (Linux)
+
+See **[MINING-LINUX.md](MINING-LINUX.md)** for full Debian/Ubuntu/ROCm setup.
+
+```bash
+chmod +x scripts/mining-amd/*.sh
+./scripts/mining-amd/build-amd-miner.sh
+./scripts/mining-amd/install-configs.sh
+./scripts/mining-amd/list-opencl-devices.sh
+./scripts/mining-amd/start-amd-hac-mining.sh
+```
+
 ## Quick start (Windows)
 
 **End users (GitHub Releases):**

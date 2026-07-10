@@ -1,4 +1,8 @@
-fn do_group_block_mining_opencl(
+use crate::gpu_oom::GpuBatchError;
+use crate::hash_util::hash_more_power;
+use crate::opencl_gpu::{enqueue_mining_kernel, read_block_gpu_results, write_stuff_to_gpu, OpenCLResources};
+
+pub fn do_group_block_mining_opencl(
     opencl: &OpenCLResources,
     height: u64,
     block_intro: Vec<u8>,
@@ -6,12 +10,13 @@ fn do_group_block_mining_opencl(
     num_work_groups: u32,
     local_work_size: u32,
     unit_size: u32,
-) -> std::result::Result<(u32, [u8; 32]), String> {
+) -> std::result::Result<(u32, [u8; 32]), GpuBatchError> {
     let mut most_nonce = 0u32;
     let mut most_hash = [255u8; 32];
     let repeat = x16rs::block_hash_repeat(height) as u32;
 
-    let write_event = write_stuff_to_gpu(opencl, &block_intro, None)?;
+    let write_event = write_stuff_to_gpu(opencl, &block_intro, None)
+        .map_err(|e| GpuBatchError::from_message(&e))?;
 
     let kernel_event = enqueue_mining_kernel(
         opencl,
@@ -25,7 +30,8 @@ fn do_group_block_mining_opencl(
 
     let mut hashes = vec![0u8; opencl.buffer_best_hashes.len()];
     let mut nonces = vec![0u32; opencl.buffer_best_nonces.len()];
-    read_block_gpu_results(opencl, &kernel_event, &mut hashes, &mut nonces)?;
+    read_block_gpu_results(opencl, &kernel_event, &mut hashes, &mut nonces)
+        .map_err(|e| GpuBatchError::from_message(&e))?;
 
     for i in 0..num_work_groups as usize {
         let hash_bytes = &hashes[i * 32..(i * 32) + 32];
@@ -33,6 +39,13 @@ fn do_group_block_mining_opencl(
             most_hash.copy_from_slice(hash_bytes);
             most_nonce = nonces[i];
         }
+    }
+
+    if opencl.needs_queue_finish {
+        opencl
+            .queue
+            .finish()
+            .map_err(|e| GpuBatchError::from_message(&format!("queue finish: {}", e)))?;
     }
 
     Ok((most_nonce, most_hash))

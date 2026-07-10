@@ -120,8 +120,10 @@
 
 // AES table - the other three are generated on the fly
 
-#ifdef __CUDA__
+#if defined(__CUDA__)
 __constant__ static const sph_u32 AES0_C[256] = {
+#elif defined(AMD_GFX_GFX1201)
+__constant static const sph_u32 AES0_C[256] = {
 #else
 static const sph_u32 AES0_C[256] = {
 #endif
@@ -191,7 +193,11 @@ static const sph_u32 AES0_C[256] = {
 	AESx(0xCBB0B07B), AESx(0xFC5454A8), AESx(0xD6BBBB6D), AESx(0x3A16162C)
 };
 
+#if defined(AMD_GFX_GFX1201)
+__constant static const sph_u32 AES1_C[256] = {
+#else
 static const sph_u32 AES1_C[256] = {
+#endif
 	AESx(0x6363C6A5), AESx(0x7C7CF884), AESx(0x7777EE99), AESx(0x7B7BF68D),
 	AESx(0xF2F2FF0D), AESx(0x6B6BD6BD), AESx(0x6F6FDEB1), AESx(0xC5C59154),
 	AESx(0x30306050), AESx(0x01010203), AESx(0x6767CEA9), AESx(0x2B2B567D),
@@ -258,7 +264,11 @@ static const sph_u32 AES1_C[256] = {
 	AESx(0xB0B07BCB), AESx(0x5454A8FC), AESx(0xBBBB6DD6), AESx(0x16162C3A)
 };
 
+#if defined(AMD_GFX_GFX1201)
+__constant static const sph_u32 AES2_C[256] = {
+#else
 static const sph_u32 AES2_C[256] = {
+#endif
 	AESx(0x63C6A563), AESx(0x7CF8847C), AESx(0x77EE9977), AESx(0x7BF68D7B),
 	AESx(0xF2FF0DF2), AESx(0x6BD6BD6B), AESx(0x6FDEB16F), AESx(0xC59154C5),
 	AESx(0x30605030), AESx(0x01020301), AESx(0x67CEA967), AESx(0x2B567D2B),
@@ -325,7 +335,11 @@ static const sph_u32 AES2_C[256] = {
 	AESx(0xB07BCBB0), AESx(0x54A8FC54), AESx(0xBB6DD6BB), AESx(0x162C3A16)
 };
 
+#if defined(AMD_GFX_GFX1201)
+__constant static const sph_u32 AES3_C[256] = {
+#else
 static const sph_u32 AES3_C[256] = {
+#endif
 	AESx(0xC6A56363), AESx(0xF8847C7C), AESx(0xEE997777), AESx(0xF68D7B7B),
 	AESx(0xFF0DF2F2), AESx(0xD6BD6B6B), AESx(0xDEB16F6F), AESx(0x9154C5C5),
 	AESx(0x60503030), AESx(0x02030101), AESx(0xCEA96767), AESx(0x567D2B2B),

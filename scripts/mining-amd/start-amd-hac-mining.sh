@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+RUN_DIR="$REPO_ROOT/target/release"
+[[ -x "$RUN_DIR/poworker" ]] || RUN_DIR="$REPO_ROOT/target/debug"
+
+if [[ ! -x "$RUN_DIR/poworker" ]]; then
+  echo "poworker not found. Run build-amd-miner.sh first."
+  exit 1
+fi
+
+if [[ ! -f "$RUN_DIR/poworker.config.ini" ]]; then
+  echo "Missing poworker.config.ini — running install-configs.sh ..."
+  "$SCRIPT_DIR/install-configs.sh"
+fi
+
+echo "Starting HAC block miner from $RUN_DIR"
+echo "Requires fullnode RPC at connect= in poworker.config.ini"
+echo
+cd "$RUN_DIR"
+exec ./poworker

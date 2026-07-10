@@ -146,6 +146,10 @@ pub struct Strings {
     pub dash_detail_connect: &'static str,
     pub dash_detail_wallet: &'static str,
     pub dash_detail_opencl: &'static str,
+    pub dash_detail_gpu_hashrate: &'static str,
+    pub dash_detail_effective_wg: &'static str,
+    pub dash_wg_breakdown_full: &'static str,
+    pub dash_wg_breakdown_simple: &'static str,
     pub dash_detail_tuning: &'static str,
     pub dash_detail_power_cost: &'static str,
     pub dash_detail_max_temp: &'static str,
@@ -178,8 +182,55 @@ pub struct Strings {
     pub help_options_title: &'static str,
     pub cpu_only: &'static str,
     pub no_gpu: &'static str,
+    pub gpu_rdna4_badge: &'static str,
+    pub gpu_rdna4_hint: &'static str,
     pub label_language: &'static str,
     pub label_currency: &'static str,
+}
+
+fn apply_format_template(template: &str, args: &[String]) -> String {
+    let mut out = template.to_string();
+    for arg in args {
+        if let Some(idx) = out.find("{}") {
+            out.replace_range(idx..idx + 2, arg);
+        }
+    }
+    out
+}
+
+impl Strings {
+    pub fn wg_breakdown_display(
+        &self,
+        effective: u32,
+        configured: u32,
+        oom: u32,
+        thermal: u32,
+    ) -> String {
+        if oom > 0 || thermal > 0 {
+            apply_format_template(
+                self.dash_wg_breakdown_full,
+                &[
+                    effective.to_string(),
+                    configured.to_string(),
+                    if oom > 0 {
+                        oom.to_string()
+                    } else {
+                        self.dash_no_data.to_string()
+                    },
+                    if thermal > 0 {
+                        thermal.to_string()
+                    } else {
+                        self.dash_no_data.to_string()
+                    },
+                ],
+            )
+        } else {
+            apply_format_template(
+                self.dash_wg_breakdown_simple,
+                &[effective.to_string(), configured.to_string()],
+            )
+        }
+    }
 }
 
 pub fn strings(lang: Lang) -> Strings {
@@ -262,6 +313,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / pool",
             dash_detail_wallet: "Reward wallet",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "GPU hashrate",
+            dash_detail_effective_wg: "Effective work groups",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · thermal {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "GPU tuning",
             dash_detail_power_cost: "Power cost",
             dash_detail_max_temp: "Max GPU temp",
@@ -294,6 +349,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Options reference (panel + .ini + executables)",
             cpu_only: "CPU only (no GPU)",
             no_gpu: "No GPU",
+            gpu_rdna4_badge: "RDNA4 — auto-tuned (WG 64)",
+            gpu_rdna4_hint: "RX 9070 XT uses work_groups=64 and unit_size=64 automatically. Save + Start Mining — no manual ini edits or extra scripts needed.",
             label_language: "Language:",
             label_currency: "Currency:",
         },
@@ -375,6 +432,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / pool",
             dash_detail_wallet: "Wallet ανταμοιβών",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "GPU hashrate",
+            dash_detail_effective_wg: "Effective work groups",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · thermal {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "GPU tuning",
             dash_detail_power_cost: "Κόστος ρεύματος",
             dash_detail_max_temp: "Μέγ. θερμ. GPU",
@@ -407,6 +468,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Αναφορά επιλογών (panel + .ini + executables)",
             cpu_only: "Μόνο CPU (χωρίς GPU)",
             no_gpu: "Χωρίς GPU",
+            gpu_rdna4_badge: "RDNA4 — αυτόματη ρύθμιση (WG 64)",
+            gpu_rdna4_hint: "Η RX 9070 XT χρησιμοποιεί αυτόματα work_groups=64 και unit_size=64. Αποθήκευση + Έναρξη mining — χωρίς χειροκίνητο ini ή επιπλέον scripts.",
             label_language: "Γλώσσα:",
             label_currency: "Νόμισμα:",
         },
@@ -488,6 +551,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / havuz",
             dash_detail_wallet: "Ödül cüzdanı",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "GPU hashrate",
+            dash_detail_effective_wg: "Etkin work groups",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · thermal {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "GPU ayarı",
             dash_detail_power_cost: "Elektrik maliyeti",
             dash_detail_max_temp: "Maks. GPU sıcaklığı",
@@ -520,6 +587,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Seçenekler referansı (panel + .ini + exe)",
             cpu_only: "Sadece CPU (GPU yok)",
             no_gpu: "GPU yok",
+            gpu_rdna4_badge: "RDNA4 — OpenCL kernel güncellemesi bekleniyor",
+            gpu_rdna4_hint: "work_groups=1024 geri yüklendi. CL_OUT_OF_RESOURCES x16rs OpenCL kernel sorunu (__local[256]) — gfx1201/RDNA4 için optimize build gerekli. local_size=256 zorunlu. Kernel güncellenene kadar burst ~3 MH/s mümkün.",
             label_language: "Dil:",
             label_currency: "Para birimi:",
         },
@@ -601,6 +670,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / 矿池",
             dash_detail_wallet: "奖励钱包",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "GPU 算力",
+            dash_detail_effective_wg: "有效工作组",
+            dash_wg_breakdown_full: "实际 {} / 配置 {} · OOM {} · 温控 {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "GPU 调优",
             dash_detail_power_cost: "电费",
             dash_detail_max_temp: "GPU 最高温度",
@@ -633,6 +706,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "选项参考（面板 + .ini + 可执行文件）",
             cpu_only: "仅 CPU（无 GPU）",
             no_gpu: "无 GPU",
+            gpu_rdna4_badge: "RDNA4 — 等待 OpenCL kernel 更新",
+            gpu_rdna4_hint: "已恢复 work_groups=1024。CL_OUT_OF_RESOURCES 源于 x16rs OpenCL kernel（__local[256]）— gfx1201/RDNA4 需优化构建。local_size 必须为 256。kernel 更新前可能有约 3 MH/s 突发。",
             label_language: "语言:",
             label_currency: "货币:",
         },
@@ -714,6 +789,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / プール",
             dash_detail_wallet: "報酬ウォレット",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "GPU ハッシュレート",
+            dash_detail_effective_wg: "実効ワークグループ",
+            dash_wg_breakdown_full: "実効 {} / 設定 {} · OOM {} · 温度 {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "GPU チューニング",
             dash_detail_power_cost: "電力コスト",
             dash_detail_max_temp: "GPU 最高温度",
@@ -746,6 +825,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "オプション一覧（パネル + .ini + 実行ファイル）",
             cpu_only: "CPU のみ（GPU なし）",
             no_gpu: "GPU なし",
+            gpu_rdna4_badge: "RDNA4 — OpenCL kernel 更新待ち",
+            gpu_rdna4_hint: "work_groups=1024 に復元。CL_OUT_OF_RESOURCES は x16rs OpenCL kernel（__local[256]）の問題 — gfx1201/RDNA4 向け最適化が必要。local_size=256 必須。kernel 更新まで burst 約 3 MH/s の可能性。",
             label_language: "言語:",
             label_currency: "通貨:",
         },
@@ -827,6 +908,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / pool",
             dash_detail_wallet: "Wallet de recompensas",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "Hashrate GPU",
+            dash_detail_effective_wg: "Grupos de trabajo efectivos",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · térmico {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "Ajuste GPU",
             dash_detail_power_cost: "Coste eléctrico",
             dash_detail_max_temp: "Temp. máx. GPU",
@@ -859,6 +944,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Referencia de opciones (panel + .ini + ejecutables)",
             cpu_only: "Solo CPU (sin GPU)",
             no_gpu: "Sin GPU",
+            gpu_rdna4_badge: "RDNA4 — actualización de kernel OpenCL pendiente",
+            gpu_rdna4_hint: "work_groups=1024 restaurado. CL_OUT_OF_RESOURCES es un problema del kernel x16rs OpenCL (__local[256]) — gfx1201/RDNA4 necesita build optimizado. local_size=256 obligatorio. Bursts ~3 MH/s hasta actualizar el kernel.",
             label_language: "Idioma:",
             label_currency: "Moneda:",
         },
@@ -940,6 +1027,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / pool",
             dash_detail_wallet: "Wallet de récompense",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "Hashrate GPU",
+            dash_detail_effective_wg: "Groupes de travail effectifs",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · thermique {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "Réglage GPU",
             dash_detail_power_cost: "Coût électricité",
             dash_detail_max_temp: "Temp. max GPU",
@@ -972,6 +1063,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Référence des options (panel + .ini + exécutables)",
             cpu_only: "CPU seul (sans GPU)",
             no_gpu: "Sans GPU",
+            gpu_rdna4_badge: "RDNA4 — mise à jour du kernel OpenCL en attente",
+            gpu_rdna4_hint: "work_groups=1024 rétabli. CL_OUT_OF_RESOURCES vient du kernel x16rs OpenCL (__local[256]) — gfx1201/RDNA4 nécessite une build optimisée. local_size=256 obligatoire. Bursts ~3 MH/s possibles en attendant le kernel.",
             label_language: "Langue :",
             label_currency: "Devise :",
         },
@@ -1053,6 +1146,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / พูล",
             dash_detail_wallet: "กระเป๋ารางวัล",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "อัตราแฮช GPU",
+            dash_detail_effective_wg: "กลุ่มงานที่ใช้จริง",
+            dash_wg_breakdown_full: "ใช้จริง {} / ตั้งค่า {} · OOM {} · ความร้อน {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "ปรับแต่ง GPU",
             dash_detail_power_cost: "ค่าไฟ",
             dash_detail_max_temp: "อุณหภูมิ GPU สูงสุด",
@@ -1085,6 +1182,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "คู่มือตัวเลือก (แผง + .ini + โปรแกรม)",
             cpu_only: "CPU เท่านั้น (ไม่มี GPU)",
             no_gpu: "ไม่มี GPU",
+            gpu_rdna4_badge: "RDNA4 — รออัปเดต OpenCL kernel",
+            gpu_rdna4_hint: "คืนค่า work_groups=1024 แล้ว CL_OUT_OF_RESOURCES มาจาก kernel x16rs OpenCL (__local[256]) — gfx1201/RDNA4 ต้องมี build ที่ optimize local_size=256 จำเป็น burst ~3 MH/s ได้จนกว่า kernel จะอัปเดต",
             label_language: "ภาษา:",
             label_currency: "สกุลเงิน:",
         },
@@ -1166,6 +1265,10 @@ pub fn strings(lang: Lang) -> Strings {
             dash_detail_connect: "RPC / пул",
             dash_detail_wallet: "Кошелёк наград",
             dash_detail_opencl: "OpenCL",
+            dash_detail_gpu_hashrate: "Хешрейт GPU",
+            dash_detail_effective_wg: "Эффективные work groups",
+            dash_wg_breakdown_full: "eff {} / cfg {} · OOM {} · thermal {}",
+            dash_wg_breakdown_simple: "{} / {}",
             dash_detail_tuning: "Настройка GPU",
             dash_detail_power_cost: "Стоимость электричества",
             dash_detail_max_temp: "Макс. темп. GPU",
@@ -1198,6 +1301,8 @@ pub fn strings(lang: Lang) -> Strings {
             help_options_title: "Справочник опций (панель + .ini + exe)",
             cpu_only: "Только CPU (без GPU)",
             no_gpu: "Без GPU",
+            gpu_rdna4_badge: "RDNA4 — ожидается обновление OpenCL kernel",
+            gpu_rdna4_hint: "work_groups=1024 восстановлено. CL_OUT_OF_RESOURCES — проблема kernel x16rs OpenCL (__local[256]); gfx1201/RDNA4 нужна оптимизированная сборка. local_size=256 обязателен. До обновления kernel возможны burst ~3 MH/s.",
             label_language: "Язык:",
             label_currency: "Валюта:",
         },

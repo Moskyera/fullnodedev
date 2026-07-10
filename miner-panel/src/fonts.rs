@@ -68,6 +68,31 @@ pub fn setup_fonts(ctx: &egui::Context) {
         }
     }
 
+    if loaded.is_empty() {
+        const LINUX_FONTS: &[(&str, &str)] = &[
+            ("dejavu", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            (
+                "noto",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            ),
+            (
+                "liberation",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ),
+            (
+                "noto_cjk",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            ),
+        ];
+        for (key, path) in LINUX_FONTS {
+            let path = PathBuf::from(path);
+            if let Some(data) = load_font(&path, 0) {
+                fonts.font_data.insert(key.to_string(), data);
+                loaded.push(key);
+            }
+        }
+    }
+
     if !loaded.is_empty() {
         let family = fonts
             .families

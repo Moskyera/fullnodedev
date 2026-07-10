@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
-use std::sync::Arc;
+use std::sync::atomic::Ordering::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use basis::difficulty::rates_to_show;
@@ -155,112 +154,7 @@ impl EfficiencyConf {
     }
 }
 
-pub struct MiningRuntimeState {
-    pub base_workgroups: AtomicU32,
-    pub effective_workgroups: AtomicU32,
-    pub active_cpu_assist: AtomicU32,
-    pub gpu_errors: AtomicU32,
-    pub throttled: AtomicBool,
-    pub paused_unprofitable: AtomicBool,
-    pub adjust_counter: AtomicU64,
-}
-
-impl MiningRuntimeState {
-    pub fn new(workgroups: u32, active_cpu: u32) -> Arc<MiningRuntimeState> {
-        let wg = workgroups.max(1);
-        Arc::new(MiningRuntimeState {
-            base_workgroups: AtomicU32::new(wg),
-            effective_workgroups: AtomicU32::new(wg),
-            active_cpu_assist: AtomicU32::new(active_cpu.max(1)),
-            gpu_errors: AtomicU32::new(0),
-            throttled: AtomicBool::new(false),
-            paused_unprofitable: AtomicBool::new(false),
-            adjust_counter: AtomicU64::new(0),
-        })
-    }
-
-    pub fn workgroups(&self, configured: u32) -> u32 {
-        let eff = self.effective_workgroups.load(Relaxed).max(1);
-        eff.min(configured.max(1))
-    }
-
-    pub fn record_gpu_error(&self, configured: u32, oom_fallback: bool) -> u32 {
-        self.gpu_errors.fetch_add(1, Relaxed);
-        if !oom_fallback {
-            return self.workgroups(configured);
-        }
-        let cur = self.effective_workgroups.load(Relaxed).max(1);
-        let next = (cur / 2).max(256);
-        if next < cur {
-            eprintln!(
-                "[efficiency] OpenCL error — reducing work_groups {} -> {}",
-                cur, next
-            );
-            self.effective_workgroups.store(next, Relaxed);
-        }
-        next
-    }
-
-    pub fn apply_thermal_throttle(
-        &self,
-        max_temp_c: u32,
-        throttle_wg: u32,
-        thermal_file: &str,
-        gpu_index: u32,
-    ) -> bool {
-        if max_temp_c == 0 {
-            return false;
-        }
-        let Some(temp) = read_thermal_c_with_gpu(thermal_file, gpu_index) else {
-            return self.throttled.load(Relaxed);
-        };
-        let temp_c = temp as u32;
-        if temp_c >= max_temp_c {
-            let wg = throttle_wg.max(256);
-            self.effective_workgroups.store(wg, Relaxed);
-            self.throttled.store(true, Relaxed);
-            return true;
-        }
-        if self.throttled.load(Relaxed) && temp_c + 5 < max_temp_c {
-            let base = self.base_workgroups.load(Relaxed).max(256);
-            self.effective_workgroups.store(base, Relaxed);
-            self.throttled.store(false, Relaxed);
-            println!(
-                "[efficiency] Thermal OK ({}C) — restored work_groups to {}",
-                temp_c, base
-            );
-        }
-        false
-    }
-
-    pub fn maybe_adjust_supervene(
-        &self,
-        eff: &EfficiencyConf,
-        gpu_nonce: u64,
-        cpu_nonce: u64,
-    ) {
-        if !eff.dynamic_supervene || eff.supervene_max == 0 {
-            return;
-        }
-        let n = self.adjust_counter.fetch_add(1, Relaxed);
-        if n % 12 != 0 {
-            return;
-        }
-        let total = gpu_nonce.saturating_add(cpu_nonce);
-        if total == 0 {
-            return;
-        }
-        let gpu_ratio = gpu_nonce as f64 / total as f64;
-        let cur = self.active_cpu_assist.load(Relaxed);
-        let min = eff.supervene_min.max(1);
-        let max = eff.supervene_max.max(min);
-        if gpu_ratio > 0.90 && cur > min {
-            self.active_cpu_assist.store(cur - 1, Relaxed);
-        } else if gpu_ratio < 0.70 && cur < max {
-            self.active_cpu_assist.store(cur + 1, Relaxed);
-        }
-    }
-}
+pub use crate::mining_runtime::MiningRuntimeState;
 
 pub fn resolve_gpu_tuning(sec_gpu: &HashMap<String, Option<String>>, eff: &EfficiencyConf) -> GpuTuning {
     let profile_ini = ini_must(sec_gpu, "gpu_profile", "");
@@ -312,6 +206,53 @@ pub fn profile_tuning(profile: &str) -> (u32, u32) {
         "nvidia_max" => (3584, 128),
         "intel_balanced" => (512, 128),
         _ => (1536, 96),
+    }
+}
+
+/// Aggressiveness tier for named gpu_profile presets (0=eco .. 4=max).
+pub fn profile_tier(profile: &str) -> i8 {
+    match profile {
+        "amd_eco" | "nvidia_eco" => 0,
+        "amd_balanced" | "nvidia_balanced" | "intel_balanced" => 1,
+        "amd_profit" | "nvidia_profit" => 2,
+        "amd_performance" | "nvidia_performance" => 3,
+        "amd_max" | "nvidia_max" => 4,
+        _ => 1,
+    }
+}
+
+/// Minimum profile tier autotune may pick for an efficiency mode.
+pub fn min_profile_tier_for_mode(mode: EfficiencyMode) -> i8 {
+    match mode {
+        EfficiencyMode::Eco => 0,
+        EfficiencyMode::Profit => 1,
+        EfficiencyMode::Max => 2,
+    }
+}
+
+pub fn tier_profile_for_vendor(vendor: crate::gpu_arch::GpuVendor, tier: i8) -> &'static str {
+    match vendor {
+        crate::gpu_arch::GpuVendor::Nvidia => match tier {
+            0 => "nvidia_eco",
+            1 => "nvidia_balanced",
+            2 => "nvidia_profit",
+            3 => "nvidia_performance",
+            _ => "nvidia_max",
+        },
+        crate::gpu_arch::GpuVendor::Intel => match tier {
+            0 => "intel_balanced",
+            1 => "intel_balanced",
+            2 => "intel_balanced",
+            3 => "intel_balanced",
+            _ => "intel_balanced",
+        },
+        _ => match tier {
+            0 => "amd_eco",
+            1 => "amd_balanced",
+            2 => "amd_profit",
+            3 => "amd_performance",
+            _ => "amd_max",
+        },
     }
 }
 
@@ -457,19 +398,33 @@ pub fn clamp_workgroups_for_vram(
     unitsize: u32,
     requested: u32,
 ) -> u32 {
+    clamp_workgroups_for_vram_with_floor(vram_bytes, localsize, unitsize, requested, 256)
+}
+
+pub fn clamp_workgroups_for_vram_with_floor(
+    vram_bytes: u64,
+    localsize: u32,
+    unitsize: u32,
+    requested: u32,
+    min_wg: u32,
+) -> u32 {
+    let floor = min_wg.max(1);
     if vram_bytes == 0 {
-        return requested.max(256);
+        return requested.max(floor);
     }
     let reserve = vram_bytes.saturating_mul(20) / 100;
     let budget = vram_bytes.saturating_sub(reserve).max(256 * 1024 * 1024);
-    let mut wg = requested.max(256);
-    while wg >= 256 {
+    let mut wg = requested.max(floor);
+    while wg >= floor {
         if estimate_vram_bytes(wg, localsize, unitsize) <= budget {
             return wg;
         }
-        wg /= 2;
+        if wg == floor {
+            break;
+        }
+        wg = (wg / 2).max(floor);
     }
-    256
+    floor
 }
 
 pub fn is_within_idle_schedule(start_hour: u32, end_hour: u32) -> bool {
@@ -746,140 +701,19 @@ mod tests {
         assert!(c.contains(&96));
         assert!(c.iter().all(|&us| us <= 128));
     }
-}
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct MiningStatsSnapshot {
-    pub status: String,
-    pub hashrate_hps: f64,
-    pub hashrate_display: String,
-    pub watts: f64,
-    pub kh_per_j: f64,
-    pub hac_per_day: f64,
-    pub network_pct: f64,
-    pub daily_cost_eur: f64,
-    pub daily_revenue_eur: f64,
-    pub daily_net_eur: f64,
-    pub height: u64,
-    pub gpu_profile: String,
-    pub active_cpu_threads: u32,
-    pub paused_unprofitable: bool,
-    /// `hac` or `hacd`
-    pub mining_kind: String,
-    pub diamond_number: u32,
-    pub diamond_best: String,
-    pub updated_unix_ms: u64,
-}
-
-pub fn build_mining_stats(
-    hashrate: f64,
-    hac_per_day: f64,
-    network_pct: f64,
-    eff: &EfficiencyConf,
-    profile: &str,
-    active_cpu: u32,
-    height: u64,
-    paused: bool,
-) -> MiningStatsSnapshot {
-    let gpu_w = eff.estimate_gpu_watts(profile);
-    let watts = gpu_w + active_cpu as f64 * eff.cpu_watts_per_thread;
-    let kh_per_j = if watts > 0.0 {
-        hashrate / watts / 1000.0
-    } else {
-        0.0
-    };
-    let daily_cost = eff.daily_power_cost_eur(profile, active_cpu);
-    let daily_revenue = hac_per_day * eff.hac_price;
-    let daily_net = daily_revenue - daily_cost;
-    let status = if paused {
-        "paused".to_string()
-    } else if hashrate > 0.0 {
-        "mining".to_string()
-    } else {
-        "idle".to_string()
-    };
-    MiningStatsSnapshot {
-        status,
-        hashrate_hps: hashrate,
-        hashrate_display: rates_to_show(hashrate),
-        watts,
-        kh_per_j,
-        hac_per_day,
-        network_pct,
-        daily_cost_eur: daily_cost,
-        daily_revenue_eur: daily_revenue,
-        daily_net_eur: daily_net,
-        height,
-        gpu_profile: profile.to_string(),
-        active_cpu_threads: active_cpu,
-        paused_unprofitable: paused,
-        mining_kind: "hac".to_string(),
-        diamond_number: 0,
-        diamond_best: String::new(),
-        updated_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+    #[test]
+    fn max_mode_requires_at_least_profit_tier() {
+        assert_eq!(min_profile_tier_for_mode(EfficiencyMode::Max), 2);
+        assert!(profile_tier("amd_profit") >= min_profile_tier_for_mode(EfficiencyMode::Max));
+        assert!(profile_tier("amd_eco") < min_profile_tier_for_mode(EfficiencyMode::Max));
     }
 }
 
-pub fn build_diamond_mining_stats(
-    hashrate: f64,
-    eff: &EfficiencyConf,
-    profile: &str,
-    active_cpu: u32,
-    diamond_number: u32,
-    diamond_best: &str,
-    paused: bool,
-) -> MiningStatsSnapshot {
-    let gpu_w = eff.estimate_gpu_watts(profile);
-    let watts = gpu_w + active_cpu as f64 * eff.cpu_watts_per_thread;
-    let kh_per_j = if watts > 0.0 {
-        hashrate / watts / 1000.0
-    } else {
-        0.0
-    };
-    let daily_cost = eff.daily_power_cost_eur(profile, active_cpu);
-    let status = if paused {
-        "paused".to_string()
-    } else if hashrate > 0.0 {
-        "mining".to_string()
-    } else {
-        "idle".to_string()
-    };
-    MiningStatsSnapshot {
-        status,
-        hashrate_hps: hashrate,
-        hashrate_display: rates_to_show(hashrate),
-        watts,
-        kh_per_j,
-        hac_per_day: 0.0,
-        network_pct: 0.0,
-        daily_cost_eur: daily_cost,
-        daily_revenue_eur: 0.0,
-        daily_net_eur: -daily_cost,
-        height: diamond_number as u64,
-        gpu_profile: profile.to_string(),
-        active_cpu_threads: active_cpu,
-        paused_unprofitable: paused,
-        mining_kind: "hacd".to_string(),
-        diamond_number,
-        diamond_best: diamond_best.to_string(),
-        updated_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-    }
-}
 
-pub fn write_mining_stats(path: &str, stats: &MiningStatsSnapshot) {
-    if path.is_empty() {
-        return;
-    }
-    if let Ok(json) = serde_json::to_string_pretty(stats) {
-        let _ = fs::write(path, json);
-    }
-}
+pub use crate::mining_stats::{
+    build_diamond_mining_stats, build_mining_stats, write_mining_stats, MiningStatsSnapshot,
+};
 
 pub fn should_pause_for_profit(
     eff: &EfficiencyConf,

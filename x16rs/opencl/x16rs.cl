@@ -3,8 +3,14 @@
 
 #ifndef __CUDA__
 #define OCL_AS_ULONG_UINT2_S10(v) as_ulong(as_uint2(v).s10)
+#ifdef AMD_GFX_GFX1201
+/* RDNA4: use __constant lookup tables — avoids ~34KB __local per work-group. */
+#define __local_array /**/
+#define OCL_LOCAL_PTR __constant
+#else
 #define __local_array __local
 #define OCL_LOCAL_PTR __local
+#endif
 #define X16RS_HASH_FN
 #else
 #define X16RS_HASH_FN __device__
@@ -136,6 +142,10 @@ typedef union ALIGN {
     }
 #endif
 
+#ifdef AMD_GFX_GFX1201
+#define X16RS_INIT_SHARED_TABLES(local_id, local_size) \
+    X16RS_DECLARE_H_BLAKE()
+#else
 #define X16RS_INIT_SHARED_TABLES(local_id, local_size) \
     X16RS_DECLARE_H_BLAKE(); \
     __local_array ulong ALIGN8 T0[256], T1[256], T2[256], T3[256]; \
@@ -165,6 +175,7 @@ typedef union ALIGN {
         mixtab3[i] = mixtab3_c[i]; \
     } \
     barrier(CLK_LOCAL_MEM_FENCE)
+#endif
 
 #define X16RS_RUN_REPEAT_LOOP(local_id, local_size, unit_size, x16rs_repeat, local_hashes, index, local_order, histogram, starting_index, offset, H_blake, T0, T1, T2, T3, AES0, AES1, AES2, AES3, LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7, mixtab0, mixtab1, mixtab2, mixtab3) \
     for (unsigned char r = 0; r < (x16rs_repeat); r++) { \
@@ -1157,7 +1168,7 @@ X16RS_HASH_FN void hash_x16rs_func_11(hash_32* hash32)
 }
 
 // fugue
-X16RS_HASH_FN void hash_x16rs_func_12(hash_32* hash, sph_u32* mixtab0, sph_u32* mixtab1, sph_u32* mixtab2, sph_u32* mixtab3)
+X16RS_HASH_FN void hash_x16rs_func_12(hash_32* hash, OCL_LOCAL_PTR const sph_u32* mixtab0, OCL_LOCAL_PTR const sph_u32* mixtab1, OCL_LOCAL_PTR const sph_u32* mixtab2, OCL_LOCAL_PTR const sph_u32* mixtab3)
 {  
   sph_u32 S00 = 0;
   sph_u32 S01 = 0;

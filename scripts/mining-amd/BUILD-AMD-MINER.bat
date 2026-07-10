@@ -41,9 +41,11 @@ echo.
 echo  OK: %REPO_ROOT%\target\release\poworker.exe
 echo      %REPO_ROOT%\target\release\diaworker.exe
 echo      %REPO_ROOT%\target\release\list_opencl.exe
+echo      %REPO_ROOT%\target\release\diagnose_opencl.exe
 echo.
 echo  Next: CONFIGURE-MINING.bat or INSTALL-CONFIGS.bat
 echo        LIST-OPENCL-DEVICES.bat
+echo        DIAGNOSE-AMD-GPU.bat  (driver / gfx1201 check)
 echo.
 pause
 exit /b 0

@@ -1,4 +1,6 @@
-use app::efficiency::{EfficiencyConf, EfficiencyMode, resolve_gpu_tuning};
+use app::efficiency::{EfficiencyMode, profile_tuning};
+use app::gpu_arch::{self, GpuVendor};
+use app::panel_tuning;
 
 #[derive(Clone)]
 pub struct CpuPreset {
@@ -11,9 +13,14 @@ pub struct GpuPreset {
     pub label: &'static str,
     pub slug: &'static str,
     pub profile: &'static str,
+    /// VRAM in GB — used for safe work_groups caps.
+    pub vram_gb: u8,
     /// Typical board power (W) for kH/J and profit estimates.
     pub watts: f64,
 }
+
+/// Effective OpenCL tuning written to poworker.config.ini by the panel.
+pub type ResolvedTuning = panel_tuning::ResolvedPanelTuning;
 
 pub fn cpu_presets() -> Vec<CpuPreset> {
     vec![
@@ -34,54 +41,73 @@ pub fn cpu_presets() -> Vec<CpuPreset> {
 
 pub fn gpu_presets() -> Vec<GpuPreset> {
     vec![
-        GpuPreset { label: "RX 6600 / 6600 XT (8GB)", slug: "rx6600", profile: "amd_balanced", watts: 130.0 },
-        GpuPreset { label: "RX 7600 (8GB)", slug: "rx7600", profile: "amd_balanced", watts: 165.0 },
-        GpuPreset { label: "RX 6700 XT (12GB)", slug: "rx6700xt", profile: "amd_performance", watts: 220.0 },
-        GpuPreset { label: "RX 6800 / 6800 XT (16GB)", slug: "rx6800xt", profile: "amd_performance", watts: 260.0 },
-        GpuPreset { label: "RX 7900 XT (20GB)", slug: "rx7900xt", profile: "amd_performance", watts: 300.0 },
-        GpuPreset { label: "RX 7900 XTX (24GB)", slug: "rx7900xtx", profile: "amd_max", watts: 355.0 },
-        GpuPreset { label: "RX 9070 XT (16GB)", slug: "rx9070xt", profile: "amd_performance", watts: 280.0 },
-        GpuPreset { label: "GTX 1660 / RTX 3060 (8GB)", slug: "rtx3060", profile: "nvidia_balanced", watts: 170.0 },
-        GpuPreset { label: "RTX 3060 Ti / 4060 (8GB)", slug: "rtx4060", profile: "nvidia_balanced", watts: 190.0 },
-        GpuPreset { label: "RTX 3070 / 4060 Ti (8-12GB)", slug: "rtx3070", profile: "nvidia_profit", watts: 220.0 },
-        GpuPreset { label: "RTX 3080 / 4070 (10-12GB)", slug: "rtx4070", profile: "nvidia_performance", watts: 250.0 },
-        GpuPreset { label: "RTX 4080 / 4090 (16GB+)", slug: "rtx4090", profile: "nvidia_max", watts: 320.0 },
-        GpuPreset { label: "RTX 5060 (8GB)", slug: "rtx5060", profile: "nvidia_balanced", watts: 150.0 },
-        GpuPreset { label: "RTX 5070 / 5070 Ti (12GB)", slug: "rtx5070", profile: "nvidia_performance", watts: 250.0 },
-        GpuPreset { label: "RTX 5080 (16GB)", slug: "rtx5080", profile: "nvidia_performance", watts: 320.0 },
-        GpuPreset { label: "RTX 5090 (32GB)", slug: "rtx5090", profile: "nvidia_max", watts: 450.0 },
-        GpuPreset { label: "No GPU", slug: "none", profile: "", watts: 0.0 },
+        GpuPreset { label: "RX 6600 / 6600 XT (8GB)", slug: "rx6600", profile: "amd_balanced", vram_gb: 8, watts: 130.0 },
+        GpuPreset { label: "RX 7600 (8GB)", slug: "rx7600", profile: "amd_balanced", vram_gb: 8, watts: 165.0 },
+        GpuPreset { label: "RX 6700 XT (12GB)", slug: "rx6700xt", profile: "amd_performance", vram_gb: 12, watts: 220.0 },
+        GpuPreset { label: "RX 6800 / 6800 XT (16GB)", slug: "rx6800xt", profile: "amd_performance", vram_gb: 16, watts: 260.0 },
+        GpuPreset { label: "RX 7900 XT (20GB)", slug: "rx7900xt", profile: "amd_performance", vram_gb: 20, watts: 300.0 },
+        GpuPreset { label: "RX 7900 XTX (24GB)", slug: "rx7900xtx", profile: "amd_max", vram_gb: 24, watts: 355.0 },
+        GpuPreset { label: "RX 9070 XT (16GB)", slug: "rx9070xt", profile: "amd_balanced", vram_gb: 16, watts: 280.0 },
+        GpuPreset { label: "GTX 1660 / RTX 3060 (8GB)", slug: "rtx3060", profile: "nvidia_balanced", vram_gb: 8, watts: 170.0 },
+        GpuPreset { label: "RTX 3060 Ti / 4060 (8GB)", slug: "rtx4060", profile: "nvidia_balanced", vram_gb: 8, watts: 190.0 },
+        GpuPreset { label: "RTX 3070 / 4060 Ti (8-12GB)", slug: "rtx3070", profile: "nvidia_profit", vram_gb: 12, watts: 220.0 },
+        GpuPreset { label: "RTX 3080 / 4070 (10-12GB)", slug: "rtx4070", profile: "nvidia_performance", vram_gb: 12, watts: 250.0 },
+        GpuPreset { label: "RTX 4080 / 4090 (16GB+)", slug: "rtx4090", profile: "nvidia_max", vram_gb: 24, watts: 320.0 },
+        GpuPreset { label: "RTX 5060 (8GB)", slug: "rtx5060", profile: "nvidia_balanced", vram_gb: 8, watts: 150.0 },
+        GpuPreset { label: "RTX 5070 / 5070 Ti (12GB)", slug: "rtx5070", profile: "nvidia_performance", vram_gb: 12, watts: 250.0 },
+        GpuPreset { label: "RTX 5080 (16GB)", slug: "rtx5080", profile: "nvidia_performance", vram_gb: 16, watts: 320.0 },
+        GpuPreset { label: "RTX 5090 (32GB)", slug: "rtx5090", profile: "nvidia_max", vram_gb: 32, watts: 450.0 },
+        GpuPreset { label: "No GPU", slug: "none", profile: "", vram_gb: 0, watts: 0.0 },
     ]
+}
+
+pub fn gpu_idx_for_slug(gpus: &[GpuPreset], slug: &str) -> Option<usize> {
+    gpus.iter().position(|g| g.slug == slug)
 }
 
 pub fn gpu_idx_for_profile(gpus: &[GpuPreset], profile: &str) -> Option<usize> {
     gpus.iter().position(|g| g.profile == profile)
 }
 
+pub fn is_rdna4_experimental(slug: &str) -> bool {
+    gpu_arch::ArchLimits::for_panel_slug(slug).is_experimental()
+}
+
+/// Resolve profile + work_groups + unit_size for a GPU preset and efficiency mode.
+pub fn resolve_panel_tuning(gpu: &GpuPreset, mode: EfficiencyMode) -> ResolvedTuning {
+    panel_tuning::resolve_panel_tuning(gpu.slug, gpu.profile, gpu.vram_gb, mode)
+}
+
+pub fn min_work_groups_for_gpu(slug: &str) -> u32 {
+    gpu_arch::panel_min_work_groups(slug)
+}
+
+/// Legacy helper — prefer `resolve_panel_tuning`.
 pub fn tuning_for_profile(profile: &str) -> (u32, u32) {
-    let eff = EfficiencyConf {
-        mode: EfficiencyMode::Profit,
-        power_cost_kwh: 0.15,
-        gpu_watts: 0.0,
-        cpu_watts_per_thread: 8.0,
-        hac_price: 0.0,
-        dynamic_supervene: true,
-        supervene_min: 2,
-        supervene_max: 0,
-        oom_fallback: true,
-        max_temp_c: 0,
-        throttle_workgroups: 1024,
-        thermal_file: String::new(),
-        idle_start_hour: 255,
-        idle_end_hour: 255,
-        pause_if_unprofitable: false,
-        benchmark_seconds: 0,
-        benchmark_fine_sweep: true,
-        thermal_gpu_index: 0,
-        stats_file: String::new(),
-    };
-    let mut sec = std::collections::HashMap::new();
-    sec.insert("gpu_profile".to_string(), Some(profile.to_string()));
-    let t = resolve_gpu_tuning(&sec, &eff);
-    (t.workgroups, t.unitsize)
+    profile_tuning(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu(slug: &str) -> GpuPreset {
+        gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == slug)
+            .unwrap_or_else(|| panic!("unknown slug {slug}"))
+    }
+
+    #[test]
+    fn rx9070xt_max_wg_capped() {
+        let t = resolve_panel_tuning(&gpu("rx9070xt"), EfficiencyMode::Max);
+        assert_eq!(t.work_groups, 64);
+        assert_eq!(t.unit_size, 64);
+    }
+
+    #[test]
+    fn rx7900xtx_max_wg_high() {
+        let t = resolve_panel_tuning(&gpu("rx7900xtx"), EfficiencyMode::Max);
+        assert!(t.work_groups >= 1024);
+    }
 }

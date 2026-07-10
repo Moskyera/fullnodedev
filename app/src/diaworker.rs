@@ -16,11 +16,17 @@ use mint::action::*;
 use mint::genesis::*;
 use sys::*;
 
-include! {"util.rs"}
+use crate::hash_util::diamond_more_power;
+
 #[cfg(feature = "ocl")]
-include! {"opencl_common.rs"}
+use crate::gpu_oom::GpuBatchError;
 #[cfg(feature = "ocl")]
-include! {"opencl_dia.rs"}
+use crate::opencl_gpu::{initialize_opencl, opencl_snapshot_from_resource, OpenclGpuHandle};
+#[cfg(feature = "ocl")]
+#[path = "opencl_dia.rs"]
+mod opencl_dia;
+#[cfg(feature = "ocl")]
+use opencl_dia::do_diamond_group_mining_opencl;
 
 /*************************************/
 
@@ -89,7 +95,7 @@ static MINING_DIAMOND_STUFF: LazyLock<RwLock<Hash>> = LazyLock::new(|| RwLock::d
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
-struct DiamondMiningResult {
+pub(crate) struct DiamondMiningResult {
     number: u32,
     nonce_start: u64,
     nonce_space: u64,
@@ -125,8 +131,10 @@ pub fn diaworker() {
 
     // Initialize OpenCL
     #[cfg(feature = "ocl")]
-    let opencl_resources: Vec<OpenCLResources> = if cnf.useopencl {
-        initialize_opencl(
+    let (scan, amd_icd_count, opencl_resources) = if cnf.useopencl {
+        let scan = crate::opencl_diag::scan_opencl();
+        let amd_icd_count = crate::opencl_diag::count_amd_platforms(&scan.platforms);
+        let resources = initialize_opencl(
             true,
             &cnf.opencldir,
             &cnf.platformid,
@@ -134,10 +142,20 @@ pub fn diaworker() {
             &cnf.workgroups,
             &cnf.localsize,
             &cnf.unitsize,
-        )
+            Some(&scan),
+            false,
+        );
+        (scan, amd_icd_count, resources)
     } else {
-        // No OpenCL miners
-        Vec::new()
+        (
+            crate::opencl_diag::OpenClScan {
+                platforms: Vec::new(),
+                warnings: Vec::new(),
+                recommended: None,
+            },
+            0usize,
+            Vec::new(),
+        )
     };
     // Calculate device/cpu quantity
     #[cfg(feature = "ocl")]
@@ -171,9 +189,20 @@ pub fn diaworker() {
         #[cfg(feature = "ocl")]
         {
             // Initialize OpenCL
-            println!("\n[Start] Create GPU diamond miner worker");
-            for (thrid, opencl_thread) in opencl_resources.into_iter().enumerate() {
-                let opencl_clone = Arc::new(opencl_thread);
+            println!("\n[Start] Create GPU diamond miner worker #{}.", opencl_resources.len());
+            for (thrid, resource) in opencl_resources.into_iter().enumerate() {
+                let vram = resource.vram_bytes;
+                let arch = resource.arch_slug.clone();
+                let gpu_snapshot = opencl_snapshot_from_resource(
+                    &resource,
+                    true,
+                    &cnf.opencldir,
+                    cnf.localsize,
+                    cnf.unitsize,
+                    amd_icd_count,
+                );
+                let gpu = OpenclGpuHandle::new(resource, gpu_snapshot, scan.clone());
+                gpu.configure_oom_floor(vram, cnf.localsize, cnf.unitsize, cnf.workgroups, &arch);
                 let cnf2 = cnf.clone();
                 let rstx: mpsc::Sender<DiamondMiningResult> = res_tx.clone();
                 spawn(move || {
@@ -182,7 +211,7 @@ pub fn diaworker() {
                             &cnf2,
                             thrid,
                             rstx.clone(),
-                            opencl_clone.clone(),
+                            gpu.clone(),
                         );
                         delay_continue_ms!(9);
                     }
@@ -341,16 +370,26 @@ fn deal_diamond_mining_results(
         most_diastr,
         cnf.gpu_profile
     );
-    let stats = build_diamond_mining_stats(
-        nonce_rates,
+    crate::mining_stats::emit_from_batch_aggregate(
+        &crate::mining_stats::BatchAggregate {
+            hashrate: nonce_rates,
+            hac_per_day: 0.0,
+            network_pct: 0.0,
+            height: deal_number as u64,
+            gpu_hashrate: nonce_rates,
+            cpu_hashrate: 0.0,
+            paused,
+        },
         &cnf.efficiency,
         &cnf.gpu_profile,
         active_cpu,
+        cnf.workgroups,
+        &cnf.runtime,
+        "hacd",
         deal_number,
         &most_diastr,
-        paused,
+        &cnf.efficiency.stats_file,
     );
-    write_mining_stats(&cnf.efficiency.stats_file, &stats);
 
     // print next
     may_print_turn_to_nex_diamond_mining(deal_number, Some(most_dia_str));
@@ -450,7 +489,7 @@ fn run_diamond_worker_thread_opencl(
     cnf: &DiaWorkConf,
     _thrid: usize,
     result_ch_tx: mpsc::Sender<DiamondMiningResult>,
-    opencl: Arc<OpenCLResources>,
+    gpu: std::sync::Arc<OpenclGpuHandle>,
 ) {
     if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
         delay_return_ms!(2000);
@@ -471,38 +510,41 @@ fn run_diamond_worker_thread_opencl(
     let mut nonce_start = 0;
 
     loop {
-        let wg_eff = cnf
-            .runtime
-            .workgroups(opencl.workgroups.min(cnf.workgroups));
-        let gpu_nonce_space = (wg_eff as u64)
+        let wg_cap = gpu.workgroups(cnf.workgroups, cnf.runtime.thermal_workgroups_cap());
+        let gpu_nonce_space = (wg_cap as u64)
             .saturating_mul(cnf.localsize as u64)
             .saturating_mul(cnf.unitsize as u64);
         let ctn = Instant::now();
-        let mut result = do_diamond_group_mining_opencl(
-            &opencl,
-            current_mining_number,
-            &current_mining_block_hash,
-            &rwd_addr,
-            &custom_nonce,
-            nonce_start,
-            gpu_nonce_space,
-            wg_eff,
-            cnf.localsize,
-            cnf.unitsize,
-        );
+        let mut result = {
+            let opencl = gpu.lock_resources();
+            do_diamond_group_mining_opencl(
+                &opencl,
+                current_mining_number,
+                &current_mining_block_hash,
+                &rwd_addr,
+                &custom_nonce,
+                nonce_start,
+                gpu_nonce_space,
+                wg_cap,
+                cnf.localsize,
+                cnf.unitsize,
+            )
+        };
         result.is_gpu = true;
         result.nonce_space = gpu_nonce_space;
         let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
         result.use_secs = use_secs;
         if !result.gpu_batch_ok {
-            let wg_cap = cnf
-                .runtime
-                .workgroups(opencl.workgroups.min(cnf.workgroups));
-            cnf.runtime
-                .record_gpu_error(wg_cap, cnf.efficiency.oom_fallback);
+            gpu.on_batch_error(
+                GpuBatchError::Other("diamond OpenCL batch failed".into()),
+                cnf.efficiency.oom_fallback,
+                cnf.workgroups,
+                &cnf.runtime,
+            );
             delay_return_ms!(50);
             return;
         }
+        gpu.on_batch_success(cnf.workgroups, &cnf.runtime);
         result_ch_tx.send(result).unwrap();
 
         let ns = nonce_start.checked_add(gpu_nonce_space);
@@ -581,7 +623,7 @@ fn do_diamond_group_mining(
     most
 }
 
-fn check_diamer_success(
+pub(crate) fn check_diamer_success(
     number: u32,
     firhx: [u8; HASH_WIDTH],
     resxh: [u8; HASH_WIDTH],
@@ -745,6 +787,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
             return;
         }
         println!("[benchmark] HACD: GPU tuning uses same profiles as HAC — run poworker benchmark or share ini.");
+        let scan = crate::opencl_diag::scan_opencl();
         let opencl_resources = initialize_opencl(
             true,
             &cnf.opencldir,
@@ -753,6 +796,8 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
             &cnf.workgroups,
             &cnf.localsize,
             &cnf.unitsize,
+            Some(&scan),
+            false,
         );
         if opencl_resources.is_empty() {
             return;
@@ -769,7 +814,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
         let msg = Hash::default();
         for profile in profiles {
             let (wg, us) = profile_tuning(profile);
-            let wg_eff = cnf.runtime.workgroups(opencl.workgroups.min(wg));
+            let wg_eff = opencl.workgroups.min(wg);
             let batch = wg_eff as u64 * cnf.localsize as u64 * us as u64;
             let deadline = Instant::now() + Duration::from_secs(per);
             let mut total = 0u64;

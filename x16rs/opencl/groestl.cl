@@ -24,36 +24,10 @@
 	#define B64_7(x)    (amd_bfe((uint)((x) >> 32U), 24U, 8U))
 #endif
 
-__inline__ ulong groestl_rbtt(const ulong *Hval,
-                           int b0, int b1, int b2, int b3,
-                           int b4, int b5, int b6, int b7,
-                           OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
-                           OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
-{
-    return ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
-             OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
-             OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
-             OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
-             OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
-}
-
-__inline__ void groestl_rbtt_last(ulong *d, const ulong *Hval,
-                               int b0, int b1, int b2, int b3,
-                               int b4, int b5, int b6, int b7,
-                               OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
-                               OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
-{
-    *d ^= ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
-            OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
-            OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
-            OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
-            OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
-}
-
 #define PC64(j, r)  ((ulong)((j) | (r)))
 #define QC64(j, r)  rotate(((ulong)(r)) ^ (~((ulong)(j))), 56UL)
 
-static const __constant ulong T0_G[] =
+static const __constant ulong T0_G[256] =
 {
 	0xc6a597f4a5f432c6UL, 0xf884eb9784976ff8UL, 0xee99c7b099b05eeeUL, 0xf68df78c8d8c7af6UL, 
 	0xff0de5170d17e8ffUL, 0xd6bdb7dcbddc0ad6UL, 0xdeb1a7c8b1c816deUL, 0x915439fc54fc6d91UL, 
@@ -120,5 +94,55 @@ static const __constant ulong T0_G[] =
 	0x82c31f5ec35edc82UL, 0x29b052cbb0cbe229UL, 0x5a77b4997799c35aUL, 0x1e113c3311332d1eUL, 
 	0x7bcbf646cb463d7bUL, 0xa8fc4b1ffc1fb7a8UL, 0x6dd6da61d6610c6dUL, 0x2c3a584e3a4e622cUL
 };
+
+__inline__ ulong groestl_rbtt(const ulong *Hval,
+                           int b0, int b1, int b2, int b3,
+                           int b4, int b5, int b6, int b7,
+                           OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
+                           OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
+{
+#ifdef AMD_GFX_GFX1201
+    (void)T0; (void)T1; (void)T2; (void)T3;
+    return ( T0_G[B64_0(Hval[b0])] ^
+             rotate(T0_G[B64_1(Hval[b1])], 8UL) ^
+             rotate(T0_G[B64_2(Hval[b2])], 16UL) ^
+             rotate(T0_G[B64_3(Hval[b3])], 24UL) ^
+             OCL_AS_ULONG_UINT2_S10(T0_G[B64_4(Hval[b4])]) ^
+             OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_5(Hval[b5])], 8UL)) ^
+             OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_6(Hval[b6])], 16UL)) ^
+             OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_7(Hval[b7])], 24UL)) );
+#else
+    return ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
+             OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
+             OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
+             OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
+             OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
+#endif
+}
+
+__inline__ void groestl_rbtt_last(ulong *d, const ulong *Hval,
+                               int b0, int b1, int b2, int b3,
+                               int b4, int b5, int b6, int b7,
+                               OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
+                               OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
+{
+#ifdef AMD_GFX_GFX1201
+    (void)T0; (void)T1; (void)T2; (void)T3;
+    *d ^= ( T0_G[B64_0(Hval[b0])] ^
+            rotate(T0_G[B64_1(Hval[b1])], 8UL) ^
+            rotate(T0_G[B64_2(Hval[b2])], 16UL) ^
+            rotate(T0_G[B64_3(Hval[b3])], 24UL) ^
+            OCL_AS_ULONG_UINT2_S10(T0_G[B64_4(Hval[b4])]) ^
+            OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_5(Hval[b5])], 8UL)) ^
+            OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_6(Hval[b6])], 16UL)) ^
+            OCL_AS_ULONG_UINT2_S10(rotate(T0_G[B64_7(Hval[b7])], 24UL)) );
+#else
+    *d ^= ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
+            OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
+            OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
+            OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
+            OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
+#endif
+}
 
 #endif

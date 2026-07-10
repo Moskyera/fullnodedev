@@ -88,6 +88,22 @@ pub fn normalize_profile(profile: &str, vendor: GpuVendor) -> String {
 
 /// Scale work_groups from device compute-unit count (waves per CU).
 pub fn suggest_workgroups(requested: u32, compute_units: u32, vendor: GpuVendor) -> u32 {
+    tune_workgroups(requested, compute_units, vendor, ArchLimits::for_slug("gfx1100"))
+}
+
+/// Apply arch limits and CU scaling without forcing a 256 WG floor on RDNA4.
+pub fn tune_workgroups(
+    requested: u32,
+    compute_units: u32,
+    vendor: GpuVendor,
+    limits: ArchLimits,
+) -> u32 {
+    if limits.is_experimental() {
+        let cap = limits.workgroups_cap(requested.max(limits.panel_min_wg), 1);
+        let mut wg = requested.max(limits.panel_min_wg).min(cap);
+        wg = (wg / 32).max(1) * 32;
+        return wg.clamp(limits.panel_min_wg, cap);
+    }
     if compute_units == 0 {
         return requested.max(256);
     }
@@ -120,6 +136,110 @@ pub fn compile_defines(vendor: GpuVendor, slug: &str, amd_fast: bool) -> String 
         defs.push_str(&format!(" -DGPU_{}=1", slug.to_uppercase()));
     }
     defs
+}
+
+/// Per-architecture OpenCL tuning limits (single source of truth).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchLimits {
+    pub oom_floor_wg: u32,
+    pub init_buffer_floor_wg: u32,
+    pub panel_min_wg: u32,
+    pub oom_ramp_to_base: bool,
+}
+
+impl ArchLimits {
+    /// Map panel preset slug (e.g. rx9070xt) or OpenCL arch slug (e.g. gfx1201).
+    pub fn for_panel_slug(slug: &str) -> Self {
+        Self::for_slug(match slug {
+            "rx9070xt" => "gfx1201",
+            other => other,
+        })
+    }
+
+    pub fn for_slug(slug: &str) -> Self {
+        if slug == "gfx1201" {
+            Self {
+                oom_floor_wg: 32,
+                init_buffer_floor_wg: 32,
+                panel_min_wg: 32,
+                oom_ramp_to_base: false,
+            }
+        } else {
+            Self {
+                oom_floor_wg: 512,
+                init_buffer_floor_wg: 256,
+                panel_min_wg: 256,
+                oom_ramp_to_base: true,
+            }
+        }
+    }
+
+    /// RDNA4 / RX 9070 XT — kernel update pending; special OOM + panel treatment.
+    pub fn is_experimental(&self) -> bool {
+        !self.oom_ramp_to_base && self.oom_floor_wg == 32
+    }
+
+    /// Cap work_groups for experimental arches (matches panel_max_work_groups).
+    pub fn workgroups_cap(&self, requested: u32, _amd_icd_count: usize) -> u32 {
+        if self.is_experimental() {
+            requested.min(64)
+        } else {
+            requested
+        }
+    }
+
+    /// Drain AMD queue after each batch when RDNA4 or duplicate ICDs are present.
+    pub fn needs_amd_queue_finish(slug: &str, duplicate_amd_icd: bool) -> bool {
+        Self::for_slug(slug).is_experimental() || duplicate_amd_icd
+    }
+
+    /// Panel preset slug → max profile tier (0..=4).
+    pub fn panel_max_tier(panel_slug: &str) -> i8 {
+        match panel_slug {
+            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" => 2,
+            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" | "rtx5080" => 3,
+            "rx6800xt" | "rx7900xt" | "rx7900xtx" | "rtx4090" | "rtx5090" => 4,
+            "rx9070xt" => 3,
+            _ => 4,
+        }
+    }
+
+    /// Panel preset slug → max unit_size (live gfx1201/RDNA4 stable path).
+    pub fn panel_max_unit_size(panel_slug: &str) -> u32 {
+        if Self::for_panel_slug(panel_slug).is_experimental() {
+            64
+        } else {
+            128
+        }
+    }
+
+    /// Panel preset slug → max work_groups before profile tuning.
+    pub fn panel_max_work_groups(panel_slug: &str, vram_gb: u8) -> u32 {
+        let limits = Self::for_panel_slug(panel_slug);
+        if limits.is_experimental() {
+            return 64;
+        }
+        match panel_slug {
+            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" => 1024,
+            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" => 1536,
+            "rtx5080" => 1792,
+            "rx6800xt" | "rx7900xt" => 2048,
+            "rx7900xtx" => 4096,
+            "rtx4090" | "rtx5090" => 3584,
+            _ => match vram_gb {
+                0..=8 => 1024,
+                9..=12 => 1536,
+                13..=16 => 2048,
+                17..=24 => 3072,
+                _ => 4096,
+            },
+        }
+    }
+}
+
+/// Panel preset slug → minimum work_groups written to ini.
+pub fn panel_min_work_groups(gpu_slug: &str) -> u32 {
+    ArchLimits::for_panel_slug(gpu_slug).panel_min_wg
 }
 
 /// Sanitize device name for use in binary cache filenames.
@@ -168,5 +288,57 @@ mod tests {
         let wg = suggest_workgroups(4096, 64, GpuVendor::Amd);
         assert!(wg >= 256 && wg <= 4096);
         assert!(wg % 64 == 0);
+    }
+
+    #[test]
+    fn gfx1201_arch_limits() {
+        let lim = ArchLimits::for_slug("gfx1201");
+        assert_eq!(lim.oom_floor_wg, 32);
+        assert_eq!(lim.panel_min_wg, 32);
+        assert!(!lim.oom_ramp_to_base);
+    }
+
+    #[test]
+    fn default_arch_limits_use_256_floor() {
+        let lim = ArchLimits::for_slug("gfx1100");
+        assert_eq!(lim.oom_floor_wg, 512);
+        assert_eq!(lim.panel_min_wg, 256);
+        assert!(lim.oom_ramp_to_base);
+    }
+
+    #[test]
+    fn panel_min_work_groups_rx9070xt() {
+        assert_eq!(panel_min_work_groups("rx9070xt"), 32);
+        assert_eq!(panel_min_work_groups("rx7900xtx"), 256);
+    }
+
+    #[test]
+    fn gfx1201_workgroups_cap_with_duplicate_icd() {
+        let lim = ArchLimits::for_slug("gfx1201");
+        assert_eq!(lim.workgroups_cap(2048, 2), 64);
+        assert_eq!(lim.workgroups_cap(2048, 1), 64);
+        assert_eq!(lim.workgroups_cap(64, 1), 64);
+        assert_eq!(lim.workgroups_cap(32, 1), 32);
+    }
+
+    #[test]
+    fn gfx1201_tune_workgroups_respects_ini_not_256_floor() {
+        let lim = ArchLimits::for_slug("gfx1201");
+        assert_eq!(tune_workgroups(64, 32, GpuVendor::Amd, lim), 64);
+        assert_eq!(tune_workgroups(128, 32, GpuVendor::Amd, lim), 64);
+    }
+
+    #[test]
+    fn rx9070xt_panel_slug_maps_to_gfx1201_limits() {
+        let lim = ArchLimits::for_panel_slug("rx9070xt");
+        assert!(lim.is_experimental());
+        assert_eq!(lim.panel_min_wg, 32);
+    }
+
+    #[test]
+    fn needs_amd_queue_finish_for_gfx1201() {
+        assert!(ArchLimits::needs_amd_queue_finish("gfx1201", false));
+        assert!(!ArchLimits::needs_amd_queue_finish("gfx1100", false));
+        assert!(ArchLimits::needs_amd_queue_finish("gfx1100", true));
     }
 }

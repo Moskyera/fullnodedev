@@ -1,7 +1,12 @@
 fn main() {
     #[cfg(feature = "ocl")]
     {
-        app::opencl_list::list_opencl_devices();
+        let json = std::env::args().any(|a| a == "--json");
+        if json {
+            println!("{}", app::opencl_list::list_opencl_json());
+        } else {
+            app::opencl_list::list_opencl_devices();
+        }
     }
     #[cfg(not(feature = "ocl"))]
     {
