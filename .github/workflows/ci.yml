@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run app tests
-        run: cargo test -p app --lib --features ocl gpu_arch gpu_oom opencl_diag
+        run: cargo test -p app --lib --features ocl
 
   build-miner-panel:
     name: Build miner-panel (no OpenCL link)
@@ -44,7 +44,7 @@ jobs:
       - name: Build miners + fullnode
         run: cargo build --release --features ocl --bin poworker --bin diaworker --bin list_opencl --bin diagnose_opencl --bin hacash
       - name: Run app OpenCL unit tests
-        run: cargo test -p app --lib --features ocl gpu_arch gpu_oom opencl_diag panel_tuning
+        run: cargo test -p app --lib --features ocl
       - name: Build miner-panel (Linux GUI)
         run: cargo build --release -p miner-panel
       - name: Run miner-panel integration tests
