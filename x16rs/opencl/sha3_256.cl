@@ -1,6 +1,10 @@
 #ifndef SHA3_256_CL
 #define SHA3_256_CL
 
+#ifndef __CUDA__
+#define __inline__ inline
+#endif
+
 #define I64(x) x##UL
 #define le2me_64(x) (x)
 #define ROTL64(x, n) rotate(as_ulong(x), (n) & 0xFFFFFFFFFFFFFFFFUL)
@@ -20,7 +24,7 @@ __constant static const ulong keccak_round_constants[NumberOfRounds] = {
 };
 
 // Keccak pi() transformation
-static inline void keccak_pi(__generic ulong A[25])
+__inline__ void keccak_pi(__generic ulong A[25])
 {
 	ulong temp[25];
 
@@ -66,7 +70,7 @@ static inline void keccak_pi(__generic ulong A[25])
 	A[4 + (i)] ^= ~A0 & A1
 
 // Keccak chi() transformation
-static inline void keccak_chi(__generic ulong A[25])
+__inline__ void keccak_chi(__generic ulong A[25])
 {
 	ulong A0, A1;
 	CHI_STEP(0);
@@ -85,7 +89,7 @@ static inline void keccak_chi(__generic ulong A[25])
 	A[(i) + 20] ^= D[(i)]
 
 // Keccak theta() transformation
-static inline void keccak_theta(__generic ulong A[25])
+__inline__ void keccak_theta(__generic ulong A[25])
 {
 	ulong D[5];
 	D[0] = ROTL64(XORED_A(1), 1) ^ XORED_A(4);
@@ -100,7 +104,7 @@ static inline void keccak_theta(__generic ulong A[25])
 	THETA_STEP(4);
 }
 
-static inline void rhash_sha3_permutation(__generic ulong ALIGN state[25])
+__inline__ void rhash_sha3_permutation(__generic ulong ALIGN state[25])
 {
 	ulong temp_state[25];
 	for (unsigned round = 0; round < NumberOfRounds; round++)
@@ -147,7 +151,7 @@ static inline void rhash_sha3_permutation(__generic ulong ALIGN state[25])
 	}
 }
 
-inline void sha3_256_hash(const ulong *input, ulong *output)
+__inline__ void sha3_256_hash(const ulong *input, ulong *output)
 {	
 	ulong ALIGN hash[25] = {
 		le2me_64(input[ 0]),
@@ -175,7 +179,7 @@ inline void sha3_256_hash(const ulong *input, ulong *output)
 	output[3] = hash[3];
 }
 
-inline void sha3_256_hash_diamond(const ulong *input, ulong *output)
+__inline__ void sha3_256_hash_diamond(const ulong *input, ulong *output)
 {	
 	ulong ALIGN hash[25] = {
 		le2me_64(input[ 0]),

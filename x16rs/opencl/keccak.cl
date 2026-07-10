@@ -681,3 +681,7 @@ __constant static const sph_u64 RC[] = {
 
 #endif
 
+#ifdef __cplusplus
+}
+#endif
+

@@ -486,3 +486,7 @@ __constant static const sph_u32 RC44[8] = {
 
 #endif
 
+#ifdef __cplusplus
+}
+#endif
+

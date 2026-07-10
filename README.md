@@ -16,9 +16,15 @@ After extract: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`*
 
 ### AMD / Ryzen mining (HAC + HACD)
 
-Official miners use **OpenCL** (AMD Radeon + Ryzen CPU). Not CUDA.
+Official miners use **OpenCL** (AMD Radeon + Ryzen CPU).
 
 See **[docs/MINING-AMD.md](docs/MINING-AMD.md)** and `scripts/mining-amd/` for build scripts, GPU configs, and `list_opencl` device discovery.
+
+### NVIDIA CUDA mining (experimental)
+
+Native CUDA block miner for RTX GPUs — same fullnode RPC as OpenCL/CPU `poworker`.
+
+See **[docs/MINING-NVIDIA-CUDA.md](docs/MINING-NVIDIA-CUDA.md)** and `scripts/mining-nvidia/` (build, genesis GPU test, RTX handoff checklist).
 
 **Maintainers:** `git tag v0.4.0 && git push origin v0.4.0` → GitHub Actions builds both ZIPs (`.github/workflows/release.yml`).
 

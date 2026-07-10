@@ -24,30 +24,30 @@
 	#define B64_7(x)    (amd_bfe((uint)((x) >> 32U), 24U, 8U))
 #endif
 
-__inline inline ulong groestl_rbtt(const ulong *Hval,
+__inline__ ulong groestl_rbtt(const ulong *Hval,
                            int b0, int b1, int b2, int b3,
                            int b4, int b5, int b6, int b7,
-                           __local const ulong *T0, __local const ulong *T1,
-                           __local const ulong *T2, __local const ulong *T3)
+                           OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
+                           OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
 {
     return ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
-             as_ulong(as_uint2(T0[B64_4(Hval[b4])]).s10) ^
-             as_ulong(as_uint2(T1[B64_5(Hval[b5])]).s10) ^
-             as_ulong(as_uint2(T2[B64_6(Hval[b6])]).s10) ^
-             as_ulong(as_uint2(T3[B64_7(Hval[b7])]).s10) );
+             OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
+             OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
+             OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
+             OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
 }
 
-__inline inline void groestl_rbtt_last(ulong *d, const ulong *Hval,
+__inline__ void groestl_rbtt_last(ulong *d, const ulong *Hval,
                                int b0, int b1, int b2, int b3,
                                int b4, int b5, int b6, int b7,
-                               __local const ulong *T0, __local const ulong *T1,
-                               __local const ulong *T2, __local const ulong *T3)
+                               OCL_LOCAL_PTR const ulong *T0, OCL_LOCAL_PTR const ulong *T1,
+                               OCL_LOCAL_PTR const ulong *T2, OCL_LOCAL_PTR const ulong *T3)
 {
     *d ^= ( T0[B64_0(Hval[b0])] ^ T1[B64_1(Hval[b1])] ^ T2[B64_2(Hval[b2])] ^ T3[B64_3(Hval[b3])] ^
-            as_ulong(as_uint2(T0[B64_4(Hval[b4])]).s10) ^
-            as_ulong(as_uint2(T1[B64_5(Hval[b5])]).s10) ^
-            as_ulong(as_uint2(T2[B64_6(Hval[b6])]).s10) ^
-            as_ulong(as_uint2(T3[B64_7(Hval[b7])]).s10) );
+            OCL_AS_ULONG_UINT2_S10(T0[B64_4(Hval[b4])]) ^
+            OCL_AS_ULONG_UINT2_S10(T1[B64_5(Hval[b5])]) ^
+            OCL_AS_ULONG_UINT2_S10(T2[B64_6(Hval[b6])]) ^
+            OCL_AS_ULONG_UINT2_S10(T3[B64_7(Hval[b7])]) );
 }
 
 #define PC64(j, r)  ((ulong)((j) | (r)))

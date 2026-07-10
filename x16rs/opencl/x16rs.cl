@@ -1,6 +1,15 @@
 #ifndef X16RX_CL
 #define X16RX_CL
 
+#ifndef __CUDA__
+#define OCL_AS_ULONG_UINT2_S10(v) as_ulong(as_uint2(v).s10)
+#define __local_array __local
+#define OCL_LOCAL_PTR __local
+#define X16RS_HASH_FN
+#else
+#define X16RS_HASH_FN __device__
+#endif
+
 #if __ENDIAN_LITTLE__
   #define SPH_LITTLE_ENDIAN 1
 #else
@@ -24,7 +33,11 @@ typedef int sph_s32;
 #define SPH_ROTL32(x, n) rotate(as_uint(x), as_uint(n))
 #define SPH_ROTR32(x, n)   SPH_ROTL32(x, (32 - (n)))
 
+#ifdef __CUDA__
+#define SPH_C64(x)    ((sph_u64)(x ## ULL))
+#else
 #define SPH_C64(x)    ((sph_u64)(x ## UL))
+#endif
 #define SPH_T64(x) (as_ulong(x))
 #define SPH_ROTL64(x, n) rotate(as_ulong(x), (n) & 0xFFFFFFFFFFFFFFFFUL)
 #define SPH_ROTR64(x, n)   SPH_ROTL64(x, (64 - (n)))
@@ -63,8 +76,13 @@ typedef int sph_s32;
 #include "whirlpool.cl"
 #include "sha2_512.cl"
 
+#ifdef __CUDA__
+#define SWAP4(x) OCL_SWAP4((uint)(x))
+#define SWAP8(x) OCL_SWAP8((ulong)(x))
+#else
 #define SWAP4(x) as_uint(as_uchar4(x).wzyx)
 #define SWAP8(x) as_ulong(as_uchar8(x).s76543210)
+#endif
 
 #if SPH_BIG_ENDIAN
   #define DEC64E(x) (x)
@@ -105,6 +123,10 @@ typedef union ALIGN {
   unsigned char h1[16];
 } diamond_t;
 
+#ifdef __CUDA__
+#define X16RS_DECLARE_H_BLAKE() \
+    const sph_u64 * const H_blake = x16rs_d_H_blake
+#else
 #define X16RS_DECLARE_H_BLAKE() \
     __constant sph_u64 ALIGN H_blake[8] = { \
         SPH_C64(0x6A09E667F3BCC908), SPH_C64(0xBB67AE8584CAA73B), \
@@ -112,13 +134,14 @@ typedef union ALIGN {
         SPH_C64(0x510E527FADE682D1), SPH_C64(0x9B05688C2B3E6C1F), \
         SPH_C64(0x1F83D9ABFB41BD6B), SPH_C64(0x5BE0CD19137E2179) \
     }
+#endif
 
 #define X16RS_INIT_SHARED_TABLES(local_id, local_size) \
     X16RS_DECLARE_H_BLAKE(); \
-    __local ulong ALIGN8 T0[256], T1[256], T2[256], T3[256]; \
-    __local sph_u32 ALIGN32 AES0[256], AES1[256], AES2[256], AES3[256]; \
-    __local sph_u64 ALIGN64 LT0[256], LT1[256], LT2[256], LT3[256], LT4[256], LT5[256], LT6[256], LT7[256]; \
-    __local sph_u32 ALIGN64 mixtab0[256], mixtab1[256], mixtab2[256], mixtab3[256]; \
+    __local_array ulong ALIGN8 T0[256], T1[256], T2[256], T3[256]; \
+    __local_array sph_u32 ALIGN32 AES0[256], AES1[256], AES2[256], AES3[256]; \
+    __local_array sph_u64 ALIGN64 LT0[256], LT1[256], LT2[256], LT3[256], LT4[256], LT5[256], LT6[256], LT7[256]; \
+    __local_array sph_u32 ALIGN64 mixtab0[256], mixtab1[256], mixtab2[256], mixtab3[256]; \
     for (unsigned i = (local_id); i < 256; i += (local_size)) { \
         T0[i] = T0_G[i]; \
         T1[i] = rotate(T0[i], 8UL); \
@@ -228,7 +251,12 @@ typedef union ALIGN {
     }
 
 // blake
-void hash_x16rs_func_0(hash_32* hash, __constant sph_u64* H_blake)
+X16RS_HASH_FN void hash_x16rs_func_0(hash_32* hash,
+#ifdef __CUDA__
+    const sph_u64* H_blake)
+#else
+    __constant sph_u64* H_blake)
+#endif
 {
     sph_u64 H0 = H_blake[0], H1 = H_blake[1], H2 = H_blake[2], H3 = H_blake[3];
     sph_u64 H4 = H_blake[4], H5 = H_blake[5], H6 = H_blake[6], H7 = H_blake[7];
@@ -266,7 +294,7 @@ void hash_x16rs_func_0(hash_32* hash, __constant sph_u64* H_blake)
 }
 
 // bmw
-void hash_x16rs_func_1(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_1(hash_32* hash)
 {
     sph_u64 ALIGN64 BMW_H[16] = { BMW_IV512[0], BMW_IV512[1], BMW_IV512[2], BMW_IV512[3], BMW_IV512[4], BMW_IV512[5], BMW_IV512[6], BMW_IV512[7], BMW_IV512[8], BMW_IV512[9], BMW_IV512[10], BMW_IV512[11], BMW_IV512[12], BMW_IV512[13], BMW_IV512[14], BMW_IV512[15] };
 
@@ -503,7 +531,7 @@ void hash_x16rs_func_1(hash_32* hash)
 }
 
 // groestl
-void hash_x16rs_func_2(hash_32* ALIGN hash, __local const ulong* ALIGN T0, __local const ulong* ALIGN T1, __local const ulong* ALIGN T2, __local const ulong* ALIGN T3)
+X16RS_HASH_FN void hash_x16rs_func_2(hash_32* ALIGN hash, OCL_LOCAL_PTR const ulong* ALIGN T0, OCL_LOCAL_PTR const ulong* ALIGN T1, OCL_LOCAL_PTR const ulong* ALIGN T2, OCL_LOCAL_PTR const ulong* ALIGN T3)
 {
   ulong ALIGN M[16];
   ulong ALIGN G[16];
@@ -523,39 +551,39 @@ void hash_x16rs_func_2(hash_32* ALIGN hash, __local const ulong* ALIGN T0, __loc
   G[2] = (T0[B64_0(H[2])] ^ T1[B64_1(H[3])] ^ 14310125096367509925);
   G[3] = (T0[B64_0(H[3])] ^ 7133757133233952611);
   G[4] = 3669252037894537041;
-  G[5] = (230739945414771191 ^ as_ulong(as_uint2(T3[B64_7(H[0])]).s10));
-  G[6] = (2210698400969090538 ^ as_ulong(as_uint2(T3[B64_7(H[1])]).s10));
-  G[7] = (519542093484052467 ^ as_ulong(as_uint2(T3[B64_7(H[2])]).s10));
-  G[8] = (2633073143201150672 ^ as_ulong(as_uint2(T3[B64_7(H[3])]).s10));
+  G[5] = (230739945414771191 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[0])]));
+  G[6] = (2210698400969090538 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[1])]));
+  G[7] = (519542093484052467 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[2])]));
+  G[8] = (2633073143201150672 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[3])]));
   G[9] = 14954345047970975975;
-  G[10] = (as_ulong(as_uint2(T2[B64_6(H[0])]).s10) ^ 10015259800346600524);
-  G[11] = (as_ulong(as_uint2(T1[B64_5(H[0])]).s10) ^ as_ulong(as_uint2(T2[B64_6(H[1])]).s10) ^ 8126327043163178471);
-  G[12] = (as_ulong(as_uint2(T0[B64_4(H[0])]).s10) ^ as_ulong(as_uint2(T1[B64_5(H[1])]).s10) ^ as_ulong(as_uint2(T2[B64_6(H[2])]).s10) ^ 8058591818875624105);
-  G[13] = (T3[B64_3(H[0])]  ^ as_ulong(as_uint2(T0[B64_4(H[1])]).s10) ^ as_ulong(as_uint2(T1[B64_5(H[2])]).s10) ^ as_ulong(as_uint2(T2[B64_6(H[3])]).s10) ^ 1456122202456506289);
-  G[14] = (T2[B64_2(H[0])] ^ T3[B64_3(H[1])]  ^ as_ulong(as_uint2(T0[B64_4(H[2])]).s10) ^ as_ulong(as_uint2(T1[B64_5(H[3])]).s10) ^ 9849160040520025817);
-  G[15] = (T1[B64_1(H[0])] ^ T2[B64_2(H[1])] ^ T3[B64_3(H[2])]  ^ as_ulong(as_uint2(T0[B64_4(H[3])]).s10) ^ 269551315503033440);
+  G[10] = (OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[0])]) ^ 10015259800346600524);
+  G[11] = (OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[0])]) ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[1])]) ^ 8126327043163178471);
+  G[12] = (OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[0])]) ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[1])]) ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[2])]) ^ 8058591818875624105);
+  G[13] = (T3[B64_3(H[0])]  ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[1])]) ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[2])]) ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[3])]) ^ 1456122202456506289);
+  G[14] = (T2[B64_2(H[0])] ^ T3[B64_3(H[1])]  ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[2])]) ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[3])]) ^ 9849160040520025817);
+  G[15] = (T1[B64_1(H[0])] ^ T2[B64_2(H[1])] ^ T3[B64_3(H[2])]  ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[3])]) ^ 269551315503033440);
   
   H[0 ] = M[0] ^ QC64(0  << 4, 0);
   H[1 ] = M[1]  ^ QC64(1  << 4, 0);
   H[2 ] = M[2]  ^ QC64(2  << 4, 0);
   H[3 ] = M[3]  ^ QC64(3  << 4, 0);
   
-  M[0] = (T0[B64_0(H[1])] ^ T1[B64_1(H[3])] ^ as_ulong(as_uint2(T0[B64_4(H[0])]).s10) ^ as_ulong(as_uint2(T1[B64_5(H[2])]).s10) ^ 15705510229074032155);
-  M[1] = (T0[B64_0(H[2])] ^ as_ulong(as_uint2(T0[B64_4(H[1])]).s10) ^ as_ulong(as_uint2(T1[B64_5(H[3])]).s10) ^ 12170560161315398722);
-  M[2] = (T0[B64_0(H[3])] ^ as_ulong(as_uint2(T0[B64_4(H[2])]).s10) ^ 13825302525975853362);
-  M[3] = (as_ulong(as_uint2(T0[B64_4(H[3])]).s10) ^ 17601400094414895344);
+  M[0] = (T0[B64_0(H[1])] ^ T1[B64_1(H[3])] ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[0])]) ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[2])]) ^ 15705510229074032155);
+  M[1] = (T0[B64_0(H[2])] ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[1])]) ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[3])]) ^ 12170560161315398722);
+  M[2] = (T0[B64_0(H[3])] ^ OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[2])]) ^ 13825302525975853362);
+  M[3] = (OCL_AS_ULONG_UINT2_S10(T0[B64_4(H[3])]) ^ 17601400094414895344);
   M[4] = 10633925005790587395;
   M[5] = (T3[B64_3(H[0])] ^ 5422291237815970993);
   M[6] = (T3[B64_3(H[1])] ^ 12882214474931762256);
   M[7] = (T3[B64_3(H[2])] ^ 8216379176195919723);
   M[8] = (T3[B64_3(H[3])] ^ 14102764044196225910);
   M[9] = 6583109234331108644;
-  M[10] = (1591459941175030872 ^ as_ulong(as_uint2(T3[B64_7(H[0])]).s10));
-  M[11] = (T2[B64_2(H[0])] ^ 5645326093933893730 ^ as_ulong(as_uint2(T3[B64_7(H[1])]).s10));
-  M[12] = (T2[B64_2(H[1])] ^ 3203209520027427372 ^ as_ulong(as_uint2(T2[B64_6(H[0])]).s10) ^ as_ulong(as_uint2(T3[B64_7(H[2])]).s10));
-  M[13] = (T1[B64_1(H[0])] ^ T2[B64_2(H[2])] ^ 1597748913811508736 ^ as_ulong(as_uint2(T2[B64_6(H[1])]).s10) ^ as_ulong(as_uint2(T3[B64_7(H[3])]).s10));
-  M[14] = (T1[B64_1(H[1])] ^ T2[B64_2(H[3])] ^ as_ulong(as_uint2(T1[B64_5(H[0])]).s10) ^ as_ulong(as_uint2(T2[B64_6(H[2])]).s10) ^ 5214724303542560770);
-  M[15] = (T0[B64_0(H[0])] ^ T1[B64_1(H[2])] ^ as_ulong(as_uint2(T1[B64_5(H[1])]).s10) ^ as_ulong(as_uint2(T2[B64_6(H[3])]).s10) ^ 16053254594141210712);
+  M[10] = (1591459941175030872 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[0])]));
+  M[11] = (T2[B64_2(H[0])] ^ 5645326093933893730 ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[1])]));
+  M[12] = (T2[B64_2(H[1])] ^ 3203209520027427372 ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[0])]) ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[2])]));
+  M[13] = (T1[B64_1(H[0])] ^ T2[B64_2(H[2])] ^ 1597748913811508736 ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[1])]) ^ OCL_AS_ULONG_UINT2_S10(T3[B64_7(H[3])]));
+  M[14] = (T1[B64_1(H[1])] ^ T2[B64_2(H[3])] ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[0])]) ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[2])]) ^ 5214724303542560770);
+  M[15] = (T0[B64_0(H[0])] ^ T1[B64_1(H[2])] ^ OCL_AS_ULONG_UINT2_S10(T1[B64_5(H[1])]) ^ OCL_AS_ULONG_UINT2_S10(T2[B64_6(H[3])]) ^ 16053254594141210712);
 
   #pragma nounroll
 	for (int i = 1; i < 14; ++i)
@@ -686,7 +714,7 @@ void hash_x16rs_func_2(hash_32* ALIGN hash, __local const ulong* ALIGN T0, __loc
 }
 
 // jh
-void hash_x16rs_func_3(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_3(hash_32* hash)
 {
     sph_u64 h0h = C64e(0x6fd14b963e00aa17) ^ hash->h8[0], h0l = C64e(0x636a2e057a15d543) ^ hash->h8[1], h1h = C64e(0x8a225e8d0c97ef0b) ^ hash->h8[2], h1l = C64e(0xe9341259f2b3c361) ^ hash->h8[3], h2h = C64e(0x891da0c1536f801e) ^ SPH_C64(0x0000000000000080), h2l = C64e(0x2aa9056bea2b6d80), h3h = C64e(0x588eccdb2075baa6), h3l = C64e(0xa90f3a76baf83bf7);
     sph_u64 h4h = C64e(0x0169e60541e34a69), h4l = C64e(0x46b58a8e2e6fe65a), h5h = C64e(0x1047a7d0c1843c24), h5l = C64e(0x3b6e71b12d5ac199), h6h = C64e(0xcf57f6ec9db1f856), h6l = C64e(0xa706887c5716b156), h7h = C64e(0xe3c2fcdfe68517fb), h7l = C64e(0x545a4678cc8cdd4b);
@@ -709,7 +737,7 @@ void hash_x16rs_func_3(hash_32* hash)
 }
 
 // keccak
-void hash_x16rs_func_4(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_4(hash_32* hash)
 {
     sph_u64 a00 = hash->h8[0], a01 = 0, a02 = 0, a03 = 0, a04 = SPH_C64(0xFFFFFFFFFFFFFFFF);
     sph_u64 a10 = SPH_C64(0xFFFFFFFFFFFFFFFF) ^ hash->h8[1], a11 = 0, a12 = 0, a13 = 0, a14 = 0;
@@ -726,7 +754,7 @@ void hash_x16rs_func_4(hash_32* hash)
 }
 
 // skein
-void hash_x16rs_func_5(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_5(hash_32* hash)
 {
     // skein
     sph_u64 h0 = SPH_C64(0x4903ADFF749C51CE), h1 = SPH_C64(0x0D95DE399746DF03), 
@@ -766,7 +794,7 @@ void hash_x16rs_func_5(hash_32* hash)
 }
 
 // luffa
-void hash_x16rs_func_6(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_6(hash_32* hash)
 {
     sph_u32 V00 = SPH_C32(0x6d251e69), V01 = SPH_C32(0x44b051e0), V02 = SPH_C32(0x4eaa6fb4), V03 = SPH_C32(0xdbf78465), V04 = SPH_C32(0x6e292011), V05 = SPH_C32(0x90152df4), V06 = SPH_C32(0xee058139), V07 = SPH_C32(0xdef610bb);
     sph_u32 V10 = SPH_C32(0xc3b44b95), V11 = SPH_C32(0xd9d2f256), V12 = SPH_C32(0x70eee9a0), V13 = SPH_C32(0xde099fa3), V14 = SPH_C32(0x5d9b0557), V15 = SPH_C32(0x8fc944b3), V16 = SPH_C32(0xcf1ccf0e), V17 = SPH_C32(0x746cd581);
@@ -819,7 +847,7 @@ void hash_x16rs_func_6(hash_32* hash)
 }
 
 // cubehash
-void hash_x16rs_func_7(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_7(hash_32* hash)
 {
     sph_u32 x0 = SPH_C32(0x2AEA2A61) ^ hash->h4[0];
     sph_u32 x1 = SPH_C32(0x50F494D4) ^ hash->h4[1];
@@ -858,7 +886,7 @@ void hash_x16rs_func_7(hash_32* hash)
 }
 
 // shavite
-void hash_x16rs_func_8(hash_32* hash, __local const sph_u32* AES0, __local const sph_u32* AES1, __local const sph_u32* AES2, __local const sph_u32* AES3)
+X16RS_HASH_FN void hash_x16rs_func_8(hash_32* hash, OCL_LOCAL_PTR const sph_u32* AES0, OCL_LOCAL_PTR const sph_u32* AES1, OCL_LOCAL_PTR const sph_u32* AES2, OCL_LOCAL_PTR const sph_u32* AES3)
 {
     // IV
     sph_u32 h0 = SPH_C32(0x72FCCDD8), h1 = SPH_C32(0x79CA4727), h2 = SPH_C32(0x128A077B), h3 = SPH_C32(0x40D55AEC);
@@ -916,7 +944,7 @@ void hash_x16rs_func_8(hash_32* hash, __local const sph_u32* AES0, __local const
 }
 
 // simd
-void hash_x16rs_func_9(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_9(hash_32* hash)
 {
   s32 ALIGN32 q[256] = { 0 };
   unsigned char ALIGN x[128] = { 0 };
@@ -1037,7 +1065,7 @@ void hash_x16rs_func_9(hash_32* hash)
 }
 
 // echo
-void hash_x16rs_func_10(hash_32* hash, __local const sph_u32* AES0, __local const sph_u32* AES1, __local const sph_u32* AES2, __local const sph_u32* AES3)
+X16RS_HASH_FN void hash_x16rs_func_10(hash_32* hash, OCL_LOCAL_PTR const sph_u32* AES0, OCL_LOCAL_PTR const sph_u32* AES1, OCL_LOCAL_PTR const sph_u32* AES2, OCL_LOCAL_PTR const sph_u32* AES3)
 {
   sph_u64 W00, W01, W10, W11, W20, W21, W30, W31, W40, W41, W50, W51, W60, W61, W70, W71, W80, W81, W90, W91, WA0, WA1, WB0, WB1, WC0, WC1, WD0, WD1, WE0, WE1, WF0, WF1;
 
@@ -1070,7 +1098,7 @@ void hash_x16rs_func_10(hash_32* hash, __local const sph_u32* AES0, __local cons
 }
 
 // hamsi
-void hash_x16rs_func_11(hash_32* hash32)
+X16RS_HASH_FN void hash_x16rs_func_11(hash_32* hash32)
 {
   hash_t ALIGN hash = { 0 };
   for(int i = 0; i < 4; i++) {
@@ -1129,7 +1157,7 @@ void hash_x16rs_func_11(hash_32* hash32)
 }
 
 // fugue
-void hash_x16rs_func_12(hash_32* hash, sph_u32* mixtab0, sph_u32* mixtab1, sph_u32* mixtab2, sph_u32* mixtab3)
+X16RS_HASH_FN void hash_x16rs_func_12(hash_32* hash, sph_u32* mixtab0, sph_u32* mixtab1, sph_u32* mixtab2, sph_u32* mixtab3)
 {  
   sph_u32 S00 = 0;
   sph_u32 S01 = 0;
@@ -1228,7 +1256,7 @@ void hash_x16rs_func_12(hash_32* hash, sph_u32* mixtab0, sph_u32* mixtab1, sph_u
 }
 
 // shabal
-void hash_x16rs_func_13(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_13(hash_32* hash)
 {
   sph_u32 A00 = A_init_512[0], A01 = A_init_512[1], A02 = A_init_512[2], A03 = A_init_512[3], A04 = A_init_512[4], A05 = A_init_512[5], A06 = A_init_512[6], A07 = A_init_512[7],
   A08 = A_init_512[8], A09 = A_init_512[9], A0A = A_init_512[10], A0B = A_init_512[11];
@@ -1262,7 +1290,7 @@ void hash_x16rs_func_13(hash_32* hash)
 }
 
 // whirlpool
-void hash_x16rs_func_14(hash_32* hash, __local const sph_u64* ALIGN LT0, __local const sph_u64* ALIGN LT1, __local const sph_u64* ALIGN LT2, __local const sph_u64* ALIGN LT3, __local const sph_u64* ALIGN LT4, __local const sph_u64* ALIGN LT5, __local const sph_u64* ALIGN LT6, __local const sph_u64* ALIGN LT7)
+X16RS_HASH_FN void hash_x16rs_func_14(hash_32* hash, OCL_LOCAL_PTR const sph_u64* ALIGN LT0, OCL_LOCAL_PTR const sph_u64* ALIGN LT1, OCL_LOCAL_PTR const sph_u64* ALIGN LT2, OCL_LOCAL_PTR const sph_u64* ALIGN LT3, OCL_LOCAL_PTR const sph_u64* ALIGN LT4, OCL_LOCAL_PTR const sph_u64* ALIGN LT5, OCL_LOCAL_PTR const sph_u64* ALIGN LT6, OCL_LOCAL_PTR const sph_u64* ALIGN LT7)
 {
     sph_u64 n0 = hash->h8[0];
     sph_u64 n1 = hash->h8[1];
@@ -1333,7 +1361,7 @@ void hash_x16rs_func_14(hash_32* hash, __local const sph_u64* ALIGN LT0, __local
 }
 
 // sha2
-void hash_x16rs_func_15(hash_32* hash)
+X16RS_HASH_FN void hash_x16rs_func_15(hash_32* hash)
 {
     unsigned char ALIGN digest[32];
     easy_sha512(hash->h1, digest);

@@ -139,7 +139,7 @@ __constant static const sph_u32 T256[32][8] = {
 };
 
 #define INPUT_SMALL   do { \
-    __constant const sph_u32 *tp = &T256[0][0]; \
+    HAMSI_CONST_PTR tp = &T256[0][0]; \
     unsigned u, v; \
     m0 = 0; \
     m1 = 0; \
@@ -8758,7 +8758,7 @@ __constant const sph_u32 T512_W[1024] = {
 };
 
 #define INPUT_BIG   do { \
-    __constant const sph_u32 *tp = &T512[0][0]; \
+    HAMSI_CONST_PTR tp = &T512[0][0]; \
     unsigned u, v; \
     m0 = 0; \
     m1 = 0; \

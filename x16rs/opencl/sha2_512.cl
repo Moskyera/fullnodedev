@@ -1,6 +1,10 @@
 #ifndef SHA512_CL
 #define SHA512_CL
 
+#ifndef __CUDA__
+#define __inline__ inline
+#endif
+
 /*
  * Copyright (c) 2018, Jiamin Ma
  * Modified for Hacash x16rs by Ivan Martin
@@ -8,7 +12,11 @@
  */
 #ifndef UINT64_T_DEFINED
 #define UINT64_T_DEFINED
+#ifdef __CUDA__
+typedef ulong uint64_t;
+#else
 typedef unsigned long uint64_t;
+#endif
 #endif
 typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
@@ -22,7 +30,7 @@ typedef unsigned char uint8_t;
  * @param   idx         idx of the byte array.
  * @retval  void
  */
-static void inline sha512_encode(uint64_t input, uint8_t output[], uint32_t idx)
+__inline__ void sha512_encode(uint64_t input, uint8_t output[], uint32_t idx)
 {
     output[idx + 0] = (uint8_t)(input >> 56);
     output[idx + 1] = (uint8_t)(input >> 48);
@@ -41,7 +49,7 @@ static void inline sha512_encode(uint64_t input, uint8_t output[], uint32_t idx)
  * @param   idx         idx of the byte array.
  * @retval  void
  */
-static inline void sha512_decode(uint64_t *output, __generic uint8_t input[], uint32_t idx)
+__inline__ void sha512_decode(uint64_t *output, __generic uint8_t input[], uint32_t idx)
 {
     *output = ((uint64_t)input[idx + 0] << 56)
             | ((uint64_t)input[idx + 1] << 48)
@@ -122,7 +130,7 @@ __constant static const uint64_t K[80] =
 
 
 
-static inline void sha512_memcpy_sha512_padding(uint8_t *dst, uint32_t size)
+__inline__ void sha512_memcpy_sha512_padding(uint8_t *dst, uint32_t size)
 {
     uint32_t i = 0;
     for (;i < size;i++) {
@@ -130,7 +138,7 @@ static inline void sha512_memcpy_sha512_padding(uint8_t *dst, uint32_t size)
     }
 }
 
-static inline void sha512_memcpy(uint8_t *src, uint8_t *dst, uint32_t size)
+__inline__ void sha512_memcpy(uint8_t *src, uint8_t *dst, uint32_t size)
 {
     uint32_t i = 0;
     for (;i < size;i++) {
@@ -143,7 +151,7 @@ static inline void sha512_memcpy(uint8_t *src, uint8_t *dst, uint32_t size)
  * @param   sha512_ctx      SHA384/512 context
  * @param   payload         address of the hash payload
  */
-static inline void sha512_init(sha512_ctx_t *sha512_ctx, uint8_t *payload_addr)
+__inline__ void sha512_init(sha512_ctx_t *sha512_ctx, uint8_t *payload_addr)
 {
     sha512_ctx->val[0] = I64(0x6A09E667F3BCC908);
     sha512_ctx->val[1] = I64(0xBB67AE8584CAA73B);
@@ -164,7 +172,7 @@ static inline void sha512_init(sha512_ctx_t *sha512_ctx, uint8_t *payload_addr)
  * @param   sha512_ctx        context of the sha384/512
  * @param   data              hash block data, 1024 bits.
  */
-static void sha512_hash_factory(sha512_ctx_t *ctx, __generic uint8_t ALIGN data[128])
+__inline__ void sha512_hash_factory(sha512_ctx_t *ctx, __generic uint8_t ALIGN data[128])
 {
     uint32_t i = 0;
     uint64_t W[80];
@@ -216,7 +224,7 @@ static void sha512_hash_factory(sha512_ctx_t *ctx, __generic uint8_t ALIGN data[
  * @param   sha512_ctx        context of the sha384/512
  * @param   output            output of hash value
  */
-static void sha512_stage2(sha512_ctx_t *sha512_ctx,
+__inline__ void sha512_stage2(sha512_ctx_t *sha512_ctx,
         uint8_t output[32])
 {
 
@@ -251,7 +259,7 @@ static void sha512_stage2(sha512_ctx_t *sha512_ctx,
  * @param   payload         address of the hash payload
  * @param   hash            output of hash value
  */
-void easy_sha512_impl(uint8_t *payload,
+__inline__ void easy_sha512_impl(uint8_t *payload,
         uint8_t output[32])
 {
     sha512_ctx_t g_sha512_ctx;
@@ -264,7 +272,7 @@ void easy_sha512_impl(uint8_t *payload,
  * @param   payload         address of the hash payload
  * @param   hash            output of hash value
  */
-void easy_sha512(uint8_t *payload, uint8_t ALIGN hash[32])
+__inline__ void easy_sha512(uint8_t *payload, uint8_t ALIGN hash[32])
 {
     return easy_sha512_impl(payload, hash);
 }

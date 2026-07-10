@@ -813,8 +813,16 @@ __constant const sph_u32 T512_W[1024] = {
 	  SPH_C32(0xe7e00a94)
 };
 
+#ifdef __CUDA__
+#define HAMSI_CONST_PTR const sph_u32 *
+#define HAMSI_LOCAL_PTR sph_u32 *
+#else
+#define HAMSI_CONST_PTR __constant const sph_u32 *
+#define HAMSI_LOCAL_PTR __local sph_u32 *
+#endif
+
 #define INPUT_BIG   do { \
-		__constant const sph_u32 *tp = &T512[0][0]; \
+		HAMSI_CONST_PTR tp = &T512[0][0]; \
 		unsigned u, v; \
 		m0 = 0; \
 		m1 = 0; \
@@ -857,7 +865,7 @@ __constant const sph_u32 T512_W[1024] = {
 	} while (0)
 
 #define INPUT_BIG_LOCAL   do { \
-		__local sph_u32 *tp = &(T512_L[0]); \
+		HAMSI_LOCAL_PTR tp = &(T512_L[0]); \
 		unsigned u, v; \
 		m0 = 0; \
 		m1 = 0; \

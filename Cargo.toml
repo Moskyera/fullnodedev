@@ -23,6 +23,7 @@ members = [
     "db",
     "sys",
     "x16rs",
+    "x16rs-cuda",
 ]
 exclude = [
     "chainv1",
@@ -58,6 +59,7 @@ testkit        = {path = "./testkit"}
 [features]
 default = ["db-sled"] #, "ocl"]
 ocl = ["app/ocl"]
+cuda = ["app/cuda"]
 db-sled = ["db/db-sled"]
 db-rusty-leveldb = ["db/db-rusty-leveldb"]
 db-leveldb-sys = ["db/db-leveldb-sys"]

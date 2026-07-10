@@ -365,7 +365,3 @@ __constant static const sph_u64 BLAKE_IV512[8] = {
 #endif
 
 __constant static const sph_u64 salt_zero_big[4] = { 0, 0, 0, 0 };
-
-#ifdef __cplusplus
-}
-#endif

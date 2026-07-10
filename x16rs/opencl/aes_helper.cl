@@ -120,7 +120,11 @@
 
 // AES table - the other three are generated on the fly
 
+#ifdef __CUDA__
+__constant__ static const sph_u32 AES0_C[256] = {
+#else
 static const sph_u32 AES0_C[256] = {
+#endif
 	AESx(0xA56363C6), AESx(0x847C7CF8), AESx(0x997777EE), AESx(0x8D7B7BF6),
 	AESx(0x0DF2F2FF), AESx(0xBD6B6BD6), AESx(0xB16F6FDE), AESx(0x54C5C591),
 	AESx(0x50303060), AESx(0x03010102), AESx(0xA96767CE), AESx(0x7D2B2B56),
@@ -394,8 +398,26 @@ static const sph_u32 AES3_C[256] = {
 #define BYTE(x, y)  (amd_bfe((x), (y) << 3U, 8U))
 #endif
 
-uint4 AES_Round(const __local uint *AES0, const __local uint *AES1, const __local uint *AES2, const __local uint *AES3, const uint4 X, uint4 key)
+__inline__ uint4 AES_Round(const OCL_LOCAL_PTR uint *AES0, const OCL_LOCAL_PTR uint *AES1, const OCL_LOCAL_PTR uint *AES2, const OCL_LOCAL_PTR uint *AES3, const uint4 X, uint4 key)
 {
+#ifdef __CUDA__
+	key.x ^= AES0[BYTE(X.x, 0)];
+    key.y ^= AES0[BYTE(X.y, 0)];
+    key.z ^= AES0[BYTE(X.z, 0)];
+    key.w ^= AES0[BYTE(X.w, 0)];
+	key.x ^= AES2[BYTE(X.z, 2)];
+    key.y ^= AES2[BYTE(X.w, 2)];
+    key.z ^= AES2[BYTE(X.x, 2)];
+    key.w ^= AES2[BYTE(X.y, 2)];
+	key.x ^= AES1[BYTE(X.y, 1)];
+    key.y ^= AES1[BYTE(X.z, 1)];
+    key.z ^= AES1[BYTE(X.w, 1)];
+    key.w ^= AES1[BYTE(X.x, 1)];
+	key.x ^= AES3[BYTE(X.w, 3)];
+    key.y ^= AES3[BYTE(X.x, 3)];
+    key.z ^= AES3[BYTE(X.y, 3)];
+    key.w ^= AES3[BYTE(X.z, 3)];
+#else
 	key.s0 ^= AES0[BYTE(X.s0, 0)];
     key.s1 ^= AES0[BYTE(X.s1, 0)];
     key.s2 ^= AES0[BYTE(X.s2, 0)];
@@ -412,6 +434,7 @@ uint4 AES_Round(const __local uint *AES0, const __local uint *AES1, const __loca
     key.s1 ^= AES3[BYTE(X.s0, 3)];
     key.s2 ^= AES3[BYTE(X.s1, 3)];
     key.s3 ^= AES3[BYTE(X.s2, 3)];
+#endif
     return key;
 }
 

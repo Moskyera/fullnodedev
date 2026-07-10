@@ -23,12 +23,16 @@ include! {"util.rs"}
 include! {"opencl_common.rs"}
 #[cfg(feature = "ocl")]
 include! {"opencl_pow.rs"}
+#[cfg(feature = "cuda")]
+include! {"cuda_pow.rs"}
 
 #[derive(Clone)]
 enum MinerBackend {
     Cpu { assist_idx: Option<u32> },
     #[cfg(feature = "ocl")]
     Opencl(Arc<OpenCLResources>),
+    #[cfg(feature = "cuda")]
+    Cuda(Arc<CudaMiningResources>),
 }
 
 /*****************************************/
@@ -40,6 +44,8 @@ pub struct PoWorkConf {
     pub noncemax: u32,
     pub noticewait: u64,   // new block notice wait
     pub useopencl: bool,   // use opencl miner
+    pub usecuda: bool,     // use cuda miner (NVIDIA)
+    pub cudadevice: i32,   // cuda device index
     pub workgroups: u32,   // opencl work groups
     pub localsize: u32,    // opencl work units per work group
     pub unitsize: u32,     // opencl hashes per work unit
@@ -69,6 +75,8 @@ impl PoWorkConf {
             noncemax: ini_must_u64(sec, "nonce_max", u32::MAX as u64) as u32,
             noticewait: ini_must_u64(sec, "notice_wait", 45),
             useopencl: ini_must_bool(sec_gpu, "use_opencl", false) as bool,
+            usecuda: ini_must_bool(sec_gpu, "use_cuda", false) as bool,
+            cudadevice: ini_must_u64(sec_gpu, "cuda_device", 0) as i32,
             workgroups: tuning.workgroups,
             localsize: ini_must_u64(sec_gpu, "local_size", 256) as u32,
             unitsize: tuning.unitsize,
@@ -237,7 +245,27 @@ fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
 fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
     let mut backends = Vec::new();
 
-    if cnf.useopencl {
+    if cnf.usecuda {
+        #[cfg(feature = "cuda")]
+        {
+            let cuda_resources = initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize);
+            if !cuda_resources.is_empty() {
+                println!(
+                    "\n[Start] Create CUDA block miner worker #{}.",
+                    cuda_resources.len()
+                );
+                for resource in cuda_resources {
+                    backends.push(MinerBackend::Cuda(resource));
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            println!(
+                "\n[Warn] use_cuda=true but app built without `cuda` feature, fallback to CPU miner."
+            );
+        }
+    } else if cnf.useopencl {
         #[cfg(feature = "ocl")]
         {
             let opencl_resources = initialize_opencl(
@@ -338,11 +366,19 @@ fn run_block_mining_item(
                 .workgroups(res.workgroups.min(_cnf.workgroups));
             wg * _cnf.localsize * _cnf.unitsize
         }
+        #[cfg(feature = "cuda")]
+        MinerBackend::Cuda(res) => {
+            let wg = _cnf.runtime.workgroups(res.workgroups.min(_cnf.workgroups));
+            wg * x16rs_cuda::DEFAULT_LOCAL_SIZE * res.unit_size
+        }
     };
-    #[cfg(feature = "ocl")]
-    let is_gpu_backend = matches!(backend, MinerBackend::Opencl(_));
-    #[cfg(not(feature = "ocl"))]
-    let is_gpu_backend = false;
+    let is_gpu_backend = match &backend {
+        #[cfg(feature = "ocl")]
+        MinerBackend::Opencl(_) => true,
+        #[cfg(feature = "cuda")]
+        MinerBackend::Cuda(_) => true,
+        _ => false,
+    };
     // stuff data
     let stuff = { MINING_BLOCK_STUFF.read().unwrap().clone() };
     let height = stuff.height;
@@ -368,6 +404,79 @@ fn run_block_mining_item(
                 let (hn, rh) =
                     do_group_block_mining(height, block_intro_bin, nonce_start, current_nonce_space);
                 (hn, rh, 0u32, current_nonce_space)
+            }
+            #[cfg(feature = "cuda")]
+            MinerBackend::Cuda(cuda) => {
+                let wg_cap = _cnf
+                    .runtime
+                    .workgroups(cuda.workgroups.min(_cnf.workgroups));
+                let unit_batch =
+                    (x16rs_cuda::DEFAULT_LOCAL_SIZE as u64) * (cuda.unit_size as u64);
+                if wg_cap == 0 || unit_batch == 0 {
+                    let (hn, rh) = do_group_block_mining(
+                        height,
+                        block_intro_bin,
+                        nonce_start,
+                        current_nonce_space,
+                    );
+                    (hn, rh, 0u32, current_nonce_space)
+                } else {
+                    let workgroups_by_space = (current_nonce_space as u64 / unit_batch) as u32;
+                    let workgroups_eff = workgroups_by_space.min(wg_cap);
+                    let gpu_nonce_space = workgroups_eff
+                        .saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
+                        .saturating_mul(cuda.unit_size);
+
+                    if workgroups_eff == 0 {
+                        let (hn, rh) = do_group_block_mining(
+                            height,
+                            block_intro_bin,
+                            nonce_start,
+                            current_nonce_space,
+                        );
+                        (hn, rh, 0u32, current_nonce_space)
+                    } else {
+                        match do_group_block_mining_cuda(
+                            cuda,
+                            height,
+                            block_intro_bin.clone(),
+                            nonce_start,
+                            workgroups_eff,
+                        ) {
+                            Err(e) => {
+                                eprintln!("[CUDA] batch failed: {e}");
+                                _cnf.runtime.record_gpu_error(
+                                    wg_cap,
+                                    _cnf.efficiency.oom_fallback,
+                                );
+                                let (hn, rh) = do_group_block_mining(
+                                    height,
+                                    block_intro_bin,
+                                    nonce_start,
+                                    current_nonce_space,
+                                );
+                                (hn, rh, 0u32, current_nonce_space)
+                            }
+                            Ok(mut best) => {
+                                let tail_space =
+                                    current_nonce_space.saturating_sub(gpu_nonce_space);
+                                if tail_space > 0 {
+                                    let tail_start = nonce_start.saturating_add(gpu_nonce_space);
+                                    let cpu_tail = do_group_block_mining(
+                                        height,
+                                        block_intro_bin,
+                                        tail_start,
+                                        tail_space,
+                                    );
+                                    if hash_more_power(&cpu_tail.1, &best.1) {
+                                        best = cpu_tail;
+                                    }
+                                }
+                                (best.0, best.1, gpu_nonce_space, tail_space)
+                            }
+                        }
+                    }
+                }
             }
             #[cfg(feature = "ocl")]
             MinerBackend::Opencl(opencl) => {

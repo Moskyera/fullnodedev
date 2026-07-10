@@ -1,0 +1,36 @@
+; HAC block miner — NVIDIA CUDA (RTX 20xx / 30xx / 40xx)
+; Copy via INSTALL-CUDA-CONFIG.bat or edit target\release\poworker.config.ini
+
+connect = 127.0.0.1:8080
+supervene = 4
+nonce_max = 4294967295
+notice_wait = 45
+
+[efficiency]
+mode = profit
+power_cost_kwh = 0.15
+gpu_watts = 0
+cpu_watts_per_thread = 8
+hac_price = 0
+dynamic_supervene = true
+supervene_min = 2
+supervene_max = 0
+oom_fallback = true
+max_temp_c = 0
+throttle_work_groups = 1024
+thermal_file =
+idle_start_hour = 255
+idle_end_hour = 255
+pause_if_unprofitable = false
+benchmark_seconds = 0
+
+[gpu]
+use_cuda = true
+use_opencl = false
+cuda_device = 0
+cpu_assist = true
+; RTX starting point — tune work_groups / unit_size after genesis test
+work_groups = 131072
+local_size = 256
+unit_size = 8
+debug = 0
