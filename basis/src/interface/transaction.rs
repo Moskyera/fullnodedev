@@ -41,6 +41,17 @@ pub trait TransactionRead: Serialize + TxExec + Send + Sync + DynClone + std::fm
         0
     }
 
+    /// Canonical billing size for gas price / fee purity.
+    /// Type3 overrides this using the deterministic signer set size.
+    fn billing_size(&self) -> Ret<usize> {
+        Ok(self.size())
+    }
+
+    /// Type3 returns `Some(D.contains(addr))`. Other types return `None`.
+    fn declared_signer_contains(&self, _: &Address) -> Ret<Option<bool>> {
+        Ok(None)
+    }
+
     fn message(&self) -> &Fixed16 {
         Fixed16::zero_ref()
     }

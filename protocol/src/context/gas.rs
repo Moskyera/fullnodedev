@@ -59,7 +59,7 @@ impl GasPrice {
             .fee_got()
             .to_238_u128()
             .map_err(|e| format!("tx gas price invalid: {}", e))?;
-        let purity_size = tx.size() as u128;
+        let purity_size = tx.billing_size()? as u128;
         let floor = crate::params::vm_lowest_fee_purity(height) as u128;
         let floor_fee = floor
             .checked_mul(purity_size)

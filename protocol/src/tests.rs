@@ -2521,3 +2521,206 @@ fn test_block_parse_rejects_oversized_transaction_count_without_oom() {
         "block with an oversized transaction_count must be rejected by the parser"
     );
 }
+
+// ── Type3 ReqSignList deterministic signers ─────────────────────────────────
+
+fn type3_acc(name: &str) -> (Account, Address) {
+    let acc = Account::create_by(name).unwrap();
+    let addr = Address::from(*acc.address());
+    (acc, addr)
+}
+
+fn type3_with_transfer(main: &Account) -> TransactionType3 {
+    let mut tx = TransactionType3::new_by(
+        Address::from(*main.address()),
+        Amount::unit238(1_000_000),
+        1_730_000_600,
+    );
+    tx.gas_max = Uint1::from(1);
+    let mut act = HacToTrs::new();
+    act.to = AddrOrPtr::from_addr(field::ADDRESS_ONEX.clone());
+    act.hacash = Amount::unit238(1);
+    tx.push_action(Box::new(act)).unwrap();
+    tx
+}
+
+#[test]
+fn test_act_scope_top_guard_names_and_rules() {
+    assert_eq!(ActScope::TOP_GUARD.name(), "TOP_GUARD");
+    assert_eq!(ActScope::TOP_GUARD_UNIQUE.name(), "TOP_GUARD_UNIQUE");
+    assert!(ActScope::TOP_GUARD.is_guard());
+    assert!(ActScope::TOP_GUARD_UNIQUE.is_guard());
+    assert!(ActScope::GUARD.is_guard());
+    assert!(!ActScope::TOP_UNIQUE.is_guard());
+    assert_eq!(ActScope::TOP_GUARD.top_rule(), None);
+    assert_eq!(ActScope::TOP_GUARD_UNIQUE.top_rule(), Some(TopRule::Unique));
+    assert!(ActScope::TOP_GUARD.allows(ExecFrom::Top));
+    assert!(!ActScope::TOP_GUARD.allows(ExecFrom::Ast));
+    assert!(!ActScope::TOP_GUARD_UNIQUE.allows(ExecFrom::Call));
+}
+
+#[test]
+fn test_req_sign_list_rejects_empty_and_duplicate() {
+    let _guard = install_test_registry();
+    assert!(ReqSignList::create_by(vec![]).is_err());
+    let (_a, addr) = type3_acc("rsl-dup");
+    let err = ReqSignList::create_by(vec![AddrOrPtr::from_addr(addr), AddrOrPtr::from_addr(addr)])
+        .unwrap()
+        .validate_against(&vec![addr])
+        .unwrap_err();
+    assert!(err.contains("duplicated"), "{err}");
+}
+
+#[test]
+fn test_type3_exact_signers_with_req_sign_list() {
+    let _guard = install_test_registry();
+    let (main_acc, _) = type3_acc("rsl-ok-main");
+    let (extra_acc, extra) = type3_acc("rsl-ok-extra");
+    let mut tx = type3_with_transfer(&main_acc);
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    assert_eq!(tx.deterministic_signers().unwrap().len(), 2);
+    tx.fill_sign(&main_acc).unwrap();
+    tx.fill_sign(&extra_acc).unwrap();
+    tx.verify_signature().unwrap();
+    assert_eq!(tx.billing_size().unwrap(), tx.size());
+}
+
+#[test]
+fn test_type3_req_sign_list_overlap_intrinsic_rejected() {
+    let _guard = install_test_registry();
+    let (main_acc, main) = type3_acc("rsl-overlap-main");
+    let (from_acc, from) = type3_acc("rsl-overlap-from");
+    let mut tx = TransactionType3::new_by(main, Amount::unit238(1_000_000), 1_730_000_601);
+    tx.push_action(Box::new(HacFromTrs::create_by(from, Amount::unit238(1))))
+        .unwrap();
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![from]).unwrap()))
+        .unwrap();
+    let err = tx.deterministic_signers().unwrap_err();
+    assert!(err.contains("overlaps"), "{err}");
+    let _ = (main_acc, from_acc);
+}
+
+#[test]
+fn test_type3_rejects_undeclared_and_missing_extra() {
+    let _guard = install_test_registry();
+    let (main_acc, _) = type3_acc("rsl-miss-main");
+    let (extra_acc, extra) = type3_acc("rsl-miss-extra");
+    let (rogue_acc, _) = type3_acc("rsl-miss-rogue");
+
+    let mut tx = type3_with_transfer(&main_acc);
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    tx.fill_sign(&main_acc).unwrap();
+    let err = tx.verify_signature().unwrap_err();
+    assert!(err.contains("SignW2 length"), "{err}");
+
+    let err = tx.fill_sign(&rogue_acc).unwrap_err();
+    assert!(err.contains("undeclared"), "{err}");
+    let _ = extra_acc;
+}
+
+#[test]
+fn test_type3_billing_size_stable_after_trim() {
+    let _guard = install_test_registry();
+    let (main_acc, _) = type3_acc("rsl-bill-main");
+    let (extra_acc, extra) = type3_acc("rsl-bill-extra");
+    let mut tx = type3_with_transfer(&main_acc);
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    tx.fill_sign(&main_acc).unwrap();
+    tx.fill_sign(&extra_acc).unwrap();
+    let bill = tx.billing_size().unwrap();
+    let purity = tx.fee_purity();
+    tx.signs = SignW2::default();
+    assert_eq!(tx.billing_size().unwrap(), bill);
+    assert_eq!(tx.fee_purity(), purity);
+}
+
+#[test]
+fn test_type3_check_sign_fast_sync_uses_d() {
+    let _guard = install_test_registry();
+    let (main_acc, main) = type3_acc("rsl-ck-main");
+    let (extra_acc, extra) = type3_acc("rsl-ck-extra");
+    let outsider = type3_acc("rsl-ck-out").1;
+    let mut tx = type3_with_transfer(&main_acc);
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    tx.fill_sign(&main_acc).unwrap();
+    tx.fill_sign(&extra_acc).unwrap();
+    let mut pruned = tx.clone();
+    pruned.signs = SignW2::default();
+    let pruned: &'static TransactionType3 = Box::leak(Box::new(pruned));
+
+    let mut env = Env::default();
+    env.chain.fast_sync = true;
+    env.tx = crate::transaction::create_tx_info(pruned);
+    let mut ctx = ContextInst::new(
+        env,
+        Box::new(AstForkableState::default()),
+        Box::new(EmptyLogs {}),
+        pruned,
+    );
+    ctx.check_sign(&extra).unwrap();
+    ctx.check_sign(&main).unwrap();
+    assert!(ctx.check_sign(&outsider).is_err());
+}
+
+#[test]
+fn test_type3_req_sign_list_only_tx_rejected_as_all_guard() {
+    let _guard = install_test_registry();
+    let (main_acc, _) = type3_acc("rsl-only-guard");
+    let (_extra_acc, extra) = type3_acc("rsl-only-guard-e");
+    let mut tx = TransactionType3::new_by(
+        Address::from(*main_acc.address()),
+        Amount::unit238(1_000_000),
+        1_730_000_602,
+    );
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    let err = precheck_tx_actions(tx.ty(), tx.actions()).unwrap_err();
+    assert!(err.contains("all GUARD") || err.contains("GUARD"), "{err}");
+}
+
+#[test]
+fn test_type2_req_sign_list_keeps_open_append() {
+    let _guard = install_test_registry();
+    let (main_acc, main) = type3_acc("rsl-t2-main");
+    let (extra_acc, extra) = type3_acc("rsl-t2-extra");
+    let (other_acc, _) = type3_acc("rsl-t2-other");
+    let mut tx = TransactionType2::new_by(main, Amount::unit238(1_000_000), 1_730_000_603);
+    tx.push_action(Box::new(HacToTrs::create_by(
+        field::ADDRESS_ONEX.clone(),
+        Amount::unit238(1),
+    )))
+    .unwrap();
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    tx.fill_sign(&main_acc).unwrap();
+    tx.fill_sign(&extra_acc).unwrap();
+    // Type2 still allows undeclared append.
+    tx.fill_sign(&other_acc).unwrap();
+    tx.verify_signature().unwrap();
+}
+
+#[test]
+fn test_top_guard_unique_coexists_with_top_only_can_with_guard() {
+    let _guard = install_test_registry();
+    // Reuse test action kinds from topology tests if available; otherwise build with HeightScope + HacTo + ReqSignList.
+    let (main_acc, main) = type3_acc("rsl-topo-main");
+    let (_e_acc, extra) = type3_acc("rsl-topo-extra");
+    let mut tx = TransactionType3::new_by(main, Amount::unit238(1_000_000), 1_730_000_604);
+    let mut height = HeightScope::new();
+    height.start = BlockHeight::from(0);
+    height.end = BlockHeight::from(0);
+    tx.push_action(Box::new(height)).unwrap();
+    tx.push_action(Box::new(HacToTrs::create_by(
+        field::ADDRESS_ONEX.clone(),
+        Amount::unit238(1),
+    )))
+    .unwrap();
+    tx.push_action(Box::new(ReqSignList::create_by_addrs(vec![extra]).unwrap()))
+        .unwrap();
+    precheck_tx_actions(tx.ty(), tx.actions()).unwrap();
+    let _ = main_acc;
+}

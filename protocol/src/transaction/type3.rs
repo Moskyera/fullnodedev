@@ -53,13 +53,19 @@ impl TransactionRead for TransactionType3 {
     }
 
     fn fee_purity(&self) -> u64 {
-        let txsz = self.size() as u64;
+        let Ok(txsz) = self.billing_size() else {
+            return 0;
+        };
         if txsz == 0 {
             return 0;
         }
         let fee238 = self.fee.to_238_u128().unwrap_or(u128::MAX);
         let purity = fee238 / txsz as u128;
         purity.min(u64::MAX as u128) as u64
+    }
+
+    fn billing_size(&self) -> Ret<usize> {
+        self.canonical_billing_size()
     }
 
     fn action_count(&self) -> usize {
@@ -75,21 +81,15 @@ impl TransactionRead for TransactionType3 {
     }
 
     fn req_sign(&self) -> Ret<HashSet<Address>> {
-        let addrs = &self.addrs();
-        let mut adrsets = HashSet::from([self.main()]);
-        for act in self.actions() {
-            for ptr in act.req_sign() {
-                let adr = ptr.real(addrs)?;
-                if adr.is_privakey() {
-                    adrsets.insert(adr);
-                }
-            }
-        }
-        Ok(adrsets)
+        self.deterministic_signers()
+    }
+
+    fn declared_signer_contains(&self, adr: &Address) -> Ret<Option<bool>> {
+        Ok(Some(self.deterministic_signers()?.contains(adr)))
     }
 
     fn verify_signature(&self) -> Rerr {
-        verify_tx_signature(self)
+        verify_type3_signatures_exact(self)
     }
 }
 
@@ -129,6 +129,7 @@ impl TxExec for TransactionType3 {
 
 impl TransactionType3 {
     pub const TYPE: u8 = 3u8;
+    pub const SIGN_ITEM_SIZE: usize = 97;
 
     pub fn new_by(addr: Address, fee: Amount, ts: u64) -> Self {
         Self {
@@ -141,6 +142,103 @@ impl TransactionType3 {
             gas_max: Uint1::default(),
             ano_mark: Fixed1::default(),
         }
+    }
+
+    /// Intrinsic R0: main ∪ static action req_sign, excluding ReqSignList.
+    pub fn intrinsic_req_sign(&self) -> Ret<HashSet<Address>> {
+        let addrs = &self.addrs();
+        let mut adrsets = HashSet::from([self.main()]);
+        for act in self.actions() {
+            if act.kind() == ReqSignList::KIND {
+                continue;
+            }
+            for ptr in act.req_sign() {
+                let adr = ptr.real(addrs)?;
+                if adr.is_privakey() {
+                    adrsets.insert(adr);
+                }
+            }
+        }
+        Ok(adrsets)
+    }
+
+    /// Extra signers E from the unique top-level ReqSignList (if any).
+    pub fn declared_extra_signers(&self) -> Ret<HashSet<Address>> {
+        let addrs = self.addrs();
+        let mut found: Option<&ReqSignList> = None;
+        for act in self.actions() {
+            if let Some(list) = ReqSignList::downcast(act) {
+                if found.is_some() {
+                    return errf!("ReqSignList must be TOP_GUARD_UNIQUE (duplicate found)");
+                }
+                found = Some(list);
+            }
+        }
+        match found {
+            None => Ok(HashSet::new()),
+            Some(list) => list.validate_against(&addrs),
+        }
+    }
+
+    /// D = R0 ∪ E with overlap and MAX_TYPE3_SIGNERS checks.
+    pub fn deterministic_signers(&self) -> Ret<HashSet<Address>> {
+        let r0 = self.intrinsic_req_sign()?;
+        let e = self.declared_extra_signers()?;
+        for adr in &e {
+            if r0.contains(adr) {
+                return errf!(
+                    "ReqSignList address {} overlaps intrinsic req_sign",
+                    adr.to_readable()
+                );
+            }
+        }
+        let mut d = r0;
+        d.extend(e);
+        if d.len() > crate::params::MAX_TYPE3_SIGNERS {
+            return errf!(
+                "Type3 signer count {} exceeds MAX_TYPE3_SIGNERS {}",
+                d.len(),
+                crate::params::MAX_TYPE3_SIGNERS
+            );
+        }
+        Ok(d)
+    }
+
+    pub fn missing_signers(&self) -> Ret<HashSet<Address>> {
+        let d = self.deterministic_signers()?;
+        let mut present = HashSet::new();
+        for sig in self.signs() {
+            let adr = Address::from(Account::get_address_by_public_key(*sig.publickey));
+            present.insert(adr);
+        }
+        Ok(d.difference(&present).copied().collect())
+    }
+
+    fn canonical_billing_size(&self) -> Ret<usize> {
+        let d = self.deterministic_signers()?;
+        let base_size = self
+            .size()
+            .checked_sub(self.signs.size())
+            .ok_or_else(|| "Type3 billing size underflow".to_owned())?;
+        let sign_item_size = Sign::default().size();
+        if sign_item_size != Self::SIGN_ITEM_SIZE {
+            return errf!(
+                "Type3 Sign encoding size must be {}, got {}",
+                Self::SIGN_ITEM_SIZE,
+                sign_item_size
+            );
+        }
+        let prefix_size = SignW2::default().size();
+        let canonical_signs_size = prefix_size
+            .checked_add(
+                d.len()
+                    .checked_mul(sign_item_size)
+                    .ok_or_else(|| "Type3 canonical signs size overflow".to_owned())?,
+            )
+            .ok_or_else(|| "Type3 canonical signs size overflow".to_owned())?;
+        base_size
+            .checked_add(canonical_signs_size)
+            .ok_or_else(|| "Type3 billing size overflow".to_owned())
     }
 
     fn hash_ex(&self, adfe: Vec<u8>) -> Hash {
@@ -170,6 +268,10 @@ impl TransactionType3 {
             return errf!("too many sign objects");
         }
         let curaddr = Address::from(Account::get_address_by_public_key(*signobj.publickey));
+        let d = self.deterministic_signers()?;
+        if !d.contains(&curaddr) {
+            return errf!("undeclared Type3 signer {}", curaddr.to_readable());
+        }
         let apbk = signobj.publickey.as_ref();
         let mut istid = usize::MAX;
         let sglist = self.signs.as_list();

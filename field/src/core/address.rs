@@ -457,6 +457,10 @@ impl FromJSON for AddrOrPtr {
 
 
 
+// AddrOrPtr list with u16 count (e.g. ReqSignList).
+combi_list!{ AddrOrPtrW2, Uint2, AddrOrPtr }
+
+
 /************************ test ************************/
 
 

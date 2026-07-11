@@ -1,4 +1,5 @@
 use std::any::*;
+use std::collections::*;
 
 use basis::component::*;
 use basis::interface::*;
@@ -24,6 +25,7 @@ include! {"asset.rs"}
 // include!{"channel.rs"}
 include! {"blob.rs"}
 include! {"chain.rs"}
+include! {"reqsign.rs"}
 
 include! {"asthelper.rs"}
 include! {"astselect.rs"}
@@ -70,6 +72,8 @@ action_register! {
     HeightScope
     ChainAllow
     BalanceFloor
+
+    ReqSignList
 
 
 }

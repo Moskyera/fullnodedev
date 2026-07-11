@@ -22,13 +22,13 @@ impl TxTopologyStats {
     fn record_top_action(&mut self, act: &dyn Action) {
         self.top_action_count += 1;
         *self.top_kind_count.entry(act.kind()).or_insert(0) += 1;
-        if act.scope() == ActScope::GUARD {
+        if act.scope().is_guard() {
             self.top_guard_count += 1;
         }
     }
 
     fn record_terminal_action(&mut self, scope: ActScope) {
-        if scope == ActScope::GUARD {
+        if scope.is_guard() {
             self.has_guard_terminal = true;
         } else {
             self.non_guard_terminal_count += 1;

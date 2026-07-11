@@ -1690,6 +1690,20 @@ impl MemChain {
         for action in actions {
             tx.push_action(action)?;
         }
+        // Addresses outside intrinsic R0 must be declared via ReqSignList.
+        let intrinsic = tx.intrinsic_req_sign()?;
+        let mut declared = Vec::new();
+        for signer in extra_signers {
+            let addr = account_address(signer);
+            if !intrinsic.contains(&addr) {
+                declared.push(addr);
+            }
+        }
+        if !declared.is_empty() {
+            tx.push_action(Box::new(protocol::action::ReqSignList::create_by_addrs(
+                declared,
+            )?))?;
+        }
         tx.fill_sign(account)?;
         for signer in extra_signers {
             tx.fill_sign(signer)?;
