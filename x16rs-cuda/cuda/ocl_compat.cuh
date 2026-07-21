@@ -20,6 +20,10 @@ typedef int32_t sph_s32;
 #define __constant __constant__
 #define __private
 #define __generic
+// OpenCL `__global` address-space qualifier -> nothing in CUDA. (Distinct token from
+// CUDA's `__global__`, which is a whole-token identifier and is NOT affected.) Only
+// reached by currently-dead DEC64BE/DEC32LE paths; defined for robustness.
+#define __global
 #define __inline__ inline __device__
 
 #define CLK_LOCAL_MEM_FENCE 0
@@ -31,8 +35,24 @@ typedef int32_t sph_s32;
 #define get_global_id(dim) (blockIdx.x * blockDim.x + threadIdx.x)
 #define get_global_size(dim) (gridDim.x * blockDim.x)
 
-#define rotate(x, n) \
-    (((x) << ((n) & 63)) | ((x) >> (64 - ((n) & 63))))
+// Width-correct rotate. The OpenCL `rotate` builtin rotates within the operand's own
+// bit width. A single 64-bit macro silently MISCOMPILES 32-bit rotates: shifting a
+// uint right by (64 - n) with n in 0..31 shifts by 33..63 -> undefined behaviour ->
+// nvcc's PTX yields 0, so the rotate degenerates into a plain left shift. That
+// corrupts cubehash/luffa/simd/hamsi (via SPH_ROTL32) and the AES tables
+// (rotate(AES0[i], 8U) -> shavite/echo). Provide width-specific overloads; the type
+// of the first argument selects the width. Both count params are `uint` so the first
+// argument alone disambiguates (no overload ambiguity when a 32-bit value is rotated
+// by a `ulong` literal count, e.g. `rotate(uint_val, 8UL)`); the count is re-masked
+// internally, preserving OpenCL's modulo-width semantics.
+static __device__ __forceinline__ uint rotate(uint x, uint n) {
+    n &= 31u;
+    return (x << n) | (x >> ((32u - n) & 31u));
+}
+static __device__ __forceinline__ ulong rotate(ulong x, uint n) {
+    n &= 63u;
+    return (x << n) | (x >> ((64u - n) & 63u));
+}
 #define as_ulong(x) ((ulong)(x))
 #define as_uint(x) ((uint)(x))
 #define as_uint2(x) (*(const uint2 *)&(x))
@@ -66,7 +86,14 @@ typedef int32_t sph_s32;
 #define ALIGN32 __align__(32)
 #define ALIGN64 __align__(64)
 
-#define __attribute__(x)
+// Do NOT redefine __attribute__ wholesale. On modern nvcc (12.x, Linux) CUDA's
+// own __global__/__device__ qualifiers expand THROUGH __attribute__, so stripping
+// it silently turns every kernel into a plain __host__ function (then __syncthreads
+// fails to compile). Only neutralize the OpenCL-specific attributes nvcc does not
+// understand; __attribute__((aligned(N))) (util.cl's ALIGN macros) is accepted by
+// nvcc as-is.
+#define work_group_size_hint(x, y, z)
+#define reqd_work_group_size(x, y, z)
 
 inline __device__ uint atomic_inc(uint *addr) {
     return atomicAdd(addr, 1u);

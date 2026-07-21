@@ -104,7 +104,7 @@ __inline__ void keccak_theta(__generic ulong A[25])
 	THETA_STEP(4);
 }
 
-__inline__ void rhash_sha3_permutation(__generic ulong ALIGN state[25])
+__inline__ void rhash_sha3_permutation(__generic ulong ALIGN_PARAM state[25])
 {
 	ulong temp_state[25];
 	for (unsigned round = 0; round < NumberOfRounds; round++)

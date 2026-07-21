@@ -68,7 +68,12 @@ extern "C" __global__ void x16rs_cuda_main(
         LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7,
         mixtab0, mixtab1, mixtab2, mixtab3);
 
-    unsigned int best_hash = 0;
+    // Must start at this thread's own first slot (index), NOT 0. Starting at 0 made every
+    // thread t>0 compare against thread 0's slot and skip its own slot index+0, so the
+    // per-thread minimum — and therefore the whole work-group reduction — was wrong (the
+    // returned hash stayed self-consistent with its nonce, but was not the batch minimum).
+    // Matches x16rs_main.cl:84 (`unsigned int best_hash = index;`).
+    unsigned int best_hash = index;
 #pragma unroll 8
     for (unsigned int i = 1; i < unit_size; i++) {
         if (diff_big_hash_dev(&local_hashes[best_hash], &local_hashes[index + i]) == 1) {

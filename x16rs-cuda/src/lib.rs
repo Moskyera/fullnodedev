@@ -167,6 +167,78 @@ mod driver {
         -> CudaError_t;
         fn cudaDeviceSynchronize() -> CudaError_t;
         fn cudaGetErrorString(err: CudaError_t) -> *const i8;
+        fn cudaFuncGetAttributes(attr: *mut CudaFuncAttributes, func: *const c_void)
+        -> CudaError_t;
+    }
+
+    // Mirrors CUDA's `cudaFuncAttributes` (leading fields only; trailing reserved for
+    // forward-compat with newer toolkits). Used to clamp the launch block size to the
+    // kernel's own `maxThreadsPerBlock` — a register-heavy kernel can have a per-kernel
+    // limit below the device's 1024, and launching above it returns
+    // cudaErrorInvalidConfiguration (9).
+    #[repr(C)]
+    struct CudaFuncAttributes {
+        shared_size_bytes: usize,
+        const_size_bytes: usize,
+        local_size_bytes: usize,
+        max_threads_per_block: i32,
+        num_regs: i32,
+        ptx_version: i32,
+        binary_version: i32,
+        cache_mode_ca: i32,
+        max_dynamic_shared_size_bytes: i32,
+        preferred_shmem_carveout: i32,
+        // Generous tail so the toolkit's (possibly newer/larger) cudaFuncAttributes
+        // never writes past this buffer; we only read the leading fields above.
+        _reserved: [i32; 48],
+    }
+
+    impl CudaFuncAttributes {
+        fn zeroed() -> Self {
+            CudaFuncAttributes {
+                shared_size_bytes: 0,
+                const_size_bytes: 0,
+                local_size_bytes: 0,
+                max_threads_per_block: 0,
+                num_regs: 0,
+                ptx_version: 0,
+                binary_version: 0,
+                cache_mode_ca: 0,
+                max_dynamic_shared_size_bytes: 0,
+                preferred_shmem_carveout: 0,
+                _reserved: [0; 48],
+            }
+        }
+    }
+
+    /// Query a kernel's resource attributes and return a block size clamped to its
+    /// `maxThreadsPerBlock` (never above `desired`, never zero).
+    unsafe fn clamped_block_size(func: *const c_void, desired: u32, label: &str) -> u32 {
+        let mut attrs = CudaFuncAttributes::zeroed();
+        let rc = unsafe { cudaFuncGetAttributes(&mut attrs, func) };
+        if rc != CUDA_SUCCESS {
+            eprintln!(
+                "[cuda] cudaFuncGetAttributes({}) failed rc={}; using {}",
+                label, rc, desired
+            );
+            return desired.max(1);
+        }
+        eprintln!(
+            "[cuda] {}: numRegs={} staticShared={}B localPerThread={}B maxThreadsPerBlock={} ptx={} bin={}",
+            label,
+            attrs.num_regs,
+            attrs.shared_size_bytes,
+            attrs.local_size_bytes,
+            attrs.max_threads_per_block,
+            attrs.ptx_version,
+            attrs.binary_version,
+        );
+        let kmax = if attrs.max_threads_per_block > 0 {
+            attrs.max_threads_per_block as u32
+        } else {
+            desired
+        };
+        desired.min(kmax).max(1)
     }
 
     const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
@@ -300,20 +372,30 @@ mod driver {
         block: (u32, u32, u32),
         args: &[*mut c_void],
     ) -> CudaResult<()> {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Dim3 {
+            x: u32,
+            y: u32,
+            z: u32,
+        }
+        // RUNTIME API cudaLaunchKernel — real signature:
+        //   cudaError_t cudaLaunchKernel(const void*, dim3, dim3, void**, size_t, cudaStream_t)
+        // dim3 is passed BY VALUE and `args` comes BEFORE sharedMem/stream. The previous
+        // declaration used the DRIVER API cuLaunchKernel layout (grid/block as six u32s,
+        // then sharedMem, stream, args, extra) but linked against cudaLaunchKernel. That
+        // scrambled the ABI: gridDim.y/z read the high halves of registers holding single
+        // u32s -> garbage grid dims -> every launch failed with
+        // cudaErrorInvalidConfiguration (9), regardless of block size or shared memory.
         #[link(name = "cudart")]
         unsafe extern "C" {
             fn cudaLaunchKernel(
                 func: *const c_void,
-                grid_dim_x: u32,
-                grid_dim_y: u32,
-                grid_dim_z: u32,
-                block_dim_x: u32,
-                block_dim_y: u32,
-                block_dim_z: u32,
-                shared_mem_bytes: usize,
-                stream: *mut c_void,
+                grid_dim: Dim3,
+                block_dim: Dim3,
                 args: *mut *mut c_void,
-                extra: *mut c_void,
+                shared_mem: usize,
+                stream: *mut c_void,
             ) -> CudaError_t;
         }
 
@@ -321,15 +403,18 @@ mod driver {
         check(unsafe {
             cudaLaunchKernel(
                 func,
-                grid.0,
-                grid.1,
-                grid.2,
-                block.0,
-                block.1,
-                block.2,
-                0,
-                ptr::null_mut(),
+                Dim3 {
+                    x: grid.0,
+                    y: grid.1,
+                    z: grid.2,
+                },
+                Dim3 {
+                    x: block.0,
+                    y: block.1,
+                    z: block.2,
+                },
                 arg_ptrs.as_mut_ptr(),
+                0,
                 ptr::null_mut(),
             )
         })
@@ -399,11 +484,16 @@ mod driver {
             )
         })?;
 
+        // Each workgroup's kernel reduction returns the lexicographically SMALLEST hash
+        // it found (diff_big_hash keeps the smaller of each pair), because mining wants
+        // the hash closest to zero (hash < target). So aggregate across workgroups by
+        // keeping the MINIMUM too — replace the running best when the candidate is
+        // smaller, i.e. when best > candidate.
         let mut best_nonce = 0u32;
         let mut best_hash = [0u8; HASH_BYTES];
         for i in 0..workgroups as usize {
             let hash = &hashes[i * HASH_BYTES..(i + 1) * HASH_BYTES];
-            if i == 0 || lex_gt(hash, &best_hash) {
+            if i == 0 || lex_gt(&best_hash, hash) {
                 best_hash.copy_from_slice(hash);
                 best_nonce = nonces[i];
             }
@@ -429,11 +519,22 @@ mod driver {
         let mut stuff_ptr = miner.stuff_buf;
         let mut repeat_val = repeat;
         let mut out_ptr = miner.best_hashes_buf;
+        // The single-hash kernel does its work on thread 0; the rest only cooperatively
+        // fill the shared tables (the fill loop strides by blockDim.x, so any block size
+        // is correct). Clamp to the kernel's own maxThreadsPerBlock to avoid
+        // cudaErrorInvalidConfiguration on register-heavy builds.
+        let block = unsafe {
+            clamped_block_size(
+                x16rs_cuda_single as *const c_void,
+                miner.local_size,
+                "single",
+            )
+        };
         unsafe {
             launch_kernel(
                 x16rs_cuda_single as *const c_void,
                 (1, 1, 1),
-                (miner.local_size, 1, 1),
+                (block, 1, 1),
                 &[
                     &mut stuff_ptr as *mut _ as *mut c_void,
                     &mut repeat_val as *mut _ as *mut c_void,

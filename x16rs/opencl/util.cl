@@ -14,6 +14,17 @@
 #define ALIGN32 __attribute__((aligned(32)))
 #define ALIGN64 __attribute__((aligned(64)))
 
+// Alignment qualifier for *function parameters*. C++/nvcc forbids an alignment
+// specifier on a parameter (an array param decays to a pointer), whereas OpenCL C
+// allows it. So ALIGN_PARAM keeps the OpenCL hint on OpenCL builds and is a no-op
+// under CUDA. Use ALIGN_PARAM (not ALIGN) on any parameter declaration; keep ALIGN
+// on struct/union/local/shared/constant declarations (nvcc accepts those).
+#ifdef __CUDA__
+  #define ALIGN_PARAM
+#else
+  #define ALIGN_PARAM ALIGN
+#endif
+
 typedef union ALIGN8 {
   unsigned char h1[88];
   ulong h8[11];
