@@ -30,7 +30,7 @@ pub fn hash_left_zero_pad3(dst: &[u8]) -> Vec<u8> {
 
 pub fn diamond_more_power(dst: &[u8], src: &[u8]) -> bool {
     let o = b'0';
-    for i in 0..16 {
+    for i in 0..dst.len().min(src.len()) {
         let (l, r) = (dst[i], src[i]);
         if l == o && r != o {
             return true;

@@ -6,7 +6,7 @@ set "REPO_ROOT=%~dp0..\.."
 cd /d "%REPO_ROOT%"
 
 echo.
-echo  Building poworker + diaworker + list_opencl with OpenCL (AMD/NVIDIA)...
+echo  Building HAC OpenCL tools + CPU-only HACD worker/fullnode...
 echo  Repo: %REPO_ROOT%
 echo.
 
@@ -28,15 +28,20 @@ if errorlevel 1 (
     )
 )
 
-cargo build --release --features ocl
-if errorlevel 1 (
+cargo build --release --features ocl --bin poworker --bin list_opencl --bin diagnose_opencl
+if errorlevel 1 goto :build_failed
+cargo build --release --bin hacash --bin diaworker
+if errorlevel 1 goto :build_failed
+goto :build_ok
+
+:build_failed
     echo.
     echo  BUILD FAILED
     echo  If you see LNK1181 / OpenCL.lib: run FIND-OPENCL-LIB.bat
     pause
     exit /b 1
-)
 
+:build_ok
 echo.
 echo  OK: %REPO_ROOT%\target\release\poworker.exe
 echo      %REPO_ROOT%\target\release\diaworker.exe

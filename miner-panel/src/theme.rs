@@ -6,26 +6,25 @@ use eframe::egui::{
 pub mod colors {
     use super::Color32;
 
-    pub const BG_DEEP: Color32 = Color32::from_rgb(10, 14, 20);
-    pub const BG_PANEL: Color32 = Color32::from_rgb(16, 22, 31);
-    pub const BG_HEADER: Color32 = Color32::from_rgb(20, 28, 40);
-    pub const BG_CARD: Color32 = Color32::from_rgb(26, 34, 48);
-    pub const BG_INPUT: Color32 = Color32::from_rgb(14, 20, 28);
-    pub const BORDER: Color32 = Color32::from_rgb(44, 58, 76);
-    pub const BORDER_SOFT: Color32 = Color32::from_rgb(34, 46, 62);
-    pub const TEXT: Color32 = Color32::from_rgb(232, 238, 245);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(130, 145, 165);
-    pub const GOLD: Color32 = Color32::from_rgb(175, 148, 90);
-    pub const GOLD_DIM: Color32 = Color32::from_rgb(130, 110, 68);
-    pub const ACCENT: Color32 = Color32::from_rgb(96, 165, 220);
-    pub const ACCENT_DIM: Color32 = Color32::from_rgb(55, 95, 140);
-    pub const SLIDER_TRACK: Color32 = Color32::from_rgb(12, 18, 28);
-    pub const GREEN: Color32 = Color32::from_rgb(58, 210, 145);
-    pub const GREEN_DIM: Color32 = Color32::from_rgb(32, 120, 82);
+    pub const BG_DEEP: Color32 = Color32::from_rgb(0, 0, 0);
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0, 0, 0);
+    pub const BG_HEADER: Color32 = Color32::from_rgb(5, 5, 5);
+    pub const BG_CARD: Color32 = Color32::from_rgb(10, 10, 10);
+    pub const BG_INPUT: Color32 = Color32::from_rgb(3, 3, 3);
+    pub const BORDER: Color32 = Color32::from_rgb(115, 52, 0);
+    pub const BORDER_SOFT: Color32 = Color32::from_rgb(51, 25, 4);
+    pub const TEXT: Color32 = Color32::from_rgb(247, 247, 247);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(178, 164, 151);
+    pub const GOLD: Color32 = Color32::from_rgb(255, 122, 0);
+    pub const GOLD_DIM: Color32 = Color32::from_rgb(143, 63, 0);
+    pub const ACCENT: Color32 = Color32::from_rgb(255, 122, 0);
+    pub const ACCENT_DIM: Color32 = Color32::from_rgb(159, 65, 0);
+    pub const SLIDER_TRACK: Color32 = Color32::from_rgb(20, 11, 3);
+    pub const GREEN: Color32 = Color32::from_rgb(255, 140, 25);
+    pub const GREEN_DIM: Color32 = Color32::from_rgb(137, 56, 0);
     pub const RED: Color32 = Color32::from_rgb(248, 108, 108);
     pub const RED_DIM: Color32 = Color32::from_rgb(140, 48, 48);
-    pub const BLUE: Color32 = Color32::from_rgb(88, 166, 255);
-
+    pub const BLUE: Color32 = Color32::from_rgb(255, 157, 46);
 }
 
 use colors::*;
@@ -41,7 +40,7 @@ pub fn setup_theme(ctx: &egui::Context) {
     v.faint_bg_color = Color32::from_rgba_premultiplied(255, 255, 255, 10);
     v.hyperlink_color = BLUE;
     v.warn_fg_color = GOLD;
-    v.selection.bg_fill = Color32::from_rgb(32, 68, 98);
+    v.selection.bg_fill = Color32::from_rgb(88, 38, 0);
     v.selection.stroke = Stroke::new(1.0, BLUE);
 
     let round = Rounding::same(8.0);
@@ -53,8 +52,8 @@ pub fn setup_theme(ctx: &egui::Context) {
 
     v.widgets.inactive.bg_fill = SLIDER_TRACK; // visible slider rail on cards
     v.widgets.noninteractive.bg_fill = BG_CARD;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(34, 44, 60);
-    v.widgets.active.bg_fill = Color32::from_rgb(40, 54, 74);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(27, 14, 5);
+    v.widgets.active.bg_fill = Color32::from_rgb(40, 19, 6);
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SOFT);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
     v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT_DIM);
@@ -63,7 +62,7 @@ pub fn setup_theme(ctx: &egui::Context) {
     v.widgets.active.fg_stroke = Stroke::new(1.5, ACCENT);
 
     v.slider_trailing_fill = true;
-    v.selection.bg_fill = Color32::from_rgb(45, 110, 85);
+    v.selection.bg_fill = Color32::from_rgb(114, 50, 0);
 
     v.window_rounding = Rounding::same(10.0);
     v.window_stroke = Stroke::new(1.0, BORDER);
@@ -79,10 +78,9 @@ pub fn setup_theme(ctx: &egui::Context) {
         TextStyle::Heading,
         FontId::new(22.0, FontFamily::Proportional),
     );
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(14.0, FontFamily::Proportional),
-    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(14.0, FontFamily::Proportional),
@@ -125,17 +123,9 @@ pub fn section_card() -> Frame {
 
 pub fn show_detail_row(ui: &mut Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(label)
-                .size(12.5)
-                .color(TEXT_MUTED),
-        );
+        ui.label(egui::RichText::new(label).size(12.5).color(TEXT_MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(value)
-                    .size(13.0)
-                    .color(TEXT),
-            );
+            ui.label(egui::RichText::new(value).size(13.0).color(TEXT));
         });
     });
     ui.add_space(4.0);
@@ -157,18 +147,9 @@ pub fn show_stat_card(ui: &mut Ui, accent: Color32, title: &str, value: &str) {
                     .rect_filled(stripe, Rounding::same(2.0), accent);
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(12.0)
-                            .color(TEXT_MUTED),
-                    );
+                    ui.label(egui::RichText::new(title).size(12.0).color(TEXT_MUTED));
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(value)
-                            .size(20.0)
-                            .strong()
-                            .color(TEXT),
-                    );
+                    ui.label(egui::RichText::new(value).size(20.0).strong().color(TEXT));
                 });
             });
         });
@@ -233,7 +214,7 @@ fn paint_tab_icon(painter: &egui::Painter, rect: Rect, icon: TabIcon, color: Col
 
 pub fn tab_bar(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
     Frame::none()
-        .fill(Color32::from_rgba_premultiplied(18, 26, 38, 220))
+        .fill(Color32::from_rgba_premultiplied(3, 3, 3, 240))
         .stroke(Stroke::new(1.0, BORDER_SOFT))
         .rounding(Rounding::same(14.0))
         .inner_margin(Margin::symmetric(8.0, 6.0))
@@ -251,11 +232,11 @@ pub fn tab_pill(ui: &mut Ui, selected: bool, icon: TabIcon, label: &str) -> bool
     if ui.is_rect_visible(rect) {
         let hover = response.hovered();
         let fill = if selected {
-            Color32::from_rgba_premultiplied(58, 118, 188, 72)
+            Color32::from_rgba_premultiplied(255, 122, 0, 58)
         } else if hover {
-            Color32::from_rgba_premultiplied(42, 58, 82, 90)
+            Color32::from_rgba_premultiplied(104, 48, 4, 90)
         } else {
-            Color32::from_rgba_premultiplied(24, 34, 48, 60)
+            Color32::from_rgba_premultiplied(8, 8, 8, 160)
         };
         let stroke = if selected {
             Stroke::new(1.5, ACCENT)
@@ -280,8 +261,7 @@ pub fn tab_pill(ui: &mut Ui, selected: bool, icon: TabIcon, label: &str) -> bool
                 egui::pos2(rect.left() + 10.0, rect.bottom() - 4.0),
                 Vec2::new(rect.width() - 20.0, 3.0),
             );
-            ui.painter()
-                .rect_filled(bar, Rounding::same(2.0), GREEN);
+            ui.painter().rect_filled(bar, Rounding::same(2.0), GREEN);
         }
 
         let icon_rect = Rect::from_center_size(
@@ -332,12 +312,9 @@ pub fn power_cost_slider(ui: &mut Ui, value: &mut f32, currency: crate::currency
     };
     ui.vertical(|ui| {
         ui.label(
-            egui::RichText::new(format!(
-                "{value:.decimals$} {}/kWh",
-                currency.symbol()
-            ))
-            .color(ACCENT)
-            .size(13.0),
+            egui::RichText::new(format!("{value:.decimals$} {}/kWh", currency.symbol()))
+                .color(ACCENT)
+                .size(13.0),
         );
         ui.add_space(4.0);
         ui.set_min_width(280.0);
@@ -375,10 +352,13 @@ pub fn status_badge(ui: &mut Ui, state: MinerBadgeState, label: &str) {
         MinerBadgeState::Mining => {
             let pulse = ((time * 3.2).sin() * 0.5 + 0.5) as f32;
             (
-                Color32::from_rgba_premultiplied(34, 120, 86, (40.0 + pulse * 35.0) as u8),
+                Color32::from_rgba_premultiplied(255, 112, 0, (28.0 + pulse * 38.0) as u8),
                 Stroke::new(1.8, GREEN),
                 GREEN,
-                Some((8.0 + pulse * 5.0, GREEN.linear_multiply(0.25 + pulse * 0.35))),
+                Some((
+                    8.0 + pulse * 5.0,
+                    GREEN.linear_multiply(0.25 + pulse * 0.35),
+                )),
                 GREEN,
             )
         }
@@ -408,27 +388,30 @@ pub fn status_badge(ui: &mut Ui, state: MinerBadgeState, label: &str) {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
                 let center = rect.center();
                 if let Some((radius, color)) = glow {
-                    ui.painter()
-                        .circle_filled(center, radius, color);
+                    ui.painter().circle_filled(center, radius, color);
                 }
                 ui.painter().circle_filled(center, 5.5, dot);
                 if state == MinerBadgeState::Mining {
-                    ui.painter()
-                        .circle_stroke(center, 7.5, Stroke::new(1.5, GREEN.linear_multiply(0.65)));
+                    ui.painter().circle_stroke(
+                        center,
+                        7.5,
+                        Stroke::new(1.5, GREEN.linear_multiply(0.65)),
+                    );
                 }
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(label).strong().color(text).size(15.5));
             });
         });
     if state == MinerBadgeState::Mining {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(80));
     }
 }
 
 pub fn footer_status_chip(ui: &mut Ui, state: MinerBadgeState, label: &str) {
     let (fill, stroke, dot, text) = match state {
         MinerBadgeState::Mining => (
-            Color32::from_rgba_premultiplied(34, 120, 86, 36),
+            Color32::from_rgba_premultiplied(255, 112, 0, 32),
             Stroke::new(1.0, GREEN_DIM),
             GREEN,
             GREEN,
@@ -502,9 +485,4 @@ pub fn logo_fallback(ui: &mut Ui) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new("HAC").strong().color(GOLD).size(17.0));
         });
-}
-
-pub fn status_dot(ui: &mut Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.5, color);
 }

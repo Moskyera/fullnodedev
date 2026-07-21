@@ -1,7 +1,7 @@
 //! Per-GPU handle: OOM recovery, context rebuild, snapshots.
 
-use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 
 use crate::gpu_arch::ArchLimits;
 use crate::gpu_oom::{GpuBatchError, GpuOomState};
@@ -9,7 +9,7 @@ use crate::mining_runtime::MiningRuntimeState;
 use crate::opencl_diag::OpenClScan;
 
 use super::init::initialize_opencl;
-use super::resources::{soft_recover_opencl, OpenCLResources};
+use super::resources::{OpenCLResources, soft_recover_opencl};
 
 #[derive(Clone)]
 pub struct OpenclGpuSnapshot {
@@ -79,23 +79,31 @@ impl OpenclGpuHandle {
     }
 
     pub fn lock_resources(&self) -> std::sync::MutexGuard<'_, OpenCLResources> {
-        self.inner.lock().expect("opencl gpu mutex")
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn workgroups(
-        &self,
-        configured: u32,
-        thermal_cap: Option<u32>,
-    ) -> u32 {
-        let res_wg = self.inner.lock().expect("opencl gpu mutex").workgroups;
+    pub fn sensor_identity(&self) -> (crate::gpu_arch::GpuVendor, u32) {
+        let resources = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (resources.vendor, resources.device_index)
+    }
+
+    pub fn workgroups(&self, configured: u32, thermal_cap: Option<u32>) -> u32 {
+        let res_wg = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .workgroups;
         self.oom
             .lock()
-            .expect("gpu oom mutex")
+            .unwrap_or_else(|e| e.into_inner())
             .workgroups(res_wg.min(configured), thermal_cap)
     }
 
     pub fn effective_wg(&self) -> u32 {
-        self.oom.lock().expect("gpu oom mutex").effective_wg()
+        self.oom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .effective_wg()
     }
 
     pub fn on_batch_error(
@@ -111,15 +119,12 @@ impl OpenclGpuHandle {
         let res_wg = res.workgroups;
         let arch_limits = ArchLimits::for_slug(&res.arch_slug);
         let experimental = arch_limits.is_experimental();
-        let mut oom = self.oom.lock().expect("gpu oom mutex");
+        let oom = self.oom.lock().unwrap_or_else(|e| e.into_inner());
         let cur_eff = oom.effective_wg();
         let at_floor = cur_eff <= oom.floor_wg();
         let n = self.consecutive_errors.fetch_add(1, Relaxed) + 1;
-        let retry_only = experimental
-            && err.is_out_of_resources()
-            && oom_fallback
-            && !at_floor
-            && n < 3;
+        let retry_only =
+            experimental && err.is_out_of_resources() && oom_fallback && !at_floor && n < 3;
         let next_wg = if retry_only {
             cur_eff
         } else {
@@ -137,7 +142,11 @@ impl OpenclGpuHandle {
         };
         if should_rebuild {
             let rebuild_wg = if wg_reduced { next_wg } else { cur_eff.max(1) };
-            let scan = self.cached_scan.lock().expect("scan cache mutex").clone();
+            let scan = self
+                .cached_scan
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if let Some(scan) = scan {
                 match rebuild_opencl_gpu(&self.snapshot, rebuild_wg, &scan) {
                     Ok(new_res) => {
@@ -163,7 +172,10 @@ impl OpenclGpuHandle {
     pub fn on_batch_success(&self, configured_wg: u32, runtime: &MiningRuntimeState) {
         use std::sync::atomic::Ordering::Relaxed;
         self.consecutive_errors.store(0, Relaxed);
-        self.oom.lock().expect("gpu oom mutex").record_success();
+        self.oom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_success();
         runtime.report_gpu_workgroups(
             self.effective_wg(),
             runtime.thermal_workgroups_cap(),

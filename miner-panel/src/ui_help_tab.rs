@@ -2,10 +2,10 @@
 
 use eframe::egui;
 
+use crate::MinerApp;
 use crate::help_options;
 use crate::mining_kind::MiningKind;
 use crate::theme;
-use crate::MinerApp;
 
 impl MinerApp {
     pub(super) fn ui_help(&mut self, ui: &mut egui::Ui) {
@@ -88,9 +88,13 @@ impl MinerApp {
             );
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(t.help_opencl_tip)
-                    .color(theme::colors::TEXT_MUTED)
-                    .size(12.5),
+                egui::RichText::new(if self.mining_kind == MiningKind::Hacd {
+                    "HACD uses CPU mining only. OpenCL and Auto Tune apply only to HAC."
+                } else {
+                    t.help_opencl_tip
+                })
+                .color(theme::colors::TEXT_MUTED)
+                .size(12.5),
             );
         });
 

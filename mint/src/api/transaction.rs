@@ -29,7 +29,6 @@ fn transaction_sign(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
         let Ok(hybrid) = HybridAccount::from_key_blob(&blob) else {
             return api_error("hybrid key material invalid");
         };
-        use basis::interface::Transaction;
         if let Err(e) = tx.fill_hybrid_sign(&hybrid) {
             return api_error(&format!("fill hybrid sign failed: {}", e));
         }

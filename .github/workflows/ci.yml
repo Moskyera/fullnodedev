@@ -14,43 +14,124 @@ jobs:
     name: Tests (app crate)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run app unit tests (no OpenCL link on Windows)
-        run: |
-          cargo test -p app --lib gpu_
-          cargo test -p app --lib panel_tuning
+      - name: Run complete app tests (no OpenCL link on Windows)
+        run: cargo test --locked -p app
 
   build-miner-panel:
     name: Build miner-panel (no OpenCL link)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build GUI
-        run: cargo build --release -p miner-panel
+      - name: Build and test GUI
+        run: |
+          cargo build --locked --release -p miner-panel
+          cargo test --locked -p miner-panel
 
   build-linux-ocl:
-    name: Build OpenCL miners (Linux x64)
-    runs-on: ubuntu-latest
+    name: Build, test and package (Ubuntu x86_64)
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-linux-ocl"
-      - name: Install OpenCL dev (link libOpenCL)
-        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev build-essential libgtk-3-dev libxcb-render0-dev libxkbcommon-dev libssl-dev
-      - name: Build miners + fullnode
-        run: cargo build --release --features ocl --bin poworker --bin diaworker --bin list_opencl --bin diagnose_opencl --bin hacash
-      - name: Run app OpenCL unit tests
-        run: cargo test -p app --lib --features ocl
-      - name: Build miner-panel (Linux GUI)
-        run: cargo build --release -p miner-panel
-      - name: Run miner-panel integration tests
-        run: cargo test -p miner-panel
-      - name: Verify binaries
+          shared-key: ci-linux-ocl
+
+      - name: Install Linux build and GUI dependencies
         run: |
-          ls -la target/release/poworker target/release/diaworker target/release/list_opencl target/release/diagnose_opencl target/release/hacash target/release/miner-panel
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config ocl-icd-opencl-dev clinfo libssl-dev \
+            libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libudev-dev xvfb xauth \
+            libx11-xcb1 libxcursor1 libxi6 libxkbcommon-x11-0 libegl1
+
+      - name: Build miners and fullnode
+        run: |
+          cargo build --locked --release --features ocl \
+            --bin poworker --bin list_opencl --bin diagnose_opencl
+          cargo build --locked --release --bin hacash --bin diaworker
+
+      - name: Run complete app OpenCL tests
+        run: cargo test --locked -p app --features ocl
+
+      - name: Verify HACD CPU-only and RX 9070 XT safe presets
+        run: bash scripts/verify-mining-presets.sh
+
+      - name: Verify config installer preserves existing settings
+        run: |
+          bash scripts/mining-amd/install-configs.sh
+          printf '%s\n' 'connect = pool.example.test:9000' > target/release/poworker.config.ini
+          bash scripts/mining-amd/install-configs.sh
+          grep -Fxq 'connect = pool.example.test:9000' target/release/poworker.config.ini
+          test "$(stat -c '%a' target/release/poworker.config.ini)" = 600
+          bash scripts/mining-amd/install-configs.sh --force
+          cmp scripts/mining-amd/poworker.amd.ini.example target/release/poworker.config.ini
+
+      - name: Build and test miner panel
+        run: |
+          cargo build --locked --release -p miner-panel
+          cargo test --locked -p miner-panel
+
+      - name: Verify linked Linux libraries
+        run: |
+          for binary in hacash poworker diaworker list_opencl diagnose_opencl miner-panel; do
+            test -x "target/release/$binary"
+            if ldd "target/release/$binary" | grep -q 'not found'; then
+              ldd "target/release/$binary"
+              exit 1
+            fi
+          done
+          if ldd target/release/diaworker | grep -qi opencl; then
+            echo "diaworker must remain CPU-only and independent of libOpenCL"
+            exit 1
+          fi
+          if ldd target/release/hacash | grep -qi opencl; then
+            echo "hacash fullnode must remain independent of libOpenCL"
+            exit 1
+          fi
+
+      - name: Smoke-test Linux GUI startup
+        run: |
+          set +e
+          timeout 5s xvfb-run -a target/release/miner-panel
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "miner-panel exited before the smoke-test timeout (code $code)"
+            exit 1
+          fi
+
+      - name: Package and verify Linux releases
+        run: |
+          bash scripts/pack-release-linux.sh ci
+          archives=(dist/hacash-miner-*-linux-x86_64.tar.gz)
+          test "${#archives[@]}" -eq 2
+          for archive in "${archives[@]}"; do
+            tar -tzf "$archive" >/dev/null
+          done
+          test -x dist/hacash-miner-full-linux-x86_64/SETUP-LINUX.sh
+          test -x dist/hacash-miner-only-linux-x86_64/START-MINER-PANEL.sh
+          full=dist/hacash-miner-full-linux-x86_64
+          only=dist/hacash-miner-only-linux-x86_64
+          test -f "$full/PRESETS-INDEX.txt"
+          test -f "$only/PRESETS-INDEX.txt"
+          pow_presets=("$full"/presets/poworker/*.ini)
+          dia_presets=("$full"/presets/diaworker/*.ini)
+          test "${#pow_presets[@]}" -eq 23
+          test "${#dia_presets[@]}" -eq 23
+          grep -Fxq 'reward = YOUR_HACD_PRIVAKEY_3x' "$full/hacash.config.ini.example"
+          HACASH_SETUP_NO_LAUNCH=1 bash "$full/SETUP-LINUX.sh" --no-launch </dev/null
+          test "$(stat -c '%a' "$full/poworker.config.ini")" = 600
+          test "$(stat -c '%a' "$full/diaworker.config.ini")" = 600
+          test "$(stat -c '%a' "$full/hacash.config.ini")" = 600
+          sed -E -i 's|^connect[[:space:]]*=.*$|connect = pool.example.test:9000|' \
+            "$full/poworker.config.ini"
+          HACASH_SETUP_NO_LAUNCH=1 bash "$full/SETUP-LINUX.sh" --no-launch </dev/null
+          grep -Fxq 'connect = pool.example.test:9000' "$full/poworker.config.ini"

@@ -69,7 +69,9 @@ pub fn run_with_scaner(cnfpath: &str, scan: Box<dyn Scaner>) -> Rerr {
         .txpool(build_txpool)
         .minter(|ini| Ok(Box::new(HacashMinter::create(ini))))
         .engine(|dbfn, cnf, minter, scaner| {
-            Ok(Box::new(ChainEngine::open(dbfn, cnf, minter, scaner, DB_VERSION)))
+            Ok(Box::new(ChainEngine::open(
+                dbfn, cnf, minter, scaner, DB_VERSION,
+            )))
         })
         .hnoder(|ini, txpool, engine| Ok(Box::new(HacashNode::open(ini, txpool, engine))))
         .server(|ini, hnoder| {

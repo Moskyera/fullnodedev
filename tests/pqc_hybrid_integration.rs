@@ -2,7 +2,9 @@ use basis::interface::{StateOperat, Transaction, TransactionRead, TxExec};
 use field::*;
 use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType4;
-use protocol::upgrade::{check_gated_tx, DEV_OPEN_MAX_HEIGHT, MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT};
+use protocol::upgrade::{
+    DEV_OPEN_MAX_HEIGHT, MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, check_gated_tx,
+};
 use sys::*;
 
 use testkit::sim::integration::ensure_standard_protocol_setup_for_tests;
@@ -57,15 +59,19 @@ fn hybrid_type4_dual_alg_verify() {
 }
 
 #[test]
-fn type4_rejects_before_activation_height_on_mainnet() {
-    let height = DEV_OPEN_MAX_HEIGHT.saturating_add(1);
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, height, 4).is_err());
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_ok());
+fn type4_is_neutralized_on_mainnet_but_allowed_off_mainnet() {
+    // PQC type 4 is neutralized on mainnet at ALL heights to match the official
+    // Istanbul node (which has no type 4)...
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, DEV_OPEN_MAX_HEIGHT.saturating_add(1), 4).is_err());
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_err());
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_err());
+    // ...but stays available off mainnet (testnet / sidechain / future rollout).
+    assert!(check_gated_tx(1u32, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
+    assert!(check_gated_tx(1u32, 0, 4).is_ok());
 }
 
 #[test]
-fn type4_execute_simple_transfer_in_dev_window() {
+fn type4_execute_simple_transfer_off_mainnet() {
     init_setup();
     let acc = HybridAccount::create_pqc_randomly(&random_fill).unwrap();
     let main = Address::from(*acc.address());
@@ -78,7 +84,9 @@ fn type4_execute_simple_transfer_in_dev_window() {
 
     let mut env = basis::component::Env::default();
     env.block.height = 100;
-    env.chain.id = MAINNET_CHAIN_ID;
+    // PQC type 4 is neutralized on mainnet, so exercise its execution on a
+    // non-mainnet chain_id (where PQC remains available).
+    env.chain.id = 1;
     env.tx = protocol::transaction::create_tx_info(&tx);
 
     let state: Box<dyn basis::interface::State> =
@@ -104,5 +112,9 @@ fn type4_rejects_wrong_alg_for_pqckey_main() {
     let sign = tx
         .create_hybrid_sign_by(&hybrid, &tx.hash_with_fee())
         .unwrap_err();
-    assert!(sign.contains("PQCKEY") || sign.contains("ML-DSA"), "{}", sign);
+    assert!(
+        sign.contains("PQCKEY") || sign.contains("ML-DSA"),
+        "{}",
+        sign
+    );
 }

@@ -28,7 +28,7 @@ if not exist "%SCRIPT_AMD%" set "SCRIPT_AMD=%~dp0"
 
 :: --- 1. Check required executables ---
 set "MISSING=0"
-for %%E in (hacash.exe poworker.exe diaworker.exe list_opencl.exe miner-panel.exe) do (
+for %%E in (hacash.exe poworker.exe diaworker.exe list_opencl.exe diagnose_opencl.exe miner-panel.exe) do (
     if not exist "%BIN%%%E" (
         echo  [MISSING] %%E
         set "MISSING=1"
@@ -37,7 +37,7 @@ for %%E in (hacash.exe poworker.exe diaworker.exe list_opencl.exe miner-panel.ex
 if "!MISSING!"=="1" (
     echo.
     echo  ERROR: Incomplete package.
-    echo  Download hacash-miner-FULL-windows-x64.zip from GitHub Releases
+    echo  Download hacash-miner-full-windows-x64*.zip from GitHub Releases
     echo  or build from source:
     echo    scripts\mining-amd\BUILD-AMD-MINER.bat
     echo    scripts\mining-amd\BUILD-MINER-PANEL.bat
@@ -75,7 +75,7 @@ if not exist "%BIN%diaworker.config.ini" (
     if exist "%SCRIPT_AMD%diaworker.amd.ini.example" (
         copy /Y "%SCRIPT_AMD%diaworker.amd.ini.example" "%BIN%diaworker.config.ini" >nul
     ) else (
-        copy /Y "%BIN%poworker.config.ini" "%BIN%diaworker.config.ini" >nul 2>nul
+        call :write_default_diaworker_ini
     )
     echo  [CREATED] diaworker.config.ini
 ) else (
@@ -95,10 +95,10 @@ powershell -NoProfile -Command ^
 if not exist "%BIN%hacash.config.ini" (
     if exist "%~dp0hacash.config.ini" (
         copy /Y "%~dp0hacash.config.ini" "%BIN%hacash.config.ini" >nul
-        echo  [CREATED] hacash.config.ini  (from template)
+        echo  [CREATED] hacash.config.ini - from template
     ) else (
         call :write_default_hacash_ini
-        echo  [CREATED] hacash.config.ini  (edit your wallet!)
+        echo  [CREATED] hacash.config.ini - edit wallet in the panel
     )
 ) else (
     echo  [OK] hacash.config.ini exists.
@@ -113,7 +113,14 @@ if exist "%SystemRoot%\System32\vcruntime140.dll" set "VCRUNTIME_OK=1"
 if "!VCRUNTIME_OK!"=="0" (
     echo  [WARN] Visual C++ Runtime may be missing.
     set /p "VCREDIST=  Install VC++ Redistributable 2015-2022 x64 now? [Y/N]: "
-    if /i "!VCREDIST!"=="Y" call :install_vcredist
+    if /i "!VCREDIST!"=="Y" (
+        call :install_vcredist
+        if errorlevel 1 (
+            echo  [ERROR] Setup cannot continue without the required runtime.
+            pause
+            exit /b 1
+        )
+    )
 ) else (
     echo  [OK] Visual C++ Runtime detected.
 )
@@ -139,8 +146,8 @@ if not "!OCL_ERR!"=="0" (
     if /i "!OPEN_DRV!"=="Y" start https://www.amd.com/en/support/download/drivers.html
 ) else (
     echo.
-    echo  [OK] OpenCL is working. Note platform_id and device_ids above.
-    echo       Set them in miner-panel Settings or in poworker.config.ini
+    echo  [OK] OpenCL is working.
+    echo       The panel will select the correct GPU automatically.
 )
 echo.
 
@@ -176,24 +183,48 @@ exit /b 0
 :write_default_poworker_ini
 (
     echo connect = 127.0.0.1:8080
-    echo supervene = 6
+    echo supervene = 0
     echo.
     echo [efficiency]
     echo mode = profit
     echo power_cost_kwh = 0.15
     echo stats_file = miner-stats.json
+    echo max_temp_c = 0
+    echo throttle_work_groups = 32
+    echo benchmark_seconds = 0
     echo.
     echo [gpu]
     echo use_opencl = true
-    echo cpu_assist = true
-    echo gpu_profile = amd_profit
+    echo use_cuda = false
+    echo cpu_assist = false
+    echo gpu_profile = amd_balanced
     echo platform_id = 0
     echo device_ids = 0
     echo opencl_dir = x16rs/opencl/
-    echo work_groups = 1536
+    echo work_groups = 64
     echo local_size = 256
-    echo unit_size = 96
+    echo unit_size = 64
 ) > "%BIN%poworker.config.ini"
+exit /b 0
+
+:write_default_diaworker_ini
+(
+    echo connect = 127.0.0.1:8080
+    echo supervene = 4
+    echo.
+    echo [efficiency]
+    echo mode = profit
+    echo cpu_watts_per_thread = 8
+    echo dynamic_supervene = true
+    echo supervene_min = 1
+    echo supervene_max = 0
+    echo benchmark_seconds = 0
+    echo.
+    echo [gpu]
+    echo use_opencl = false
+    echo use_cuda = false
+    echo cpu_assist = false
+) > "%BIN%diaworker.config.ini"
 exit /b 0
 
 :write_default_hacash_ini
@@ -201,10 +232,11 @@ exit /b 0
     echo [server]
     echo enable = true
     echo listen = 8080
+    echo bind = 127.0.0.1
     echo diamond_form = true
     echo.
     echo [miner]
-    echo enable = true
+    echo enable = false
     echo reward = YOUR_HAC_WALLET_ADDRESS
     echo.
     echo [diamondminer]
@@ -221,13 +253,18 @@ powershell -NoProfile -Command ^
 if errorlevel 1 (
     echo  [ERROR] Download failed. Install manually:
     echo    https://aka.ms/vs/17/release/vc_redist.x64.exe
-    exit /b 0
+    exit /b 1
 )
 echo  Installing (may need Administrator)...
 start /wait "" "%VCR_TMP%" /install /quiet /norestart
 if errorlevel 1 (
     echo  [WARN] Silent install failed. Running interactive installer...
     start /wait "" "%VCR_TMP%"
+    if errorlevel 1 (
+        echo  [ERROR] VC++ Redistributable installation failed.
+        del "%VCR_TMP%" >nul 2>&1
+        exit /b 1
+    )
 )
 del "%VCR_TMP%" >nul 2>&1
 echo  [OK] VC++ Redistributable install finished.

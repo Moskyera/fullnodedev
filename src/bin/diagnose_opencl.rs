@@ -16,7 +16,10 @@ fn main() {
         let scan = app::opencl_diag::scan_opencl();
 
         if json_only {
-            println!("{}", serde_json::to_string_pretty(&scan).unwrap_or_else(|_| "{}".into()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scan).unwrap_or_else(|_| "{}".into())
+            );
         } else {
             app::opencl_diag::print_scan_report(&scan);
         }

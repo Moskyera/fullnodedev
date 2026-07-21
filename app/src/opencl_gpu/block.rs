@@ -1,6 +1,8 @@
 use crate::gpu_oom::GpuBatchError;
 use crate::hash_util::hash_more_power;
-use crate::opencl_gpu::{enqueue_mining_kernel, read_block_gpu_results, write_stuff_to_gpu, OpenCLResources};
+use crate::opencl_gpu::{
+    OpenCLResources, enqueue_mining_kernel, read_block_gpu_results, write_stuff_to_gpu,
+};
 
 pub fn do_group_block_mining_opencl(
     opencl: &OpenCLResources,

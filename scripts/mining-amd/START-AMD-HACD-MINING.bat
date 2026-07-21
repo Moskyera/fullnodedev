@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title HACD diamond miner (AMD OpenCL + Ryzen CPU)
+title HACD diamond miner (CPU only)
 
 set "REPO_ROOT=%~dp0..\.."
 set "RUN_DIR=%REPO_ROOT%\target\release"
@@ -19,7 +19,8 @@ if not exist "%RUN_DIR%\diaworker.config.ini" (
     exit /b 1
 )
 
-echo Starting HACD diamond miner from %RUN_DIR%
+echo Starting HACD CPU diamond miner from %RUN_DIR%
+echo HACD does not use OpenCL; supervene controls CPU threads.
 echo Requires fullnode with [diamondminer] enable = true
 echo.
 cd /d "%RUN_DIR%"

@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 title Find OpenCL.lib for MSVC linker
 
 echo.
-echo  Searching for OpenCL.lib (required to link poworker/diaworker)...
+echo  Searching for OpenCL.lib (required to link HAC poworker/tools)...
 echo.
 
 set "FOUND="

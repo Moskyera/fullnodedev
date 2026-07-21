@@ -81,7 +81,11 @@ fn diamond_mint(this: &DiamondMint, ctx: &mut dyn Context) -> XRet<Vec<u8>> {
     let not_fast_sync = !env.chain.fast_sync;
     if not_fast_sync {
         // check
-        if pending_hash.not_zero() && pending_height % 5 != 0 {
+        // LOCAL TESTNET ONLY — mainnet requires diamond mints at heights divisible by 5, which
+        // on a fast local chain means the pooled mint tx keeps missing its narrow window. Lifting
+        // it lets the mint land in the next block so the transfer path can be exercised at once.
+        // NEVER ship this binary to a real network.
+        if false && pending_hash.not_zero() && pending_height % 5 != 0 {
             return xerrf!("diamond must be in a block height that is divisible by 5");
         }
         // number

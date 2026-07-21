@@ -1,7 +1,20 @@
 //! Cross-platform binary names — Windows keeps `.exe` first (unchanged behavior).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+pub fn configure_background_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
 /// Candidate filenames for a worker/fullnode binary (platform-preferred order).
 pub fn binary_names(stem: &str) -> Vec<String> {
     if cfg!(windows) {
@@ -62,11 +75,28 @@ pub fn find_fullnode(work_dir: &Path) -> PathBuf {
     find_binary(work_dir, &fullnode_names())
 }
 
-/// UI label: `poworker.exe` on Windows, `poworker` on Linux.
-pub fn bin_label(stem: &str) -> String {
+/// Best-effort guard against launching a second node on the same database.
+pub fn fullnode_process_running() -> bool {
     if cfg!(windows) {
-        format!("{stem}.exe")
-    } else {
-        stem.to_string()
+        return fullnode_names().iter().any(|name| {
+            let mut command = Command::new("tasklist");
+            configure_background_command(&mut command);
+            command
+                .args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).to_ascii_lowercase())
+                .map(|out| out.contains(&format!("\"{}\"", name.to_ascii_lowercase())))
+                .unwrap_or(false)
+        });
     }
+
+    ["hacash", "fullnode"].iter().any(|name| {
+        Command::new("pgrep")
+            .args(["-x", name])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }

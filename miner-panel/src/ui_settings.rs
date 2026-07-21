@@ -2,9 +2,10 @@
 
 use eframe::egui;
 
+use crate::MinerApp;
+use crate::mining_kind::MiningKind;
 use crate::presets;
 use crate::theme;
-use crate::MinerApp;
 
 impl MinerApp {
     pub(super) fn show_hw_tuning_section(&mut self, ui: &mut egui::Ui) {
@@ -12,6 +13,54 @@ impl MinerApp {
         let cpu_idx = self.cpu_idx;
         let gpu_idx = self.gpu_idx;
         let mode_idx = self.mode_idx;
+
+        if self.mining_kind == MiningKind::Hacd {
+            theme::section_card().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("HACD • CPU / full-node mining")
+                        .strong()
+                        .size(15.0)
+                        .color(theme::colors::ACCENT),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "OpenCL, GPU profiles and Auto Tune are intentionally disabled for HACD.",
+                    )
+                    .size(12.0)
+                    .color(theme::colors::TEXT_MUTED),
+                );
+                ui.add_space(12.0);
+                egui::Grid::new("hacd_cpu_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 12.0])
+                    .show(ui, |ui| {
+                        theme::field_label(ui, "CPU mining threads:");
+                        let selected = &self.cpu_presets[self.cpu_idx];
+                        egui::ComboBox::from_id_salt("hacd_cpu")
+                            .selected_text(format!(
+                                "{} — {} threads",
+                                selected.label, selected.supervene
+                            ))
+                            .width(400.0)
+                            .show_ui(ui, |ui| {
+                                for (i, preset) in self.cpu_presets.iter().enumerate() {
+                                    if preset.supervene > 0 {
+                                        ui.selectable_value(
+                                            &mut self.cpu_idx,
+                                            i,
+                                            format!(
+                                                "{} — {} threads",
+                                                preset.label, preset.supervene
+                                            ),
+                                        );
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    });
+            });
+            return;
+        }
 
         theme::section_card().show(ui, |ui| {
             egui::Grid::new("hw_grid")
@@ -23,13 +72,8 @@ impl MinerApp {
                         .selected_text(self.cpu_label(cpu_idx))
                         .width(400.0)
                         .show_ui(ui, |ui| {
-                            for (i, _) in self.cpu_presets.iter().enumerate() {
-                                let label = if i + 1 == self.cpu_presets.len() {
-                                    t.cpu_only
-                                } else {
-                                    self.cpu_presets[i].label
-                                };
-                                ui.selectable_value(&mut self.cpu_idx, i, label);
+                            for (i, preset) in self.cpu_presets.iter().enumerate() {
+                                ui.selectable_value(&mut self.cpu_idx, i, preset.label);
                             }
                         });
                     ui.end_row();

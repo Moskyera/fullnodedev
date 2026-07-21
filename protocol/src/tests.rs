@@ -1250,11 +1250,7 @@ fn test_transfer_rejects_system_recipient_but_allows_blackhole() {
     }
 
     let err = tx.execute(&mut ctx).unwrap_err();
-    assert!(
-        err.contains("cannot transfer to system address"),
-        "{}",
-        err
-    );
+    assert!(err.contains("cannot transfer to system address"), "{}", err);
 
     let mut tx_ok = TransactionType2::new_by(main, Amount::mei(1), 1730000000);
     let mut act_ok = HacToTrs::new();

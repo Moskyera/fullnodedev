@@ -1,5 +1,6 @@
-; HACD diamond miner — AMD GPU + Ryzen hybrid
-; Requires [diamondminer] enable = true in hacash.config.ini
+; HACD diamond miner - CPU/fullnode mining only
+; OpenCL and GPU tuning apply to HAC poworker, not HACD.
+; Requires [diamondminer] enable = true in hacash.config.ini.
 
 connect = 127.0.0.1:8080
 supervene = 4
@@ -7,18 +8,13 @@ supervene = 4
 [efficiency]
 mode = profit
 power_cost_kwh = 0.15
+cpu_watts_per_thread = 8
 dynamic_supervene = true
-supervene_min = 2
+supervene_min = 1
 supervene_max = 0
+benchmark_seconds = 0
 
 [gpu]
-use_opencl = true
-cpu_assist = true
-gpu_profile = amd_performance
-platform_id = 0
-device_ids = 0
-opencl_dir = ../../x16rs/opencl/
-work_groups = 2048
-local_size = 256
-unit_size = 96
-debug = 0
+use_opencl = false
+use_cuda = false
+cpu_assist = false

@@ -29,10 +29,10 @@ mod transport;
 pub use api::HacashNode;
 pub use sync::SyncTracker;
 
+pub use metrics::PqcMetrics as NodePqcMetrics;
 pub(crate) use metrics::{
     PqcMetrics, RuntimeMetrics, install_global_pqc_metrics, install_pqc_metrics_hook,
 };
-pub use metrics::PqcMetrics as NodePqcMetrics;
 pub(crate) use protocol::{
     handle_new_block, handle_new_tx, receive_blocks, receive_hashs, receive_status, send_blocks,
     send_hashs, send_status,

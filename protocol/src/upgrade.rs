@@ -57,14 +57,18 @@ pub fn check_gated_tx(chain_id: u32, height: u64, tx_type: u8) -> Rerr {
         return Ok(());
     }
     if is_pqc_tx_type(tx_type) {
-        if is_pqc_type4_open(height) || is_dev_upgrade_open(height) {
-            return Ok(());
-        }
+        // The post-quantum (PQC) transaction type 4 is NOT part of the official
+        // Istanbul mainnet upgrade (the official node registers tx types 1-3 only).
+        // Reject it on mainnet at ALL heights so mainnet consensus stays
+        // byte-faithful with the official node. PQC remains fully available on
+        // non-mainnet chain_ids, which returned Ok above (for testnet / future
+        // rollout). PQC_TYPE4_OPEN_HEIGHT is retained only as documentation of the
+        // intended future activation height.
+        let _ = (PQC_TYPE4_OPEN_HEIGHT, is_pqc_type4_open(height));
         return errf!(
-            "tx type {} not enabled at height {}, allowed when height >= {}",
+            "PQC tx type {} is not enabled on mainnet (chain_id {})",
             tx_type,
-            height,
-            PQC_TYPE4_OPEN_HEIGHT
+            chain_id
         );
     }
     if is_online_upgrade_open(height)
@@ -109,6 +113,14 @@ pub fn check_transfer_addr_online_open(
 ) -> Rerr {
     if chain_id != MAINNET_CHAIN_ID {
         return Ok(());
+    }
+    // PQC address versions (v6 PQCKEY, v7 HYBRID / ML-DSA-65) are not part of the
+    // official Istanbul mainnet — the official node's Address::check_version
+    // rejects them. Reject any transfer touching a PQC address at ALL mainnet
+    // heights (this must run before the online-open early return below) so our
+    // mainnet acceptance stays byte-faithful with the official node.
+    if from.is_pqckey() || from.is_hybrid() || to.is_pqckey() || to.is_hybrid() {
+        return errf!("PQC address versions (v6/v7) are not enabled on mainnet");
     }
     if is_online_upgrade_open(height) {
         return Ok(());
@@ -211,13 +223,34 @@ mod tests {
     }
 
     #[test]
-    fn tx_type4_is_open_at_pqc_activation_height() {
-        assert!(is_pqc_type4_open(PQC_TYPE4_OPEN_HEIGHT));
-        assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
+    fn tx_type4_is_rejected_on_mainnet_at_all_heights() {
+        // PQC type 4 is neutralized on mainnet to match the official Istanbul node
+        // (which has no type 4) — rejected at the dev window, the middle interval,
+        // the online-open height, and the former PQC activation height alike.
+        for height in [0u64, DEV_OPEN_MAX_HEIGHT, ONLINE_OPEN_HEIGHT, PQC_TYPE4_OPEN_HEIGHT] {
+            assert!(check_gated_tx(MAINNET_CHAIN_ID, height, 4).is_err());
+        }
     }
 
     #[test]
-    fn tx_type4_is_open_in_dev_window() {
-        assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_ok());
+    fn tx_type4_is_allowed_on_non_mainnet() {
+        // PQC stays available off mainnet (testnet / sidechain / future rollout).
+        let sidechain_id = 1u32;
+        assert!(check_gated_tx(sidechain_id, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
+        assert!(check_gated_tx(sidechain_id, 0, 4).is_ok());
+    }
+
+    #[test]
+    fn pqc_addresses_are_rejected_in_mainnet_transfers() {
+        let priva = Address::from_readable("1271438866CSDpJUqrnchoJAiGGBFSQhjd").unwrap();
+        let pqc = Address::create_pqckey([9u8; 20]);
+        let hybrid = Address::create_hybrid([7u8; 20]);
+        // A normal privakey->privakey transfer is fine at any mainnet height.
+        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &priva).is_ok());
+        // Any PQC address as from or to is rejected on mainnet, even above online-open.
+        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &pqc, &priva).is_err());
+        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &hybrid).is_err());
+        // Off mainnet, PQC addresses are allowed.
+        assert!(check_transfer_addr_online_open(1u32, ONLINE_OPEN_HEIGHT, &pqc, &hybrid).is_ok());
     }
 }

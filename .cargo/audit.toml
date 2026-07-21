@@ -1,0 +1,22 @@
+# cargo-audit configuration.
+#
+# The ignored advisories below are BOTH in `quick-xml`, which enters the
+# dependency graph ONLY on Linux, transitively through `zbus` (D-Bus, used by
+# eframe/egui 0.30 for clipboard/accessibility). It is:
+#   * NOT compiled into the Windows miner binaries at all, and
+#   * only ever exercised (on Linux) to parse the D-Bus introspection XML that
+#     the desktop environment itself provides — the miner never parses attacker
+#     -controlled XML.
+# Both advisories are denial-of-service via maliciously crafted XML, so they do
+# not apply to this application's threat model.
+#
+# Proper remediation is to upgrade the GUI stack to eframe 0.35 (which pulls
+# quick-xml >= 0.41.0). That upgrade currently fails to build on Windows due to a
+# wgpu-hal/D3D12 vs `windows` crate version conflict and needs a dedicated
+# GUI-stack upgrade; tracked separately. Re-audit and remove these entries once
+# that lands.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml: quadratic run time on duplicate-attribute check (DoS)
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation (DoS)
+]

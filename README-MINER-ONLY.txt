@@ -8,7 +8,10 @@ QUICK START
 -----------
 1. Extract ZIP to a folder
 2. Run SETUP-MINER.bat
-3. Open miner-panel.exe → Settings → Start
+3. Open miner-panel.exe and choose:
+   - HAC: OpenCL GPU is detected automatically; Auto Tune is available.
+   - HACD: CPU/full-node mining; choose CPU threads (OpenCL is not used).
+4. Enter the reward wallet and press Start.
 
 INCLUDED
 --------
@@ -16,7 +19,15 @@ INCLUDED
   poworker.exe     HAC miner
   diaworker.exe    HACD miner
   list_opencl.exe  GPU device list
+  diagnose_opencl.exe  GPU diagnostics and automatic selection
   x16rs/opencl/    OpenCL kernels
+
+MINER FLEET (MULTIPLE MINERS)
+-----------------------------
+1. On each remote panel: Settings → Miner Fleet → enable LAN sharing.
+2. Copy its LAN address/port and access token.
+3. On the main panel: Dashboard → Manage miners → Add miner.
+The dashboard totals hashrate, online panels, power and daily cost. The LAN API is read-only and disabled by default.
 
 NOT INCLUDED (you must have these)
 ----------------------------------
@@ -27,4 +38,4 @@ Default connect: 127.0.0.1:8080
 
 CLEAN PC?
 ---------
-Download hacash-miner-FULL-windows-x64.zip instead.
+Download hacash-miner-full-windows-x64*.zip instead.

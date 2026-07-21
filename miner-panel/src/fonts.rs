@@ -94,10 +94,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
     }
 
     if !loaded.is_empty() {
-        let family = fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default();
+        let family = fonts.families.entry(FontFamily::Proportional).or_default();
         family.clear();
         for key in &loaded {
             family.push((*key).to_owned());

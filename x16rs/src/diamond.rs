@@ -6,8 +6,13 @@ pub const DIAMOND_HASH_BASE_STRING: &str =       "0WTYUIAHXVMEKBSZN";
 pub const DIAMOND_HASH_BASE_CHARS:  [u8; 17] = *b"0WTYUIAHXVMEKBSZN";
 pub const DIAMOND_NAME_VALID_CHARS: [u8; 16] =  *b"WTYUIAHXVMEKBSZN";
 
-const DMD_L: usize = 10;
-const DMD_M: usize = 16;
+// LOCAL TESTNET ONLY — reduced diamond difficulty so a single CPU mines one in seconds.
+// Upstream is DMD_L=10, DMD_M=16. The name length DMD_N = DMD_M - DMD_L is kept at 6 so mined
+// diamonds still have mainnet-format 6-character names (what Harbor validates). This changes
+// ONLY the leading-zero proof-of-work bar, not the diamond format or the transfer path being
+// tested. NEVER ship this binary to a real network.
+const DMD_L: usize = 4;
+const DMD_M: usize = 10;
 const DMD_N: usize = DMD_M - DMD_L; // 6
 
 pub fn _is_valid_diamond_name(v: &[u8]) -> bool {

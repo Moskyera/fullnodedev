@@ -2,15 +2,30 @@
 # AMD OpenCL diagnostic — Linux
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="$REPO_ROOT/target/release"
-[[ -x "$BIN/poworker" ]] || BIN="$REPO_ROOT/target/debug"
+
+find_bin_dir() {
+  local profile
+  for profile in release debug; do
+    if [[ -x "$REPO_ROOT/target/$profile/diagnose_opencl" ]]; then
+      printf '%s\n' "$REPO_ROOT/target/$profile"
+      return 0
+    fi
+  done
+  return 1
+}
 
 echo "=== Hacash AMD GPU diagnostic ==="
 echo "Repo: $REPO_ROOT"
 
-if [[ ! -x "$BIN/diagnose_opencl" ]]; then
+BIN="$(find_bin_dir || true)"
+if [[ -z "$BIN" ]]; then
   echo "Building..."
-  (cd "$REPO_ROOT" && cargo build --release --features ocl)
+  (cd "$REPO_ROOT" && cargo build --locked --release --features ocl --bin diagnose_opencl --bin poworker)
+  BIN="$(find_bin_dir || true)"
+fi
+if [[ -z "$BIN" ]]; then
+  echo "diagnose_opencl was not produced by the release build." >&2
+  exit 1
 fi
 
 echo "--- OpenCL scan ---"

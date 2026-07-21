@@ -3,7 +3,7 @@
 
 // Macros and table for Wolf's OpenCL Groestl implementation
 
-#ifdef NO_AMD_OPS
+#if NO_AMD_OPS
 	#define B64_0(x)    ((x) & 0xFF)
 	#define B64_1(x)    (((x) >> 8) & 0xFF)
 	#define B64_2(x)    (((x) >> 16) & 0xFF)
@@ -94,6 +94,20 @@ static const __constant ulong T0_G[256] =
 	0x82c31f5ec35edc82UL, 0x29b052cbb0cbe229UL, 0x5a77b4997799c35aUL, 0x1e113c3311332d1eUL, 
 	0x7bcbf646cb463d7bUL, 0xa8fc4b1ffc1fb7a8UL, 0x6dd6da61d6610c6dUL, 0x2c3a584e3a4e622cUL
 };
+
+/* RDNA4 keeps the Groestl table in constant memory; derive rotated views on lookup. */
+#ifdef AMD_GFX_GFX1201
+#define GROESTL_T0(table, index) (T0_G[(index)])
+#define GROESTL_T1(table, index) rotate(T0_G[(index)], 8UL)
+#define GROESTL_T2(table, index) rotate(T0_G[(index)], 16UL)
+#define GROESTL_T3(table, index) rotate(T0_G[(index)], 24UL)
+#else
+#define GROESTL_T0(table, index) ((table)[(index)])
+#define GROESTL_T1(table, index) ((table)[(index)])
+#define GROESTL_T2(table, index) ((table)[(index)])
+#define GROESTL_T3(table, index) ((table)[(index)])
+#endif
+
 
 __inline__ ulong groestl_rbtt(const ulong *Hval,
                            int b0, int b1, int b2, int b3,

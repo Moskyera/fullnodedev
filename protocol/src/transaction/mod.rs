@@ -1,5 +1,3 @@
-use std::collections::*;
-
 use basis::component::*;
 use basis::interface::*;
 use field::*;

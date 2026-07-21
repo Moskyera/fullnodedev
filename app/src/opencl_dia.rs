@@ -1,17 +1,17 @@
 //! OpenCL diamond mining kernel path (submodule of diaworker).
 
 use field::{Address, DiamondName, DiamondNumber, Fixed8, Hash};
-use mint::action::DiamondMint;
 use mint::action::DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE;
-use x16rs::diamond_hash;
+use mint::action::DiamondMint;
 use x16rs::calculate_hash;
+use x16rs::diamond_hash;
 
 use crate::hash_util::diamond_more_power;
 use crate::opencl_gpu::{
-    enqueue_diamond_kernel, read_diamond_gpu_results, write_stuff_to_gpu, OpenCLResources,
+    OpenCLResources, enqueue_diamond_kernel, read_diamond_gpu_results, write_stuff_to_gpu,
 };
 
-use super::{check_diamer_success, DiamondMiningResult, HASH_WIDTH};
+use super::{DiamondMiningResult, HASH_WIDTH, check_diamer_success};
 
 pub(crate) fn do_diamond_group_mining_opencl(
     opencl: &OpenCLResources,
@@ -38,7 +38,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
         nonce_space,
         u64_nonce: 0,
         msg_nonce: custom_nonce.to_vec(),
-        dia_str: [b'W'; 16],
+        dia_str: [b'W'; 10],
         is_success: None,
         use_secs: 0.0,
         is_gpu: true,

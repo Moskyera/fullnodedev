@@ -2,7 +2,9 @@ use basis::interface::Transaction;
 use field::*;
 use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType4;
-use protocol::upgrade::{check_gated_tx, DEV_OPEN_MAX_HEIGHT, MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT};
+use protocol::upgrade::{
+    DEV_OPEN_MAX_HEIGHT, MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, check_gated_tx,
+};
 use sys::*;
 
 use testkit::sim::integration::ensure_standard_protocol_setup_for_tests;
@@ -19,12 +21,15 @@ fn random_fill(buf: &mut [u8]) -> Rerr {
 }
 
 #[test]
-fn type4_mempool_gate_respects_dev_and_activation_window() {
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_ok());
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, DEV_OPEN_MAX_HEIGHT, 4).is_ok());
+fn type4_mempool_gate_is_neutralized_on_mainnet() {
+    // Neutralized on mainnet at all heights (matches official Istanbul)...
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, 0, 4).is_err());
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, DEV_OPEN_MAX_HEIGHT, 4).is_err());
     let mid = DEV_OPEN_MAX_HEIGHT.saturating_add(1);
     assert!(check_gated_tx(MAINNET_CHAIN_ID, mid, 4).is_err());
-    assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
+    assert!(check_gated_tx(MAINNET_CHAIN_ID, PQC_TYPE4_OPEN_HEIGHT, 4).is_err());
+    // ...but available off mainnet (testnet / sidechain / future rollout).
+    assert!(check_gated_tx(1u32, PQC_TYPE4_OPEN_HEIGHT, 4).is_ok());
 }
 
 #[test]
@@ -38,7 +43,11 @@ fn type4_wire_size_within_mempool_cap() {
         .unwrap();
     tx.fill_hybrid_sign(&acc).unwrap();
     let wire = tx.serialize();
-    assert!(wire.len() >= 5_000, "type4 wire should be ~5-6KB, got {}", wire.len());
+    assert!(
+        wire.len() >= 5_000,
+        "type4 wire should be ~5-6KB, got {}",
+        wire.len()
+    );
     assert!(wire.len() <= 16 * 1024);
     let cap = protocol::transaction::effective_max_tx_wire_size(16 * 1024, 4);
     assert!(wire.len() <= cap);

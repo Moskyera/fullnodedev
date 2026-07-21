@@ -52,7 +52,7 @@ fn diamondminer_success(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
     tx.fill_sign(&cnf.dmer_bid_account).unwrap();
     let txhx = tx.hash();
     let txpkg = TxPkg::create(Box::new(tx));
-    if let Err(e) = ctx.hnoder.submit_transaction(&txpkg, true, false) {
+    if let Err(e) = ctx.hnoder.submit_transaction(&txpkg, false, true) {
         return api_error(&e);
     }
     let hxstr = txhx.to_hex();

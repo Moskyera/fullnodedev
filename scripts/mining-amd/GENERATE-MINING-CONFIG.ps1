@@ -1,4 +1,4 @@
-# Generates poworker.config.ini + diaworker.config.ini from CPU + GPU input.
+# Generates HAC OpenCL config plus a strictly CPU-only HACD config.
 # Usage: interactive (no args) or  -Cpu "9950x" -Gpu "7900xtx"
 
 param(
@@ -31,7 +31,7 @@ $GpuCatalog = @(
     @{ Id = "5";  Slug = "rx6900xt";  Label = "RX 6900 XT (16 GB)";             Profile = "amd_performance"; WorkGroups = 2048; UnitSize = 96;  VramGb = 16; Aliases = @("6900","6900xt","rx6900","rx6900xt","rx 6900") }
     @{ Id = "6";  Slug = "rx7900xt";  Label = "RX 7900 XT / GRE (16-20 GB)";   Profile = "amd_performance"; WorkGroups = 2048; UnitSize = 96;  VramGb = 20; Aliases = @("7900xt","7900gre","7900 gre","rx7900xt","rx 7900xt","7900 xt") }
     @{ Id = "7";  Slug = "rx7900xtx"; Label = "RX 7900 XTX (24 GB)";            Profile = "amd_max";         WorkGroups = 4096; UnitSize = 128; VramGb = 24; Aliases = @("7900xtx","rx7900xtx","rx 7900 xtx","7900 xtx") }
-    @{ Id = "8";  Slug = "rx9070xt";  Label = "RX 9070 XT (16 GB, RDNA4)";      Profile = "amd_performance"; WorkGroups = 2048; UnitSize = 96;  VramGb = 16; Aliases = @("9070","9070xt","rx9070","rx9070xt","rx 9070") }
+    @{ Id = "8";  Slug = "rx9070xt";  Label = "RX 9070 XT (16 GB, RDNA4)";      Profile = "amd_balanced";    WorkGroups = 64;   UnitSize = 64;  VramGb = 16; Aliases = @("9070","9070xt","rx9070","rx9070xt","rx 9070") }
     @{ Id = "9";  Slug = "none";      Label = "(no GPU - CPU only)";              Profile = "";                WorkGroups = 0;    UnitSize = 0;   VramGb = 0;  Aliases = @("none","no-gpu","nogpu","cpu","skip") }
 )
 
@@ -172,52 +172,39 @@ function New-PoworkerContent($CpuEntry, $GpuEntry, [string]$ComboLabel) {
             "debug = 0"
         )
         if ($GpuEntry.Slug -eq "rx9070xt") {
-            $lines += "; Tip: if stable and no OOM, try gpu_profile = amd_max"
+            $lines += "; RDNA4 safe baseline; Auto Tune measures the best stable mode-specific point."
         }
     }
     return ($lines -join "`r`n") + "`r`n"
 }
 
 function New-DiaworkerContent($CpuEntry, $GpuEntry, [string]$ComboLabel) {
-    $cpuOnly = ($CpuEntry.Slug -eq "cpu-only") -or ($GpuEntry.Slug -eq "none")
-    $svPow = if ($cpuOnly) { Get-CpuOnlySupervene $CpuEntry } else { $CpuEntry.Supervene }
-    $sv = [Math]::Max(2, $svPow - 2)
+    # HACD is CPU/fullnode mining. GPU choices only affect the HAC poworker.
+    $sv = [Math]::Max(1, (Get-CpuOnlySupervene $CpuEntry))
 
     $lines = @(
         "; ============================================================================"
         "; HACD diamond miner - auto-generated for: $ComboLabel"
+        "; CPU only - OpenCL/GPU settings are intentionally disabled"
         "; Requires [diamondminer] enable = true in hacash.config.ini"
         "; ============================================================================"
         ""
         "connect = 127.0.0.1:8080"
         "supervene = $sv"
         ""
+        "[efficiency]"
+        "mode = profit"
+        "cpu_watts_per_thread = 8"
+        "dynamic_supervene = true"
+        "supervene_min = 1"
+        "supervene_max = $sv"
+        "benchmark_seconds = 0"
+        ""
         "[gpu]"
+        "use_opencl = false"
+        "use_cuda = false"
+        "cpu_assist = false"
     )
-
-    if ($cpuOnly) {
-        $lines += @(
-            "use_opencl = false"
-            "cpu_assist = false"
-            "platform_id = 0"
-            "device_ids = 0"
-            "opencl_dir = ../../x16rs/opencl/"
-            "debug = 0"
-        )
-    } else {
-        $lines += @(
-            "use_opencl = true"
-            "cpu_assist = true"
-            "gpu_profile = $($GpuEntry.Profile)"
-            "platform_id = 0"
-            "device_ids = 0"
-            "opencl_dir = ../../x16rs/opencl/"
-            "work_groups = $($GpuEntry.WorkGroups)"
-            "local_size = 256"
-            "unit_size = $($GpuEntry.UnitSize)"
-            "debug = 0"
-        )
-    }
     return ($lines -join "`r`n") + "`r`n"
 }
 
