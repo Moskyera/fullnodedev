@@ -299,10 +299,7 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
                         .as_ref()
                         .and_then(|j| j["err"].as_str())
                         .unwrap_or("");
-                    println!(
-                        "[submit] node rejected height {}: {}",
-                        success.height, err
-                    );
+                    println!("[submit] node rejected height {}: {}", success.height, err);
                 }
                 break;
             }

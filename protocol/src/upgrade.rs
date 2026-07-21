@@ -227,7 +227,12 @@ mod tests {
         // PQC type 4 is neutralized on mainnet to match the official Istanbul node
         // (which has no type 4) — rejected at the dev window, the middle interval,
         // the online-open height, and the former PQC activation height alike.
-        for height in [0u64, DEV_OPEN_MAX_HEIGHT, ONLINE_OPEN_HEIGHT, PQC_TYPE4_OPEN_HEIGHT] {
+        for height in [
+            0u64,
+            DEV_OPEN_MAX_HEIGHT,
+            ONLINE_OPEN_HEIGHT,
+            PQC_TYPE4_OPEN_HEIGHT,
+        ] {
             assert!(check_gated_tx(MAINNET_CHAIN_ID, height, 4).is_err());
         }
     }
@@ -246,10 +251,19 @@ mod tests {
         let pqc = Address::create_pqckey([9u8; 20]);
         let hybrid = Address::create_hybrid([7u8; 20]);
         // A normal privakey->privakey transfer is fine at any mainnet height.
-        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &priva).is_ok());
+        assert!(
+            check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &priva)
+                .is_ok()
+        );
         // Any PQC address as from or to is rejected on mainnet, even above online-open.
-        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &pqc, &priva).is_err());
-        assert!(check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &hybrid).is_err());
+        assert!(
+            check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &pqc, &priva)
+                .is_err()
+        );
+        assert!(
+            check_transfer_addr_online_open(MAINNET_CHAIN_ID, ONLINE_OPEN_HEIGHT, &priva, &hybrid)
+                .is_err()
+        );
         // Off mainnet, PQC addresses are allowed.
         assert!(check_transfer_addr_online_open(1u32, ONLINE_OPEN_HEIGHT, &pqc, &hybrid).is_ok());
     }

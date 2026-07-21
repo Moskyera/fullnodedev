@@ -23,3 +23,4 @@ pub mod poworker;
 // pub mod svrapi; // server api
 pub mod diabider;
 pub mod fullnode;
+pub mod node_api;

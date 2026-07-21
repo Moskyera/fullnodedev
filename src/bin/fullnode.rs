@@ -78,6 +78,7 @@ pub fn run_with_scaner(cnfpath: &str, scan: Box<dyn Scaner>) -> Rerr {
             #[allow(unused_mut)]
             let mut services: Vec<std::sync::Arc<dyn ApiService>> = vec![mint::api::service()];
             services.push(vm::api::service());
+            services.push(app::node_api::service());
             let debug_open = ServerConf::new(ini).debug_open;
             Ok(Box::new(HttpServer::open(
                 ini,
