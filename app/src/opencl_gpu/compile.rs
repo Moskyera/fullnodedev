@@ -356,8 +356,17 @@ pub(crate) fn compile_program_from_source(
     };
 
     let arch_defs = gpu_arch::compile_defines(vendor, arch_slug, amd_fast);
+    // -cl-uniform-work-group-size is an optional OpenCL 2.0 optimization hint that
+    // NVIDIA's OpenCL compiler does not recognize — it rejects the whole build
+    // ("Don't understand command line argument ..."). Omit it on NVIDIA; AMD and
+    // Intel keep it unchanged (their kernel build is byte-identical to before).
+    let uniform_wg = if vendor == gpu_arch::GpuVendor::Nvidia {
+        ""
+    } else {
+        " -cl-uniform-work-group-size"
+    };
     let compile_options = format!(
-        "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable -cl-uniform-work-group-size {include_option}{arch_defs}"
+        "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable{uniform_wg} {include_option}{arch_defs}"
     );
     println!("[OpenCL] compile opts:{arch_defs}");
     let program = match Program::builder()
