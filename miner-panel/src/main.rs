@@ -34,7 +34,9 @@ use config::{
     recover_interrupted_benchmark, restore_benchmark_backup, write_diaworker_config,
     write_poworker_benchmark_config, write_poworker_config,
 };
-use connect::{ConnectMode, SOLO_DEFAULT, connect_port, normalize_connect, pool_presets};
+use connect::{
+    ConnectMode, PoolInfo, SOLO_DEFAULT, connect_port, load_pool_directory, normalize_connect,
+};
 use currency::{Currency, load_currency, save_currency};
 use eframe::egui;
 use hacash_config::{
@@ -106,6 +108,14 @@ struct MinerApp {
     connect: String,
     connect_mode: ConnectMode,
     pool_preset_idx: usize,
+    /// Built-in pools plus any from a `pools.json` next to the exe (updatable).
+    pool_directory: Vec<PoolInfo>,
+    /// poworker knobs surfaced in the GUI so no file editing is ever needed.
+    nonce_max: u32,
+    notice_wait: u64,
+    /// Result text of the last "Test connection" / "Test upstream" reachability probe.
+    connect_test_status: String,
+    upstream_test_status: String,
     max_temp_c: u32,
     pause_unprofitable: bool,
     work_groups: u32,
@@ -281,6 +291,7 @@ impl MinerApp {
             }
         }
         let connect_mode = ConnectMode::for_connect(&connect);
+        let pool_directory = load_pool_directory(&work_dir);
         let mut app = Self {
             work_dir,
             config_path,
@@ -312,6 +323,11 @@ impl MinerApp {
             connect,
             connect_mode,
             pool_preset_idx: 0,
+            pool_directory,
+            nonce_max: u32::MAX,
+            notice_wait: 45,
+            connect_test_status: String::new(),
+            upstream_test_status: String::new(),
             max_temp_c,
             pause_unprofitable,
             work_groups,
@@ -517,7 +533,14 @@ impl MinerApp {
             thermal_gpu_index: self.device_id,
             work_groups: self.work_groups,
             unit_size: self.unit_size,
+            nonce_max: self.nonce_max,
+            notice_wait: self.notice_wait,
         }
+    }
+
+    /// Master Panel tab: the fleet worker table (local miner + remote/VPS miners).
+    fn ui_master(&mut self, ui: &mut egui::Ui) {
+        self.fleet.show_master(ui, &self.stats);
     }
 
     fn set_mining_kind(&mut self, kind: MiningKind) {
@@ -723,11 +746,28 @@ impl MinerApp {
 
     fn apply_pool_preset(&mut self, idx: usize) {
         self.pool_preset_idx = idx;
-        let pools = pool_presets();
-        if let Some(p) = pools.get(idx) {
-            if !p.host.is_empty() {
-                self.connect = p.host.to_string();
-            }
+        let Some(p) = self.pool_directory.get(idx).cloned() else {
+            return;
+        };
+        // Empty connect = a pool whose address comes from its web config
+        // generator; keep whatever the user has typed and let the note guide them.
+        if !p.connect.is_empty() {
+            self.connect = p.connect;
+        }
+        if let Some(v) = p.nonce_max {
+            self.nonce_max = v;
+        }
+        if let Some(v) = p.notice_wait {
+            self.notice_wait = v;
+        }
+    }
+
+    /// Re-read `pools.json` next to the exe so freshly published pools appear
+    /// without restarting the panel.
+    fn refresh_pool_directory(&mut self) {
+        self.pool_directory = load_pool_directory(&self.work_dir);
+        if self.pool_preset_idx >= self.pool_directory.len() {
+            self.pool_preset_idx = 0;
         }
     }
 
@@ -1207,30 +1247,24 @@ impl eframe::App for MinerApp {
                     ) {
                         self.tab = 1;
                     }
+                    if theme::tab_pill(ui, self.tab == 3, theme::TabIcon::Dashboard, "Master Panel")
+                    {
+                        self.tab = 3;
+                    }
                     if theme::tab_pill(ui, self.tab == 2, theme::TabIcon::Help, t.tab_help) {
                         self.tab = 2;
                     }
                 });
                 ui.add_space(16.0);
 
-                match self.tab {
-                    0 | 2 => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if self.tab == 0 {
-                                    self.ui_settings(ui);
-                                } else {
-                                    self.ui_help(ui);
-                                }
-                            });
-                    }
-                    _ => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.ui_dashboard(ui));
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.tab {
+                        0 => self.ui_settings(ui),
+                        2 => self.ui_help(ui),
+                        3 => self.ui_master(ui),
+                        _ => self.ui_dashboard(ui),
+                    });
             });
     }
 

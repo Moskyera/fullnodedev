@@ -63,6 +63,17 @@ impl MinerApp {
             return;
         }
 
+        // All-in-one: start local public pool before mining when hosting is enabled.
+        if self.mining_kind == MiningKind::Hac
+            && self.public_pool.host_enabled
+            && !self.public_pool_running
+        {
+            self.start_public_pool();
+            if !self.public_pool_running {
+                return;
+            }
+        }
+
         self.restart_worker = None;
         self.restart_attempts = 0;
         if self.mining_kind == MiningKind::Hac && self.gpu_presets[self.gpu_idx].slug != "none" {

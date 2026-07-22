@@ -15,6 +15,24 @@ fn discover_cuda_root() -> Option<String> {
                 return entry.path().to_str().map(|s| s.to_string());
             }
         }
+        return None;
+    }
+    // Linux / Colab: common toolkit prefixes
+    for candidate in [
+        "/usr/local/cuda",
+        "/usr/local/cuda-13",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12.6",
+        "/usr/local/cuda-12",
+        "/usr/local/cuda-12.4",
+        "/usr/local/cuda-12.2",
+        "/usr/local/cuda-11",
+        "/usr/lib/cuda",
+    ] {
+        let nvcc = PathBuf::from(candidate).join("bin").join("nvcc");
+        if nvcc.is_file() {
+            return Some(candidate.to_string());
+        }
     }
     None
 }
@@ -74,11 +92,18 @@ fn main() {
     build.define("__CUDA__", None);
     build.define("__ENDIAN_LITTLE__", None);
 
-    // RTX 20xx / 30xx / 40xx fat binary
+    // Real SASS for shipping NVIDIA GPUs (RTX 20xx/30xx/40xx = sm_75/86/89) PLUS a
+    // virtual PTX target (compute_89, code=compute_89). PTX is forward-compatible:
+    // the runtime driver JIT-compiles it to the actual GPU's SASS, so a newer
+    // architecture the fatbin has no SASS for (Hopper sm_90, Blackwell / RTX 50xx
+    // sm_120, ...) still runs instead of failing at launch with
+    // cudaErrorNoKernelImageForDevice. This is what makes "new CUDA / new GPUs"
+    // work without editing this list every generation.
     for arch in [
         "arch=compute_75,code=sm_75",
         "arch=compute_86,code=sm_86",
         "arch=compute_89,code=sm_89",
+        "arch=compute_89,code=compute_89",
     ] {
         build.flag("-gencode").flag(arch);
     }

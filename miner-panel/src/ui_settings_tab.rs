@@ -4,9 +4,18 @@ use eframe::egui;
 
 use crate::MinerApp;
 use crate::OpenClAction;
-use crate::connect::{ConnectMode, pool_presets};
+use crate::connect::{ConnectMode, PoolInfo};
 use crate::mining_kind::MiningKind;
 use crate::theme;
+
+/// Dropdown label for a pool: appends a check mark for endpoints we verified.
+fn pool_menu_label(p: &PoolInfo) -> String {
+    if p.verified {
+        format!("{} \u{2713}", p.name)
+    } else {
+        p.name.clone()
+    }
+}
 
 impl MinerApp {
     pub(super) fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -282,24 +291,42 @@ impl MinerApp {
                         },
                     );
                     ui.vertical(|ui| {
-                        if self.connect_mode == ConnectMode::Pool && self.mining_kind == MiningKind::Hac {
-                            let pools = pool_presets();
-                            let preset_label = pools
+                        let hac_pool = self.connect_mode == ConnectMode::Pool
+                            && self.mining_kind == MiningKind::Hac;
+                        if hac_pool {
+                            // Clone the directory so the combo closure can call
+                            // &mut self (apply/refresh) without aliasing self.
+                            let pools = self.pool_directory.clone();
+                            let selected_label = pools
                                 .get(self.pool_preset_idx)
-                                .map(|p| p.label)
-                                .unwrap_or("Pool");
-                            egui::ComboBox::from_id_salt("pool_preset")
-                                .selected_text(preset_label)
-                                .show_ui(ui, |ui| {
-                                    for (i, p) in pools.iter().enumerate() {
-                                        if ui
-                                            .selectable_value(&mut self.pool_preset_idx, i, p.label)
-                                            .clicked()
-                                        {
-                                            self.apply_pool_preset(i);
+                                .map(pool_menu_label)
+                                .unwrap_or_else(|| "Pool".to_string());
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("pool_preset")
+                                    .selected_text(selected_label)
+                                    .width(300.0)
+                                    .show_ui(ui, |ui| {
+                                        for (i, p) in pools.iter().enumerate() {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.pool_preset_idx,
+                                                    i,
+                                                    pool_menu_label(p),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.apply_pool_preset(i);
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                if ui
+                                    .button("Refresh")
+                                    .on_hover_text("Reload pools.json next to the panel")
+                                    .clicked()
+                                {
+                                    self.refresh_pool_directory();
+                                }
+                            });
                         }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.connect)
@@ -307,38 +334,128 @@ impl MinerApp {
                                 .margin(egui::Margin::symmetric(8.0, 6.0)),
                         );
                         if self.connect_mode == ConnectMode::Pool {
-                            ui.label(
-                                egui::RichText::new(if self.mining_kind == MiningKind::Hacd {
-                                    "All HACD miners may point to the same full node; its hashrate is accumulated."
-                                } else {
-                                    t.connect_pool_hint
-                                })
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button("Test connection")
+                                    .on_hover_text("Check the address is reachable from this PC")
+                                    .clicked()
+                                {
+                                    self.connect_test_status = match crate::connect::probe_reachable(
+                                        &self.connect,
+                                        1500,
+                                    ) {
+                                        Ok(ms) => format!("Reachable ({} ms)", ms),
+                                        Err(e) => format!("Not reachable: {}", e),
+                                    };
+                                }
+                                if !self.connect_test_status.is_empty() {
+                                    let color = if self.connect_test_status.starts_with("Reachable") {
+                                        theme::colors::GREEN
+                                    } else {
+                                        theme::colors::GOLD_DIM
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(&self.connect_test_status)
+                                            .size(11.5)
+                                            .color(color),
+                                    );
+                                }
+                            });
+                        }
+                        if self.connect_mode == ConnectMode::Pool {
+                            if hac_pool {
+                                // Per-pool guidance + link from the directory entry.
+                                if let Some(p) =
+                                    self.pool_directory.get(self.pool_preset_idx).cloned()
+                                {
+                                    let note = if p.note.is_empty() {
+                                        t.connect_pool_hint.to_string()
+                                    } else {
+                                        p.note.clone()
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(note)
+                                            .size(11.5)
+                                            .color(theme::colors::TEXT_MUTED),
+                                    );
+                                    if !p.url.is_empty() {
+                                        ui.hyperlink_to(format!("Open {}", p.url), &p.url);
+                                    }
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "All HACD miners may point to the same full node; its hashrate is accumulated.",
+                                    )
                                     .size(11.5)
                                     .color(theme::colors::TEXT_MUTED),
-                            );
+                                );
+                            }
                         }
                     });
                     ui.end_row();
                 });
         });
 
+        // Everything a different pool might need, editable from the GUI so the
+        // user never has to open poworker.config.ini. Defaults suit every pool;
+        // a directory entry can also preset these when a pool is selected.
+        if self.mining_kind == MiningKind::Hac && self.connect_mode == ConnectMode::Pool {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("Advanced worker settings (optional)")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Only change these if a pool documents specific values.",
+                        )
+                        .size(11.0)
+                        .color(theme::colors::TEXT_MUTED),
+                    );
+                    egui::Grid::new("adv_worker_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 8.0])
+                        .show(ui, |ui| {
+                            theme::field_label(ui, "nonce_max");
+                            ui.add(egui::DragValue::new(&mut self.nonce_max));
+                            ui.end_row();
+                            theme::field_label(ui, "notice_wait (s)");
+                            ui.add(egui::DragValue::new(&mut self.notice_wait).range(1..=600));
+                            ui.end_row();
+                        });
+                    if ui.button("Reset to defaults").clicked() {
+                        self.nonce_max = u32::MAX;
+                        self.notice_wait = 45;
+                    }
+                });
+        }
+
         // All-in-one public free-IP pool (hac-pool)
         if self.mining_kind == MiningKind::Hac {
             ui.add_space(12.0);
             theme::section_card().show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("PUBLIC FREE-IP POOL (ALL-IN-ONE)")
+                    egui::RichText::new("SHARED NODE / OPEN WORK RELAY")
                         .strong()
                         .size(12.0)
                         .color(theme::colors::ACCENT),
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Host a public pool from this PC. Others connect with your IP:HTTP port. \
-Local mining can use 127.0.0.1 via the pool. Requires hac-pool.exe next to the panel.",
+                        "Share this PC's mining work so others can point their miners at YOUR IP:HTTP port \
+(local mining can use 127.0.0.1). Requires hac-pool.exe next to the panel.",
                     )
                     .size(11.5)
                     .color(theme::colors::TEXT_MUTED),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Honest note: this is a work relay, not a share/payout pool. Any block found is \
+minted to THIS node's reward wallet (the host) - connected workers help find blocks but are not \
+individually paid. No share accounting or payouts (v1).",
+                    )
+                    .size(11.0)
+                    .color(theme::colors::GOLD_DIM),
                 );
                 ui.add_space(8.0);
 
@@ -440,6 +557,35 @@ Local mining can use 127.0.0.1 via the pool. Requires hac-pool.exe next to the p
                         ui.label(egui::RichText::new(badge.0).color(badge.1).strong());
                     });
 
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Test upstream")
+                            .on_hover_text("Check the upstream full node is reachable from this PC")
+                            .clicked()
+                        {
+                            self.upstream_test_status = match crate::connect::probe_reachable(
+                                &self.public_pool.upstream,
+                                1500,
+                            ) {
+                                Ok(ms) => format!("Upstream reachable ({} ms)", ms),
+                                Err(e) => format!("Upstream not reachable: {}", e),
+                            };
+                        }
+                        if !self.upstream_test_status.is_empty() {
+                            let color =
+                                if self.upstream_test_status.starts_with("Upstream reachable") {
+                                    theme::colors::GREEN
+                                } else {
+                                    theme::colors::GOLD_DIM
+                                };
+                            ui.label(
+                                egui::RichText::new(&self.upstream_test_status)
+                                    .size(11.5)
+                                    .color(color),
+                            );
+                        }
+                    });
+
                     if !self.public_pool_status.is_empty() {
                         ui.label(
                             egui::RichText::new(&self.public_pool_status)
@@ -449,7 +595,9 @@ Local mining can use 127.0.0.1 via the pool. Requires hac-pool.exe next to the p
                     }
                     ui.label(
                         egui::RichText::new(format!(
-                            "External workers: connect = YOUR_PUBLIC_IP:{}  (firewall must allow it)",
+                            "External workers connect to  YOUR_PUBLIC_IP:{}. For this to reach them over \
+the internet you need a public IP and the port forwarded/allowed by your router + firewall (home \
+NAT/CGNAT often blocks it). This panel cannot verify external reachability - test from another network.",
                             self.public_pool.http_port
                         ))
                         .size(11.0)
