@@ -173,7 +173,7 @@ fn aes_gcm_decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Ret<Vec<u
     let nonce = Nonce::from_slice(nonce);
     cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e: aes_gcm::Error| "keystore decrypt failed: bad password or corrupted data".to_string())
+        .map_err(|_error: aes_gcm::Error| "keystore decrypt failed: bad password or corrupted data".to_string())
 }
 
 pub fn random_bytes(n: usize) -> Ret<Vec<u8>> {

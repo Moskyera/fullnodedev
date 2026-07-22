@@ -1,6 +1,9 @@
 pub mod context;
+pub mod disk;
+pub mod dualchain;
 pub mod integration;
 pub mod logs;
+pub mod memchain;
 pub mod miner_api;
 pub mod state;
 pub mod tx;

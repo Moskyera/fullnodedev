@@ -98,7 +98,8 @@ pub fn count_amd_platforms(platforms: &[OpenClPlatformEntry]) -> usize {
 /// Discrete GPU device indices on a platform (empty device_ids → mine all).
 pub fn discrete_device_indices(platforms: &[OpenClPlatformEntry], platform_id: u32) -> Vec<u32> {
     platforms
-        .get(platform_id as usize)
+        .iter()
+        .find(|platform| platform.index == platform_id)
         .map(|p| {
             p.devices
                 .iter()
@@ -122,20 +123,29 @@ pub fn scan_opencl() -> OpenClScan {
         let version = platform.version().unwrap_or_else(|_| "?".into());
         let amd_app_build = parse_amd_app_build(&version).unwrap_or(0);
         let mut devices = Vec::new();
-        for (di, device) in Device::list_all(platform).unwrap_or_default().iter().enumerate() {
+        for (di, device) in Device::list_all(platform)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
             let dname = device.name().unwrap_or_else(|_| "?".into());
             let dvendor = device.vendor().unwrap_or_else(|_| "?".into());
             let slug = crate::gpu_arch::arch_slug(&dname);
             let compute_units = device_compute_units(device);
             let vram_mb = device_global_mem_bytes(device) / (1024 * 1024);
-            let max_wg = device
-                .max_wg_size()
-                .map(|v| v as u32)
-                .unwrap_or(256);
-            let is_amd = dvendor.to_lowercase().contains("amd")
-                || dname.to_lowercase().contains("radeon")
-                || dname.to_lowercase().contains("gfx");
-            let discrete = is_amd && is_discrete_amd(&slug, compute_units, &dname);
+            let max_wg = device.max_wg_size().map(|v| v as u32).unwrap_or(256);
+            let vendor_kind = crate::gpu_arch::detect_vendor(&dvendor, &dname);
+            let is_amd = vendor_kind == crate::gpu_arch::GpuVendor::Amd;
+            let discrete = match vendor_kind {
+                crate::gpu_arch::GpuVendor::Amd => is_discrete_amd(&slug, compute_units, &dname),
+                crate::gpu_arch::GpuVendor::Nvidia => compute_units > 2 && vram_mb >= 2_048,
+                crate::gpu_arch::GpuVendor::Intel => {
+                    dname.to_ascii_lowercase().contains("arc ")
+                        && compute_units > 2
+                        && vram_mb >= 2_048
+                }
+                crate::gpu_arch::GpuVendor::Unknown => false,
+            };
             devices.push(OpenClDeviceEntry {
                 index: di as u32,
                 name: dname,
@@ -173,17 +183,17 @@ pub fn scan_opencl() -> OpenClScan {
         ));
     }
 
-    let recommended = recommend_discrete_amd(&platforms);
+    let recommended = recommend_opencl_device(&platforms);
     if let Some(ref sel) = recommended {
         let limits = crate::gpu_arch::ArchLimits::for_slug(&sel.device_slug);
         if limits.is_experimental() && amd_platforms.len() > 1 {
             warnings.push(
-                "gfx1201 (RX 9070 XT): duplicate AMD OpenCL platforms — miner will cap work_groups to 512 until only one platform remains."
+                "gfx1201 (RX 9070 XT): duplicate AMD OpenCL platforms — miner will cap work_groups to 64 on this architecture."
                     .to_string(),
             );
         }
     } else {
-        warnings.push("No discrete AMD GPU found in OpenCL scan.".to_string());
+        warnings.push("No compatible discrete OpenCL GPU found.".to_string());
     }
 
     OpenClScan {
@@ -198,10 +208,12 @@ fn device_compute_units(device: &ocl::Device) -> u32 {
     device
         .info(ocl::core::DeviceInfo::MaxComputeUnits)
         .ok()
-        .and_then(|v| if let ocl::core::DeviceInfoResult::MaxComputeUnits(n) = v {
-            Some(n as u32)
-        } else {
-            None
+        .and_then(|v| {
+            if let ocl::core::DeviceInfoResult::MaxComputeUnits(n) = v {
+                Some(n as u32)
+            } else {
+                None
+            }
         })
         .unwrap_or(0)
 }
@@ -211,10 +223,12 @@ fn device_global_mem_bytes(device: &ocl::Device) -> u64 {
     device
         .info(ocl::core::DeviceInfo::GlobalMemSize)
         .ok()
-        .and_then(|v| if let ocl::core::DeviceInfoResult::GlobalMemSize(n) = v {
-            Some(n)
-        } else {
-            None
+        .and_then(|v| {
+            if let ocl::core::DeviceInfoResult::GlobalMemSize(n) = v {
+                Some(n)
+            } else {
+                None
+            }
         })
         .unwrap_or(0)
 }
@@ -247,6 +261,31 @@ pub fn recommend_discrete_amd(platforms: &[OpenClPlatformEntry]) -> Option<OpenC
     best_sel
 }
 
+/// Prefer AMD (the primary tested path), then fall back to another discrete
+/// OpenCL GPU. This remains an OpenCL-only selection; CUDA is never required.
+pub fn recommend_opencl_device(platforms: &[OpenClPlatformEntry]) -> Option<OpenClSelection> {
+    if let Some(amd) = recommend_discrete_amd(platforms) {
+        return Some(amd);
+    }
+    platforms
+        .iter()
+        .flat_map(|platform| {
+            platform
+                .devices
+                .iter()
+                .filter(|device| device.is_discrete)
+                .map(move |device| (platform, device))
+        })
+        .max_by_key(|(_, device)| (device.vram_mb, device.compute_units))
+        .map(|(platform, device)| OpenClSelection {
+            platform_id: platform.index,
+            device_id: device.index,
+            device_slug: device.slug.clone(),
+            device_name: device.name.clone(),
+            amd_app_build: platform.amd_app_build,
+        })
+}
+
 /// Resolve config platform/device to the best matching OpenCL runtime selection.
 pub fn resolve_opencl_selection(
     platforms: &[OpenClPlatformEntry],
@@ -255,7 +294,7 @@ pub fn resolve_opencl_selection(
 ) -> (u32, u32, Vec<String>) {
     let mut notes = Vec::new();
     let Some(plat) = platforms.iter().find(|p| p.index == configured_platform) else {
-        if let Some(rec) = recommend_discrete_amd(platforms) {
+        if let Some(rec) = recommend_opencl_device(platforms) {
             notes.push(format!(
                 "[OpenCL] platform_id={} invalid — using recommended platform {} device {} ({})",
                 configured_platform, rec.platform_id, rec.device_id, rec.device_slug
@@ -266,7 +305,7 @@ pub fn resolve_opencl_selection(
     };
 
     let Some(dev) = plat.devices.iter().find(|d| d.index == configured_device) else {
-        if let Some(rec) = recommend_discrete_amd(platforms) {
+        if let Some(rec) = recommend_opencl_device(platforms) {
             notes.push(format!(
                 "[OpenCL] device_id={} not found on platform {} — using {} ({})",
                 configured_device, configured_platform, rec.device_id, rec.device_slug
@@ -279,6 +318,7 @@ pub fn resolve_opencl_selection(
     if dev.is_discrete {
         let slug = dev.slug.clone();
         let mut best_plat = configured_platform;
+        let mut best_device = configured_device;
         let mut best_build = plat.amd_app_build;
         for p in platforms {
             if !is_amd_vendor(&p.vendor) {
@@ -287,8 +327,9 @@ pub fn resolve_opencl_selection(
             if p.amd_app_build <= best_build {
                 continue;
             }
-            if p.devices.iter().any(|d| d.slug == slug && d.is_discrete) {
+            if let Some(candidate) = p.devices.iter().find(|d| d.slug == slug && d.is_discrete) {
                 best_plat = p.index;
+                best_device = candidate.index;
                 best_build = p.amd_app_build;
             }
         }
@@ -299,7 +340,7 @@ pub fn resolve_opencl_selection(
             ));
         }
         if is_igpu_slug(&dev.slug, dev.compute_units, &dev.name) {
-            if let Some(rec) = recommend_discrete_amd(platforms) {
+            if let Some(rec) = recommend_opencl_device(platforms) {
                 notes.push(format!(
                     "[OpenCL] device {} looks like iGPU — switching to {} ({})",
                     dev.name, rec.device_name, rec.device_slug
@@ -307,10 +348,10 @@ pub fn resolve_opencl_selection(
                 return (rec.platform_id, rec.device_id, notes);
             }
         }
-        return (best_plat, configured_device, notes);
+        return (best_plat, best_device, notes);
     }
 
-    if let Some(rec) = recommend_discrete_amd(platforms) {
+    if let Some(rec) = recommend_opencl_device(platforms) {
         notes.push(format!(
             "[OpenCL] Configured device is not discrete — using {} ({})",
             rec.device_name, rec.device_slug
@@ -352,11 +393,7 @@ pub fn print_scan_report(scan: &OpenClScan) {
     if let Some(rec) = &scan.recommended {
         println!(
             "Recommended: platform_id={} device_id={}  {} ({})  AMD-APP {}",
-            rec.platform_id,
-            rec.device_id,
-            rec.device_name,
-            rec.device_slug,
-            rec.amd_app_build
+            rec.platform_id, rec.device_id, rec.device_name, rec.device_slug, rec.amd_app_build
         );
     }
     if !scan.warnings.is_empty() {
@@ -399,13 +436,24 @@ mod resolve_tests {
     #[test]
     fn resolve_upgrades_to_newer_amd_platform() {
         let platforms = vec![
-            plat(0, 3679, vec![dev(1, "gfx1201", 32, true)]),
+            plat(0, 3679, vec![dev(4, "gfx1201", 32, true)]),
             plat(1, 3652, vec![dev(1, "gfx1201", 32, true)]),
         ];
         let (p, d, notes) = resolve_opencl_selection(&platforms, 1, 1);
         assert_eq!(p, 0);
-        assert_eq!(d, 1);
+        assert_eq!(d, 4);
         assert!(!notes.is_empty());
+    }
+
+    #[test]
+    fn discrete_indices_use_platform_identity_not_vector_position() {
+        let platforms = vec![
+            plat(7, 3679, vec![dev(2, "gfx1201", 32, true)]),
+            plat(9, 3652, vec![dev(5, "gfx1100", 84, true)]),
+        ];
+        assert_eq!(discrete_device_indices(&platforms, 7), vec![2]);
+        assert_eq!(discrete_device_indices(&platforms, 9), vec![5]);
+        assert!(discrete_device_indices(&platforms, 0).is_empty());
     }
 
     #[test]
@@ -413,13 +461,35 @@ mod resolve_tests {
         let platforms = vec![plat(
             0,
             3679,
-            vec![
-                dev(0, "gfx1036", 1, false),
-                dev(1, "gfx1201", 32, true),
-            ],
+            vec![dev(0, "gfx1036", 1, false), dev(1, "gfx1201", 32, true)],
         )];
         let rec = recommend_discrete_amd(&platforms).unwrap();
         assert_eq!(rec.device_id, 1);
         assert_eq!(rec.device_slug, "gfx1201");
+    }
+
+    #[test]
+    fn opencl_recommendation_falls_back_to_non_amd_discrete_gpu() {
+        let device = OpenClDeviceEntry {
+            index: 0,
+            name: "NVIDIA GeForce RTX 4070".into(),
+            slug: "rtx4070".into(),
+            vendor: "NVIDIA Corporation".into(),
+            compute_units: 46,
+            vram_mb: 12_288,
+            max_work_group_size: 1024,
+            is_discrete: true,
+            is_amd: false,
+        };
+        let platform = OpenClPlatformEntry {
+            index: 0,
+            name: "NVIDIA CUDA OpenCL".into(),
+            vendor: "NVIDIA Corporation".into(),
+            version: "OpenCL 3.0".into(),
+            amd_app_build: 0,
+            devices: vec![device],
+        };
+        let rec = recommend_opencl_device(&[platform]).unwrap();
+        assert_eq!(rec.device_slug, "rtx4070");
     }
 }

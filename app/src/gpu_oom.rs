@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
-use crate::efficiency::clamp_workgroups_for_vram;
 use crate::gpu_arch::ArchLimits;
 
 /// Minimum work_groups after OOM fallback on standard AMD/NVIDIA paths.
@@ -48,12 +47,11 @@ impl GpuOomState {
             return;
         }
         self.oom_ramp_to_base = true;
-        let floor = if vram_bytes > 0 {
-            clamp_workgroups_for_vram(vram_bytes, localsize, unitsize, configured)
-        } else {
-            OOM_FLOOR_WG
-        };
-        self.oom_floor_wg = floor.max(OOM_FLOOR_WG);
+        // This is the architectural recovery minimum, not the largest
+        // allocation that currently fits. The latter made record_error()
+        // unable to reduce work-groups on otherwise roomy GPUs.
+        let _ = (vram_bytes, localsize, unitsize);
+        self.oom_floor_wg = limits.oom_floor_wg.min(configured.max(1));
     }
 
     pub fn effective_wg(&self) -> u32 {
@@ -116,10 +114,7 @@ impl GpuOomState {
             self.effective_workgroups.store(base, Relaxed);
             self.oom_reduced.store(false, Relaxed);
             self.success_batches_since_oom.store(0, Relaxed);
-            println!(
-                "[efficiency] GPU stable — restored work_groups to {}",
-                base
-            );
+            println!("[efficiency] GPU stable — restored work_groups to {}", base);
         }
     }
 }
@@ -206,6 +201,15 @@ mod tests {
         );
         st.record_error(512, true);
         assert_eq!(st.effective_workgroups.load(Relaxed), 32);
+    }
+
+    #[test]
+    fn standard_gpu_configure_floor_can_reduce_a_roomy_allocation() {
+        let mut st = GpuOomState::new(2048);
+        st.configure_floor(16 * 1024 * 1024 * 1024, 256, 96, 2048, "gfx1100");
+        assert_eq!(st.floor_wg(), 512);
+        assert_eq!(st.record_error(2048, true), 1024);
+        assert_eq!(st.record_error(2048, true), 512);
     }
 
     #[test]

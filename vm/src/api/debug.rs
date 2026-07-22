@@ -41,14 +41,14 @@ fn debug_contract_storage(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
             Err(e) => api_error(&e.to_string()),
         },
         "storage" | "" => match state.debug_storage_get(&gst, &cap, height, &addr, &key) {
-            Ok(Some((value, live_rest, recover_rest, active, recoverable))) => api_data_raw(format!(
+            Ok(Some(info)) => api_data_raw(format!(
                 r#""height":{},"kind":"storage","exists":true,"active":{},"recoverable":{},"live_rest":{},"recover_rest":{},"value":{}"#,
                 height,
-                active,
-                recoverable,
-                live_rest,
-                recover_rest,
-                value.to_debug_json()
+                info.active,
+                info.recoverable,
+                info.live_blocks,
+                info.recover_blocks,
+                info.value.to_debug_json()
             )),
             Ok(None) => api_data_raw(format!(
                 r#""height":{},"kind":"storage","exists":false,"active":false,"recoverable":false,"live_rest":0,"recover_rest":0,"value":{}"#,

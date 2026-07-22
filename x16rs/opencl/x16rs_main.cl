@@ -55,7 +55,7 @@ __kernel void x16rs_main(
         // Hash Block
         sha3_256_hash(base_stuff.h8, local_hashes[index + i].h8);
     }          
-    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
 #ifdef AMD_GFX_GFX1201
     X16RS_RUN_REPEAT_LOOP(
@@ -81,19 +81,19 @@ __kernel void x16rs_main(
     );
 #endif
     
-    unsigned int best_hash = 0;
+    unsigned int best_hash = index;
     X16RS_PRAGMA_UNROLL_8
     for (unsigned int i = 1; i < unit_size; i++) {
         if (diff_big_hash(&local_hashes[best_hash], &local_hashes[index + i]) == 1) {
             best_hash = index + i;
         }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     local_hashes[index] = local_hashes[best_hash];
     local_nonces[local_id] = global_offset + best_hash - index;
     
-    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     // Now perform the reduction across threads
     for (unsigned int smax = local_size >> 1; smax > 0; smax >>= 1) {
@@ -105,7 +105,7 @@ __kernel void x16rs_main(
                 local_nonces[local_id] = local_nonces[local_id + smax];
             }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
     }
 
     if(local_id == 0) {
@@ -115,3 +115,18 @@ __kernel void x16rs_main(
         best_hashes[group_id].h1[local_id] = local_hashes[0].h1[local_id];
     }
 }
+
+#ifdef AMD_GFX_GFX1201
+/* One-work-item protocol vector used by the host before mining starts. */
+__kernel void x16rs_test_groestl2(
+    __global const hash_32* input_hashes,
+    __global hash_32* output_hashes
+) {
+    if (get_global_id(0) != 0) {
+        return;
+    }
+    hash_32 value = input_hashes[0];
+    hash_x16rs_func_2(&value, T0_G, T0_G, T0_G, T0_G);
+    output_hashes[0] = value;
+}
+#endif

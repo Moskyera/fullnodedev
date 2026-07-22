@@ -1,12 +1,15 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use app::efficiency::{min_profile_tier_for_mode, profile_tier, EfficiencyMode};
-use app::gpu_arch::ArchLimits;
+use app::efficiency::{EfficiencyMode, min_profile_tier_for_mode, profile_tier};
+use app::gpu_arch::{ArchLimits, normalize_profile, profile_vendor};
+
+use crate::currency::Currency;
 
 use crate::presets::{
-    gpu_idx_for_profile, gpu_idx_for_slug, min_work_groups_for_gpu, resolve_panel_tuning,
-    tuning_for_profile, CpuPreset, GpuPreset,
+    CpuPreset, GpuPreset, gpu_idx_for_profile, gpu_idx_for_slug, min_work_groups_for_gpu,
+    resolve_panel_tuning, tuning_for_profile,
 };
 
 pub struct PanelSettings {
@@ -33,6 +36,93 @@ pub struct PanelSettings {
     pub unit_size: u32,
 }
 
+const BENCHMARK_BACKUP_PRESENT: &str = "HACASH_MINER_PANEL_AUTOTUNE_BACKUP_V1:PRESENT\n";
+const BENCHMARK_BACKUP_ABSENT: &str = "HACASH_MINER_PANEL_AUTOTUNE_BACKUP_V1:ABSENT\n";
+
+/// Durable marker used to recover the exact pre-benchmark config after a
+/// panel/worker crash. The sidecar remains until Auto Tune commits or rolls
+/// back successfully.
+#[derive(Debug)]
+pub struct BenchmarkConfigBackup {
+    sidecar_path: PathBuf,
+}
+
+fn benchmark_backup_path(config_path: &Path) -> PathBuf {
+    let mut name = config_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("poworker.config.ini"))
+        .to_os_string();
+    name.push(".autotune-backup");
+    config_path.with_file_name(name)
+}
+
+pub fn create_benchmark_backup(config_path: &Path) -> io::Result<BenchmarkConfigBackup> {
+    let sidecar_path = benchmark_backup_path(config_path);
+    if sidecar_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "an interrupted Auto Tune backup already exists: {}",
+                sidecar_path.display()
+            ),
+        ));
+    }
+    let body = match std::fs::read_to_string(config_path) {
+        Ok(content) => format!("{BENCHMARK_BACKUP_PRESENT}{content}"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            BENCHMARK_BACKUP_ABSENT.to_string()
+        }
+        Err(error) => return Err(error),
+    };
+    crate::hacash_config::atomic_write_private(&sidecar_path, &body)?;
+    Ok(BenchmarkConfigBackup { sidecar_path })
+}
+
+pub fn restore_benchmark_backup(
+    config_path: &Path,
+    backup: &BenchmarkConfigBackup,
+) -> io::Result<()> {
+    let raw = std::fs::read_to_string(&backup.sidecar_path)?;
+    if let Some(content) = raw.strip_prefix(BENCHMARK_BACKUP_PRESENT) {
+        crate::hacash_config::atomic_write_private(config_path, content)?;
+    } else if raw == BENCHMARK_BACKUP_ABSENT {
+        match std::fs::remove_file(config_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Auto Tune backup marker",
+        ));
+    }
+    std::fs::remove_file(&backup.sidecar_path)
+}
+
+pub fn commit_benchmark_backup(backup: &BenchmarkConfigBackup) -> io::Result<()> {
+    std::fs::remove_file(&backup.sidecar_path)
+}
+
+pub fn recover_interrupted_benchmark(config_path: &Path) -> io::Result<bool> {
+    let sidecar_path = benchmark_backup_path(config_path);
+    if !sidecar_path.exists() {
+        return Ok(false);
+    }
+    let backup = BenchmarkConfigBackup { sidecar_path };
+    restore_benchmark_backup(config_path, &backup)?;
+    Ok(true)
+}
+
+/// Return the durable rollback marker after a failed startup recovery so the
+/// UI can stay locked and offer an explicit retry instead of hiding the error.
+pub fn interrupted_benchmark_backup(config_path: &Path) -> Option<BenchmarkConfigBackup> {
+    let sidecar_path = benchmark_backup_path(config_path);
+    sidecar_path
+        .exists()
+        .then_some(BenchmarkConfigBackup { sidecar_path })
+}
+
 #[derive(Default)]
 pub struct LoadedPanelIni {
     pub supervene: Option<u32>,
@@ -48,6 +138,7 @@ pub struct LoadedPanelIni {
     pub hac_price: Option<f64>,
     pub max_temp_c: Option<u32>,
     pub pause_if_unprofitable: Option<bool>,
+    pub benchmark_seconds: Option<u32>,
 }
 
 fn parse_u32(s: &str) -> Option<u32> {
@@ -72,7 +163,10 @@ fn section_map(content: &str, section: &str) -> HashMap<String, String> {
             continue;
         }
         if let Some((k, v)) = trimmed.split_once('=') {
-            out.insert(k.trim().to_lowercase(), v.split(';').next().unwrap_or(v).trim().to_string());
+            out.insert(
+                k.trim().to_lowercase(),
+                v.split(';').next().unwrap_or(v).trim().to_string(),
+            );
         }
     }
     out
@@ -116,15 +210,14 @@ pub fn load_panel_ini(path: &Path) -> LoadedPanelIni {
             .and_then(|v| v.split(',').next())
             .and_then(|v| parse_u32(v)),
         connect: root_value(&content, "connect"),
-        mode: eff
-            .get("mode")
-            .map(|s| EfficiencyMode::from_str(s)),
+        mode: eff.get("mode").map(|s| EfficiencyMode::from_str(s)),
         power_cost_kwh: eff.get("power_cost_kwh").and_then(|v| parse_f64(v)),
         hac_price: eff.get("hac_price").and_then(|v| parse_f64(v)),
         max_temp_c: eff.get("max_temp_c").and_then(|v| parse_u32(v)),
         pause_if_unprofitable: eff
             .get("pause_if_unprofitable")
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes")),
+        benchmark_seconds: eff.get("benchmark_seconds").and_then(|v| parse_u32(v)),
     }
 }
 
@@ -144,6 +237,7 @@ pub fn apply_loaded_ini(
     hac_price: &mut f32,
     max_temp_c: &mut u32,
     pause_unprofitable: &mut bool,
+    currency: Currency,
 ) {
     if let Some(sv) = loaded.supervene {
         if let Some(i) = cpus.iter().position(|c| c.supervene == sv) {
@@ -176,10 +270,10 @@ pub fn apply_loaded_ini(
         *connect = c.clone();
     }
     if let Some(c) = loaded.power_cost_kwh {
-        *power_cost = c as f32;
+        *power_cost = Currency::convert(c, Currency::Eur, currency) as f32;
     }
     if let Some(p) = loaded.hac_price {
-        *hac_price = p as f32;
+        *hac_price = Currency::convert(p, Currency::Eur, Currency::Usd) as f32;
     }
     if let Some(t) = loaded.max_temp_c {
         *max_temp_c = t;
@@ -189,8 +283,27 @@ pub fn apply_loaded_ini(
     }
 }
 
-/// After autotune benchmark, load measured profile + work_groups + unit_size from ini.
-/// Rejects profiles below the minimum tier for the selected efficiency mode (e.g. Max ≠ amd_eco).
+fn safe_profile_for_gpu(gpu: &GpuPreset, requested: &str, mode: EfficiencyMode) -> String {
+    let default = resolve_panel_tuning(gpu, mode);
+    let vendor = profile_vendor(gpu.profile);
+    let candidate = if requested.trim().is_empty() {
+        default.profile.to_string()
+    } else {
+        normalize_profile(requested, vendor)
+    };
+    let tier = profile_tier(&candidate);
+    if profile_vendor(&candidate) != vendor
+        || tier < min_profile_tier_for_mode(mode)
+        || tier > ArchLimits::panel_max_tier(gpu.slug)
+    {
+        default.profile.to_string()
+    } else {
+        candidate
+    }
+}
+
+/// Load the exact successful autotune point and clamp only to hard device
+/// limits. Mode defaults must not overwrite a measured result.
 pub fn apply_benchmark_ini(
     loaded: &LoadedPanelIni,
     gpus: &[GpuPreset],
@@ -204,70 +317,68 @@ pub fn apply_benchmark_ini(
         if let Some(i) = gpu_idx_for_slug(gpus, slug) {
             *gpu_idx = i;
         }
-    }
-    if let Some(ref profile) = loaded.gpu_profile {
-        *gpu_profile = profile.clone();
-        if loaded.gpu_slug.is_none() {
-            if let Some(i) = gpu_idx_for_profile(gpus, profile) {
-                *gpu_idx = i;
-            }
+    } else if let Some(ref profile) = loaded.gpu_profile {
+        if let Some(i) = gpu_idx_for_profile(gpus, profile) {
+            *gpu_idx = i;
         }
     }
-    let min_tier = min_profile_tier_for_mode(mode);
-    if profile_tier(gpu_profile) < min_tier {
-        if let Some(gpu) = gpus.get(*gpu_idx) {
-            let t = resolve_panel_tuning(gpu, mode);
-            *gpu_profile = t.profile.to_string();
-            *work_groups = t.work_groups;
-            *unit_size = t.unit_size;
-            return;
-        }
+    let Some(gpu) = gpus.get(*gpu_idx) else {
+        return;
+    };
+    if gpu.slug == "none" {
+        *work_groups = 0;
+        *unit_size = 0;
+        gpu_profile.clear();
+        return;
     }
-    if let Some(wg) = loaded.work_groups {
-        *work_groups = wg;
-    } else if !gpu_profile.is_empty() {
-        let (wg, us) = tuning_for_profile(gpu_profile);
-        *work_groups = wg;
-        *unit_size = us;
-    }
-    if let Some(us) = loaded.unit_size {
-        *unit_size = us;
-    }
-    if let Some(gpu) = gpus.get(*gpu_idx) {
-        let t = resolve_panel_tuning(gpu, mode);
-        let min_wg = min_work_groups_for_gpu(&gpu.slug);
-        *work_groups = (*work_groups).min(t.work_groups).max(min_wg);
-        *unit_size = (*unit_size).min(t.unit_size).max(32);
-    }
+
+    let requested_profile = loaded
+        .gpu_profile
+        .as_deref()
+        .unwrap_or(gpu_profile.as_str());
+    *gpu_profile = safe_profile_for_gpu(gpu, requested_profile, mode);
+    let (default_wg, default_us) = tuning_for_profile(gpu_profile);
+    let min_wg = min_work_groups_for_gpu(&gpu.slug);
+    let max_wg = ArchLimits::panel_max_work_groups(&gpu.slug, gpu.vram_gb);
+    let max_us = ArchLimits::panel_max_unit_size(&gpu.slug);
+    *work_groups = loaded
+        .work_groups
+        .unwrap_or(default_wg)
+        .clamp(min_wg, max_wg);
+    *unit_size = loaded.unit_size.unwrap_or(default_us).clamp(32, max_us);
 }
 
-/// Resolve ini tuning: UI/benchmark values capped by arch-safe resolver limits.
+/// Resolve UI/default/autotune tuning. Explicit benchmark values are
+/// preserved and only hard architecture/VRAM caps are applied.
 fn resolve_ini_tuning(s: &PanelSettings) -> (u32, u32, String) {
-    let cpu_only = s.gpu.slug == "none";
-    if cpu_only {
+    if s.gpu.slug == "none" {
         return (0, 0, String::new());
     }
-    let cap = resolve_panel_tuning(&s.gpu, s.mode);
-    let profile = if !s.gpu_profile.is_empty() {
-        s.gpu_profile.clone()
-    } else {
-        cap.profile.to_string()
-    };
+    let default = resolve_panel_tuning(&s.gpu, s.mode);
+    let profile = safe_profile_for_gpu(&s.gpu, &s.gpu_profile, s.mode);
     let min_wg = min_work_groups_for_gpu(&s.gpu.slug);
+    let max_wg = ArchLimits::panel_max_work_groups(&s.gpu.slug, s.gpu.vram_gb);
+    let max_us = ArchLimits::panel_max_unit_size(&s.gpu.slug);
     let wg = if s.work_groups > 0 {
-        s.work_groups.min(cap.work_groups).max(min_wg)
+        s.work_groups.clamp(min_wg, max_wg)
     } else {
-        cap.work_groups
+        default.work_groups
     };
     let us = if s.unit_size > 0 {
-        s.unit_size.min(cap.unit_size).max(32)
+        s.unit_size.clamp(32, max_us)
     } else {
-        cap.unit_size
+        default.unit_size
     };
     (wg, us, profile)
 }
 
-fn efficiency_section(s: &PanelSettings, throttle_work_groups: u32) -> String {
+fn efficiency_section(
+    s: &PanelSettings,
+    throttle_work_groups: u32,
+    gpu_watts: f64,
+    max_temp_c: u32,
+    supervene: u32,
+) -> String {
     let mode = s.mode.label();
     format!(
         r"[efficiency]
@@ -276,8 +387,8 @@ power_cost_kwh = {cost}
 gpu_watts = {gpu_watts}
 cpu_watts_per_thread = 8
 hac_price = {hac_price}
-dynamic_supervene = true
-supervene_min = 2
+dynamic_supervene = {dynamic_supervene}
+supervene_min = {sv_min}
 supervene_max = {sv}
 oom_fallback = true
 max_temp_c = {max_temp}
@@ -292,10 +403,12 @@ stats_file = {stats_file}
 ",
         mode = mode,
         cost = s.power_cost_kwh,
-        gpu_watts = s.gpu.watts,
+        gpu_watts = gpu_watts,
         hac_price = s.hac_price,
-        sv = s.cpu.supervene,
-        max_temp = s.max_temp_c,
+        sv = supervene,
+        dynamic_supervene = supervene > 0,
+        sv_min = if supervene > 0 { 1 } else { 0 },
+        max_temp = max_temp_c,
         idle_start = s.idle_start_hour,
         idle_end = s.idle_end_hour,
         pause_unprofitable = s.pause_if_unprofitable,
@@ -308,6 +421,7 @@ stats_file = {stats_file}
 
 pub fn write_poworker_config(path: &Path, s: &PanelSettings) -> std::io::Result<()> {
     let cpu_only = s.gpu.slug == "none";
+    let cpu_assist = !cpu_only && s.cpu.supervene > 0;
     let (wg, us, profile) = resolve_ini_tuning(s);
     let body = format!(
         r"; Generated by miner-panel — do not edit by hand; use the panel UI.
@@ -319,6 +433,7 @@ notice_wait = 45
 {efficiency}
 [gpu]
 use_opencl = {use_ocl}
+use_cuda = false
 cpu_assist = {cpu_assist}
 gpu_slug = {gpu_slug}
 gpu_profile = {profile}
@@ -332,9 +447,16 @@ debug = 0
 ",
         connect = s.connect,
         sv = s.cpu.supervene,
-        efficiency = efficiency_section(s, wg.max(1)),
+        // Thermal cap must be below full load; half of WG (min 1) actually reduces heat.
+        efficiency = efficiency_section(
+            s,
+            (wg / 2).max(1),
+            s.gpu.watts,
+            s.max_temp_c,
+            s.cpu.supervene,
+        ),
         use_ocl = if cpu_only { "false" } else { "true" },
-        cpu_assist = if cpu_only { "false" } else { "true" },
+        cpu_assist = if cpu_assist { "true" } else { "false" },
         gpu_slug = s.gpu.slug,
         profile = profile,
         platform_id = s.platform_id,
@@ -343,67 +465,79 @@ debug = 0
         wg = wg,
         us = us,
     );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, body)
+    crate::hacash_config::atomic_write_private(path, &body)
 }
 
 pub fn write_diaworker_config(path: &Path, s: &PanelSettings) -> std::io::Result<()> {
-    let cpu_only = s.gpu.slug == "none";
-    let (wg, us, profile) = resolve_ini_tuning(s);
+    // HACD mining is officially CPU/full-node only. Keep this config strict so
+    // selecting a GPU for HAC can never leak an experimental GPU path into HACD.
+    let supervene = s.cpu.supervene.max(1);
     let body = format!(
-        r"; Generated by miner-panel (HACD / diamond mining) — use the panel UI.
+        r"; Generated by miner-panel (HACD / diamond mining) — CPU/full-node only.
 connect = {connect}
 supervene = {sv}
 
 {efficiency}
 [gpu]
-use_opencl = {use_ocl}
-cpu_assist = {cpu_assist}
-gpu_slug = {gpu_slug}
-gpu_profile = {profile}
-platform_id = {platform_id}
-device_ids = {device_id}
-opencl_dir = {opencl_dir}
-work_groups = {wg}
+use_opencl = false
+use_cuda = false
+cpu_assist = false
+gpu_slug = none
+gpu_profile =
+platform_id = 0
+device_ids = 0
+opencl_dir =
+work_groups = 0
 local_size = 256
-unit_size = {us}
+unit_size = 0
 debug = 0
 ",
         connect = s.connect,
-        sv = s.cpu.supervene,
-        efficiency = efficiency_section(s, wg.max(1)),
-        use_ocl = if cpu_only { "false" } else { "true" },
-        cpu_assist = if cpu_only { "false" } else { "true" },
-        gpu_slug = s.gpu.slug,
-        profile = profile,
-        platform_id = s.platform_id,
-        device_id = s.device_id,
-        opencl_dir = s.opencl_dir,
-        wg = wg,
-        us = us,
+        sv = supervene,
+        efficiency = efficiency_section(s, 1, 0.0, 0, supervene),
     );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, body)
+    crate::hacash_config::atomic_write_private(path, &body)
 }
 
-pub fn write_poworker_benchmark_config(path: &Path, s: &PanelSettings, seconds: u32) -> std::io::Result<()> {
+pub fn write_poworker_benchmark_config(
+    path: &Path,
+    s: &PanelSettings,
+    seconds: u32,
+) -> std::io::Result<()> {
     let mut bench = s.clone_settings();
     bench.benchmark_seconds = seconds;
-    // RDNA4/gfx1201: skip wg sweep (256+ candidates); profile pick only at WG≤64.
-    bench.benchmark_fine_sweep =
-        seconds >= 60 && !ArchLimits::for_panel_slug(&s.gpu.slug).is_experimental();
-    write_poworker_config(path, &bench)
+    bench.benchmark_fine_sweep = seconds >= 60;
+    write_poworker_config(path, &bench)?;
+
+    // Allocate for the full safe range of this preset. The worker will record
+    // only the exact point that actually ran after runtime CU/VRAM clamping.
+    let max_wg = ArchLimits::panel_max_work_groups(&s.gpu.slug, s.gpu.vram_gb);
+    let max_us = ArchLimits::panel_max_unit_size(&s.gpu.slug);
+    let raw = std::fs::read_to_string(path)?;
+    let mut in_gpu = false;
+    let mut out = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_gpu = trimmed.eq_ignore_ascii_case("[gpu]");
+        }
+        if in_gpu && trimmed.starts_with("work_groups") && trimmed.contains('=') {
+            out.push_str(&format!("work_groups = {max_wg}"));
+        } else if in_gpu && trimmed.starts_with("unit_size") && trimmed.contains('=') {
+            out.push_str(&format!("unit_size = {max_us}"));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    crate::hacash_config::atomic_write_private(path, &out)
 }
 
 #[cfg(test)]
 mod write_tuning_tests {
     use super::*;
+    use crate::presets::{GpuPreset, cpu_presets, gpu_presets};
     use app::efficiency::EfficiencyMode;
-    use crate::presets::{cpu_presets, gpu_presets, GpuPreset};
 
     fn panel_with_wg(gpu: &GpuPreset, wg: u32, us: u32) -> PanelSettings {
         PanelSettings {
@@ -452,6 +586,151 @@ mod write_tuning_tests {
         let (wg, us, _) = resolve_ini_tuning(&s);
         assert_eq!(wg, 64);
         assert_eq!(us, 64);
+    }
+
+    #[test]
+    fn measured_point_is_not_clamped_back_to_mode_default() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rx7900xtx")
+            .unwrap();
+        let mut s = panel_with_wg(&gpu, 4096, 128);
+        s.mode = EfficiencyMode::Eco;
+        s.gpu_profile = "amd_max".into();
+        let (wg, us, profile) = resolve_ini_tuning(&s);
+        assert_eq!((wg, us), (4096, 128));
+        assert_eq!(profile, "amd_max");
+    }
+
+    #[test]
+    fn benchmark_allocates_full_safe_range_for_every_gpu_preset() {
+        for gpu in gpu_presets().into_iter().filter(|g| g.slug != "none") {
+            let s = panel_with_wg(&gpu, 1, 32);
+            let path = std::env::temp_dir().join(format!(
+                "hacash-panel-autotune-{}-{}.ini",
+                gpu.slug,
+                std::process::id()
+            ));
+            write_poworker_benchmark_config(&path, &s, 90).unwrap();
+            let loaded = load_panel_ini(&path);
+            let _ = std::fs::remove_file(path);
+            assert_eq!(
+                loaded.work_groups,
+                Some(ArchLimits::panel_max_work_groups(&gpu.slug, gpu.vram_gb)),
+                "{}",
+                gpu.slug
+            );
+            assert_eq!(
+                loaded.unit_size,
+                Some(ArchLimits::panel_max_unit_size(&gpu.slug)),
+                "{}",
+                gpu.slug
+            );
+            assert_eq!(loaded.benchmark_seconds, Some(90), "{}", gpu.slug);
+        }
+    }
+
+    #[test]
+    fn gpu_only_config_disables_cpu_assist_and_cuda() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rx9070xt")
+            .unwrap();
+        let s = panel_with_wg(&gpu, 64, 64);
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-config-{}.ini", std::process::id()));
+        write_poworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(raw.contains("use_opencl = true"));
+        assert!(raw.contains("use_cuda = false"));
+        assert!(raw.contains("cpu_assist = false"));
+        assert!(raw.contains("supervene = 0"));
+        assert!(
+            raw.contains("throttle_work_groups = 32"),
+            "thermal throttle must be half of work_groups=64, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn hacd_config_is_strictly_cpu_only() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rx9070xt")
+            .unwrap();
+        let s = panel_with_wg(&gpu, 64, 64);
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-hacd-{}.ini", std::process::id()));
+        write_diaworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(raw.contains("supervene = 1"));
+        assert!(raw.contains("gpu_watts = 0"));
+        assert!(raw.contains("max_temp_c = 0"));
+        assert!(raw.contains("use_opencl = false"));
+        assert!(raw.contains("use_cuda = false"));
+        assert!(raw.contains("cpu_assist = false"));
+        assert!(raw.contains("gpu_slug = none"));
+        assert!(raw.contains("work_groups = 0"));
+        assert!(!raw.contains("use_opencl = true"));
+    }
+
+    #[test]
+    fn benchmark_completion_marker_is_loaded() {
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-benchmark-{}.ini", std::process::id()));
+        std::fs::write(
+            &path,
+            "[efficiency]
+benchmark_seconds = 0
+[gpu]
+work_groups = 64
+",
+        )
+        .unwrap();
+        let loaded = load_panel_ini(&path);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(loaded.benchmark_seconds, Some(0));
+        assert_eq!(loaded.work_groups, Some(64));
+    }
+
+    #[test]
+    fn interrupted_benchmark_restores_exact_config() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hacash-panel-backup-{}-{unique}.ini",
+            std::process::id()
+        ));
+        let original = "; user spacing is preserved\r\nconnect = 127.0.0.1:8081\r\n";
+        std::fs::write(&path, original).unwrap();
+        let _backup = create_benchmark_backup(&path).unwrap();
+        std::fs::write(&path, "benchmark_seconds = 90\n").unwrap();
+
+        assert!(recover_interrupted_benchmark(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!recover_interrupted_benchmark(&path).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn interrupted_benchmark_restores_missing_config_state() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hacash-panel-absent-backup-{}-{unique}.ini",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _backup = create_benchmark_backup(&path).unwrap();
+        std::fs::write(&path, "benchmark_seconds = 90\n").unwrap();
+
+        assert!(recover_interrupted_benchmark(&path).unwrap());
+        assert!(!path.exists());
     }
 }
 

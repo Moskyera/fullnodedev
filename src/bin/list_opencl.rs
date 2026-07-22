@@ -4,8 +4,9 @@ fn main() {
         let json = std::env::args().any(|a| a == "--json");
         if json {
             println!("{}", app::opencl_list::list_opencl_json());
-        } else {
-            app::opencl_list::list_opencl_devices();
+        } else if !app::opencl_list::list_opencl_devices() {
+            eprintln!("No usable OpenCL GPU was detected.");
+            std::process::exit(2);
         }
     }
     #[cfg(not(feature = "ocl"))]

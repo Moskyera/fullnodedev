@@ -8,6 +8,19 @@ pub enum GpuVendor {
     Unknown,
 }
 
+/// Infer the vendor encoded in a named tuning profile.
+pub fn profile_vendor(profile: &str) -> GpuVendor {
+    if profile.starts_with("nvidia_") {
+        GpuVendor::Nvidia
+    } else if profile.starts_with("intel_") {
+        GpuVendor::Intel
+    } else if profile.starts_with("amd_") {
+        GpuVendor::Amd
+    } else {
+        GpuVendor::Unknown
+    }
+}
+
 impl GpuVendor {
     pub fn prefix(self) -> &'static str {
         match self {
@@ -23,7 +36,10 @@ impl GpuVendor {
 pub fn detect_vendor(vendor: &str, name: &str) -> GpuVendor {
     let v = vendor.to_lowercase();
     let n = name.to_lowercase();
-    if v.contains("nvidia") || n.contains("geforce") || n.contains("rtx ") || n.contains("gtx ")
+    if v.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rtx ")
+        || n.contains("gtx ")
         || n.contains("quadro")
     {
         return GpuVendor::Nvidia;
@@ -54,7 +70,16 @@ pub fn arch_slug(name: &str) -> String {
             return tail;
         }
     }
-    for token in ["rtx 5090", "rtx 5080", "rtx 5070", "rtx 5060", "rtx 4090", "rtx 4080", "rtx 4070", "rtx 4060", "rtx 3090", "rtx 3080", "rtx 3070", "rtx 3060", "rx 7900", "rx 7800", "rx 7700", "rx 7600", "rx 6900", "rx 6800", "rx 6700", "rx 6600"] {
+    for model in ["a770", "a750", "a580", "a380", "a310"] {
+        if n.contains(model) && n.contains("arc") {
+            return format!("arc{model}");
+        }
+    }
+    for token in [
+        "rtx 5090", "rtx 5080", "rtx 5070", "rtx 5060", "rtx 4090", "rtx 4080", "rtx 4070",
+        "rtx 4060", "rtx 3090", "rtx 3080", "rtx 3070", "rtx 3060", "rx 7900", "rx 7800",
+        "rx 7700", "rx 7600", "rx 6900", "rx 6800", "rx 6700", "rx 6600",
+    ] {
         if n.contains(token) {
             return token.replace(' ', "");
         }
@@ -88,7 +113,12 @@ pub fn normalize_profile(profile: &str, vendor: GpuVendor) -> String {
 
 /// Scale work_groups from device compute-unit count (waves per CU).
 pub fn suggest_workgroups(requested: u32, compute_units: u32, vendor: GpuVendor) -> u32 {
-    tune_workgroups(requested, compute_units, vendor, ArchLimits::for_slug("gfx1100"))
+    tune_workgroups(
+        requested,
+        compute_units,
+        vendor,
+        ArchLimits::for_slug("gfx1100"),
+    )
 }
 
 /// Apply arch limits and CU scaling without forcing a 256 WG floor on RDNA4.
@@ -99,10 +129,11 @@ pub fn tune_workgroups(
     limits: ArchLimits,
 ) -> u32 {
     if limits.is_experimental() {
-        let cap = limits.workgroups_cap(requested.max(limits.panel_min_wg), 1);
-        let mut wg = requested.max(limits.panel_min_wg).min(cap);
-        wg = (wg / 32).max(1) * 32;
-        return wg.clamp(limits.panel_min_wg, cap);
+        // RDNA4 Auto Tune validates exact launch points such as 48 WG.
+        // Preserve that measured value instead of silently rounding it down to 32.
+        return limits
+            .workgroups_cap(requested.max(limits.panel_min_wg), 1)
+            .max(limits.panel_min_wg);
     }
     if compute_units == 0 {
         return requested.max(256);
@@ -174,7 +205,7 @@ impl ArchLimits {
         }
     }
 
-    /// RDNA4 / RX 9070 XT — kernel update pending; special OOM + panel treatment.
+    /// RDNA4 / RX 9070 XT — validated conservative launch and OOM treatment.
     pub fn is_experimental(&self) -> bool {
         !self.oom_ramp_to_base && self.oom_floor_wg == 32
     }
@@ -196,21 +227,21 @@ impl ArchLimits {
     /// Panel preset slug → max profile tier (0..=4).
     pub fn panel_max_tier(panel_slug: &str) -> i8 {
         match panel_slug {
-            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" => 2,
-            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" | "rtx5080" => 3,
-            "rx6800xt" | "rx7900xt" | "rx7900xtx" | "rtx4090" | "rtx5090" => 4,
+            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" | "arc_a380" => 2,
+            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" | "rtx5080" | "arc_a750" => 3,
+            "rx6800xt" | "rx7900xt" | "rx7900xtx" | "rtx4090" | "rtx5090" | "arc_a770" => 4,
             "rx9070xt" => 3,
             _ => 4,
         }
     }
 
     /// Panel preset slug → max unit_size (live gfx1201/RDNA4 stable path).
+    pub fn max_unit_size(&self) -> u32 {
+        if self.is_experimental() { 64 } else { 128 }
+    }
+
     pub fn panel_max_unit_size(panel_slug: &str) -> u32 {
-        if Self::for_panel_slug(panel_slug).is_experimental() {
-            64
-        } else {
-            128
-        }
+        Self::for_panel_slug(panel_slug).max_unit_size()
     }
 
     /// Panel preset slug → max work_groups before profile tuning.
@@ -220,10 +251,10 @@ impl ArchLimits {
             return 64;
         }
         match panel_slug {
-            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" => 1024,
-            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" => 1536,
+            "rx6600" | "rx7600" | "rtx3060" | "rtx4060" | "rtx5060" | "arc_a380" => 1024,
+            "rx6700xt" | "rtx3070" | "rtx4070" | "rtx5070" | "arc_a750" => 1536,
             "rtx5080" => 1792,
-            "rx6800xt" | "rx7900xt" => 2048,
+            "rx6800xt" | "rx7900xt" | "arc_a770" => 2048,
             "rx7900xtx" => 4096,
             "rtx4090" | "rtx5090" => 3584,
             _ => match vram_gb {
@@ -255,6 +286,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_vendor_is_detected() {
+        assert_eq!(profile_vendor("amd_profit"), GpuVendor::Amd);
+        assert_eq!(profile_vendor("nvidia_max"), GpuVendor::Nvidia);
+        assert_eq!(profile_vendor("intel_balanced"), GpuVendor::Intel);
+        assert_eq!(profile_vendor("custom"), GpuVendor::Unknown);
+    }
+
+    #[test]
     fn detects_nvidia() {
         assert_eq!(
             detect_vendor("NVIDIA Corporation", "NVIDIA GeForce RTX 4070"),
@@ -281,6 +320,11 @@ mod tests {
     #[test]
     fn arch_slug_rtx() {
         assert!(arch_slug("NVIDIA GeForce RTX 4090").contains("rtx4090"));
+    }
+
+    #[test]
+    fn arch_slug_intel_arc() {
+        assert_eq!(arch_slug("Intel(R) Arc(TM) A770 Graphics"), "arca770");
     }
 
     #[test]
@@ -324,6 +368,8 @@ mod tests {
     #[test]
     fn gfx1201_tune_workgroups_respects_ini_not_256_floor() {
         let lim = ArchLimits::for_slug("gfx1201");
+        assert_eq!(tune_workgroups(32, 32, GpuVendor::Amd, lim), 32);
+        assert_eq!(tune_workgroups(48, 32, GpuVendor::Amd, lim), 48);
         assert_eq!(tune_workgroups(64, 32, GpuVendor::Amd, lim), 64);
         assert_eq!(tune_workgroups(128, 32, GpuVendor::Amd, lim), 64);
     }

@@ -42,7 +42,7 @@ pub fn start_diamond_auto_bidding(mut worker: Worker, hnode: Arc<dyn HNoder>) {
             &bidmax,
             &bidmin
         );
-        panic!("");
+        return;
     }
 
     println!(

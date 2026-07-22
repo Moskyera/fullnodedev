@@ -56,8 +56,7 @@ fn estimate_protocol_cost_auto_with_periods(
         tx.gas_max = Uint1::from(8);
         tx.fill_sign(&acc).unwrap();
 
-        let fee_purity =
-            protocol::params::vm_effective_fee_purity(0, tx.fee_purity()) as u128;
+        let fee_purity = protocol::params::vm_effective_fee_purity(0, tx.fee_purity()) as u128;
         let mut need = fee_purity
             .saturating_mul(charge_bytes)
             .saturating_mul(periods as u128);

@@ -17,6 +17,12 @@ pub const CONTRACT_STORE_PERM_PERIODS: u64 = 10_000;
 */
 pub const VM_LOWEST_FEE_PURITY: u64 = 50_000;
 
+/*
+    Maximum number of deterministic Type3 signers (|D| = |R0 ∪ E|).
+    Fixed consensus parameter.
+*/
+pub const MAX_TYPE3_SIGNERS: usize = 200;
+
 // Future consensus changes can lower the VM fee purity floor by appending
 // `(activation_height, new_floor)` here. The first value intentionally has no
 // activation height: tx type3 is already gated by the upgrade gate, so this

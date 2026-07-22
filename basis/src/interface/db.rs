@@ -25,6 +25,24 @@ pub trait DiskDB : Send + Sync {
     fn remove(&self, _: &[u8]) {}
     fn write(&self, _: &dyn MemDB) {} // dyn MemDB
     // fn write_batch(&self, _: Box<dyn Any>) {} // dyn MemBatch
+    fn flush(&self) -> Ret<()> { Ok(()) }
+    fn entry_count(&self) -> Ret<usize> {
+        let mut count = 0usize;
+        self.for_each(&mut |_, _| {
+            count += 1;
+            true
+        })?;
+        Ok(count)
+    }
+    fn dump_entries(&self) -> Ret<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        self.for_each(&mut |key, value| {
+            entries.push((key.to_vec(), value.to_vec()));
+            true
+        })?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
     // debug
     fn for_each(&self, _: &mut dyn FnMut(&[u8], &[u8])->bool) -> Ret<()>;
 }

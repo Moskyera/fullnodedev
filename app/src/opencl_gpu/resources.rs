@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use crate::gpu_arch::GpuVendor;
-use crate::gpu_oom::{from_ocl_error, GpuBatchError};
+use crate::gpu_oom::{GpuBatchError, from_ocl_error};
 use ocl::enums::{DeviceInfo, DeviceInfoResult};
 use ocl::flags::{CommandQueueProperties, MemFlags};
 use ocl::{Buffer, Context, Device, Event, Kernel, Program, Queue};
@@ -25,19 +25,22 @@ pub(crate) fn pinned_host_read_flags() -> MemFlags {
         .host_read_only()
 }
 
-pub(crate) fn create_command_queue(context: &Context, device: &Device) -> (Queue, bool) {
+pub(crate) fn create_command_queue(
+    context: &Context,
+    device: &Device,
+) -> std::result::Result<(Queue, bool), String> {
     let ooo = CommandQueueProperties::new().out_of_order();
     match Queue::new(context, device.clone(), Some(ooo)) {
         Ok(queue) => {
             println!("[OpenCL] Out-of-order command queue enabled");
-            (queue, true)
+            Ok((queue, true))
         }
-        Err(_) => {
-            let queue = Queue::new(context, device.clone(), None)
-                .expect("Can't create OpenCL event queue");
-            println!("[OpenCL] In-order command queue (OOO not supported)");
-            (queue, false)
-        }
+        Err(ooo_error) => Queue::new(context, device.clone(), None)
+            .map(|queue| {
+                println!("[OpenCL] In-order command queue (OOO not supported)");
+                (queue, false)
+            })
+            .map_err(|e| format!("cannot create command queue: {e}; OOO attempt: {ooo_error}")),
     }
 }
 
@@ -56,10 +59,7 @@ pub fn write_stuff_to_gpu(
     let mut padded = vec![0u8; STUFF_BUFFER_CAP];
     padded[..data.len()].copy_from_slice(data);
     let mut write_event = Event::empty();
-    let mut cmd = opencl
-        .buffer_stuff
-        .write(&padded)
-        .enew(&mut write_event);
+    let mut cmd = opencl.buffer_stuff.write(&padded).enew(&mut write_event);
     if let Some(dep) = wait {
         cmd = cmd.ewait(dep);
     }
@@ -78,21 +78,19 @@ pub struct OpenCLResources {
     /// GPU buffers sized for this unit_size (runtime values must not exceed it).
     pub allocated_unitsize: u32,
     pub vendor: GpuVendor,
-    compute_units: u32,
     diamond: bool,
-    out_of_order: bool,
     pub needs_queue_finish: bool,
     program: Program,
     pub queue: Queue,
-    pub buffer_best_nonces: Buffer::<u32>,
-    pub buffer_best_nonces_diamond: Buffer::<u64>,
-    buffer_global_hashes: Buffer::<u8>,
-    buffer_global_order: Buffer::<u32>,
-    pub buffer_best_hashes: Buffer::<u8>,
+    pub buffer_best_nonces: Buffer<u32>,
+    pub buffer_best_nonces_diamond: Buffer<u64>,
+    buffer_global_hashes: Buffer<u8>,
+    buffer_global_order: Buffer<u32>,
+    pub buffer_best_hashes: Buffer<u8>,
     /// Reused input buffer — avoids per-kernel GPU allocation.
-    buffer_stuff: Buffer::<u8>,
+    buffer_stuff: Buffer<u8>,
     /// Cached OpenCL kernel — rebuilt only when `unit_size` changes.
-    pub(crate) kernel_slot: Mutex<KernelSlot>,
+    kernel_slot: Mutex<KernelSlot>,
 }
 
 pub(crate) fn soft_recover_opencl(res: &mut OpenCLResources) {
@@ -177,6 +175,12 @@ fn run_cached_kernel(
             unit_size, res.allocated_unitsize
         )));
     }
+    if num_work_groups > res.workgroups {
+        return Err(GpuBatchError::Other(format!(
+            "num_work_groups {} exceeds allocated buffer count {}",
+            num_work_groups, res.workgroups
+        )));
+    }
     let global_work_size = num_work_groups.saturating_mul(local_work_size);
     let mut slot = res
         .kernel_slot
@@ -184,11 +188,9 @@ fn run_cached_kernel(
         .map_err(|e| GpuBatchError::Other(e.to_string()))?;
     if slot.kernel.is_none() || slot.unit_size != unit_size {
         let k = if res.diamond {
-            build_diamond_kernel(res, unit_size)
-                .map_err(|e| GpuBatchError::Other(e))?
+            build_diamond_kernel(res, unit_size).map_err(|e| GpuBatchError::Other(e))?
         } else {
-            build_block_kernel(res, unit_size)
-                .map_err(|e| GpuBatchError::Other(e))?
+            build_block_kernel(res, unit_size).map_err(|e| GpuBatchError::Other(e))?
         };
         slot.kernel = Some(k);
         slot.unit_size = unit_size;
@@ -197,8 +199,7 @@ fn run_cached_kernel(
         .kernel
         .as_mut()
         .ok_or_else(|| GpuBatchError::Other("kernel cache empty".to_string()))?;
-    update(kernel)
-        .map_err(|e| GpuBatchError::Other(e))?;
+    update(kernel).map_err(|e| GpuBatchError::Other(e))?;
     let mut kernel_event = Event::empty();
     unsafe {
         let mut cmd = kernel
@@ -332,6 +333,73 @@ pub fn enqueue_diamond_kernel(
     )
 }
 
+fn run_gfx1201_groestl_self_test(res: &OpenCLResources) -> std::result::Result<(), String> {
+    const INPUT_HEX: &str = "73710d4acc7ace564b0239839f88c735ad499a667a197974634a52292282fa04";
+    const EXPECTED_HEX: &str = "d4f2ebda478be732d5e6efe5b4c6588c7057a781c3bbd8a610fb3534210b6a7f";
+
+    let input = hex::decode(INPUT_HEX).map_err(|e| format!("self-test input decode: {e}"))?;
+    let expected =
+        hex::decode(EXPECTED_HEX).map_err(|e| format!("self-test expected decode: {e}"))?;
+    let input_buffer = Buffer::<u8>::builder()
+        .queue(res.queue.clone())
+        .flags(ocl::core::MEM_READ_WRITE)
+        .len(HASH_WIDTH)
+        .build()
+        .map_err(|e| format!("self-test input buffer: {e}"))?;
+    let output_buffer = Buffer::<u8>::builder()
+        .queue(res.queue.clone())
+        .flags(ocl::core::MEM_READ_WRITE)
+        .len(HASH_WIDTH)
+        .build()
+        .map_err(|e| format!("self-test output buffer: {e}"))?;
+
+    input_buffer
+        .write(&input)
+        .enq()
+        .map_err(|e| format!("self-test input write: {e}"))?;
+    res.queue
+        .finish()
+        .map_err(|e| format!("self-test input wait: {e}"))?;
+
+    let kernel = Kernel::builder()
+        .program(&res.program)
+        .name("x16rs_test_groestl2")
+        .queue(res.queue.clone())
+        .arg(&input_buffer)
+        .arg(&output_buffer)
+        .build()
+        .map_err(|e| format!("self-test kernel build: {e}"))?;
+    unsafe {
+        kernel
+            .cmd()
+            .global_work_size(1)
+            .local_work_size(1)
+            .enq()
+            .map_err(|e| format!("self-test kernel enqueue: {e}"))?;
+    }
+    res.queue
+        .finish()
+        .map_err(|e| format!("self-test kernel wait: {e}"))?;
+
+    let mut actual = [0u8; HASH_WIDTH];
+    output_buffer
+        .read(&mut actual[..])
+        .enq()
+        .map_err(|e| format!("self-test output read: {e}"))?;
+    res.queue
+        .finish()
+        .map_err(|e| format!("self-test output wait: {e}"))?;
+
+    if actual.as_slice() != expected.as_slice() {
+        return Err(format!(
+            "gfx1201 Groestl integrity self-test failed: gpu={} cpu={}",
+            hex::encode(actual),
+            EXPECTED_HEX
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_opencl_resources(
     program: &Program,
     queue: &Queue,
@@ -339,7 +407,6 @@ pub(crate) fn build_opencl_resources(
     unitsize: u32,
     global_work_size: u32,
     vendor: GpuVendor,
-    compute_units: u32,
     vram_bytes: u64,
     diamond: bool,
     out_of_order: bool,
@@ -386,17 +453,15 @@ pub(crate) fn build_opencl_resources(
     if out_of_order {
         println!("[OpenCL] Pinned host buffers enabled for stuff + readback");
     }
-    Ok(OpenCLResources {
+    let resources = OpenCLResources {
         workgroups,
         platform_index: 0,
         device_index: 0,
         arch_slug: arch_slug.to_string(),
         allocated_unitsize: unitsize,
         vendor,
-        compute_units,
         vram_bytes,
         diamond,
-        out_of_order,
         needs_queue_finish,
         program: program.clone(),
         queue: queue.clone(),
@@ -410,5 +475,10 @@ pub(crate) fn build_opencl_resources(
             kernel: None,
             unit_size: 0,
         }),
-    })
+    };
+    if arch_slug == "gfx1201" && !diamond {
+        run_gfx1201_groestl_self_test(&resources)?;
+        println!("[OpenCL] gfx1201 Groestl integrity self-test passed");
+    }
+    Ok(resources)
 }

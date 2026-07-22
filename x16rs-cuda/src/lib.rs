@@ -163,12 +163,8 @@ mod driver {
         fn cudaGetDeviceProperties(prop: *mut CudaDeviceProp, device: i32) -> CudaError_t;
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError_t;
         fn cudaFree(ptr: *mut c_void) -> CudaError_t;
-        fn cudaMemcpy(
-            dst: *mut c_void,
-            src: *const c_void,
-            count: usize,
-            kind: i32,
-        ) -> CudaError_t;
+        fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32)
+        -> CudaError_t;
         fn cudaDeviceSynchronize() -> CudaError_t;
         fn cudaGetErrorString(err: CudaError_t) -> *const i8;
     }
@@ -257,9 +253,7 @@ mod driver {
         let mut global_order_buf = ptr::null_mut();
 
         check(unsafe { cudaMalloc(&mut stuff_buf, STUFF_BYTES) })?;
-        check(unsafe {
-            cudaMalloc(&mut best_hashes_buf, (wg as usize) * HASH_BYTES)
-        })?;
+        check(unsafe { cudaMalloc(&mut best_hashes_buf, (wg as usize) * HASH_BYTES) })?;
         check(unsafe { cudaMalloc(&mut best_nonces_buf, (wg as usize) * 4) })?;
         let global_slots = (wg as usize) * (local_size as usize) * (unit_size as usize);
         check(unsafe { cudaMalloc(&mut global_hashes_buf, global_slots * HASH_BYTES) })?;
@@ -500,11 +494,6 @@ fn cuda_mine_batch(
 }
 
 #[cfg(not(cuda_available))]
-fn cuda_block_hash_single(
-    _: &CudaMiner,
-    _: &[u8],
-    _: u32,
-) -> CudaResult<[u8; HASH_BYTES]> {
+fn cuda_block_hash_single(_: &CudaMiner, _: &[u8], _: u32) -> CudaResult<[u8; HASH_BYTES]> {
     Err(CudaError::NotCompiled)
 }
-

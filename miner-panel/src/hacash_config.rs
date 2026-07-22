@@ -1,6 +1,13 @@
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use field::Address;
+static TEMP_FILE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+use field::{Address, Amount};
 
 pub fn find_hacash_config(work_dir: &Path) -> PathBuf {
     let candidates = [
@@ -13,7 +20,9 @@ pub fn find_hacash_config(work_dir: &Path) -> PathBuf {
             return c.canonicalize().unwrap_or(c.clone());
         }
     }
-    work_dir.join("..").join("..").join("hacash.config.ini")
+    // A packaged release must never write outside its extracted folder. The
+    // development layout is already handled by the candidates above.
+    work_dir.join("hacash.config.ini")
 }
 
 fn strip_comment(value: &str) -> String {
@@ -56,6 +65,18 @@ pub fn validate_wallet(wallet: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_hacd_wallet(wallet: &str) -> Result<(), String> {
+    let trimmed = wallet.trim();
+    if trimmed.is_empty() {
+        return Err("empty".to_string());
+    }
+    let address = Address::from_readable(trimmed).map_err(|e| e.to_string())?;
+    if !address.is_privakey() {
+        return Err("HACD rewards require a PRIVAKEY address".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct DiamondMinerSettings {
     pub reward: String,
@@ -63,6 +84,21 @@ pub struct DiamondMinerSettings {
     pub bid_min: String,
     pub bid_max: String,
     pub bid_step: String,
+}
+
+pub fn validate_diamond_settings(d: &DiamondMinerSettings) -> Result<(), String> {
+    let min = Amount::from(d.bid_min.trim()).map_err(|e| format!("invalid minimum bid: {e}"))?;
+    let max = Amount::from(d.bid_max.trim()).map_err(|e| format!("invalid maximum bid: {e}"))?;
+    let _step = Amount::from(d.bid_step.trim()).map_err(|e| format!("invalid bid step: {e}"))?;
+    let zero = Amount::zero();
+    if min < zero || max < zero {
+        return Err("diamond bid values cannot be negative".into());
+    }
+
+    if min > max {
+        return Err("minimum diamond bid cannot exceed maximum bid".into());
+    }
+    Ok(())
 }
 
 pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
@@ -113,14 +149,12 @@ fn read_section_key(content: &str, section: &str, key: &str) -> String {
     String::new()
 }
 
-pub fn write_miner_reward(path: &Path, wallet: &str) -> std::io::Result<()> {
-    let wallet = wallet.trim();
-    let content = read_or_empty(path);
-    let updated = upsert_miner_reward(&content, wallet);
-    write_config(path, &updated)
-}
-
-pub fn write_diamond_miner(path: &Path, wallet: &str, d: &DiamondMinerSettings) -> std::io::Result<()> {
+pub fn write_diamond_miner(
+    path: &Path,
+    wallet: &str,
+    d: &DiamondMinerSettings,
+    rpc_port: Option<u16>,
+) -> std::io::Result<()> {
     let content = read_or_empty(path);
     let mut updated = upsert_section_fields(
         &content,
@@ -134,18 +168,44 @@ pub fn write_diamond_miner(path: &Path, wallet: &str, d: &DiamondMinerSettings) 
             ("bid_step", d.bid_step.trim()),
         ],
     );
-    updated = upsert_section_fields(
-        &updated,
-        "miner",
-        &[("enable", "false")],
-    );
+    updated = upsert_section_fields(&updated, "miner", &[("enable", "false")]);
+    if let Some(port) = rpc_port {
+        let listen = port.to_string();
+        updated = upsert_section_fields(
+            &updated,
+            "server",
+            &[
+                ("enable", "true"),
+                ("listen", &listen),
+                ("bind", "127.0.0.1"),
+                ("diamond_form", "true"),
+            ],
+        );
+    }
     write_config(path, &updated)
 }
 
-pub fn write_hac_miner_only(path: &Path, wallet: &str) -> std::io::Result<()> {
+pub fn write_hac_miner_only(
+    path: &Path,
+    wallet: &str,
+    rpc_port: Option<u16>,
+) -> std::io::Result<()> {
     let content = read_or_empty(path);
     let mut updated = upsert_miner_reward(&content, wallet);
     updated = upsert_section_fields(&updated, "diamondminer", &[("enable", "false")]);
+    if let Some(port) = rpc_port {
+        let listen = port.to_string();
+        updated = upsert_section_fields(
+            &updated,
+            "server",
+            &[
+                ("enable", "true"),
+                ("listen", &listen),
+                ("bind", "127.0.0.1"),
+                ("diamond_form", "true"),
+            ],
+        );
+    }
     write_config(path, &updated)
 }
 
@@ -154,10 +214,96 @@ fn read_or_empty(path: &Path) -> String {
 }
 
 fn write_config(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    atomic_write_private(path, content)
+}
+
+/// Write to a private, uniquely named file in the destination directory and
+/// replace the old config atomically. A crash can leave the old or new complete
+/// file, never a partially written config.
+pub(crate) fn atomic_write_private(path: &Path, content: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    std::fs::write(path, content)
+
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let (temporary_path, mut temporary_file) = (0..64)
+        .find_map(|_| {
+            let nonce = TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(".{stem}.{}.{}.tmp", std::process::id(), nonce));
+            match options.open(&candidate) {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique temporary config file",
+            )
+        })?;
+
+    let write_result = temporary_file
+        .write_all(content.as_bytes())
+        .and_then(|_| temporary_file.sync_all());
+    drop(temporary_file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    if let Err(error) = atomic_replace(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(once(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: both buffers are valid, NUL-terminated UTF-16 paths and remain
+    // alive for the duration of the call.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn upsert_section_fields(content: &str, section: &str, fields: &[(&str, &str)]) -> String {
@@ -186,12 +332,7 @@ fn upsert_section_fields(content: &str, section: &str, fields: &[(&str, &str)]) 
 
         let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in &mut lines[start + 1..end] {
-            let key = line
-                .split('=')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
+            let key = line.split('=').next().unwrap_or("").trim().to_lowercase();
             for (k, v) in fields {
                 if key == k.to_lowercase() {
                     *line = format!("{k} = {v}");
@@ -249,11 +390,16 @@ fn upsert_miner_reward(content: &str, wallet: &str) -> String {
         let mut has_reward = false;
         let mut has_enable = false;
         for line in &mut lines[start + 1..end] {
-            let trimmed = line.trim();
-            if trimmed.starts_with("reward") {
+            let key = line
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if key == "reward" {
                 *line = format!("reward = {wallet}");
                 has_reward = true;
-            } else if trimmed.starts_with("enable") {
+            } else if key == "enable" {
                 *line = "enable = true".to_string();
                 has_enable = true;
             }
@@ -299,5 +445,70 @@ mod tests {
         let out = upsert_miner_reward("", "3xHYiddmZUtgY92pq7gGDoyHiGE7K47b4X");
         assert!(out.contains("[miner]"));
         assert!(out.contains("reward = 3xHYiddmZUtgY92pq7gGDoyHiGE7K47b4X"));
+    }
+
+    #[test]
+    fn upsert_is_case_insensitive_without_duplicates() {
+        let input = "[miner]\nEnable = false\nReward = old\n";
+        let out = upsert_miner_reward(input, "1NewWalletAddr");
+        assert_eq!(out.matches("reward = 1NewWalletAddr").count(), 1);
+        assert_eq!(out.matches("enable = true").count(), 1);
+    }
+
+    #[test]
+    fn validates_diamond_bid_range() {
+        let valid = DiamondMinerSettings {
+            bid_min: "1:0".into(),
+            bid_max: "31:0".into(),
+            bid_step: "0:5".into(),
+            ..Default::default()
+        };
+        assert!(validate_diamond_settings(&valid).is_ok());
+
+        let mut invalid = valid;
+        invalid.bid_min = "40:0".into();
+        assert!(validate_diamond_settings(&invalid).is_err());
+    }
+
+    #[test]
+    fn local_rpc_settings_are_written() {
+        let path =
+            std::env::temp_dir().join(format!("hacash-fullnode-config-{}.ini", std::process::id()));
+        write_hac_miner_only(&path, "wallet", Some(8085)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(raw.contains("[server]"));
+        assert!(raw.contains("listen = 8085"));
+        assert!(raw.contains("bind = 127.0.0.1"));
+        assert!(raw.contains("diamond_form = true"));
+    }
+
+    #[test]
+    fn config_write_replaces_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "hacash-atomic-config-{}-{}.ini",
+            std::process::id(),
+            TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_config(&path, "old").unwrap();
+        write_config(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "hacash-private-config-{}-{}.ini",
+            std::process::id(),
+            TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_config(&path, "bid_password = secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(path);
+        assert_eq!(mode, 0o600);
     }
 }

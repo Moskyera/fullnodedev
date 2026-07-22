@@ -34,6 +34,41 @@ impl State for StateInst {
 
     fn as_mem(&self) -> &MemMap { &self.mem.memry }
 
+    fn overlay_entries(&self) -> Ret<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        let mut entries: Vec<_> = self
+            .mem
+            .memry
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
+    fn effective_entries(&self) -> Ret<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        if let Some(parent) = self.parent.upgrade() {
+            for (key, value) in parent.effective_entries()? {
+                out.insert(key, value);
+            }
+        } else {
+            for (key, value) in self.disk.dump_entries()? {
+                out.insert(key, value);
+            }
+        }
+        for (key, value) in self.mem.memry.iter() {
+            match value {
+                Some(value) => {
+                    out.insert(key.clone(), value.clone());
+                }
+                None => {
+                    out.remove(key);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     fn write_to_disk(&self) { self.disk.write(&self.mem); }
 
     fn get(&self, k: Vec<u8>) -> Option<Vec<u8>> {

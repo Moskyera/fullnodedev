@@ -42,7 +42,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [07] ryzen7-rx9070xt
      CPU: Ryzen 7 (5800X, 7700X, 8 cores / 16 threads)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=6  gpu_profile=amd_performance
+     supervene=6  gpu_profile=amd_balanced
 
 [08] ryzen9-rx6800xt
      CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
@@ -62,7 +62,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [11] ryzen9-rx9070xt
      CPU: Ryzen 9 (5900X, 7900X, 12 cores / 24 threads)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=8  gpu_profile=amd_performance
+     supervene=8  gpu_profile=amd_balanced
 
 [12] ryzen9-9950x-rx7900xt
      CPU: Ryzen 9 9950X (16 cores / 32 threads)
@@ -77,7 +77,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [14] ryzen9-9950x-rx9070xt
      CPU: Ryzen 9 9950X (16 cores / 32 threads)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=10  gpu_profile=amd_performance
+     supervene=10  gpu_profile=amd_balanced
 
 [15] tr-7960x-rx7900xtx
      CPU: Threadripper 7960X (24 cores / 48 threads)
@@ -87,7 +87,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [16] tr-7960x-rx9070xt
      CPU: Threadripper 7960X (24 cores / 48 threads)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=14  gpu_profile=amd_performance
+     supervene=14  gpu_profile=amd_balanced
 
 [17] tr-7970x-rx7900xtx
      CPU: Threadripper 7970X (32 cores / 64 threads)
@@ -97,7 +97,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [18] tr-7970x-rx9070xt
      CPU: Threadripper 7970X (32 cores / 64 threads)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=18  gpu_profile=amd_performance
+     supervene=18  gpu_profile=amd_balanced
 
 [19] tr-7980x-rx7900xtx
      CPU: Threadripper 7980X / 9980WX (64+ cores)
@@ -107,7 +107,7 @@ After install: LIST-OPENCL-DEVICES.bat  → set platform_id / device_ids
 [20] tr-7980x-rx9070xt
      CPU: Threadripper 7980X / 9980WX (64+ cores)
      GPU: RX 9070 XT (16 GB VRAM, RDNA4)
-     supervene=22  gpu_profile=amd_performance
+     supervene=22  gpu_profile=amd_balanced
 
 [21] cpu-only-ryzen5
      CPU: Ryzen 5 CPU only (no AMD GPU / OpenCL off)

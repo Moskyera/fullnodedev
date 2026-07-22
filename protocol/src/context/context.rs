@@ -12,6 +12,14 @@ pub struct ContextInst<'a> {
     vm: Option<Box<dyn VM>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDiag {
+    pub exec_from: ExecFrom,
+    pub p2sh_count: usize,
+    pub gas: GasDiag,
+    pub vm_initialized: bool,
+}
+
 impl<'a> ContextInst<'a> {
     pub fn new(
         env: Env,
@@ -55,6 +63,19 @@ impl<'a> ContextInst<'a> {
 
     pub fn test_set_vm(&mut self, vm: Box<dyn VM>) {
         self.vm = Some(vm);
+    }
+
+    pub fn gas_diag(&self) -> GasDiag {
+        self.gas.diag()
+    }
+
+    pub fn diag(&self) -> ContextDiag {
+        ContextDiag {
+            exec_from: self.exec_from,
+            p2sh_count: self.psh.len(),
+            gas: self.gas_diag(),
+            vm_initialized: self.vm.is_some(),
+        }
     }
 
     fn vm_unavailable_error(&self) -> String {
@@ -161,7 +182,15 @@ impl<'a> ContextInst<'a> {
             res
         } else {
             adr.must_privakey()?;
-            verify_target_signature(adr, self.txr)
+            if self.env.chain.fast_sync && self.txr.ty() == TransactionType3::TYPE {
+                match self.txr.declared_signer_contains(adr)? {
+                    Some(true) => Ok(true),
+                    Some(false) => errf!("{} signature verification failed", adr),
+                    None => errf!("Type3 declared_signer_contains returned None"),
+                }
+            } else {
+                verify_target_signature(adr, self.txr)
+            }
         };
         self.check_sign_cache.insert(*adr, isok.clone());
         isok.map(|_| ())

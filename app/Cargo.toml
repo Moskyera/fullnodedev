@@ -16,7 +16,7 @@ serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
 getrandom = "0.3.2"
 ctrlc = "3.4.5"
-reqwest = { version = "0.11.27", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 ocl = { version = "0.19.7", optional = true }
 x16rs-cuda = { path = "../x16rs-cuda", optional = true }
 
@@ -25,7 +25,7 @@ ocl = ["dep:ocl"]
 cuda = ["dep:x16rs-cuda", "x16rs-cuda/cuda"]
 
 [dev-dependencies]
-x16rs-sys = "0.1.1"
+x16rs-sys = "=0.1.2"
 testkit = { path = "../testkit" }
 sys = { path = "../sys" }
 

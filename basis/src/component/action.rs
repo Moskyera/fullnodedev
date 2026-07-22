@@ -85,6 +85,18 @@ impl ActScope {
         exec: ExecPolicy::TopAndAst,
         top: TopRule::None,
     };
+    /// Top-level-only guard companion (may appear multiple times unless Unique).
+    pub const TOP_GUARD: Self = Self {
+        kind: ScopeKind::Guard,
+        exec: ExecPolicy::TopOnly,
+        top: TopRule::None,
+    };
+    /// Top-level-only guard companion; at most one action of this kind.
+    pub const TOP_GUARD_UNIQUE: Self = Self {
+        kind: ScopeKind::Guard,
+        exec: ExecPolicy::TopOnly,
+        top: TopRule::Unique,
+    };
     pub const CALL: Self = Self {
         kind: ScopeKind::Call,
         exec: ExecPolicy::Anywhere,
@@ -96,9 +108,15 @@ impl ActScope {
         top: TopRule::None,
     };
 
+    pub const fn is_guard(self) -> bool {
+        matches!(self.kind, ScopeKind::Guard)
+    }
+
     pub const fn top_rule(self) -> Option<TopRule> {
         match self.kind {
             ScopeKind::Top => Some(self.top),
+            // TOP_GUARD* may carry TopRule::Unique (or future Only*).
+            ScopeKind::Guard if !matches!(self.top, TopRule::None) => Some(self.top),
             _ => None,
         }
     }
@@ -110,6 +128,8 @@ impl ActScope {
             (ScopeKind::Top, TopRule::OnlyCanWithGuard, _) => "TOP_ONLY_CAN_WITH_GUARD",
             (ScopeKind::Top, TopRule::Unique, _) => "TOP_UNIQUE",
             (ScopeKind::Ast, _, _) => "AST",
+            (ScopeKind::Guard, TopRule::None, ExecPolicy::TopOnly) => "TOP_GUARD",
+            (ScopeKind::Guard, TopRule::Unique, ExecPolicy::TopOnly) => "TOP_GUARD_UNIQUE",
             (ScopeKind::Guard, _, _) => "GUARD",
             (ScopeKind::Call, _, ExecPolicy::Anywhere) => "CALL",
             (ScopeKind::Call, _, ExecPolicy::CallOnly) => "CALL_ONLY",

@@ -1,5 +1,6 @@
 //! Block PoW miner backends, batch dispatch, and result aggregation.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, RwLock, mpsc};
 
@@ -10,11 +11,11 @@ use serde_json::Value as JV;
 
 use crate::efficiency::*;
 use crate::hash_util::{hash_left_zero_pad3, hash_more_power};
-use crate::mining_batch::{BatchCtx, BlockMinerBackend, CpuBlockBackend};
-#[cfg(feature = "ocl")]
-use crate::mining_batch::OpenclBlockBackend;
 #[cfg(feature = "cuda")]
 use crate::mining_batch::CudaBlockBackend;
+#[cfg(feature = "ocl")]
+use crate::mining_batch::OpenclBlockBackend;
+use crate::mining_batch::{BatchCtx, BlockMinerBackend, CpuBlockBackend};
 
 use basis::difficulty::*;
 use basis::interface::*;
@@ -26,15 +27,15 @@ use sys::*;
 
 use super::PoWorkConf;
 
-#[cfg(feature = "ocl")]
-use crate::opencl_gpu::{
-    initialize_opencl, opencl_snapshot_from_resource, OpenclGpuHandle,
-};
 #[cfg(feature = "cuda")]
 use super::CudaMiningResources;
+#[cfg(feature = "ocl")]
+use crate::opencl_gpu::{OpenclGpuHandle, initialize_opencl, opencl_snapshot_from_resource};
 
 const HASH_WIDTH: usize = 32;
 const MINING_INTERVAL: f64 = 3.0;
+const WORKER_RATE_STALE_MS: u64 = 15_000;
+const HASHRATE_EWMA_NEW_WEIGHT: f64 = 0.25;
 const TARGET_BLOCK_TIME: f64 = 300.0;
 const ONEDAY_BLOCK_NUM: f64 = 288.0;
 
@@ -44,7 +45,9 @@ static MINING_BLOCK_STUFF: LazyLock<RwLock<Arc<BlockMiningStuff>>> =
 
 #[derive(Clone)]
 pub(crate) enum MinerBackend {
-    Cpu { assist_idx: Option<u32> },
+    Cpu {
+        assist_idx: Option<u32>,
+    },
     #[cfg(feature = "ocl")]
     Opencl(Arc<OpenclGpuHandle>),
     #[cfg(feature = "cuda")]
@@ -62,6 +65,7 @@ struct BlockMiningStuff {
 
 #[derive(Clone, Default)]
 pub(crate) struct BlockMiningResult {
+    worker_id: usize,
     pub height: u64,
     pub nonce_start: u32,
     nonce_space: u32,
@@ -83,24 +87,151 @@ impl BlockMiningResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkerHashrate {
+    gpu_hps: f64,
+    cpu_hps: f64,
+    updated_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HashrateTotals {
+    gpu_hps: f64,
+    cpu_hps: f64,
+}
+
+impl HashrateTotals {
+    fn total_hps(self) -> f64 {
+        self.gpu_hps + self.cpu_hps
+    }
+}
+
+#[derive(Default)]
+struct HashrateTracker {
+    by_worker: HashMap<usize, WorkerHashrate>,
+}
+
+impl HashrateTracker {
+    fn record_result(&mut self, result: &BlockMiningResult, now_ms: u64) {
+        self.record_sample(
+            result.worker_id,
+            result.nonce_space,
+            result.gpu_nonce_space,
+            result.cpu_nonce_space,
+            result.is_gpu,
+            result.use_secs,
+            now_ms,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_sample(
+        &mut self,
+        worker_id: usize,
+        nonce_space: u32,
+        gpu_nonce_space: u32,
+        cpu_nonce_space: u32,
+        is_gpu: bool,
+        use_secs: f64,
+        now_ms: u64,
+    ) {
+        if !use_secs.is_finite() || use_secs <= 0.0 {
+            return;
+        }
+        let mut gpu_nonce = gpu_nonce_space as u64;
+        let mut cpu_nonce = cpu_nonce_space as u64;
+        if gpu_nonce == 0 && cpu_nonce == 0 {
+            if is_gpu {
+                gpu_nonce = nonce_space as u64;
+            } else {
+                cpu_nonce = nonce_space as u64;
+            }
+        }
+        let sample_gpu = gpu_nonce as f64 / use_secs;
+        let sample_cpu = cpu_nonce as f64 / use_secs;
+        self.by_worker
+            .entry(worker_id)
+            .and_modify(|rate| {
+                rate.gpu_hps += (sample_gpu - rate.gpu_hps) * HASHRATE_EWMA_NEW_WEIGHT;
+                rate.cpu_hps += (sample_cpu - rate.cpu_hps) * HASHRATE_EWMA_NEW_WEIGHT;
+                rate.updated_ms = now_ms;
+            })
+            .or_insert(WorkerHashrate {
+                gpu_hps: sample_gpu,
+                cpu_hps: sample_cpu,
+                updated_ms: now_ms,
+            });
+    }
+
+    fn totals(&mut self, now_ms: u64) -> HashrateTotals {
+        self.by_worker
+            .retain(|_, rate| now_ms.saturating_sub(rate.updated_ms) <= WORKER_RATE_STALE_MS);
+        self.by_worker
+            .values()
+            .fold(HashrateTotals::default(), |mut totals, rate| {
+                totals.gpu_hps += rate.gpu_hps;
+                totals.cpu_hps += rate.cpu_hps;
+                totals
+            })
+    }
+}
+
 pub(crate) fn start_block_mining_workers(
     cnf: &PoWorkConf,
     stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-) {
+) -> bool {
     let (res_tx, res_rx) = mpsc::channel();
     let miner_backends = build_miner_backends(cnf);
+    if miner_backends.is_empty() {
+        return false;
+    }
+
+    let thermal_devices: Vec<_> = miner_backends
+        .iter()
+        .filter_map(|backend| match backend {
+            #[cfg(feature = "ocl")]
+            MinerBackend::Opencl(gpu) => Some(gpu.sensor_identity()),
+            #[cfg(feature = "cuda")]
+            MinerBackend::Cuda(_) => Some((
+                crate::gpu_arch::GpuVendor::Nvidia,
+                cnf.cudadevice.max(0) as u32,
+            )),
+            MinerBackend::Cpu { .. } => None,
+        })
+        .collect();
+    if !thermal_devices.is_empty() {
+        crate::mining_runtime::start_thermal_monitor(
+            &cnf.runtime,
+            &cnf.efficiency,
+            cnf.workgroups,
+            &thermal_devices,
+            stop_flag.clone(),
+        );
+    }
 
     let cnf1 = cnf.clone();
     let worker_qty = miner_backends.len();
     let stop_flag_res = stop_flag.clone();
+    let result_thread_guard = cnf.runtime.track_mining_thread();
     spawn(move || {
+        let _result_thread_guard = result_thread_guard;
+        let rate_clock = Instant::now();
+        let mut rate_tracker = HashrateTracker::default();
         let mut most_hash = vec![255u8; 32];
         let mut rstx = res_rx;
         loop {
             if super::should_stop(&stop_flag_res) {
                 return;
             }
-            deal_block_mining_results(&cnf1, &mut most_hash, &mut rstx, worker_qty);
+            let now_ms = rate_clock.elapsed().as_millis() as u64;
+            deal_block_mining_results(
+                &cnf1,
+                &mut most_hash,
+                &mut rstx,
+                worker_qty,
+                &mut rate_tracker,
+                now_ms,
+            );
             std::thread::sleep(Duration::from_millis(123));
         }
     });
@@ -109,41 +240,62 @@ pub(crate) fn start_block_mining_workers(
         let cnf2 = cnf.clone();
         let rstx = res_tx.clone();
         let stop_flag_miner = stop_flag.clone();
+        let mining_thread_guard = cnf.runtime.track_mining_thread();
         spawn(move || {
+            let _mining_thread_guard = mining_thread_guard;
             loop {
                 if super::should_stop(&stop_flag_miner) {
                     return;
                 }
-                run_block_mining_item(&cnf2, thrid, rstx.clone(), backend.clone());
+                run_block_mining_item(
+                    &cnf2,
+                    thrid,
+                    rstx.clone(),
+                    backend.clone(),
+                    &stop_flag_miner,
+                );
                 std::thread::sleep(Duration::from_millis(9));
             }
         });
     }
+    true
 }
 
 pub(crate) fn current_mining_height() -> u64 {
     MINING_BLOCK_HEIGHT.load(Relaxed)
 }
 
-pub(crate) fn set_pending_block_stuff(height: u64, res: JV) {
-    let jstr = |k: &str| res[k].as_str().unwrap_or("");
-    let target_hash = Hash::from(
-        hex::decode(jstr("target_hash"))
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
-    let block_intro = BlockIntro::must(&hex::decode(jstr("block_intro")).unwrap());
-    let coinbase_tx = TransactionCoinbase::must(&hex::decode(jstr("coinbase_body")).unwrap());
+pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String> {
+    let decode = |key: &str| -> Result<Vec<u8>, String> {
+        let value = res[key].as_str().ok_or_else(|| format!("missing {key}"))?;
+        hex::decode(value).map_err(|e| format!("invalid {key}: {e}"))
+    };
+
+    let target_bytes = decode("target_hash")?;
+    let target_array: [u8; HASH_WIDTH] = target_bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("invalid target_hash length: {}", v.len()))?;
+    let target_hash = Hash::from(target_array);
+
+    let intro_bytes = decode("block_intro")?;
+    let block_intro =
+        BlockIntro::build(&intro_bytes).map_err(|e| format!("invalid block_intro: {e}"))?;
+    let coinbase_bytes = decode("coinbase_body")?;
+    let coinbase_tx = TransactionCoinbase::build(&coinbase_bytes)
+        .map_err(|e| format!("invalid coinbase_body: {e}"))?;
+
     let mut mkrl_list = Vec::new();
     if let JV::Array(ref lists) = res["mkrl_modify_list"] {
         for li in lists {
-            mkrl_list.push(Hash::from(
-                hex::decode(li.as_str().unwrap_or(""))
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            ));
+            let text = li
+                .as_str()
+                .ok_or_else(|| "invalid mkrl_modify_list entry".to_string())?;
+            let bytes =
+                hex::decode(text).map_err(|e| format!("invalid mkrl_modify_list entry: {e}"))?;
+            let array: [u8; HASH_WIDTH] = bytes
+                .try_into()
+                .map_err(|v: Vec<u8>| format!("invalid merkle hash length: {}", v.len()))?;
+            mkrl_list.push(Hash::from(array));
         }
     }
     let new_stuff = BlockMiningStuff {
@@ -153,8 +305,12 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) {
         coinbase_tx,
         mkrl_list,
     };
-    *MINING_BLOCK_STUFF.write().unwrap() = new_stuff.into();
+    let mut guard = MINING_BLOCK_STUFF
+        .write()
+        .map_err(|e| format!("mining state lock poisoned: {e}"))?;
+    *guard = new_stuff.into();
     MINING_BLOCK_HEIGHT.store(height, Relaxed);
+    Ok(())
 }
 
 fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
@@ -163,7 +319,8 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
     if cnf.usecuda {
         #[cfg(feature = "cuda")]
         {
-            let cuda_resources = super::initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize);
+            let cuda_resources =
+                super::initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize);
             if !cuda_resources.is_empty() {
                 println!(
                     "\n[Start] Create CUDA block miner worker #{}.",
@@ -220,6 +377,11 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
                         cnf.workgroups,
                         &arch,
                     );
+                    cnf.runtime.report_gpu_workgroups(
+                        gpu.effective_wg(),
+                        cnf.runtime.thermal_workgroups_cap(),
+                        cnf.workgroups,
+                    );
                     backends.push(MinerBackend::Opencl(gpu));
                 }
             }
@@ -248,6 +410,12 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
     }
 
     if backends.is_empty() {
+        if cnf.useopencl {
+            eprintln!(
+                "[Fatal] OpenCL was requested but no usable GPU backend initialized; refusing silent CPU fallback."
+            );
+            return backends;
+        }
         let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene.max(1)) as usize;
         println!(
             "\n[Start] Create #{} CPU block miner worker thread.",
@@ -261,12 +429,45 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
     backends
 }
 
+fn backend_nonce_space(_cnf: &PoWorkConf, backend: &MinerBackend) -> u32 {
+    match backend {
+        MinerBackend::Cpu { .. } => 100_000,
+        #[cfg(feature = "ocl")]
+        MinerBackend::Opencl(gpu) => {
+            let wg = gpu.workgroups(_cnf.workgroups, _cnf.runtime.thermal_workgroups_cap());
+            wg.saturating_mul(_cnf.localsize)
+                .saturating_mul(_cnf.unitsize)
+                .max(1)
+        }
+        #[cfg(feature = "cuda")]
+        MinerBackend::Cuda(res) => {
+            let wg = res.workgroups.min(_cnf.workgroups);
+            wg.saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
+                .saturating_mul(res.unit_size)
+                .max(1)
+        }
+    }
+}
+
+fn next_nonce_space(current: u32, use_secs: f64, is_gpu_backend: bool) -> u32 {
+    // A GPU backend can process exactly one effective device batch. Expanding
+    // this window creates a CPU tail that hides the GPU for several seconds.
+    if is_gpu_backend || !use_secs.is_finite() || use_secs <= 0.0 {
+        return current.max(1);
+    }
+    ((current as f64 * MINING_INTERVAL / use_secs) as u32).max(1)
+}
+
 fn run_block_mining_item(
     _cnf: &PoWorkConf,
-    _thrid: usize,
+    thrid: usize,
     result_ch_tx: mpsc::Sender<Arc<BlockMiningResult>>,
     backend: MinerBackend,
+    stop_flag: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
+    if super::should_stop(stop_flag) {
+        return;
+    }
     if mining_is_gated(&_cnf.runtime, &_cnf.efficiency) {
         std::thread::sleep(Duration::from_millis(2000));
         return;
@@ -279,9 +480,15 @@ fn run_block_mining_item(
     }
 
     let mut coinbase_nonce = [0u8; HASH_WIDTH];
-    getrandom::fill(&mut coinbase_nonce).unwrap();
+    if let Err(e) = getrandom::fill(&mut coinbase_nonce) {
+        eprintln!("[Mining] Secure random nonce failed: {e}");
+        return;
+    }
     let coinbase_nonce = Hash::from(coinbase_nonce);
-    if let MinerBackend::Cpu { assist_idx: Some(idx) } = &backend {
+    if let MinerBackend::Cpu {
+        assist_idx: Some(idx),
+    } = &backend
+    {
         let active = _cnf.runtime.active_cpu_assist.load(Relaxed);
         if *idx >= active {
             std::thread::sleep(Duration::from_millis(400));
@@ -291,19 +498,7 @@ fn run_block_mining_item(
 
     let mut nonce_start: u32 = 0;
     let nonce_limit = _cnf.noncemax.max(1);
-    let mut nonce_space: u32 = match &backend {
-        MinerBackend::Cpu { .. } => 100000,
-        #[cfg(feature = "ocl")]
-        MinerBackend::Opencl(gpu) => {
-            let wg = gpu.workgroups(_cnf.workgroups, _cnf.runtime.thermal_workgroups_cap());
-            wg * _cnf.localsize * _cnf.unitsize
-        }
-        #[cfg(feature = "cuda")]
-        MinerBackend::Cuda(res) => {
-            let wg = res.workgroups.min(_cnf.workgroups);
-            wg * x16rs_cuda::DEFAULT_LOCAL_SIZE * res.unit_size
-        }
-    };
+    let mut nonce_space = backend_nonce_space(_cnf, &backend);
     let is_gpu_backend = match &backend {
         #[cfg(feature = "ocl")]
         MinerBackend::Opencl(_) => true,
@@ -311,7 +506,13 @@ fn run_block_mining_item(
         MinerBackend::Cuda(_) => true,
         _ => false,
     };
-    let stuff = { MINING_BLOCK_STUFF.read().unwrap().clone() };
+    let stuff = match MINING_BLOCK_STUFF.read() {
+        Ok(stuff) => stuff.clone(),
+        Err(e) => {
+            eprintln!("[Mining] Block state lock failed: {e}");
+            return;
+        }
+    };
     let height = stuff.height;
     let mut coinbase_tx = stuff.coinbase_tx.clone();
     coinbase_tx.set_nonce(coinbase_nonce);
@@ -321,8 +522,15 @@ fn run_block_mining_item(
         &stuff.mkrl_list,
     ));
     loop {
+        if super::should_stop(stop_flag) || _cnf.runtime.thermal_pause_active() {
+            return;
+        }
         if nonce_start >= nonce_limit {
             return;
+        }
+        if is_gpu_backend {
+            // Re-read the OOM/thermal-adjusted capacity before every GPU batch.
+            nonce_space = backend_nonce_space(_cnf, &backend);
         }
 
         let remain = nonce_limit.saturating_sub(nonce_start);
@@ -367,8 +575,9 @@ fn run_block_mining_item(
         let gpu_ns = batch.gpu_nonce_space;
         let cpu_ns = batch.cpu_nonce_space;
 
-        let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
+        let use_secs = ctn.elapsed().as_secs_f64();
         let mlres = BlockMiningResult {
+            worker_id: thrid,
             height,
             nonce_start,
             nonce_space: current_nonce_space,
@@ -381,12 +590,11 @@ fn run_block_mining_item(
             use_secs,
             is_gpu: is_gpu_backend,
         };
-        result_ch_tx.send(mlres.into()).unwrap();
-
-        if use_secs > 0.0 {
-            nonce_space = (current_nonce_space as f64 * MINING_INTERVAL / use_secs) as u32;
-            nonce_space = nonce_space.max(1);
+        if result_ch_tx.send(mlres.into()).is_err() {
+            return;
         }
+
+        nonce_space = next_nonce_space(current_nonce_space, use_secs, is_gpu_backend);
 
         let Some(nst) = nonce_start.checked_add(current_nonce_space) else {
             return;
@@ -425,6 +633,8 @@ fn deal_block_mining_results(
     most_hash: &mut Vec<u8>,
     result_ch_rx: &mut mpsc::Receiver<Arc<BlockMiningResult>>,
     worker_qty: usize,
+    rate_tracker: &mut HashrateTracker,
+    now_ms: u64,
 ) {
     let vene = worker_qty.max(1) as u32;
     let mut deal_hei = 0u64;
@@ -432,11 +642,6 @@ fn deal_block_mining_results(
     let mut total_nonce_space = 0u64;
     let mut gpu_nonce_space = 0u64;
     let mut cpu_nonce_space = 0u64;
-    let mut gpu_batch_space = 0u64;
-    let mut cpu_batch_space = 0u64;
-    let mut gpu_batch_secs = 0.0f64;
-    let mut cpu_batch_secs = 0.0f64;
-    let mut total_use_secs = 0.0;
     let mut recv_count = 0;
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_hei = res.height;
@@ -444,24 +649,12 @@ fn deal_block_mining_results(
         if res.gpu_nonce_space > 0 || res.cpu_nonce_space > 0 {
             gpu_nonce_space += res.gpu_nonce_space as u64;
             cpu_nonce_space += res.cpu_nonce_space as u64;
-            if res.gpu_nonce_space > 0 {
-                gpu_batch_space += res.gpu_nonce_space as u64;
-                gpu_batch_secs += res.use_secs;
-            }
-            if res.cpu_nonce_space > 0 {
-                cpu_batch_space += res.cpu_nonce_space as u64;
-                cpu_batch_secs += res.use_secs;
-            }
         } else if res.is_gpu {
             gpu_nonce_space += res.nonce_space as u64;
-            gpu_batch_space += res.nonce_space as u64;
-            gpu_batch_secs += res.use_secs;
         } else {
             cpu_nonce_space += res.nonce_space as u64;
-            cpu_batch_space += res.nonce_space as u64;
-            cpu_batch_secs += res.use_secs;
         }
-        total_use_secs += res.use_secs;
+        rate_tracker.record_result(&res, now_ms);
         if hash_more_power(&res.result_hash, &most.result_hash) {
             most = res.clone();
         }
@@ -476,27 +669,15 @@ fn deal_block_mining_results(
     if hash_more_power(&most.result_hash, most_hash) {
         *most_hash = most.result_hash.clone();
     }
-    let tarhx: [u8; HASH_WIDTH] = most.target_hash.clone().try_into().unwrap();
+    let Ok(tarhx) = most.target_hash.clone().try_into() else {
+        eprintln!("[Mining] Ignoring result with invalid target hash length.");
+        return;
+    };
     let target_rates = hash_to_rates(&tarhx, TARGET_BLOCK_TIME);
-    let avg_use_secs = total_use_secs / recv_count as f64;
-    let nonce_rates = if avg_use_secs.is_finite() && avg_use_secs > 0.0 {
-        total_nonce_space as f64 / avg_use_secs
-    } else {
-        0.0
-    };
-    let mut gpu_hashrate = if gpu_batch_secs > 0.0 {
-        gpu_batch_space as f64 / gpu_batch_secs
-    } else {
-        0.0
-    };
-    let cpu_hashrate = if cpu_batch_secs > 0.0 {
-        cpu_batch_space as f64 / cpu_batch_secs
-    } else {
-        0.0
-    };
-    if gpu_hashrate <= 0.0 && nonce_rates > cpu_hashrate {
-        gpu_hashrate = nonce_rates - cpu_hashrate;
-    }
+    let rates = rate_tracker.totals(now_ms);
+    let gpu_hashrate = rates.gpu_hps;
+    let cpu_hashrate = rates.cpu_hps;
+    let nonce_rates = rates.total_hps();
     let mut mnper = if target_rates.is_finite() && target_rates > 0.0 {
         nonce_rates / target_rates
     } else {
@@ -569,7 +750,10 @@ pub(crate) fn may_print_turn_to_nex_block_mining(curr_hei: u64, most_hash: Optio
     if let Some(most_hash) = most_hash {
         *most_hash = vec![255u8; 32];
     }
-    let stuff = MINING_BLOCK_STUFF.read().unwrap();
+    let Ok(stuff) = MINING_BLOCK_STUFF.read() else {
+        eprintln!("[Mining] Cannot read block state.");
+        return;
+    };
     let tarhx = hash_left_zero_pad3(&stuff.target_hash.as_bytes()).to_hex();
 
     println!(
@@ -578,4 +762,56 @@ pub(crate) fn may_print_turn_to_nex_block_mining(curr_hei: u64, most_hash: Optio
         mining_hei,
         tarhx
     );
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_pending_block_is_rejected_without_panicking() {
+        assert!(set_pending_block_stuff(1, serde_json::json!({})).is_err());
+        let invalid_hex = serde_json::json!({"target_hash": "zz"});
+        assert!(set_pending_block_stuff(1, invalid_hex).is_err());
+    }
+
+    #[test]
+    fn gpu_nonce_window_never_expands_into_a_cpu_tail() {
+        let gpu_window = 64 * 256 * 64;
+        assert_eq!(next_nonce_space(gpu_window, 0.010, true), gpu_window);
+        assert_eq!(next_nonce_space(gpu_window, 0.010, false), 314_572_800);
+    }
+
+    #[test]
+    fn sequential_batches_from_one_worker_are_not_counted_as_parallel() {
+        let mut tracker = HashrateTracker::default();
+        for now_ms in [0, 10, 20, 30] {
+            tracker.record_sample(0, 1_048_576, 1_048_576, 0, true, 0.010, now_ms);
+        }
+        let rates = tracker.totals(30);
+        assert!((rates.gpu_hps - 104_857_600.0).abs() < 0.001);
+        assert_eq!(rates.cpu_hps, 0.0);
+        assert!((rates.total_hps() - rates.gpu_hps).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latest_rates_from_parallel_workers_are_summed() {
+        let mut tracker = HashrateTracker::default();
+        tracker.record_sample(0, 1_000_000, 1_000_000, 0, true, 0.010, 100);
+        tracker.record_sample(1, 100_000, 0, 100_000, false, 0.100, 100);
+        tracker.record_sample(2, 100_000, 0, 100_000, false, 0.100, 100);
+
+        let rates = tracker.totals(100);
+        assert!((rates.gpu_hps - 100_000_000.0).abs() < 0.001);
+        assert!((rates.cpu_hps - 2_000_000.0).abs() < 0.001);
+        assert!((rates.total_hps() - 102_000_000.0).abs() < 0.001);
+        assert!((rates.total_hps() - rates.gpu_hps - rates.cpu_hps).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stale_worker_rates_expire() {
+        let mut tracker = HashrateTracker::default();
+        tracker.record_sample(0, 1_000_000, 1_000_000, 0, true, 0.010, 0);
+        assert!(tracker.totals(WORKER_RATE_STALE_MS).total_hps() > 0.0);
+        assert_eq!(tracker.totals(WORKER_RATE_STALE_MS + 1).total_hps(), 0.0);
+    }
 }

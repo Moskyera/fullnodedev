@@ -57,6 +57,34 @@ impl ProtocolSetup {
     pub fn action_hook(&mut self, f: FnActionHookFunc) {
         self.action_hooks.push(f);
     }
+
+    pub fn has_vm_assigner(&self) -> bool {
+        self.vm_assigner.is_some()
+    }
+
+    pub fn registered_tx_types(&self) -> Vec<u8> {
+        let mut out: Vec<_> = self.tx_codecs.keys().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    pub fn registered_action_kinds(&self) -> Vec<u16> {
+        let mut out: Vec<_> = self.action_codecs.keys().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    pub fn action_hook_count(&self) -> usize {
+        self.action_hooks.len()
+    }
+
+    pub fn has_tx_type(&self, ty: u8) -> bool {
+        self.tx_codecs.contains_key(&ty)
+    }
+
+    pub fn has_action_kind(&self, kind: u16) -> bool {
+        self.action_codecs.contains_key(&kind)
+    }
 }
 
 impl Default for ProtocolSetup {

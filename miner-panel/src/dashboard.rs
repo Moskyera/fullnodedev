@@ -31,13 +31,67 @@ pub fn show_dashboard_details(ui: &mut egui::Ui, d: &DashboardDetails<'_>) {
             .color(theme::colors::TEXT),
     );
     ui.add_space(10.0);
-    egui::Grid::new("dash_details")
+
+    if d.mining_kind == MiningKind::Hacd {
+        show_hacd_details(ui, d);
+    } else {
+        show_hac_details(ui, d);
+    }
+}
+
+fn show_hacd_details(ui: &mut egui::Ui, d: &DashboardDetails<'_>) {
+    egui::Grid::new("dash_details_hacd")
         .num_columns(2)
-        .spacing([24.0, 6.0])
-        .min_col_width(320.0)
+        .spacing([24.0, 8.0])
+        .min_col_width(360.0)
         .show(ui, |ui| {
-            theme::show_detail_row(ui, d.t.dash_detail_cpu, &d.cpu_label);
-            theme::show_detail_row(ui, d.t.dash_detail_gpu, &d.gpu_label);
+            theme::show_detail_row(ui, d.t.dash_detail_cpu, d.cpu_label);
+            theme::show_detail_row(ui, "Backend", "CPU only • no OpenCL");
+            ui.end_row();
+
+            theme::show_detail_row(ui, d.t.dash_detail_connect, &d.connect_display);
+            theme::show_detail_row(ui, d.t.dash_detail_wallet, &d.wallet_display);
+            ui.end_row();
+
+            theme::show_detail_row(ui, "CPU configuration", &d.tuning_display);
+            theme::show_detail_row(ui, d.t.dash_detail_power_cost, &d.power_cost_display);
+            ui.end_row();
+
+            theme::show_detail_row(ui, d.t.dash_detail_last_update, &d.last_update);
+            theme::show_detail_row(ui, d.t.dash_detail_stats_status, &d.stats_status);
+            ui.end_row();
+
+            if d.stats.diamond_number > 0 || !d.stats.diamond_best.is_empty() {
+                let number = if d.stats.diamond_number > 0 {
+                    format!("#{}", d.stats.diamond_number)
+                } else {
+                    d.t.dash_no_data.to_string()
+                };
+                theme::show_detail_row(ui, d.t.dash_detail_diamond, &number);
+                theme::show_detail_row(
+                    ui,
+                    d.t.stat_diamond_best,
+                    if d.stats.diamond_best.is_empty() {
+                        d.t.dash_no_data
+                    } else {
+                        &d.stats.diamond_best
+                    },
+                );
+                ui.end_row();
+            }
+        });
+}
+
+fn show_hac_details(ui: &mut egui::Ui, d: &DashboardDetails<'_>) {
+    egui::Grid::new("dash_details_hac")
+        .num_columns(2)
+        .spacing([24.0, 8.0])
+        .min_col_width(360.0)
+        .show(ui, |ui| {
+            theme::show_detail_row(ui, d.t.dash_detail_cpu, d.cpu_label);
+            theme::show_detail_row(ui, d.t.dash_detail_gpu, d.gpu_label);
+            ui.end_row();
+
             if presets::is_rdna4_experimental(d.gpu_slug) {
                 ui.label(
                     egui::RichText::new(d.t.gpu_rdna4_badge)
@@ -50,60 +104,55 @@ pub fn show_dashboard_details(ui: &mut egui::Ui, d: &DashboardDetails<'_>) {
                         .size(11.0),
                 );
                 ui.end_row();
-            } else {
-                ui.end_row();
             }
+
             theme::show_detail_row(ui, d.t.dash_detail_connect, &d.connect_display);
             theme::show_detail_row(ui, d.t.dash_detail_wallet, &d.wallet_display);
             ui.end_row();
+
             theme::show_detail_row(ui, d.t.dash_detail_opencl, &d.opencl_display);
-            if d.stats.gpu_hashrate_hps > 0.0 {
+            theme::show_detail_row(ui, d.t.dash_detail_tuning, &d.tuning_display);
+            ui.end_row();
+
+            if d.stats.gpu_hashrate_hps > 0.0 || d.stats.effective_work_groups > 0 {
                 theme::show_detail_row(
                     ui,
                     d.t.dash_detail_gpu_hashrate,
-                    &d.stats.gpu_hashrate_display,
+                    if d.stats.gpu_hashrate_hps > 0.0 {
+                        &d.stats.gpu_hashrate_display
+                    } else {
+                        d.t.dash_no_data
+                    },
                 );
-            }
-            if d.stats.effective_work_groups > 0 {
-                let wg_detail = d.t.wg_breakdown_display(
-                    d.stats.effective_work_groups,
-                    d.stats.configured_work_groups,
-                    d.stats.oom_work_groups,
-                    d.stats.thermal_cap_work_groups,
-                );
+                let wg_detail = if d.stats.effective_work_groups > 0 {
+                    d.t.wg_breakdown_display(
+                        d.stats.effective_work_groups,
+                        d.stats.configured_work_groups,
+                        d.stats.oom_work_groups,
+                        d.stats.thermal_cap_work_groups,
+                    )
+                } else {
+                    d.t.dash_no_data.to_string()
+                };
                 theme::show_detail_row(ui, d.t.dash_detail_effective_wg, &wg_detail);
+                ui.end_row();
             }
-            theme::show_detail_row(ui, d.t.dash_detail_tuning, &d.tuning_display);
-            ui.end_row();
+
             theme::show_detail_row(ui, d.t.dash_detail_power_cost, &d.power_cost_display);
             theme::show_detail_row(
                 ui,
                 d.t.dash_detail_max_temp,
-                &format!("{}°C", d.max_temp_c),
+                if d.max_temp_c == 0 {
+                    "Off".to_string()
+                } else {
+                    format!("{}°C", d.max_temp_c)
+                }
+                .as_str(),
             );
             ui.end_row();
+
             theme::show_detail_row(ui, d.t.dash_detail_last_update, &d.last_update);
             theme::show_detail_row(ui, d.t.dash_detail_stats_status, &d.stats_status);
             ui.end_row();
-            let diamond_label = (d.mining_kind == MiningKind::Hacd && d.stats.diamond_number > 0)
-                .then(|| (d.t.dash_detail_diamond, format!("#{}", d.stats.diamond_number)));
-            let profile_label = (!d.stats.gpu_profile.is_empty())
-                .then(|| (d.t.stat_gpu_profile, d.stats.gpu_profile.clone()));
-            match (profile_label, diamond_label) {
-                (Some((pl, pv)), Some((dl, dv))) => {
-                    theme::show_detail_row(ui, pl, &pv);
-                    theme::show_detail_row(ui, dl, &dv);
-                    ui.end_row();
-                }
-                (Some((pl, pv)), None) => {
-                    theme::show_detail_row(ui, pl, &pv);
-                    ui.end_row();
-                }
-                (None, Some((dl, dv))) => {
-                    theme::show_detail_row(ui, dl, &dv);
-                    ui.end_row();
-                }
-                (None, None) => {}
-            }
         });
 }

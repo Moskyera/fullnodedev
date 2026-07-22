@@ -69,13 +69,16 @@ pub fn run_with_scaner(cnfpath: &str, scan: Box<dyn Scaner>) -> Rerr {
         .txpool(build_txpool)
         .minter(|ini| Ok(Box::new(HacashMinter::create(ini))))
         .engine(|dbfn, cnf, minter, scaner| {
-            Ok(Box::new(ChainEngine::open(dbfn, cnf, minter, scaner, DB_VERSION)))
+            Ok(Box::new(ChainEngine::open(
+                dbfn, cnf, minter, scaner, DB_VERSION,
+            )))
         })
         .hnoder(|ini, txpool, engine| Ok(Box::new(HacashNode::open(ini, txpool, engine))))
         .server(|ini, hnoder| {
             #[allow(unused_mut)]
             let mut services: Vec<std::sync::Arc<dyn ApiService>> = vec![mint::api::service()];
             services.push(vm::api::service());
+            services.push(app::node_api::service());
             let debug_open = ServerConf::new(ini).debug_open;
             Ok(Box::new(HttpServer::open(
                 ini,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Hacash OpenCL miners (poworker, diaworker, list_opencl, fullnode) on Linux.
+# Build HAC OpenCL tools plus CPU-only HACD worker/fullnode on Linux.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 echo
-echo "  Building poworker + diaworker + list_opencl + hacash (OpenCL)..."
+echo "  Building HAC OpenCL tools + CPU-only HACD worker/fullnode..."
 echo "  Repo: $REPO_ROOT"
 echo
 
@@ -41,7 +41,8 @@ if [[ -n "${MISSING_DEV:-}" ]]; then
   [[ "${ans,,}" == "y" ]] || exit 1
 fi
 
-cargo build --release --features ocl
+cargo build --release --features ocl --bin poworker --bin list_opencl --bin diagnose_opencl
+cargo build --release --bin hacash --bin diaworker
 
 echo
 echo "  OK: $REPO_ROOT/target/release/poworker"

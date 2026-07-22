@@ -4,7 +4,10 @@ use std::path::PathBuf;
 fn discover_cuda_root() -> Option<String> {
     if cfg!(windows) {
         let base = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
-        let mut versions: Vec<_> = std::fs::read_dir(&base).ok()?.filter_map(|e| e.ok()).collect();
+        let mut versions: Vec<_> = std::fs::read_dir(&base)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .collect();
         versions.sort_by_key(|e| e.file_name());
         for entry in versions.into_iter().rev() {
             let nvcc = entry.path().join("bin").join("nvcc.exe");
@@ -41,11 +44,9 @@ fn main() {
         return;
     };
 
-    let nvcc = PathBuf::from(&cuda_root).join("bin").join(if cfg!(windows) {
-        "nvcc.exe"
-    } else {
-        "nvcc"
-    });
+    let nvcc = PathBuf::from(&cuda_root)
+        .join("bin")
+        .join(if cfg!(windows) { "nvcc.exe" } else { "nvcc" });
 
     println!("cargo:warning=Using CUDA Toolkit at {}", cuda_root);
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -86,11 +87,7 @@ fn main() {
         build.flag("-Xcompiler=/MD");
     }
 
-    let lib_dir = PathBuf::from(&cuda_root).join(if cfg!(windows) {
-        "lib/x64"
-    } else {
-        "lib64"
-    });
+    let lib_dir = PathBuf::from(&cuda_root).join(if cfg!(windows) { "lib/x64" } else { "lib64" });
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=cudart");
 

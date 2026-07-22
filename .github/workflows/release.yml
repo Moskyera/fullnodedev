@@ -1,4 +1,4 @@
-name: Release (Windows miner)
+name: Release (Windows + Linux miners)
 
 on:
   push:
@@ -6,20 +6,24 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Build jobs: least privilege (checkout recommendation). Publish job elevates only for release assets.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RELEASE_REF_NAME: ${{ github.ref_name }}
 
 jobs:
   build-windows:
-    name: Build & package (Windows x64)
+    name: Build and package (Windows x64)
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -27,7 +31,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-windows-ocl"
+          shared-key: release-windows-ocl
 
       - name: Install OpenCL.lib (vcpkg)
         shell: pwsh
@@ -40,56 +44,286 @@ jobs:
           "LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTFLAGS=-Clink-arg=/LIBPATH:$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build miners + fullnode (OpenCL)
-        run: cargo build --release --features ocl
+      - name: Build HAC OpenCL tools
+        run: cargo build --locked --release --features ocl --bin poworker --bin list_opencl --bin diagnose_opencl
 
-      - name: Build miner-panel (GUI)
-        run: cargo build --release -p miner-panel
+      - name: Build CPU-only HACD worker and fullnode
+        run: cargo build --locked --release --bin hacash --bin diaworker
 
-      - name: Package release ZIPs (full + miner-only)
+      - name: Verify Windows HACD binaries are CPU-only
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}"
-          if ($version -eq "${{ github.ref }}") { $version = "manual" }
+          $dumpbin = Get-ChildItem -Path "$env:ProgramFiles\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -File |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          foreach ($binary in @("hacash.exe", "diaworker.exe")) {
+            $binaryPath = Join-Path "$env:GITHUB_WORKSPACE\target\release" $binary
+            $dependencies = (& $dumpbin.FullName /DEPENDENTS $binaryPath | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $binary" }
+            if ($dependencies -match "(?i)OpenCL\.dll") {
+              throw "$binary must not depend on OpenCL.dll"
+            }
+          }
+
+      - name: Build miner panel
+        run: cargo build --locked --release -p miner-panel
+
+      - name: Run Windows release tests
+        run: |
+          cargo test --locked -p x16rs
+          cargo test --locked --release -p x16rs
+          cargo test --locked -p sys
+          cargo test --locked -p app --features ocl
+          cargo test --locked -p miner-panel
+          cargo test --locked -p basis --lib
+
+      - name: Package release ZIPs
+        shell: pwsh
+        run: |
+          $version = "manual"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $candidate = $env:RELEASE_REF_NAME
+            if ($candidate -notmatch '^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+              throw "Refusing unsafe or non-SemVer release tag: $candidate"
+            }
+            $version = $candidate
+          }
           & "$env:GITHUB_WORKSPACE\scripts\pack-release.ps1" -Version $version
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Validate Windows release ZIPs
+        shell: pwsh
+        run: |
+          $zips = @(Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter "*.zip" -File)
+          if ($zips.Count -ne 2) { throw "Expected 2 Windows ZIPs, found $($zips.Count)" }
+          foreach ($zip in $zips) {
+            $checksumPath = "$($zip.FullName).sha256"
+            if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+              throw "Missing checksum for $($zip.Name)"
+            }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip.FullName).Hash.ToLowerInvariant()
+            $expectedLine = "$actual  $($zip.Name)"
+            if ([IO.File]::ReadAllText($checksumPath).Trim() -ne $expectedLine) {
+              throw "Checksum mismatch for $($zip.Name)"
+            }
+
+            $extract = Join-Path $env:RUNNER_TEMP $zip.BaseName
+            if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extract
+            $roots = @(Get-ChildItem -LiteralPath $extract -Directory)
+            if ($roots.Count -ne 1) { throw "$($zip.Name) must contain one package root" }
+            $stage = $roots[0].FullName
+            $required = @(
+              "poworker.exe", "diaworker.exe", "list_opencl.exe", "diagnose_opencl.exe",
+              "miner-panel.exe", "poworker.amd.ini.example", "diaworker.amd.ini.example",
+              "PRESETS-INDEX.txt", "START-MINER-PANEL.bat", "LIST-OPENCL.bat"
+            )
+            $isFull = $zip.Name -like "hacash-miner-full-windows-x64*"
+            if ($isFull) { $required += @("hacash.exe", "SETUP.bat", "README-RELEASE.txt") }
+            else { $required += @("SETUP-MINER.bat", "README-MINER-ONLY.txt") }
+            foreach ($file in $required) {
+              if (-not (Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {
+                throw "$($zip.Name) missing $file"
+              }
+            }
+            if (-not $isFull -and (Test-Path -LiteralPath (Join-Path $stage "hacash.exe"))) {
+              throw "Miner-only ZIP unexpectedly contains hacash.exe"
+            }
+            $kernels = @(Get-ChildItem -LiteralPath (Join-Path $stage "x16rs\opencl") -Filter "*.cl" -File)
+            if ($kernels.Count -ne 25) { throw "$($zip.Name) has $($kernels.Count) kernels, expected 25" }
+            foreach ($kind in @("poworker", "diaworker")) {
+              $presetPath = Join-Path $stage "presets\$kind"
+              $presetCount = @(Get-ChildItem -LiteralPath $presetPath -Filter "*.ini" -File).Count
+              if ($presetCount -ne 23) { throw "$($zip.Name) has $presetCount $kind presets" }
+            }
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
         with:
           name: hacash-miner-windows-x64
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  build-linux:
+    name: Build and package (Ubuntu x86_64)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-ocl
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config ocl-icd-opencl-dev clinfo libssl-dev \
+            libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libudev-dev xvfb xauth \
+            libx11-xcb1 libxcursor1 libxi6 libxkbcommon-x11-0 libegl1
+
+      - name: Build miners and fullnode
+        run: |
+          cargo build --locked --release --features ocl \
+            --bin poworker --bin list_opencl --bin diagnose_opencl
+          cargo build --locked --release --bin hacash --bin diaworker
+
+      - name: Build and test miner panel
+        run: |
+          cargo build --locked --release -p miner-panel
+          cargo test --locked -p x16rs
+          cargo test --locked --release -p x16rs
+          cargo test --locked -p sys
+          cargo test --locked -p app --features ocl
+          cargo test --locked -p miner-panel
+          cargo test --locked -p basis --lib
+
+      - name: Verify HACD CPU-only and release preset completeness
+        run: bash scripts/verify-mining-presets.sh
+
+      - name: Verify linked Linux libraries
+        run: |
+          for binary in hacash poworker diaworker list_opencl diagnose_opencl miner-panel; do
+            test -x "target/release/$binary"
+            if ldd "target/release/$binary" | grep -q 'not found'; then
+              ldd "target/release/$binary"
+              exit 1
+            fi
+          done
+          for binary in hacash diaworker; do
+            if ldd "target/release/$binary" | grep -qi opencl; then
+              echo "$binary must not depend on libOpenCL"
+              exit 1
+            fi
+          done
+
+      - name: Smoke-test Linux GUI startup
+        run: |
+          set +e
+          timeout 5s xvfb-run -a target/release/miner-panel
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "miner-panel exited before the smoke-test timeout (code $code)"
+            exit 1
+          fi
+
+      - name: Package Linux archives
+        run: |
+          version="manual"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            candidate="$RELEASE_REF_NAME"
+            if [[ ! "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Refusing unsafe or non-SemVer release tag: $candidate"
+              exit 1
+            fi
+            version="$candidate"
+          fi
+          bash scripts/pack-release-linux.sh "$version"
+          archives=(dist/hacash-miner-*-linux-x86_64*.tar.gz)
+          test "${#archives[@]}" -eq 2
+          for archive in "${archives[@]}"; do
+            tar -tzf "$archive" >/dev/null
+          done
+          (cd dist && sha256sum -c ./*.tar.gz.sha256)
+
+          full=dist/hacash-miner-full-linux-x86_64
+          only=dist/hacash-miner-only-linux-x86_64
+          test -x "$full/SETUP-LINUX.sh"
+          test -x "$only/START-MINER-PANEL.sh"
+          test -f "$full/PRESETS-INDEX.txt"
+          test -f "$only/PRESETS-INDEX.txt"
+          pow_presets=("$full"/presets/poworker/*.ini)
+          dia_presets=("$full"/presets/diaworker/*.ini)
+          test "${#pow_presets[@]}" -eq 23
+          test "${#dia_presets[@]}" -eq 23
+          grep -Fxq 'reward = YOUR_HACD_PRIVAKEY_3x' "$full/hacash.config.ini.example"
+
+          HACASH_SETUP_NO_LAUNCH=1 bash "$full/SETUP-LINUX.sh" --no-launch </dev/null
+          HACASH_SETUP_NO_LAUNCH=1 bash "$only/SETUP-LINUX.sh" --no-launch </dev/null
+          test "$(stat -c '%a' "$full/poworker.config.ini")" = 600
+          test "$(stat -c '%a' "$full/diaworker.config.ini")" = 600
+          test "$(stat -c '%a' "$full/hacash.config.ini")" = 600
+          test "$(stat -c '%a' "$only/poworker.config.ini")" = 600
+          test "$(stat -c '%a' "$only/diaworker.config.ini")" = 600
+
+          sed -E -i 's|^connect[[:space:]]*=.*$|connect = pool.example.test:9000|' \
+            "$full/poworker.config.ini"
+          HACASH_SETUP_NO_LAUNCH=1 bash "$full/SETUP-LINUX.sh" --no-launch </dev/null
+          grep -Fxq 'connect = pool.example.test:9000' "$full/poworker.config.ini"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: hacash-miner-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Validate release tag
+        run: |
+          tag="$RELEASE_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing to publish release for unsafe or non-version tag: $tag"
+            exit 1
+          fi
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
           generate_release_notes: true
           body: |
-            ## HAC Miner — Windows x64 · By Mosky
+            ## HAC Miner - Windows and Linux x86_64 - By Mosky
 
-            Choose the package that fits your PC:
+            Choose the package that matches the operating system:
 
-            | Download | When to use |
-            |----------|-------------|
-            | **`hacash-miner-full-*.zip`** | **Clean PC** — fullnode + miners + GUI + `SETUP.bat` |
-            | **`hacash-miner-only-*.zip`** | You **already have** `hacash.exe` + `hacash.config.ini` |
+            | Download | Use when |
+            |---|---|
+            | `hacash-miner-full-windows-x64*.zip` | New Windows PC |
+            | `hacash-miner-only-windows-x64*.zip` | Windows fullnode already exists |
+            | `hacash-miner-full-linux-x86_64*.tar.gz` | New Ubuntu/Debian PC |
+            | `hacash-miner-only-linux-x86_64*.tar.gz` | Linux fullnode already exists |
 
-            ### Full package (recommended for new users)
-            1. Extract `hacash-miner-full-*.zip`
-            2. Run **`SETUP.bat`**
-            3. Open **`miner-panel.exe`** → Settings → wallet → Start
+            Windows: extract and run `SETUP.bat` or `SETUP-MINER.bat`.
+            Verify a ZIP with `Get-FileHash .\<file>.zip -Algorithm SHA256` and compare it with `<file>.zip.sha256`.
 
-            ### Miner only (existing fullnode)
-            1. Extract `hacash-miner-only-*.zip` next to your fullnode **or** any folder
-            2. Run **`SETUP-MINER.bat`**
-            3. Ensure fullnode RPC is on `127.0.0.1:8080`
-            4. Open **`miner-panel.exe`**
+            Linux: extract and run `./SETUP-LINUX.sh` (or `bash SETUP-LINUX.sh`).
+            Verify an archive with `sha256sum -c <file>.tar.gz.sha256`.
 
-            ### Requirements
-            - Windows 10/11 x64
-            - AMD Adrenalin or NVIDIA drivers (GPU / OpenCL)
-            - Visual C++ Redistributable 2015–2022 x64 (setup scripts can install)
+            HAC uses OpenCL GPU mining and supports automatic GPU detection/Auto Tune.
+            Auto Tune supports one selected GPU per poworker config; use separate instances/configs for heterogeneous GPUs.
+            HACD is CPU/fullnode mining and does not use OpenCL.
+            Miner Fleet combines multiple LAN Windows/Linux panels in one dashboard.
 
-            [docs/MINING-AMD.md](docs/MINING-AMD.md)
+            Linux still requires the GPU vendor's OpenCL driver. For AMD Radeon,
+            follow the current ROCm Linux compatibility and installation guides.

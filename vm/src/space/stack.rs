@@ -80,7 +80,9 @@ impl Stack {
 
     pub fn alloc(&mut self, num: u8) -> VmrtRes<u8> {
         let osz = self.datas.len();
-        let tsz = osz.checked_add(num as usize).ok_or_else(|| ItrErr::code(OutOfStack))?;
+        let tsz = osz
+            .checked_add(num as usize)
+            .ok_or_else(|| ItrErr::code(OutOfStack))?;
         if tsz > self.limit {
             return itr_err_code!(OutOfStack);
         }

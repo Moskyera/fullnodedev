@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering::*};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::*};
 
 use std::time::*;
 
@@ -8,8 +8,11 @@ use serde_json::Value as JV;
 
 use crate::efficiency::*;
 
+#[cfg(feature = "ocl")]
 use basis::difficulty::*;
+#[cfg(any(feature = "ocl", test))]
 use field::*;
+#[cfg(any(feature = "ocl", test))]
 use protocol::block::*;
 use sys::*;
 
@@ -28,6 +31,8 @@ mod block_mining_runtime;
 #[derive(Clone)]
 pub struct PoWorkConf {
     pub rpcaddr: String,
+    /// Optional fullnode API token (`X-Api-Token`) when server requires auth.
+    pub api_token: String,
     pub supervene: u32, // cpu core (configured)
     pub noncemax: u32,
     pub noticewait: u64,   // new block notice wait
@@ -44,6 +49,7 @@ pub struct PoWorkConf {
     /// When OpenCL is on, also run Ryzen CPU miner threads (hybrid).
     pub cpu_assist: bool,
     pub gpu_profile: String,
+    pub gpu_slug: String,
     pub efficiency: EfficiencyConf,
     pub runtime: Arc<MiningRuntimeState>,
 }
@@ -59,6 +65,7 @@ impl PoWorkConf {
         let runtime = MiningRuntimeState::new(tuning.workgroups, active);
         let cnf = PoWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
+            api_token: ini_must(sec, "api_token", "").trim().to_string(),
             supervene: configured_supervene,
             noncemax: ini_must_u64(sec, "nonce_max", u32::MAX as u64) as u32,
             noticewait: ini_must_u64(sec, "notice_wait", 45),
@@ -74,6 +81,7 @@ impl PoWorkConf {
             deviceids: ini_must(sec_gpu, "device_ids", ""),
             cpu_assist: ini_must_bool(sec_gpu, "cpu_assist", true) as bool,
             gpu_profile: tuning.profile.clone(),
+            gpu_slug: ini_must(sec_gpu, "gpu_slug", ""),
             efficiency,
             runtime,
         };
@@ -103,15 +111,31 @@ impl PoWorkConf {
 /*****************************************/
 
 use std::sync::LazyLock;
-static HTTP_CLIENT: LazyLock<HttpClient> =
-    LazyLock::new(|| HttpClient::builder().no_proxy().build().unwrap());
+static HTTP_CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
+    crate::rpc_http::build_client()
+        .unwrap_or_else(|e| panic!("cannot create bounded RPC client: {e}"))
+});
 
 pub fn poworker() {
-    let cnfp = "./poworker.config.ini".to_string();
-    let inicnf = sys::load_config(cnfp.clone());
+    let default_config = "./poworker.config.ini";
+    let config_path = sys::resolve_config_path(default_config);
+    let inicnf = sys::load_config_path(&config_path);
     let cnf = PoWorkConf::new(&inicnf);
+    // Mainnet-representative (x16rs repeat=16) benchmark. Runs only when
+    // HACASH_REPEAT16_BENCH_SECONDS is set to a positive integer, then exits.
+    // Zero-touch when the variable is unset; see bench_mainnet_repeat16.rs.
+    if crate::bench_mainnet_repeat16::run_from_env(
+        &cnf.opencldir,
+        &cnf.platformid,
+        &cnf.deviceids,
+        &cnf.workgroups,
+        &cnf.localsize,
+        &cnf.unitsize,
+    ) {
+        return;
+    }
     if cnf.efficiency.benchmark_seconds > 0 {
-        run_block_mining_benchmark(&cnf, &cnfp);
+        run_block_mining_benchmark(&cnf, config_path.to_string_lossy().as_ref());
         return;
     }
     poworker_with_conf(cnf);
@@ -122,30 +146,22 @@ pub fn poworker_with_conf(cnf: PoWorkConf) {
 }
 
 pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
-    block_mining_runtime::start_block_mining_workers(&cnf, stop_flag.clone());
+    if !block_mining_runtime::start_block_mining_workers(&cnf, stop_flag.clone()) {
+        eprintln!("[Fatal] Mining worker startup failed.");
+        return;
+    }
 
     // loop
     loop {
         if should_stop(&stop_flag) {
             return;
         }
-        if !is_within_idle_schedule(
-            cnf.efficiency.idle_start_hour,
-            cnf.efficiency.idle_end_hour,
-        ) {
+        if !is_within_idle_schedule(cnf.efficiency.idle_start_hour, cnf.efficiency.idle_end_hour) {
             delay_continue_ms!(5000);
-            continue;
         }
         if cnf.runtime.paused_unprofitable.load(Relaxed) {
             delay_continue_ms!(3000);
-            continue;
         }
-        cnf.runtime.apply_thermal_throttle(
-            cnf.efficiency.max_temp_c,
-            cnf.efficiency.throttle_workgroups,
-            &cnf.efficiency.thermal_file,
-            cnf.efficiency.thermal_gpu_index,
-        );
         pull_pending_block_stuff(&cnf);
         delay_continue_ms!(25);
     }
@@ -154,7 +170,6 @@ pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
 fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
     stop_flag.as_ref().map(|f| f.load(Relaxed)).unwrap_or(false)
 }
-
 
 ///////////////////////////////
 
@@ -167,18 +182,17 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
         &cnf.rpcaddr,
         sys::curtimes()
     );
-    let res = HTTP_CLIENT.get(&urlapi_pending).send();
-    let Ok(repv) = res else {
-        println!("Error: cannot get block data at {}\n", &urlapi_pending);
-        delay_return!(30);
-    };
-    let Ok(jsdata) = repv.text() else {
-        println!(
-            "Error: cannot read block data body at {}\n",
-            &urlapi_pending
-        );
-        delay_return!(10);
-    };
+    let jsdata =
+        match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
+            Ok(t) => t,
+            Err(e) => {
+                println!(
+                    "Error: cannot get block data at {}: {}\n",
+                    &urlapi_pending, e
+                );
+                delay_return!(30);
+            }
+        };
     let Ok(res) = serde_json::from_str::<JV>(&jsdata) else {
         println!(
             "Error: invalid block data json at {} (body len {})\n",
@@ -197,7 +211,10 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
 
     // set pending block stuff
     if pending_height > curr_hei {
-        block_mining_runtime::set_pending_block_stuff(pending_height, res);
+        if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
+            println!("Error: invalid block data from {urlapi_pending}: {e}");
+            delay_return!(10);
+        }
         if curr_hei == 0 {
             block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
         }
@@ -206,7 +223,10 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
     // with notice
     let mut rpid = vec![0].repeat(16);
     loop {
-        getrandom::fill(&mut rpid).unwrap();
+        if let Err(e) = getrandom::fill(&mut rpid) {
+            println!("Error: cannot generate request id: {e}");
+            delay_return!(1);
+        }
         let urlapi_notice = format!(
             "http://{}/query/miner/notice?wait={}&height={}&rqid={}",
             &cnf.rpcaddr,
@@ -215,21 +235,24 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
             &hex::encode(&rpid)
         );
         // println!("\n-------- {} -------- {}\n", &ctshow(), &urlapi_notice);
-        let res = HTTP_CLIENT
-            .get(&urlapi_notice)
-            .timeout(Duration::from_secs(300))
-            .send();
-        let Ok(repv) = res else {
-            println!("Error: cannot get miner notice at {}\n", &urlapi_notice);
-            delay_return!(10);
-        };
-        let Ok(jsdata) = repv.text() else {
-            println!("Error: cannot read miner notice at {}", &urlapi_notice);
-            delay_return!(1);
+        let jsdata = match crate::rpc_http::get_text(
+            &HTTP_CLIENT,
+            &urlapi_notice,
+            &cnf.api_token,
+            Some(Duration::from_secs(300)),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                println!(
+                    "Error: cannot get miner notice at {}: {}\n",
+                    &urlapi_notice, e
+                );
+                delay_return!(10);
+            }
         };
         let Ok(res2) = serde_json::from_str::<JV>(&jsdata) else {
-            // println!("{}", &jsdata);
-            panic!("miner notice error: {}", &jsdata);
+            println!("Error: invalid miner notice JSON at {urlapi_notice}");
+            delay_return!(1);
         };
         let jnum = |k| res2[k].as_u64().unwrap_or(0);
         let res_hei = jnum("height");
@@ -238,14 +261,14 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
             // next block discover
             break;
         }
-        // continue to wait
+        // No new block yet. A compliant server long-polls (so this rarely loops),
+        // but a fast-returning/incompatible server or notice_wait=0 would otherwise
+        // spin this at 100% CPU — cap the spin with a small delay before re-polling.
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn push_block_mining_success(
-    cnf: &PoWorkConf,
-    success: &block_mining_runtime::BlockMiningResult,
-) {
+fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::BlockMiningResult) {
     let urlapi_success = format!(
         "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}",
         &cnf.rpcaddr,
@@ -254,18 +277,182 @@ fn push_block_mining_success(
         success.coinbase_nonce.to_hex(),
         sys::curtimes()
     );
-    let res_text = match HTTP_CLIENT.get(&urlapi_success).send() {
-        Ok(resp) => resp.text().unwrap_or_default(),
-        Err(e) => format!("Request failed: {}", e),
-    };
-    println!("{} {}", &urlapi_success, res_text);
-    // print
-    println!(
-        "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
-        success.height,
-        success.result_hash.to_hex()
-    );
+    // Submitting the winning block is the entire payoff of solo mining, and the
+    // result was already drained from the channel — so a single transient network
+    // error must not silently lose it. Retry transport failures with backoff, and
+    // only claim SUCCESS once the node confirms acceptance (ret == 0).
+    const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+    let mut accepted = false;
+    let mut last = String::new();
+    for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
+        match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_success, &cnf.api_token, None) {
+            Ok(body) => {
+                let parsed = serde_json::from_str::<JV>(&body).ok();
+                let ret = parsed.as_ref().and_then(|j| j["ret"].as_i64());
+                last = body;
+                if ret == Some(0) {
+                    accepted = true;
+                } else if ret.is_some() {
+                    // Deterministic node rejection (stale height, invalid, etc.):
+                    // retrying will not help, so stop and report it honestly.
+                    let err = parsed
+                        .as_ref()
+                        .and_then(|j| j["err"].as_str())
+                        .unwrap_or("");
+                    println!("[submit] node rejected height {}: {}", success.height, err);
+                }
+                break;
+            }
+            Err(e) => {
+                last = format!("transport error: {e}");
+                println!(
+                    "[submit] attempt {}/{} failed: {e}",
+                    attempt, MAX_SUBMIT_ATTEMPTS
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
+                }
+            }
+        }
+    }
+    println!("{} {}", &urlapi_success, last);
+    if accepted {
+        println!(
+            "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
+            success.height,
+            success.result_hash.to_hex()
+        );
+    } else {
+        println!(
+            "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
+            success.height,
+            MAX_SUBMIT_ATTEMPTS,
+            success.result_hash.to_hex()
+        );
+    }
     println!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
+}
+#[cfg(feature = "ocl")]
+const AUTOTUNE_WARMUP_BATCHES: u32 = 3;
+#[cfg(any(feature = "ocl", test))]
+const AUTOTUNE_MIN_VALID_SAMPLES: u32 = 5;
+#[cfg(any(feature = "ocl", test))]
+const AUTOTUNE_ECO_MIN_PERFORMANCE_RATIO: f64 = 0.70;
+#[cfg(any(feature = "ocl", test))]
+const AUTOTUNE_VERIFY_MIN_HPS_RATIO: f64 = 0.70;
+
+#[cfg(any(feature = "ocl", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BenchmarkMeasurement {
+    hps: f64,
+    samples: u32,
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn finish_benchmark_measurement(
+    total_hashes: u64,
+    total_secs: f64,
+    samples: u32,
+) -> Result<BenchmarkMeasurement, String> {
+    if total_hashes == 0 {
+        return Err("zero hashes measured".to_string());
+    }
+    if samples < AUTOTUNE_MIN_VALID_SAMPLES {
+        return Err(format!(
+            "only {samples} valid samples (minimum {AUTOTUNE_MIN_VALID_SAMPLES})"
+        ));
+    }
+    if !total_secs.is_finite() || total_secs <= 0.0 {
+        return Err("invalid measured duration".to_string());
+    }
+    let hps = total_hashes as f64 / total_secs;
+    if !hps.is_finite() || hps <= 0.0 {
+        return Err("zero or invalid hashrate".to_string());
+    }
+    Ok(BenchmarkMeasurement { hps, samples })
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn x16rs_algorithm_id(hash: &[u8; 32]) -> u8 {
+    (u32::from_le_bytes([hash[28], hash[29], hash[30], hash[31]]) % 16) as u8
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn validate_benchmark_batch_result(
+    height: u64,
+    block_intro: &[u8],
+    nonce_start: u32,
+    batch: u32,
+    result_nonce: u32,
+    result_hash: &[u8; 32],
+) -> Result<(), String> {
+    if batch == 0 {
+        return Err("zero-size OpenCL batch".to_string());
+    }
+    if result_hash.iter().all(|byte| *byte == 0) {
+        return Err("OpenCL returned a zero hash result".to_string());
+    }
+    if *result_hash == [u8::MAX; 32] {
+        return Err("OpenCL returned no best hash".to_string());
+    }
+    if result_nonce.wrapping_sub(nonce_start) >= batch {
+        return Err(format!(
+            "OpenCL returned nonce {result_nonce} outside batch starting at {nonce_start}"
+        ));
+    }
+    if block_intro.len() < 83 {
+        return Err("benchmark block intro is too short".to_string());
+    }
+    let mut verify_intro = block_intro.to_vec();
+    verify_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
+    let expected_hash = x16rs::block_hash(height, &verify_intro);
+    if expected_hash != *result_hash {
+        let prehash = x16rs::calculate_hash(&verify_intro);
+        return Err(format!(
+            "OpenCL nonce/hash result failed CPU verification: nonce={result_nonce} algorithm={} gpu={} cpu={}",
+            x16rs_algorithm_id(&prehash),
+            hex::encode(result_hash),
+            hex::encode(expected_hash)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ocl")]
+fn execute_benchmark_batch(
+    opencl: &crate::opencl_gpu::OpenCLResources,
+    cnf: &PoWorkConf,
+    height: u64,
+    block_intro: &[u8],
+    nonce_start: u32,
+    batch: u32,
+    wg_eff: u32,
+    us: u32,
+) -> Result<f64, String> {
+    let started = Instant::now();
+    let (result_nonce, result_hash) = do_group_block_mining_opencl(
+        opencl,
+        height,
+        block_intro.to_vec(),
+        nonce_start,
+        wg_eff,
+        cnf.localsize,
+        us,
+    )
+    .map_err(|error| error.display())?;
+    let used = started.elapsed().as_secs_f64();
+    if !used.is_finite() || used <= 0.0 {
+        return Err("OpenCL batch returned an invalid duration".to_string());
+    }
+    validate_benchmark_batch_result(
+        height,
+        block_intro,
+        nonce_start,
+        batch,
+        result_nonce,
+        &result_hash,
+    )?;
+    Ok(used)
 }
 
 #[cfg(feature = "ocl")]
@@ -275,98 +462,146 @@ fn bench_block_hps(
     wg_eff: u32,
     us: u32,
     seconds: u64,
-) -> f64 {
+) -> Result<BenchmarkMeasurement, String> {
     let height = 1u64;
     let block_intro = BlockIntro::default().serialize();
-    let batch = wg_eff.saturating_mul(cnf.localsize).saturating_mul(us);
+    let batch_u64 = (wg_eff as u64)
+        .saturating_mul(cnf.localsize as u64)
+        .saturating_mul(us as u64);
+    if batch_u64 == 0 || batch_u64 > u32::MAX as u64 {
+        return Err(format!(
+            "invalid launch size wg={wg_eff} local={} unit_size={us}",
+            cnf.localsize
+        ));
+    }
+    let batch = batch_u64 as u32;
+    let mut nonce = 0u32;
+    for warmup in 0..AUTOTUNE_WARMUP_BATCHES {
+        execute_benchmark_batch(opencl, cnf, height, &block_intro, nonce, batch, wg_eff, us)
+            .map_err(|error| format!("warm-up batch {} failed: {error}", warmup + 1))?;
+        nonce = nonce.wrapping_add(batch);
+    }
+
     let deadline = Instant::now() + Duration::from_secs(seconds.max(3));
     let mut total_hashes = 0u64;
     let mut total_secs = 0.0f64;
     let mut success_batches = 0u32;
-    let mut first_err: Option<String> = None;
-    let mut nonce = 0u32;
     while Instant::now() < deadline {
-        let ctn = Instant::now();
-        match do_group_block_mining_opencl(
-            opencl,
-            height,
-            block_intro.clone(),
-            nonce,
-            wg_eff,
-            cnf.localsize,
-            us,
-        ) {
-            Ok(_) => {
-                success_batches += 1;
-                total_hashes += batch as u64;
-            }
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e.display());
-                }
-            }
-        }
-        let used = ctn.elapsed().as_secs_f64();
-        if used > 0.0 {
-            total_secs += used;
-        }
+        let used =
+            execute_benchmark_batch(opencl, cnf, height, &block_intro, nonce, batch, wg_eff, us)
+                .map_err(|error| {
+                    format!("measured batch {} failed: {error}", success_batches + 1)
+                })?;
+        success_batches += 1;
+        total_hashes = total_hashes.saturating_add(batch as u64);
+        total_secs += used;
         nonce = nonce.wrapping_add(batch);
     }
-    if success_batches == 0 || total_secs <= 0.0 {
-        if let Some(e) = first_err {
-            eprintln!(
-                "[benchmark] GPU error at wg={} unit_size={}: {}",
-                wg_eff, us, e
-            );
+    finish_benchmark_measurement(total_hashes, total_secs, success_batches)
+}
+
+#[cfg(any(feature = "ocl", test))]
+#[derive(Clone, Debug)]
+struct ProfileBenchResult {
+    pick: BenchmarkPick,
+    hps: f64,
+    estimated_watts: f64,
+    estimated_kh_per_j: f64,
+    samples: u32,
+}
+
+#[cfg(any(feature = "ocl", test))]
+impl ProfileBenchResult {
+    fn new(pick: BenchmarkPick, hps: f64, estimated_watts: f64, samples: u32) -> Option<Self> {
+        if !hps.is_finite()
+            || hps <= 0.0
+            || !estimated_watts.is_finite()
+            || estimated_watts <= 0.0
+            || samples < AUTOTUNE_MIN_VALID_SAMPLES
+        {
+            return None;
         }
-        0.0
-    } else {
-        total_hashes as f64 / total_secs
+        Some(Self {
+            pick,
+            hps,
+            estimated_watts,
+            estimated_kh_per_j: hps / estimated_watts / 1000.0,
+            samples,
+        })
     }
 }
 
-#[cfg(feature = "ocl")]
-struct ProfileBenchResult {
-    profile: &'static str,
-    hps: f64,
-    kh_per_j: f64,
-}
-
-#[cfg(feature = "ocl")]
-fn pick_benchmark_profile(
+#[cfg(any(feature = "ocl", test))]
+fn pick_benchmark_result(
     results: &[ProfileBenchResult],
     mode: EfficiencyMode,
-    vendor: crate::gpu_arch::GpuVendor,
-    min_tier: i8,
-) -> &'static str {
-    let viable: Vec<&ProfileBenchResult> = results
-        .iter()
-        .filter(|r| r.hps > 0.0 && profile_tier(r.profile) >= min_tier)
-        .collect();
-    let pool: Vec<&ProfileBenchResult> = if viable.is_empty() {
-        results.iter().filter(|r| r.hps > 0.0).collect()
-    } else {
-        viable
+) -> Option<&ProfileBenchResult> {
+    let stable = || {
+        results.iter().filter(|result| {
+            result.hps.is_finite()
+                && result.hps > 0.0
+                && result.estimated_watts.is_finite()
+                && result.estimated_watts > 0.0
+                && result.estimated_kh_per_j.is_finite()
+                && result.estimated_kh_per_j > 0.0
+                && result.samples >= AUTOTUNE_MIN_VALID_SAMPLES
+        })
     };
-    if pool.is_empty() {
-        return tier_profile_for_vendor(vendor, min_tier);
-    }
     match mode {
-        EfficiencyMode::Max => pool
-            .iter()
-            .max_by(|a, b| a.hps.partial_cmp(&b.hps).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|r| r.profile)
-            .unwrap_or(tier_profile_for_vendor(vendor, min_tier)),
-        _ => pool
-            .iter()
-            .max_by(|a, b| {
-                a.kh_per_j
-                    .partial_cmp(&b.kh_per_j)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|r| r.profile)
-            .unwrap_or(tier_profile_for_vendor(vendor, min_tier)),
+        EfficiencyMode::Max => stable().max_by(|a, b| a.hps.total_cmp(&b.hps)),
+        EfficiencyMode::Profit => {
+            stable().max_by(|a, b| a.estimated_kh_per_j.total_cmp(&b.estimated_kh_per_j))
+        }
+        EfficiencyMode::Eco => {
+            let max_hps = stable().map(|result| result.hps).fold(0.0f64, f64::max);
+            let minimum_hps = max_hps * AUTOTUNE_ECO_MIN_PERFORMANCE_RATIO;
+            stable()
+                .filter(|result| result.hps >= minimum_hps)
+                .min_by(|a, b| {
+                    a.estimated_watts
+                        .total_cmp(&b.estimated_watts)
+                        .then_with(|| b.hps.total_cmp(&a.hps))
+                })
+        }
     }
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn verification_is_stable(expected_hps: f64, verified_hps: f64) -> bool {
+    expected_hps.is_finite()
+        && expected_hps > 0.0
+        && verified_hps.is_finite()
+        && verified_hps >= expected_hps * AUTOTUNE_VERIFY_MIN_HPS_RATIO
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn verification_seconds(total_secs: u64) -> u64 {
+    (total_secs / 4).clamp(5, 15)
+}
+
+#[cfg(any(feature = "ocl", test))]
+fn autotune_device_count_is_supported(device_count: usize) -> bool {
+    device_count == 1
+}
+#[cfg(feature = "ocl")]
+fn benchmark_candidate(
+    opencl: &crate::opencl_gpu::OpenCLResources,
+    cnf: &PoWorkConf,
+    pick: BenchmarkPick,
+    seconds: u64,
+    max_workgroups: u32,
+    max_unitsize: u32,
+) -> Result<ProfileBenchResult, String> {
+    let measurement = bench_block_hps(opencl, cnf, pick.workgroups, pick.unitsize, seconds)?;
+    let estimated_watts = cnf.efficiency.estimate_tuning_watts(
+        &pick.profile,
+        pick.workgroups,
+        pick.unitsize,
+        max_workgroups,
+        max_unitsize,
+    );
+    ProfileBenchResult::new(pick, measurement.hps, estimated_watts, measurement.samples)
+        .ok_or_else(|| "candidate produced an invalid measurement".to_string())
 }
 
 fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
@@ -382,6 +617,12 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             println!("[benchmark] Set use_opencl=true in [gpu]");
             return;
         }
+        println!(
+            "[benchmark] Power and kH/J figures are estimates derived from configured board power; they are not hardware telemetry."
+        );
+        println!(
+            "[benchmark] NOTE: the MH/s below are raw X16RS repeat=1 tuning rates (relative comparison only). The live mainnet runs 16 rounds, so real block-hash throughput is roughly 1/11-1/16 of these numbers. For the honest mainnet figure run: set HACASH_REPEAT16_BENCH_SECONDS=30 and run poworker."
+        );
         let total_secs = cnf.efficiency.benchmark_seconds.max(15) as u64;
         let fine = cnf.efficiency.wants_fine_sweep();
         let profile_secs = if fine {
@@ -413,140 +654,217 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             println!("[benchmark] No OpenCL devices");
             return;
         }
+        if !autotune_device_count_is_supported(opencl_resources.len()) {
+            println!(
+                "[benchmark] Auto Tune requires exactly one OpenCL device, but detected {}. The current config has one shared work_groups/unit_size pair, so multi-GPU tuning would be ambiguous. Set [gpu] device_ids to one device and tune each GPU separately; config unchanged.",
+                opencl_resources.len()
+            );
+            return;
+        }
 
         for (dev_i, opencl) in opencl_resources.iter().enumerate() {
-            let profiles = benchmark_profiles_for_vendor(opencl.vendor);
-            let per = (profile_secs / profiles.len() as u64).max(4);
+            let limits = crate::gpu_arch::ArchLimits::for_slug(&opencl.arch_slug);
+            let min_wg = limits.panel_min_wg.min(opencl.workgroups);
+            let max_wg = opencl.workgroups;
+            let max_us = limits
+                .max_unit_size()
+                .min(opencl.allocated_unitsize)
+                .max(32);
+            let max_tier = crate::gpu_arch::ArchLimits::panel_max_tier(&cnf.gpu_slug);
+            let candidates = benchmark_candidates_for_device(
+                opencl.vendor,
+                min_profile_tier_for_mode(cnf.efficiency.mode),
+                max_tier,
+                min_wg,
+                max_wg,
+                max_us,
+            );
+            if candidates.is_empty() {
+                println!(
+                    "[benchmark] No safe tuning candidates for device #{}",
+                    dev_i
+                );
+                continue;
+            }
+            let per = (profile_secs / candidates.len() as u64).max(4);
             println!(
-                "[benchmark] Device #{}: {}s x {} profiles{}",
+                "[benchmark] Device #{}: {}s x {} exact tuning points{}",
                 dev_i,
                 per,
-                profiles.len(),
-                if fine { " + fine sweep" } else { "" }
+                candidates.len(),
+                if fine { " + bounded fine sweep" } else { "" }
             );
 
-            let min_tier = min_profile_tier_for_mode(cnf.efficiency.mode);
-            let mut bench_results: Vec<ProfileBenchResult> = Vec::new();
+            let mut bench_results = Vec::new();
+            for pick in candidates {
+                match benchmark_candidate(opencl, cnf, pick.clone(), per, max_wg, max_us) {
+                    Ok(result) => {
+                        println!(
+                            "[benchmark] dev{} {}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples, wg={}, unit_size={})",
+                            dev_i,
+                            result.pick.profile,
+                            rates_to_show(result.hps),
+                            result.estimated_kh_per_j,
+                            result.estimated_watts,
+                            result.samples,
+                            result.pick.workgroups,
+                            result.pick.unitsize
+                        );
+                        bench_results.push(result);
+                    }
+                    Err(error) => {
+                        println!(
+                            "[benchmark] dev{} {}: REJECTED ({error}, wg={}, unit_size={})",
+                            dev_i, pick.profile, pick.workgroups, pick.unitsize
+                        );
+                    }
+                }
+            }
 
-            for profile in profiles {
-                let (wg, us) = profile_tuning(profile);
-                let wg_eff = opencl.workgroups.min(wg);
-                let hps = bench_block_hps(opencl, cnf, wg_eff, us, per);
-                let watts = cnf.efficiency.estimate_gpu_watts(profile);
-                let kh_per_j = if watts > 0.0 {
-                    hps / watts / 1000.0
-                } else {
-                    0.0
-                };
-                if hps <= 0.0 {
+            let Some(base) = pick_benchmark_result(&bench_results, cnf.efficiency.mode) else {
+                println!(
+                    "[benchmark] No successful tuning points — config unchanged (check OpenCL driver)."
+                );
+                continue;
+            };
+            let mut selected = base.clone();
+
+            if fine && sweep_secs > 0 {
+                let wg_sweep_secs = sweep_secs / 2;
+                let us_sweep_secs = sweep_secs.saturating_sub(wg_sweep_secs).max(6);
+                let wg_candidates = sweep_workgroup_candidates_bounded(
+                    selected.pick.workgroups,
+                    opencl.vram_bytes,
+                    cnf.localsize,
+                    selected.pick.unitsize,
+                    min_wg,
+                    max_wg,
+                );
+                let per_wg = (wg_sweep_secs / wg_candidates.len().max(1) as u64).max(3);
+                println!(
+                    "[benchmark] dev{} bounded wg sweep: {:?} x {}s",
+                    dev_i, wg_candidates, per_wg
+                );
+                let mut wg_results = Vec::new();
+                for wg_try in wg_candidates {
+                    let candidate = BenchmarkPick {
+                        profile: selected.pick.profile.clone(),
+                        workgroups: wg_try,
+                        unitsize: selected.pick.unitsize,
+                    };
+                    match benchmark_candidate(opencl, cnf, candidate, per_wg, max_wg, max_us) {
+                        Ok(result) => {
+                            println!(
+                                "[benchmark] dev{} wg={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
+                                dev_i,
+                                wg_try,
+                                rates_to_show(result.hps),
+                                result.estimated_kh_per_j,
+                                result.estimated_watts,
+                                result.samples
+                            );
+                            wg_results.push(result);
+                        }
+                        Err(error) => {
+                            println!("[benchmark] dev{} wg={}: REJECTED ({error})", dev_i, wg_try);
+                        }
+                    }
+                }
+                if let Some(best) = pick_benchmark_result(&wg_results, cnf.efficiency.mode) {
+                    selected = best.clone();
+                }
+
+                let us_candidates = sweep_unitsize_candidates(selected.pick.unitsize, max_us);
+                let per_us = (us_sweep_secs / us_candidates.len().max(1) as u64).max(3);
+                println!(
+                    "[benchmark] dev{} bounded unit_size sweep: {:?} x {}s",
+                    dev_i, us_candidates, per_us
+                );
+                let mut us_results = Vec::new();
+                for us_try in us_candidates {
+                    let candidate = BenchmarkPick {
+                        profile: selected.pick.profile.clone(),
+                        workgroups: selected.pick.workgroups,
+                        unitsize: us_try,
+                    };
+                    match benchmark_candidate(opencl, cnf, candidate, per_us, max_wg, max_us) {
+                        Ok(result) => {
+                            println!(
+                                "[benchmark] dev{} unit_size={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
+                                dev_i,
+                                us_try,
+                                rates_to_show(result.hps),
+                                result.estimated_kh_per_j,
+                                result.estimated_watts,
+                                result.samples
+                            );
+                            us_results.push(result);
+                        }
+                        Err(error) => {
+                            println!(
+                                "[benchmark] dev{} unit_size={}: REJECTED ({error})",
+                                dev_i, us_try
+                            );
+                        }
+                    }
+                }
+                if let Some(best) = pick_benchmark_result(&us_results, cnf.efficiency.mode) {
+                    selected = best.clone();
+                }
+            }
+
+            let verify_secs = verification_seconds(total_secs);
+            println!(
+                "[benchmark] dev{} final verification soak: {}s at wg={} unit_size={}",
+                dev_i, verify_secs, selected.pick.workgroups, selected.pick.unitsize
+            );
+            let verified = match benchmark_candidate(
+                opencl,
+                cnf,
+                selected.pick.clone(),
+                verify_secs,
+                max_wg,
+                max_us,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
                     println!(
-                        "[benchmark] dev{} {}: SKIPPED (OOM/failed, wg={})",
-                        dev_i, profile, wg_eff
+                        "[benchmark] dev{} final verification REJECTED ({error}) - config unchanged.",
+                        dev_i
                     );
                     continue;
                 }
+            };
+            if !verification_is_stable(selected.hps, verified.hps) {
                 println!(
-                    "[benchmark] dev{} {}: {} ({:.1} kH/J, wg={})",
+                    "[benchmark] dev{} final verification REJECTED: {} is below {:.0}% of measured {} - config unchanged.",
                     dev_i,
-                    profile,
-                    rates_to_show(hps),
-                    kh_per_j,
-                    wg_eff
+                    rates_to_show(verified.hps),
+                    AUTOTUNE_VERIFY_MIN_HPS_RATIO * 100.0,
+                    rates_to_show(selected.hps)
                 );
-                bench_results.push(ProfileBenchResult {
-                    profile,
-                    hps,
-                    kh_per_j,
-                });
+                continue;
             }
-
-            let base_profile =
-                pick_benchmark_profile(&bench_results, cnf.efficiency.mode, opencl.vendor, min_tier);
-            let (base_wg, us) = profile_tuning(base_profile);
-            let mut pick = BenchmarkPick::from_profile(base_profile);
-
-            if fine && sweep_secs > 0 {
-                let vram = opencl.vram_bytes;
-                let wg_sweep_secs = sweep_secs / 2;
-                let us_sweep_secs = sweep_secs.saturating_sub(wg_sweep_secs).max(6);
-                let candidates = sweep_workgroup_candidates(base_wg, vram, cnf.localsize, us);
-                let per_wg = (wg_sweep_secs / candidates.len() as u64).max(3);
-                let mut best_sweep_hps = 0.0f64;
-                let mut best_sweep_wg = pick.workgroups;
-                println!(
-                    "[benchmark] dev{} fine wg sweep: {} candidates x {}s",
-                    dev_i,
-                    candidates.len(),
-                    per_wg
-                );
-                for wg_try in candidates {
-                    let wg_eff = opencl.workgroups.min(wg_try);
-                    let hps = bench_block_hps(opencl, cnf, wg_eff, us, per_wg);
-                    println!(
-                        "[benchmark] dev{} wg={}: {}",
-                        dev_i,
-                        wg_eff,
-                        rates_to_show(hps)
-                    );
-                    if hps > 0.0 && hps > best_sweep_hps {
-                        best_sweep_hps = hps;
-                        best_sweep_wg = wg_eff;
-                    }
-                }
-                if best_sweep_hps > 0.0 {
-                    pick.workgroups = best_sweep_wg;
-                }
-
-                let us_candidates =
-                    sweep_unitsize_candidates(pick.unitsize, opencl.allocated_unitsize);
-                let per_us = (us_sweep_secs / us_candidates.len() as u64).max(3);
-                let mut best_us_hps = 0.0f64;
-                let mut best_us = pick.unitsize;
-                println!(
-                    "[benchmark] dev{} fine unit_size sweep: {:?} x {}s",
-                    dev_i,
-                    us_candidates,
-                    per_us
-                );
-                for us_try in us_candidates {
-                    let hps = bench_block_hps(opencl, cnf, pick.workgroups, us_try, per_us);
-                    println!(
-                        "[benchmark] dev{} unit_size={}: {}",
-                        dev_i,
-                        us_try,
-                        rates_to_show(hps)
-                    );
-                    if hps > 0.0 && hps > best_us_hps {
-                        best_us_hps = hps;
-                        best_us = us_try;
-                    }
-                }
-                if best_us_hps > 0.0 {
-                    pick.unitsize = best_us;
-                }
-            }
-
             println!(
-                "[benchmark] dev{} pick: profile={} work_groups={} unit_size={} (mode={})",
+                "[benchmark] dev{} verified: profile={} work_groups={} unit_size={} {} (estimated {:.1} kH/J @ {:.0}W, {} samples, mode={})",
                 dev_i,
-                pick.profile,
-                pick.workgroups,
-                pick.unitsize,
+                verified.pick.profile,
+                verified.pick.workgroups,
+                verified.pick.unitsize,
+                rates_to_show(verified.hps),
+                verified.estimated_kh_per_j,
+                verified.estimated_watts,
+                verified.samples,
                 cnf.efficiency.mode.label()
             );
-
             if dev_i == 0 {
-                if bench_results.iter().any(|r| r.hps > 0.0) {
-                    match apply_benchmark_pick(config_path, &pick) {
-                        Ok(()) => {
-                            println!("[benchmark] Config updated — restart mining with the new tuning.")
-                        }
-                        Err(e) => println!("[benchmark] Could not patch ini: {}", e),
+                match apply_benchmark_pick(config_path, &verified.pick) {
+                    Ok(()) => {
+                        println!(
+                            "[benchmark] Config updated only after successful final verification."
+                        )
                     }
-                } else {
-                    println!(
-                        "[benchmark] No successful profiles — config unchanged (check OpenCL driver / work_groups cap)."
-                    );
+                    Err(e) => println!("[benchmark] Could not patch ini: {}", e),
                 }
             }
         }
@@ -556,6 +874,199 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bench_result(
+        profile: &str,
+        workgroups: u32,
+        unitsize: u32,
+        hps: f64,
+        estimated_watts: f64,
+    ) -> ProfileBenchResult {
+        ProfileBenchResult::new(
+            BenchmarkPick {
+                profile: profile.to_string(),
+                workgroups,
+                unitsize,
+            },
+            hps,
+            estimated_watts,
+            AUTOTUNE_MIN_VALID_SAMPLES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn autotune_pick_preserves_the_exact_measured_values() {
+        let results = vec![
+            bench_result("amd_profit", 1024, 96, 100.0, 100.0),
+            bench_result("amd_performance", 1536, 64, 120.0, 150.0),
+        ];
+        assert_eq!(
+            pick_benchmark_result(&results, EfficiencyMode::Max)
+                .unwrap()
+                .pick,
+            results[1].pick
+        );
+        assert_eq!(
+            pick_benchmark_result(&results, EfficiencyMode::Profit)
+                .unwrap()
+                .pick,
+            results[0].pick
+        );
+    }
+
+    #[test]
+    fn autotune_selection_is_mode_aware() {
+        let results = vec![
+            bench_result("amd_eco", 32, 32, 60.0, 20.0),
+            bench_result("amd_balanced", 48, 48, 75.0, 40.0),
+            bench_result("amd_performance", 64, 64, 100.0, 80.0),
+        ];
+
+        assert_eq!(
+            pick_benchmark_result(&results, EfficiencyMode::Max)
+                .unwrap()
+                .pick
+                .profile,
+            "amd_performance"
+        );
+        assert_eq!(
+            pick_benchmark_result(&results, EfficiencyMode::Profit)
+                .unwrap()
+                .pick
+                .profile,
+            "amd_eco"
+        );
+        assert_eq!(
+            pick_benchmark_result(&results, EfficiencyMode::Eco)
+                .unwrap()
+                .pick
+                .profile,
+            "amd_balanced"
+        );
+    }
+
+    #[test]
+    fn autotune_rejects_zero_and_under_sampled_measurements() {
+        assert!(finish_benchmark_measurement(0, 1.0, 10).is_err());
+        assert!(
+            finish_benchmark_measurement(1_000, 1.0, AUTOTUNE_MIN_VALID_SAMPLES.saturating_sub(1))
+                .is_err()
+        );
+        let valid = finish_benchmark_measurement(1_000, 2.0, AUTOTUNE_MIN_VALID_SAMPLES).unwrap();
+        assert_eq!(valid.hps, 500.0);
+        assert_eq!(valid.samples, AUTOTUNE_MIN_VALID_SAMPLES);
+    }
+
+    #[test]
+    fn autotune_final_verification_requires_repeatable_hashrate() {
+        assert!(verification_is_stable(100.0, 70.0));
+        assert!(!verification_is_stable(100.0, 69.99));
+        assert!(!verification_is_stable(100.0, f64::NAN));
+        assert_eq!(verification_seconds(15), 5);
+        assert_eq!(verification_seconds(60), 15);
+        assert_eq!(verification_seconds(600), 15);
+    }
+
+    #[test]
+    fn autotune_rejects_ambiguous_multi_gpu_targets() {
+        assert!(!autotune_device_count_is_supported(0));
+        assert!(autotune_device_count_is_supported(1));
+        assert!(!autotune_device_count_is_supported(2));
+    }
+
+    #[test]
+    fn autotune_rejects_invalid_gpu_results_and_accepts_cpu_verified_result() {
+        let height = 1u64;
+        let block_intro = BlockIntro::default().serialize();
+        let nonce_start = 11u32;
+        let batch = 256u32;
+
+        assert!(
+            validate_benchmark_batch_result(
+                height,
+                &block_intro,
+                nonce_start,
+                batch,
+                nonce_start,
+                &[0u8; 32]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_benchmark_batch_result(
+                height,
+                &block_intro,
+                nonce_start,
+                batch,
+                nonce_start,
+                &[u8::MAX; 32]
+            )
+            .is_err()
+        );
+
+        let result_nonce = nonce_start + 42;
+        let mut verified_intro = block_intro.clone();
+        verified_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
+        let result_hash = x16rs::block_hash(height, &verified_intro);
+        validate_benchmark_batch_result(
+            height,
+            &block_intro,
+            nonce_start,
+            batch,
+            result_nonce,
+            &result_hash,
+        )
+        .unwrap();
+
+        assert!(
+            validate_benchmark_batch_result(
+                height,
+                &block_intro,
+                nonce_start,
+                batch,
+                nonce_start + batch,
+                &result_hash
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gfx1201_groestl_failure_vector_is_cpu_rejected() {
+        let height = 1u64;
+        let block_intro = BlockIntro::default().serialize();
+        let result_nonce = 6_858_338u32;
+        let mut verified_intro = block_intro.clone();
+        verified_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
+        let pre_x16rs = x16rs::calculate_hash(&verified_intro);
+        let expected = x16rs::block_hash(height, &verified_intro);
+        let bad_gpu_hash: [u8; 32] =
+            hex::decode("00004f8f9d0fd569407298186d7015bc19d70bd379a551190b7233135562cb33")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        println!(
+            "nonce={result_nonce} pre_x16rs={} algorithm={} expected_x16rs={} bad_gpu={}",
+            hex::encode(pre_x16rs),
+            x16rs_algorithm_id(&pre_x16rs),
+            hex::encode(expected),
+            hex::encode(bad_gpu_hash)
+        );
+        assert_eq!(x16rs_algorithm_id(&pre_x16rs), 2);
+        assert!(
+            validate_benchmark_batch_result(
+                height,
+                &block_intro,
+                result_nonce,
+                1,
+                result_nonce,
+                &bad_gpu_hash
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn cpu_group_mining_result_matches_manual_scan() {

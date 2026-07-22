@@ -98,7 +98,6 @@ pub fn sign_transaction(param: SignTxParam) -> Ret<SignTxResult> {
 
 #[wasm_bindgen]
 pub fn sign_transaction_v4(param: SignTxV4Param) -> Ret<SignTxResult> {
-    use basis::interface::Transaction;
     use protocol::transaction::TransactionType4;
 
     if param.hybrid_keystore.is_empty() {

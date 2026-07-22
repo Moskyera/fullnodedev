@@ -69,14 +69,8 @@ impl PqcMetrics {
 
     pub fn prometheus_lines(&self) -> Vec<String> {
         vec![
-            format!(
-                "hacash_pqc_tx_total {}",
-                self.pqc_tx_total
-            ),
-            format!(
-                "hacash_hybrid_tx_total {}",
-                self.hybrid_tx_total
-            ),
+            format!("hacash_pqc_tx_total {}", self.pqc_tx_total),
+            format!("hacash_hybrid_tx_total {}", self.hybrid_tx_total),
             format!(
                 "hacash_type4_mempool_rejected_total {}",
                 self.type4_mempool_rejected
@@ -85,25 +79,19 @@ impl PqcMetrics {
                 "hacash_type4_sign_verified_total {}",
                 self.type4_sign_verified
             ),
-            format!(
-                "hacash_mldsa_verify_ms {}",
-                self.mldsa_verify_ms()
-            ),
-            format!(
-                "hacash_mldsa_verify_count {}",
-                self.mldsa_verify_count
-            ),
-            format!(
-                "hacash_mldsa_verify_ms_avg {}",
-                self.mldsa_verify_ms_avg()
-            ),
+            format!("hacash_mldsa_verify_ms {}", self.mldsa_verify_ms()),
+            format!("hacash_mldsa_verify_count {}", self.mldsa_verify_count),
+            format!("hacash_mldsa_verify_ms_avg {}", self.mldsa_verify_ms_avg()),
         ]
     }
 
     pub fn to_json_map(&self) -> std::collections::HashMap<String, String> {
         let mut m = std::collections::HashMap::new();
         m.insert("pqc_tx_total".to_owned(), self.pqc_tx_total.to_string());
-        m.insert("hybrid_tx_total".to_owned(), self.hybrid_tx_total.to_string());
+        m.insert(
+            "hybrid_tx_total".to_owned(),
+            self.hybrid_tx_total.to_string(),
+        );
         m.insert(
             "type4_mempool_rejected".to_owned(),
             self.type4_mempool_rejected.to_string(),

@@ -15,22 +15,52 @@ struct TxTopologyStats {
     top_guard_count: usize,
     non_guard_terminal_count: usize,
     has_guard_terminal: bool,
+    max_ast_depth: usize,
 }
 
 impl TxTopologyStats {
     fn record_top_action(&mut self, act: &dyn Action) {
         self.top_action_count += 1;
         *self.top_kind_count.entry(act.kind()).or_insert(0) += 1;
-        if act.scope() == ActScope::GUARD {
+        if act.scope().is_guard() {
             self.top_guard_count += 1;
         }
     }
 
     fn record_terminal_action(&mut self, scope: ActScope) {
-        if scope == ActScope::GUARD {
+        if scope.is_guard() {
             self.has_guard_terminal = true;
         } else {
             self.non_guard_terminal_count += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxActionTopology {
+    pub top_action_count: usize,
+    pub top_kind_count: Vec<(u16, usize)>,
+    pub top_guard_count: usize,
+    pub non_guard_terminal_count: usize,
+    pub has_guard_terminal: bool,
+    pub max_ast_depth: usize,
+}
+
+impl From<&TxTopologyStats> for TxActionTopology {
+    fn from(stats: &TxTopologyStats) -> Self {
+        let mut top_kind_count: Vec<_> = stats
+            .top_kind_count
+            .iter()
+            .map(|(kind, count)| (*kind, *count))
+            .collect();
+        top_kind_count.sort_by_key(|(kind, _)| *kind);
+        Self {
+            top_action_count: stats.top_action_count,
+            top_kind_count,
+            top_guard_count: stats.top_guard_count,
+            non_guard_terminal_count: stats.non_guard_terminal_count,
+            has_guard_terminal: stats.has_guard_terminal,
+            max_ast_depth: stats.max_ast_depth,
         }
     }
 }
@@ -125,6 +155,7 @@ fn visit_tx_node(
     stats: &mut TxTopologyStats,
 ) -> Rerr {
     validate_current_node(tx_type, act, origin)?;
+    stats.max_ast_depth = stats.max_ast_depth.max(ast_depth);
     let shape = action_shape(act);
     collect_tx_topology(act, origin, &shape, stats);
     match shape {
@@ -241,6 +272,19 @@ pub fn precheck_tx_actions(tx_type: u8, actions: &[Box<dyn Action>]) -> Rerr {
         visit_tx_node(tx_type, act.as_ref(), ExecFrom::Top, 0, &mut stats)?;
     }
     validate_tx_topology(actions, &stats)
+}
+
+pub fn precheck_tx_actions_report(
+    tx_type: u8,
+    actions: &[Box<dyn Action>],
+) -> Ret<TxActionTopology> {
+    validate_tx_action_count(actions)?;
+    let mut stats = TxTopologyStats::default();
+    for act in actions {
+        visit_tx_node(tx_type, act.as_ref(), ExecFrom::Top, 0, &mut stats)?;
+    }
+    validate_tx_topology(actions, &stats)?;
+    Ok(TxActionTopology::from(&stats))
 }
 
 pub fn precheck_runtime_action(tx_type: u8, act: &dyn Action, from: ExecFrom) -> Rerr {

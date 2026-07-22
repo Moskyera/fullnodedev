@@ -20,6 +20,31 @@ combi_struct_with_parse!{ BlockV1,
 	transactions : DynVecTransaction
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockTxExecutionReport {
+    pub index: usize,
+    pub tx_hash: Hash,
+    pub tx_type: u8,
+    pub fee_got: Amount,
+    pub gas_used: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockExecutionReport {
+    pub height: u64,
+    pub hash: Hash,
+    pub tx_count: usize,
+    pub total_fee: Amount,
+    pub fee_receiver: Option<Address>,
+    pub txs: Vec<BlockTxExecutionReport>,
+}
+
+pub struct BlockExecutionOutput {
+    pub state: Box<dyn State>,
+    pub logs: Box<dyn Logs>,
+    pub report: BlockExecutionReport,
+}
+
 
 
 /********************/
@@ -78,6 +103,18 @@ impl BlockRead for BlockV1 {
 
 impl BlockExec for BlockV1 {
     fn execute(&self, ccnf: ChainInfo, state: Box<dyn State>, logs: Box<dyn Logs>) -> Ret<(Box<dyn State>, Box<dyn Logs>)> {
+        let out = self.execute_with_report(ccnf, state, logs)?;
+        Ok((out.state, out.logs))
+    }
+}
+
+impl BlockV1 {
+    pub fn execute_with_report(
+        &self,
+        ccnf: ChainInfo,
+        state: Box<dyn State>,
+        logs: Box<dyn Logs>,
+    ) -> Ret<BlockExecutionOutput> {
         // create env
         let mut env = Env {
             chain: ccnf,
@@ -98,16 +135,37 @@ impl BlockExec for BlockV1 {
         let ctx = &mut ctxobj;
         let txs = self.transactions();
         let mut total_fee = Amount::zero();
+        let mut reports = Vec::with_capacity(txs.len());
         // exec each tx
-        for tx in txs {
+        for (index, tx) in txs.iter().enumerate() {
             ctx.reset_for_new_tx(tx.as_read());
             tx.execute(ctx)?; // do exec
+            let gas_used = ctx.gas_diag().used_net;
             total_fee = total_fee.add_mode_u64(&tx.fee_got())?; // add fee
+            reports.push(BlockTxExecutionReport {
+                index,
+                tx_hash: tx.hash(),
+                tx_type: tx.ty(),
+                fee_got: tx.fee_got(),
+                gas_used,
+            });
         }
         if let Some(fee_receiver) = fee_receiver.filter(|_| total_fee.is_positive()) {
             operate::hac_add(ctx, &fee_receiver, &total_fee)?;
         }
-        Ok(ctxobj.release())
+        let (state, logs) = ctxobj.release();
+        Ok(BlockExecutionOutput {
+            state,
+            logs,
+            report: BlockExecutionReport {
+                height: self.height().uint(),
+                hash: self.hash(),
+                tx_count: txs.len(),
+                total_fee,
+                fee_receiver,
+                txs: reports,
+            },
+        })
 
     }
 }

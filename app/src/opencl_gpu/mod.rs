@@ -9,6 +9,6 @@ mod resources;
 pub use handle::{OpenclGpuHandle, OpenclGpuSnapshot, opencl_snapshot_from_resource};
 pub use init::initialize_opencl;
 pub use resources::{
-    enqueue_diamond_kernel, enqueue_mining_kernel, read_block_gpu_results,
-    read_diamond_gpu_results, write_stuff_to_gpu, OpenCLResources,
+    OpenCLResources, enqueue_diamond_kernel, enqueue_mining_kernel, read_block_gpu_results,
+    read_diamond_gpu_results, write_stuff_to_gpu,
 };

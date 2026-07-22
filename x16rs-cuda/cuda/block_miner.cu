@@ -101,6 +101,12 @@ extern "C" __global__ void x16rs_cuda_main(
     }
 }
 
+// Single-hash reference kernel (used by the genesis correctness test).
+// The batch mining kernel (x16rs_cuda_main) does the histogram/order dance across
+// a whole work-group; for one hash that machinery is unnecessary and its shared
+// bookkeeping does not translate to a per-thread array. All threads cooperatively
+// build the shared lookup tables (needed by the algorithm functions), then thread
+// 0 runs the plain SHA3 -> x16rs-repeat chain on that single hash.
 extern "C" __global__ void x16rs_cuda_single(
     const block_t *input_stuff_89,
     const unsigned int x16rs_repeat,
@@ -108,32 +114,35 @@ extern "C" __global__ void x16rs_cuda_single(
 {
     const unsigned int local_id = threadIdx.x;
     const unsigned int local_size = blockDim.x;
-    const unsigned int index = 0;
-    hash_32 local_hashes[1];
-    unsigned int local_order[1];
-    __shared__ unsigned int ALIGN histogram[16];
-    __shared__ unsigned int ALIGN starting_index[16];
-    __shared__ unsigned int ALIGN offset[16];
 
+    // Declares H_blake + the shared T0/AES/LT/mixtab tables and ends in a barrier
+    // reached by every thread (must be outside the thread-0 branch below).
     X16RS_INIT_SHARED_TABLES(local_id, local_size);
 
-    if (threadIdx.x == 0) {
+    if (local_id == 0) {
+        hash_32 h;
         block_t base_stuff = input_stuff_89[0];
-        sha3_256_hash(base_stuff.h8, local_hashes[0].h8);
-    }
-    __syncthreads();
-
-    X16RS_RUN_REPEAT_LOOP(
-        local_id, local_size, 1, x16rs_repeat,
-        local_hashes, index, local_order,
-        histogram, starting_index, offset,
-        H_blake,
-        T0, T1, T2, T3,
-        AES0, AES1, AES2, AES3,
-        LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7,
-        mixtab0, mixtab1, mixtab2, mixtab3);
-
-    if (threadIdx.x == 0) {
-        *out_hash = local_hashes[0];
+        sha3_256_hash(base_stuff.h8, h.h8);
+        for (unsigned char r = 0; r < x16rs_repeat; r++) {
+            switch (h.h4[7] % 16) {
+                case 0:  hash_x16rs_func_0(&h, H_blake); break;
+                case 1:  hash_x16rs_func_1(&h); break;
+                case 2:  hash_x16rs_func_2(&h, T0, T1, T2, T3); break;
+                case 3:  hash_x16rs_func_3(&h); break;
+                case 4:  hash_x16rs_func_4(&h); break;
+                case 5:  hash_x16rs_func_5(&h); break;
+                case 6:  hash_x16rs_func_6(&h); break;
+                case 7:  hash_x16rs_func_7(&h); break;
+                case 8:  hash_x16rs_func_8(&h, AES0, AES1, AES2, AES3); break;
+                case 9:  hash_x16rs_func_9(&h); break;
+                case 10: hash_x16rs_func_10(&h, AES0, AES1, AES2, AES3); break;
+                case 11: hash_x16rs_func_11(&h); break;
+                case 12: hash_x16rs_func_12(&h, mixtab0, mixtab1, mixtab2, mixtab3); break;
+                case 13: hash_x16rs_func_13(&h); break;
+                case 14: hash_x16rs_func_14(&h, LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7); break;
+                case 15: hash_x16rs_func_15(&h); break;
+            }
+        }
+        *out_hash = h;
     }
 }

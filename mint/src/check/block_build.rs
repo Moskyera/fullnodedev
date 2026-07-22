@@ -150,7 +150,7 @@ fn append_valid_tx_pick_from_txpool(
     }
 
     // pick one diamond mint tx
-    if pending_hei % 5 == 0 {
+    if true { // TESTNET: was pending_hei % 5 == 0
         let mut pick_dmint = |a: &TxPkg| {
             let txsz = a.data().len();
             if txsz + *txallsz > txmaxsz {

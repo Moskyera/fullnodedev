@@ -1,7 +1,7 @@
 HAC Miner Panel · By Mosky
 ===
 
-Hacash fullnode + **OpenCL miners** (AMD / NVIDIA) + **GUI panel** for easy setup.
+Hacash fullnode + **OpenCL miners** (AMD / NVIDIA / Intel) + **GUI panel** for easy setup.
 
 ### Download (no GitHub knowledge needed)
 
@@ -12,21 +12,19 @@ Hacash fullnode + **OpenCL miners** (AMD / NVIDIA) + **GUI panel** for easy setu
 | **Full** | Clean PC `hacash.exe` + workers + panel + `SETUP.bat` |
 | **Miner only** | You already run the fullnode |
 
-After extract: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`**
+After extract on Windows: **`SETUP.bat`** or **`SETUP-MINER.bat`** → **`miner-panel.exe`**
 
-### AMD / Ryzen mining (HAC + HACD)
+On Linux x86_64: extract the `.tar.gz` package → **`./SETUP-LINUX.sh`** → **`./START-MINER-PANEL.sh`**
 
-Official miners use **OpenCL** (AMD Radeon + Ryzen CPU).
+Verify Windows downloads with `Get-FileHash <file>.zip -Algorithm SHA256`; on Linux use `sha256sum -c <file>.tar.gz.sha256`.
+
+### HAC OpenCL + HACD CPU mining
+
+**HAC** uses OpenCL GPUs (AMD/NVIDIA/Intel). CUDA is intentionally not included in the release. **HACD** is CPU/fullnode mining and does not use OpenCL.
 
 See **[docs/MINING-AMD.md](docs/MINING-AMD.md)** (Windows) and **[docs/MINING-LINUX.md](docs/MINING-LINUX.md)** (Linux) — `scripts/mining-amd/` build scripts, GPU configs, `list_opencl` device discovery.
 
-### NVIDIA CUDA mining (experimental)
-
-Native CUDA block miner for RTX GPUs — same fullnode RPC as OpenCL/CPU `poworker`.
-
-See **[docs/MINING-NVIDIA-CUDA.md](docs/MINING-NVIDIA-CUDA.md)** and `scripts/mining-nvidia/` (build, genesis GPU test, RTX handoff checklist).
-
-**Maintainers:** `git tag v0.4.0 && git push origin v0.4.0` → GitHub Actions builds both ZIPs (`.github/workflows/release.yml`).
+**Maintainers:** pushing a new SemVer tag such as `vX.Y.Z` runs `.github/workflows/release.yml` and builds both Windows ZIPs and both Linux `.tar.gz` archives.
 
 ### Module Architecture
 

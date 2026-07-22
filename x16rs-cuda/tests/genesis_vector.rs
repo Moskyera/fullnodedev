@@ -16,7 +16,9 @@ fn cpu_genesis_block_hash() {
 #[cfg(feature = "cuda")]
 fn cuda_genesis_block_hash_when_available() {
     if !x16rs_cuda::CudaMiner::is_available() {
-        eprintln!("CUDA kernels not compiled (install CUDA Toolkit + rebuild with --features cuda)");
+        eprintln!(
+            "CUDA kernels not compiled (install CUDA Toolkit + rebuild with --features cuda)"
+        );
         return;
     }
     let intro = hex::decode(GENESIS_INTRO).unwrap();

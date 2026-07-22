@@ -17,7 +17,8 @@ if [[ ! -f "$RUN_DIR/diaworker.config.ini" ]]; then
   "$SCRIPT_DIR/install-configs.sh"
 fi
 
-echo "Starting HACD diamond miner from $RUN_DIR"
+echo "Starting HACD CPU diamond miner from $RUN_DIR"
+echo "HACD does not use OpenCL; supervene controls CPU threads."
 echo "Requires fullnode with [diamondminer] enable = true"
 echo
 cd "$RUN_DIR"

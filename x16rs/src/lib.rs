@@ -1,7 +1,7 @@
 use ripemd::Ripemd160;
 use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
-use x16rs_sys::x16rs_hash;
+pub use x16rs_sys::x16rs_hash;
 
 pub const H32S: usize = 32;
 
