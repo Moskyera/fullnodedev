@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use app::efficiency::{EfficiencyMode, min_profile_tier_for_mode, profile_tier};
-use app::gpu_arch::{ArchLimits, normalize_profile, profile_vendor};
+use app::gpu_arch::{ArchLimits, GpuVendor, normalize_profile, profile_vendor};
 
 use crate::currency::Currency;
 
@@ -22,6 +22,9 @@ pub struct PanelSettings {
     pub hac_price: f64,
     pub platform_id: u32,
     pub device_id: u32,
+    /// Use the CUDA backend (NVIDIA) instead of OpenCL. Requires a miner built with
+    /// `--features cuda`; only honored for NVIDIA GPUs (write_poworker_config gates it).
+    pub use_cuda: bool,
     pub connect: String,
     pub stats_file: String,
     pub opencl_dir: String,
@@ -139,6 +142,7 @@ pub struct LoadedPanelIni {
     pub max_temp_c: Option<u32>,
     pub pause_if_unprofitable: Option<bool>,
     pub benchmark_seconds: Option<u32>,
+    pub use_cuda: Option<bool>,
 }
 
 fn parse_u32(s: &str) -> Option<u32> {
@@ -218,6 +222,9 @@ pub fn load_panel_ini(path: &Path) -> LoadedPanelIni {
             .get("pause_if_unprofitable")
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes")),
         benchmark_seconds: eff.get("benchmark_seconds").and_then(|v| parse_u32(v)),
+        use_cuda: gpu
+            .get("use_cuda")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes")),
     }
 }
 
@@ -237,6 +244,7 @@ pub fn apply_loaded_ini(
     hac_price: &mut f32,
     max_temp_c: &mut u32,
     pause_unprofitable: &mut bool,
+    use_cuda: &mut bool,
     currency: Currency,
 ) {
     if let Some(sv) = loaded.supervene {
@@ -280,6 +288,9 @@ pub fn apply_loaded_ini(
     }
     if let Some(p) = loaded.pause_if_unprofitable {
         *pause_unprofitable = p;
+    }
+    if let Some(c) = loaded.use_cuda {
+        *use_cuda = c;
     }
 }
 
@@ -421,6 +432,9 @@ stats_file = {stats_file}
 
 pub fn write_poworker_config(path: &Path, s: &PanelSettings) -> std::io::Result<()> {
     let cpu_only = s.gpu.slug == "none";
+    // CUDA is only a valid backend for NVIDIA GPUs; gate here so a stale checkbox never
+    // writes use_cuda=true for an AMD/Intel selection.
+    let cuda_on = s.use_cuda && !cpu_only && profile_vendor(s.gpu.profile) == GpuVendor::Nvidia;
     let cpu_assist = !cpu_only && s.cpu.supervene > 0;
     let (wg, us, profile) = resolve_ini_tuning(s);
     let body = format!(
@@ -433,12 +447,13 @@ notice_wait = 45
 {efficiency}
 [gpu]
 use_opencl = {use_ocl}
-use_cuda = false
+use_cuda = {use_cuda}
 cpu_assist = {cpu_assist}
 gpu_slug = {gpu_slug}
 gpu_profile = {profile}
 platform_id = {platform_id}
 device_ids = {device_id}
+cuda_device = {device_id}
 opencl_dir = {opencl_dir}
 work_groups = {wg}
 local_size = 256
@@ -455,7 +470,8 @@ debug = 0
             s.max_temp_c,
             s.cpu.supervene,
         ),
-        use_ocl = if cpu_only { "false" } else { "true" },
+        use_ocl = if cpu_only || cuda_on { "false" } else { "true" },
+        use_cuda = if cuda_on { "true" } else { "false" },
         cpu_assist = if cpu_assist { "true" } else { "false" },
         gpu_slug = s.gpu.slug,
         profile = profile,
@@ -549,6 +565,7 @@ mod write_tuning_tests {
             hac_price: 0.01,
             platform_id: 0,
             device_id: 0,
+            use_cuda: false,
             connect: "127.0.0.1:8080".into(),
             stats_file: String::new(),
             opencl_dir: String::new(),
@@ -653,6 +670,51 @@ mod write_tuning_tests {
     }
 
     #[test]
+    fn cuda_enabled_for_nvidia_writes_cuda_backend() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rtx4090")
+            .unwrap();
+        let mut s = panel_with_wg(&gpu, 64, 64);
+        s.use_cuda = true;
+        s.device_id = 2;
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-cuda-{}.ini", std::process::id()));
+        write_poworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // CUDA selected on an NVIDIA GPU: OpenCL off, CUDA on, cuda_device carried through.
+        assert!(raw.contains("use_cuda = true"), "{raw}");
+        assert!(raw.contains("use_opencl = false"), "{raw}");
+        assert!(raw.contains("cuda_device = 2"), "{raw}");
+        // The written config round-trips back through the loader.
+        let tmp =
+            std::env::temp_dir().join(format!("hacash-panel-cuda2-{}.ini", std::process::id()));
+        std::fs::write(&tmp, &raw).unwrap();
+        let loaded = load_panel_ini(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded.use_cuda, Some(true));
+    }
+
+    #[test]
+    fn cuda_flag_ignored_for_non_nvidia_gpu() {
+        // A stale use_cuda=true must never enable CUDA for a non-NVIDIA GPU.
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rx9070xt")
+            .unwrap();
+        let mut s = panel_with_wg(&gpu, 64, 64);
+        s.use_cuda = true;
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-amdcuda-{}.ini", std::process::id()));
+        write_poworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(raw.contains("use_cuda = false"), "{raw}");
+        assert!(raw.contains("use_opencl = true"), "{raw}");
+    }
+
+    #[test]
     fn hacd_config_is_strictly_cpu_only() {
         let gpu = gpu_presets()
             .into_iter()
@@ -745,6 +807,7 @@ impl PanelSettings {
             hac_price: self.hac_price,
             platform_id: self.platform_id,
             device_id: self.device_id,
+            use_cuda: self.use_cuda,
             connect: self.connect.clone(),
             stats_file: self.stats_file.clone(),
             opencl_dir: self.opencl_dir.clone(),

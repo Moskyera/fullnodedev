@@ -81,10 +81,17 @@ static __device__ __forceinline__ ulong rotate(ulong x, uint n) {
 #define X16RS_PRAGMA_UNROLL_8 _Pragma("unroll 8")
 #define X16RS_PRAGMA_UNROLL_4 _Pragma("unroll 4")
 
-#define ALIGN8 __align__(8)
-#define ALIGN __align__(16)
-#define ALIGN32 __align__(32)
-#define ALIGN64 __align__(64)
+// Alignment here is a performance hint only: the kernels access these buffers
+// element-wise (h1/h4/h8, table[i]) and never do vector/uint4 loads that would require
+// greater-than-natural alignment. The spelling nvcc accepts for an alignment attribute
+// differs by host compiler — Linux uses __attribute__((aligned(N))), but Windows MSVC
+// rejects it in these positions and wants __declspec(align(N)) with different placement.
+// To compile on BOTH toolchains, make ALIGN a no-op under CUDA; natural alignment keeps
+// results byte-identical. (util.cl keeps the __attribute__ versions for OpenCL builds.)
+#define ALIGN8
+#define ALIGN
+#define ALIGN32
+#define ALIGN64
 
 // Do NOT redefine __attribute__ wholesale. On modern nvcc (12.x, Linux) CUDA's
 // own __global__/__device__ qualifiers expand THROUGH __attribute__, so stripping

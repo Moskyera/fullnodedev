@@ -101,6 +101,7 @@ struct MinerApp {
     hac_price: f32,
     platform_id: u32,
     device_id: u32,
+    use_cuda: bool,
     connect: String,
     connect_mode: ConnectMode,
     pool_preset_idx: usize,
@@ -178,6 +179,7 @@ impl MinerApp {
         let mut hac_price = 0.0f32;
         let mut platform_id = 0u32;
         let mut device_id = 0u32;
+        let mut use_cuda = false;
         let mut connect = SOLO_DEFAULT.to_string();
         let mut max_temp_c = 0u32;
         let mut pause_unprofitable = false;
@@ -199,6 +201,7 @@ impl MinerApp {
             &mut hac_price,
             &mut max_temp_c,
             &mut pause_unprofitable,
+            &mut use_cuda,
             currency,
         );
         if mining_kind == MiningKind::Hacd && cpus[cpu_idx].supervene == 0 {
@@ -298,6 +301,7 @@ impl MinerApp {
             hac_price,
             platform_id,
             device_id,
+            use_cuda,
             connect,
             connect_mode,
             pool_preset_idx: 0,
@@ -489,6 +493,7 @@ impl MinerApp {
             hac_price: Currency::convert(self.hac_price as f64, Currency::Usd, Currency::Eur),
             platform_id: self.platform_id,
             device_id: self.device_id,
+            use_cuda: self.use_cuda,
             connect: self.connect.clone(),
             stats_file: self.stats_path.to_string_lossy().to_string(),
             opencl_dir: opencl_dir_for(&self.work_dir),

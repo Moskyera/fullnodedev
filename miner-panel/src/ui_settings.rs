@@ -98,6 +98,13 @@ impl MinerApp {
                     }
                     ui.end_row();
 
+                    // CUDA backend is NVIDIA-only and needs a `--features cuda` miner build.
+                    if presets::profile_is_nvidia(self.gpu_presets[self.gpu_idx].profile) {
+                        theme::field_label(ui, "");
+                        ui.checkbox(&mut self.use_cuda, t.label_use_cuda);
+                        ui.end_row();
+                    }
+
                     if presets::is_rdna4_experimental(&self.gpu_presets[self.gpu_idx].slug) {
                         ui.label("");
                         ui.vertical(|ui| {

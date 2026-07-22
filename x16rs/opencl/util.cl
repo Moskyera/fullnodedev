@@ -9,10 +9,15 @@
   #define X16RS_PRAGMA_UNROLL_4
 #endif
 
+// Under CUDA these are made no-ops by ocl_compat.cuh (Windows nvcc/MSVC rejects the
+// __attribute__((aligned)) spelling). Only (re)define the OpenCL attribute versions when
+// not building for CUDA, so OpenCL builds are byte-identical to before.
+#ifndef __CUDA__
 #define ALIGN8 __attribute__((aligned(8)))
 #define ALIGN __attribute__((aligned(16)))
 #define ALIGN32 __attribute__((aligned(32)))
 #define ALIGN64 __attribute__((aligned(64)))
+#endif
 
 // Alignment qualifier for *function parameters*. C++/nvcc forbids an alignment
 // specifier on a parameter (an array param decays to a pointer), whereas OpenCL C

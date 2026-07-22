@@ -301,6 +301,11 @@ pub fn is_rdna4_experimental(slug: &str) -> bool {
     gpu_arch::ArchLimits::for_panel_slug(slug).is_experimental()
 }
 
+/// True when the preset's profile is an NVIDIA GPU (where the optional CUDA backend applies).
+pub fn profile_is_nvidia(profile: &str) -> bool {
+    gpu_arch::profile_vendor(profile) == gpu_arch::GpuVendor::Nvidia
+}
+
 /// Resolve profile + work_groups + unit_size for a GPU preset and efficiency mode.
 pub fn resolve_panel_tuning(gpu: &GpuPreset, mode: EfficiencyMode) -> ResolvedTuning {
     panel_tuning::resolve_panel_tuning(gpu.slug, gpu.profile, gpu.vram_gb, mode)

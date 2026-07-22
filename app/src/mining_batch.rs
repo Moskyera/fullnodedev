@@ -7,7 +7,7 @@ use crate::hash_util::hash_more_power;
 
 #[cfg(feature = "ocl")]
 use crate::gpu_oom::GpuBatchError;
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 use crate::mining_runtime::MiningRuntimeState;
 #[cfg(feature = "ocl")]
 use crate::opencl_gpu::OpenclGpuHandle;
@@ -322,7 +322,7 @@ impl BlockMinerBackend for OpenclBlockBackend {
 
 #[cfg(feature = "cuda")]
 pub struct CudaBlockBackend {
-    pub cuda: Arc<crate::CudaMiningResources>,
+    pub cuda: Arc<crate::poworker::CudaMiningResources>,
     pub configured_wg: u32,
     pub runtime: Arc<MiningRuntimeState>,
 }
@@ -351,7 +351,7 @@ impl BlockMinerBackend for CudaBlockBackend {
             );
         };
 
-        match crate::do_group_block_mining_cuda(
+        match crate::poworker::do_group_block_mining_cuda(
             &self.cuda,
             ctx.height,
             ctx.block_intro.clone(),

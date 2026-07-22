@@ -104,9 +104,12 @@ pub fn validate_diamond_settings(d: &DiamondMinerSettings) -> Result<(), String>
 pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
     let Ok(content) = std::fs::read_to_string(path) else {
         return DiamondMinerSettings {
-            bid_min: "1:0".to_string(),
-            bid_max: "31:0".to_string(),
-            bid_step: "0:5".to_string(),
+            // Bid amounts are plain HAC (mei/decimal): "1" = 1 HAC, "0.5" = half a
+            // HAC. The colon form "X:Y" is coin(mantissa X, unit Y), so "1:0" is
+            // 10^-248 HAC (dust), NOT 1 HAC — do not use it here.
+            bid_min: "1".to_string(),
+            bid_max: "31".to_string(),
+            bid_step: "0.5".to_string(),
             ..Default::default()
         };
     };
@@ -115,15 +118,15 @@ pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
         bid_password: read_section_key(&content, "diamondminer", "bid_password"),
         bid_min: {
             let v = read_section_key(&content, "diamondminer", "bid_min");
-            if v.is_empty() { "1:0".into() } else { v }
+            if v.is_empty() { "1".into() } else { v }
         },
         bid_max: {
             let v = read_section_key(&content, "diamondminer", "bid_max");
-            if v.is_empty() { "31:0".into() } else { v }
+            if v.is_empty() { "31".into() } else { v }
         },
         bid_step: {
             let v = read_section_key(&content, "diamondminer", "bid_step");
-            if v.is_empty() { "0:5".into() } else { v }
+            if v.is_empty() { "0.5".into() } else { v }
         },
     }
 }
@@ -458,15 +461,15 @@ mod tests {
     #[test]
     fn validates_diamond_bid_range() {
         let valid = DiamondMinerSettings {
-            bid_min: "1:0".into(),
-            bid_max: "31:0".into(),
-            bid_step: "0:5".into(),
+            bid_min: "1".into(),
+            bid_max: "31".into(),
+            bid_step: "0.5".into(),
             ..Default::default()
         };
         assert!(validate_diamond_settings(&valid).is_ok());
 
         let mut invalid = valid;
-        invalid.bid_min = "40:0".into();
+        invalid.bid_min = "40".into();
         assert!(validate_diamond_settings(&invalid).is_err());
     }
 

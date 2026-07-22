@@ -221,7 +221,7 @@ impl MinerApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.bid_min)
                                 .desired_width(160.0)
-                                .hint_text("1:0"),
+                                .hint_text("1"),
                         );
                         ui.end_row();
 
@@ -229,7 +229,7 @@ impl MinerApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.bid_max)
                                 .desired_width(160.0)
-                                .hint_text("31:0"),
+                                .hint_text("31"),
                         );
                         ui.end_row();
 
