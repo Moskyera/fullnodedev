@@ -1,0 +1,24 @@
+[package]
+name = "miner-pool"
+version = "0.1.0"
+edition = "2024"
+description = "Public free-IP mining pool for Hacash: fullnode miner RPC proxy + minimal Stratum"
+license = "MIT"
+
+[[bin]]
+name = "hac-pool"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7.9"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+hex = "0.4.3"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }

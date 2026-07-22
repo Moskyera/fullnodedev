@@ -13,6 +13,7 @@ mod mining_kind;
 mod opencl_status;
 mod platform;
 mod presets;
+mod public_pool;
 mod stats_poll;
 mod theme;
 mod ui_dashboard_tab;
@@ -138,6 +139,11 @@ struct MinerApp {
     pending_opencl_action: Option<OpenClAction>,
     auto_select_detected_gpu: bool,
     fleet: fleet::FleetState,
+    /// Host public free-IP pool (hac-pool) from this panel.
+    public_pool: public_pool::PublicPoolSettings,
+    public_pool_child: Option<Child>,
+    public_pool_running: bool,
+    public_pool_status: String,
 }
 
 impl MinerApp {
@@ -165,6 +171,7 @@ impl MinerApp {
         };
         let stats_path = work_dir.join("miner-stats.json");
         let fleet = fleet::FleetState::load(&work_dir, &stats_path);
+        let public_pool = public_pool::load_settings(&work_dir);
         let poworker_path = platform::find_worker(&work_dir, "poworker");
         let diaworker_path = platform::find_worker(&work_dir, "diaworker");
         let cpus = cpu_presets();
@@ -338,6 +345,10 @@ impl MinerApp {
             pending_opencl_action: None,
             auto_select_detected_gpu: !gpu_configured_in_ini,
             fleet,
+            public_pool,
+            public_pool_child: None,
+            public_pool_running: false,
+            public_pool_status: String::new(),
         };
         if mining_kind == MiningKind::Hac {
             app.request_opencl_probe(OpenClAction::InitialScan {
@@ -1093,6 +1104,7 @@ impl eframe::App for MinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_opencl_probe();
         self.poll_stats();
+        self.poll_public_pool();
         self.fleet.poll();
         ctx.request_repaint_after(Duration::from_millis(500));
 
@@ -1226,12 +1238,70 @@ impl eframe::App for MinerApp {
         // The app is already closing, so signal termination directly and do
         // not wait. Auto Tune's durable sidecar is recovered next launch.
         self.stop_mining_on_exit();
+        public_pool::stop_pool(&mut self.public_pool_child);
+        self.public_pool_running = false;
         if let Some(mut child) = self.benchmark_child.take() {
             let _ = child.kill();
         }
         self.benchmarking = false;
         self.benchmark_log_rx = None;
         self.fleet.stop();
+    }
+}
+
+impl MinerApp {
+    pub(crate) fn save_public_pool_settings(&mut self) {
+        if let Err(e) = public_pool::save_settings(&self.work_dir, &self.public_pool) {
+            self.public_pool_status = format!("Could not save pool settings: {e}");
+        }
+    }
+
+    pub(crate) fn start_public_pool(&mut self) {
+        if self.public_pool_running {
+            self.public_pool_status = "Public pool already running.".into();
+            return;
+        }
+        self.save_public_pool_settings();
+        match public_pool::start_pool(&self.work_dir, &self.public_pool) {
+            Ok(child) => {
+                self.public_pool_child = Some(child);
+                self.public_pool_running = true;
+                if self.public_pool.mine_through_pool {
+                    self.connect_mode = ConnectMode::Pool;
+                    self.connect = public_pool::local_pool_connect(self.public_pool.http_port);
+                }
+                self.public_pool_status = format!(
+                    "Public pool running — HTTP 0.0.0.0:{} · Stratum 0.0.0.0:{} · upstream {}",
+                    self.public_pool.http_port,
+                    self.public_pool.stratum_port,
+                    self.public_pool.upstream
+                );
+                self.status_msg = self.public_pool_status.clone();
+            }
+            Err(e) => {
+                self.public_pool_running = false;
+                self.public_pool_status = e.clone();
+                self.status_msg = e;
+            }
+        }
+    }
+
+    pub(crate) fn stop_public_pool(&mut self) {
+        public_pool::stop_pool(&mut self.public_pool_child);
+        self.public_pool_running = false;
+        self.public_pool_status = "Public pool stopped.".into();
+        self.status_msg = self.public_pool_status.clone();
+    }
+
+    pub(crate) fn poll_public_pool(&mut self) {
+        if !self.public_pool_running {
+            return;
+        }
+        if !public_pool::poll_pool(&mut self.public_pool_child) {
+            self.public_pool_running = false;
+            self.public_pool_status =
+                "Public pool process exited. Start it again from Settings.".into();
+        }
     }
 }
 

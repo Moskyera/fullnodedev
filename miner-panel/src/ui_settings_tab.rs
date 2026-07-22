@@ -319,7 +319,152 @@ impl MinerApp {
                         }
                     });
                     ui.end_row();
+                });
+        });
 
+        // All-in-one public free-IP pool (hac-pool)
+        if self.mining_kind == MiningKind::Hac {
+            ui.add_space(12.0);
+            theme::section_card().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("PUBLIC FREE-IP POOL (ALL-IN-ONE)")
+                        .strong()
+                        .size(12.0)
+                        .color(theme::colors::ACCENT),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Host a public pool from this PC. Others connect with your IP:HTTP port. \
+Local mining can use 127.0.0.1 via the pool. Requires hac-pool.exe next to the panel.",
+                    )
+                    .size(11.5)
+                    .color(theme::colors::TEXT_MUTED),
+                );
+                ui.add_space(8.0);
+
+                let mut host = self.public_pool.host_enabled;
+                if ui
+                    .checkbox(&mut host, "Enable public pool controls")
+                    .changed()
+                {
+                    self.public_pool.host_enabled = host;
+                    self.save_public_pool_settings();
+                }
+
+                ui.add_enabled_ui(self.public_pool.host_enabled, |ui| {
+                    egui::Grid::new("public_pool_grid")
+                        .num_columns(2)
+                        .spacing([20.0, 10.0])
+                        .show(ui, |ui| {
+                            theme::field_label(ui, "Upstream fullnode");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.public_pool.upstream)
+                                        .desired_width(280.0)
+                                        .hint_text("127.0.0.1:8080"),
+                                )
+                                .changed()
+                            {
+                                self.save_public_pool_settings();
+                            }
+                            ui.end_row();
+
+                            theme::field_label(ui, "HTTP port (workers)");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.public_pool.http_port)
+                                        .range(1024..=65535),
+                                )
+                                .changed()
+                            {
+                                self.save_public_pool_settings();
+                            }
+                            ui.end_row();
+
+                            theme::field_label(ui, "Stratum port");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.public_pool.stratum_port)
+                                        .range(1024..=65535),
+                                )
+                                .changed()
+                            {
+                                self.save_public_pool_settings();
+                            }
+                            ui.end_row();
+
+                            theme::field_label(ui, "Pool token (optional)");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.public_pool.token)
+                                        .desired_width(280.0)
+                                        .hint_text("empty = open free pool"),
+                                )
+                                .changed()
+                            {
+                                self.save_public_pool_settings();
+                            }
+                            ui.end_row();
+                        });
+
+                    if ui
+                        .checkbox(
+                            &mut self.public_pool.mine_through_pool,
+                            "When pool starts, mine through it (set Connect to 127.0.0.1:HTTP)",
+                        )
+                        .changed()
+                    {
+                        self.save_public_pool_settings();
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let can_start = !self.public_pool_running;
+                        if ui
+                            .add_enabled(can_start, egui::Button::new("Start public pool"))
+                            .clicked()
+                        {
+                            self.start_public_pool();
+                        }
+                        if ui
+                            .add_enabled(self.public_pool_running, egui::Button::new("Stop public pool"))
+                            .clicked()
+                        {
+                            self.stop_public_pool();
+                        }
+                        let badge = if self.public_pool_running {
+                            ("RUNNING", theme::colors::GREEN)
+                        } else {
+                            ("STOPPED", theme::colors::TEXT_MUTED)
+                        };
+                        ui.label(egui::RichText::new(badge.0).color(badge.1).strong());
+                    });
+
+                    if !self.public_pool_status.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&self.public_pool_status)
+                                .size(11.5)
+                                .color(theme::colors::TEXT_MUTED),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "External workers: connect = YOUR_PUBLIC_IP:{}  (firewall must allow it)",
+                            self.public_pool.http_port
+                        ))
+                        .size(11.0)
+                        .color(theme::colors::GOLD_DIM),
+                    );
+                });
+            });
+        }
+
+        ui.add_space(12.0);
+        theme::section_card().show(ui, |ui| {
+            egui::Grid::new("wallet_grid_after_pool")
+                .num_columns(2)
+                .spacing([20.0, 12.0])
+                .show(ui, |ui| {
                     theme::field_label(ui, t.label_wallet);
                     ui.vertical(|ui| {
                         ui.add(
@@ -414,24 +559,21 @@ impl MinerApp {
                 });
         });
 
-        });
-
         ui.add_space(12.0);
         self.fleet.show_settings(ui);
 
         ui.add_space(18.0);
-        ui.add_enabled_ui(!settings_locked, |ui| {
-            ui.horizontal(|ui| {
-                if theme::btn_secondary(ui, t.btn_save).clicked() {
-                    self.save_config();
-                }
-                ui.add_space(8.0);
-                if theme::btn_primary(ui, t.btn_start_mining).clicked() {
-                    self.start_mining();
-                    self.tab = 1;
-                }
-            });
+        ui.horizontal(|ui| {
+            if theme::btn_secondary(ui, t.btn_save).clicked() {
+                self.save_config();
+            }
+            ui.add_space(8.0);
+            if theme::btn_primary(ui, t.btn_start_mining).clicked() {
+                self.start_mining();
+                self.tab = 1;
+            }
         });
         ui.add_space(8.0);
+        }); // end add_enabled_ui(!settings_locked)
     }
 }

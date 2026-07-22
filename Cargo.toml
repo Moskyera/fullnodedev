@@ -24,6 +24,7 @@ members = [
     "sys",
     "x16rs",
     "x16rs-cuda",
+    "miner-pool",
 ]
 exclude = [
     "chainv1",
