@@ -158,7 +158,7 @@ pub fn write_diamond_miner(
     d: &DiamondMinerSettings,
     rpc_port: Option<u16>,
 ) -> std::io::Result<()> {
-    let content = read_or_empty(path);
+    let content = ensure_mainnet_node_section(&read_or_empty(path));
     let mut updated = upsert_section_fields(
         &content,
         "diamondminer",
@@ -193,7 +193,7 @@ pub fn write_hac_miner_only(
     wallet: &str,
     rpc_port: Option<u16>,
 ) -> std::io::Result<()> {
-    let content = read_or_empty(path);
+    let content = ensure_mainnet_node_section(&read_or_empty(path));
     let mut updated = upsert_miner_reward(&content, wallet);
     updated = upsert_section_fields(&updated, "diamondminer", &[("enable", "false")]);
     if let Some(port) = rpc_port {
@@ -214,6 +214,23 @@ pub fn write_hac_miner_only(
 
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Guarantee the fullnode joins MAINNET. Without a `[node]` section (boot nodes +
+/// `not_find_nodes = false`) hacash starts an ISOLATED LOCAL chain: the height stays
+/// near 0, so x16rs runs at repeat=1 (an inflated MH/s that is NOT real mining). The
+/// panel writes hacash.config.ini for the reward wallet, so it must ensure `[node]` is
+/// present — otherwise a config created before START-MAINNET.bat has run is off-network.
+/// An existing `[node]` section is left untouched (respects a user/launcher setup).
+fn ensure_mainnet_node_section(content: &str) -> String {
+    let has_node = content
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("[node]"));
+    if has_node {
+        return content.to_string();
+    }
+    let node = "[node]\nname = rust_node\nlisten = 3337\nboots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337\nnot_find_nodes = false\nfast_sync = true\n\n";
+    format!("{node}{content}")
 }
 
 fn write_config(path: &Path, content: &str) -> std::io::Result<()> {
@@ -484,6 +501,52 @@ mod tests {
         assert!(raw.contains("listen = 8085"));
         assert!(raw.contains("bind = 127.0.0.1"));
         assert!(raw.contains("diamond_form = true"));
+    }
+
+    #[test]
+    fn fresh_hac_and_hacd_configs_get_mainnet_node_section() {
+        // A panel-written config on an empty file must join MAINNET. Without [node]
+        // (boots + not_find_nodes=false) hacash starts an isolated LOCAL chain
+        // (height ~0 -> x16rs repeat=1 -> inflated MH/s, not real mining).
+        let path = std::env::temp_dir().join(format!("hacash-node-cfg-{}.ini", std::process::id()));
+
+        let _ = std::fs::remove_file(&path);
+        write_hac_miner_only(&path, "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v", Some(8080)).unwrap();
+        let hac = std::fs::read_to_string(&path).unwrap();
+        assert!(hac.contains("[node]"), "HAC config missing [node]:\n{hac}");
+        assert!(hac.contains("not_find_nodes = false"), "{hac}");
+        assert!(hac.contains("boots = 54.193.49.59:3337"), "{hac}");
+
+        let _ = std::fs::remove_file(&path);
+        write_diamond_miner(
+            &path,
+            "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v",
+            &DiamondMinerSettings::default(),
+            Some(8080),
+        )
+        .unwrap();
+        let hacd = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(hacd.contains("[node]"), "HACD config missing [node]:\n{hacd}");
+        assert!(hacd.contains("not_find_nodes = false"), "{hacd}");
+    }
+
+    #[test]
+    fn existing_node_section_is_preserved() {
+        // An existing [node] (from START-MAINNET.bat or a custom user setup) must not
+        // be clobbered or duplicated when the panel rewrites the miner fields.
+        let path =
+            std::env::temp_dir().join(format!("hacash-keepnode-cfg-{}.ini", std::process::id()));
+        std::fs::write(
+            &path,
+            "[node]\nlisten = 9999\nnot_find_nodes = false\n\n[miner]\nreward = old\n",
+        )
+        .unwrap();
+        write_hac_miner_only(&path, "1NewWallet", Some(8080)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(raw.contains("listen = 9999"), "custom [node] listen lost:\n{raw}");
+        assert_eq!(raw.matches("[node]").count(), 1, "duplicate [node]:\n{raw}");
     }
 
     #[test]
