@@ -1,4 +1,4 @@
-//! Cross-platform binary names — Windows keeps `.exe` first (unchanged behavior).
+//! Cross-platform binary names: Windows keeps `.exe` first (unchanged behavior).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

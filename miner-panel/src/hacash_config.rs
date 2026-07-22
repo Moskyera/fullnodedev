@@ -106,7 +106,7 @@ pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
         return DiamondMinerSettings {
             // Bid amounts are plain HAC (mei/decimal): "1" = 1 HAC, "0.5" = half a
             // HAC. The colon form "X:Y" is coin(mantissa X, unit Y), so "1:0" is
-            // 10^-248 HAC (dust), NOT 1 HAC — do not use it here.
+            // 10^-248 HAC (dust), NOT 1 HAC: do not use it here.
             bid_min: "1".to_string(),
             bid_max: "31".to_string(),
             bid_step: "0.5".to_string(),

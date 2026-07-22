@@ -38,7 +38,7 @@ impl MinerApp {
                         let selected = &self.cpu_presets[self.cpu_idx];
                         egui::ComboBox::from_id_salt("hacd_cpu")
                             .selected_text(format!(
-                                "{} — {} threads",
+                                "{}: {} threads",
                                 selected.label, selected.supervene
                             ))
                             .width(400.0)
@@ -49,7 +49,7 @@ impl MinerApp {
                                             &mut self.cpu_idx,
                                             i,
                                             format!(
-                                                "{} — {} threads",
+                                                "{}: {} threads",
                                                 preset.label, preset.supervene
                                             ),
                                         );
@@ -98,28 +98,17 @@ impl MinerApp {
                     }
                     ui.end_row();
 
-                    // CUDA backend is NVIDIA-only and needs a `--features cuda` miner build.
+                    // Mining backend selector, shown only for NVIDIA. CUDA needs a miner
+                    // built with `--features cuda`; OpenCL is the default for everyone else.
                     if presets::profile_is_nvidia(self.gpu_presets[self.gpu_idx].profile) {
-                        theme::field_label(ui, "");
-                        ui.checkbox(&mut self.use_cuda, t.label_use_cuda);
-                        ui.end_row();
-                    }
-
-                    if presets::is_rdna4_experimental(&self.gpu_presets[self.gpu_idx].slug) {
-                        ui.label("");
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(t.gpu_rdna4_badge)
-                                    .color(theme::colors::GOLD)
-                                    .strong()
-                                    .size(12.5),
-                            );
-                            ui.label(
-                                egui::RichText::new(t.gpu_rdna4_hint)
-                                    .color(theme::colors::TEXT_MUTED)
-                                    .size(11.5),
-                            );
-                        });
+                        theme::field_label(ui, t.label_backend);
+                        egui::ComboBox::from_id_salt("backend")
+                            .selected_text(if self.use_cuda { "CUDA" } else { "OpenCL" })
+                            .width(400.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.use_cuda, false, "OpenCL");
+                                ui.selectable_value(&mut self.use_cuda, true, "CUDA");
+                            });
                         ui.end_row();
                     }
 

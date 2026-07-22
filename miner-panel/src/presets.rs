@@ -13,7 +13,7 @@ pub struct GpuPreset {
     pub label: &'static str,
     pub slug: &'static str,
     pub profile: &'static str,
-    /// VRAM in GB — used for safe work_groups caps.
+    /// VRAM in GB: used for safe work_groups caps.
     pub vram_gb: u8,
     /// Typical board power (W) for kH/J and profit estimates.
     pub watts: f64,
@@ -297,10 +297,6 @@ pub fn gpu_idx_for_opencl(
     gpu_idx_for_slug(gpus, preset)
 }
 
-pub fn is_rdna4_experimental(slug: &str) -> bool {
-    gpu_arch::ArchLimits::for_panel_slug(slug).is_experimental()
-}
-
 /// True when the preset's profile is an NVIDIA GPU (where the optional CUDA backend applies).
 pub fn profile_is_nvidia(profile: &str) -> bool {
     gpu_arch::profile_vendor(profile) == gpu_arch::GpuVendor::Nvidia
@@ -315,7 +311,7 @@ pub fn min_work_groups_for_gpu(slug: &str) -> u32 {
     gpu_arch::panel_min_work_groups(slug)
 }
 
-/// Legacy helper — prefer `resolve_panel_tuning`.
+/// Legacy helper: prefer `resolve_panel_tuning`.
 pub fn tuning_for_profile(profile: &str) -> (u32, u32) {
     profile_tuning(profile)
 }

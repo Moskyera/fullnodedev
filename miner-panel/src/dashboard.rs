@@ -3,7 +3,6 @@ use eframe::egui;
 
 use crate::i18n::Strings;
 use crate::mining_kind::MiningKind;
-use crate::presets;
 use crate::theme;
 
 pub struct DashboardDetails<'a> {
@@ -11,7 +10,6 @@ pub struct DashboardDetails<'a> {
     pub stats: &'a MiningStatsSnapshot,
     pub cpu_label: &'a str,
     pub gpu_label: &'a str,
-    pub gpu_slug: &'a str,
     pub connect_display: String,
     pub wallet_display: String,
     pub opencl_display: String,
@@ -91,20 +89,6 @@ fn show_hac_details(ui: &mut egui::Ui, d: &DashboardDetails<'_>) {
             theme::show_detail_row(ui, d.t.dash_detail_cpu, d.cpu_label);
             theme::show_detail_row(ui, d.t.dash_detail_gpu, d.gpu_label);
             ui.end_row();
-
-            if presets::is_rdna4_experimental(d.gpu_slug) {
-                ui.label(
-                    egui::RichText::new(d.t.gpu_rdna4_badge)
-                        .color(theme::colors::GOLD)
-                        .size(12.0),
-                );
-                ui.label(
-                    egui::RichText::new(d.t.gpu_rdna4_hint)
-                        .color(theme::colors::TEXT_MUTED)
-                        .size(11.0),
-                );
-                ui.end_row();
-            }
 
             theme::show_detail_row(ui, d.t.dash_detail_connect, &d.connect_display);
             theme::show_detail_row(ui, d.t.dash_detail_wallet, &d.wallet_display);

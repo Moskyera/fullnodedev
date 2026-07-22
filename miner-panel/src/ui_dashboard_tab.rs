@@ -240,7 +240,6 @@ impl MinerApp {
                     stats: s,
                     cpu_label: self.cpu_label(self.cpu_idx),
                     gpu_label: self.gpu_label(self.gpu_idx),
-                    gpu_slug: &self.gpu_presets[self.gpu_idx].slug,
                     connect_display,
                     wallet_display,
                     opencl_display,

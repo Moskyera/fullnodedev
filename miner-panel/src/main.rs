@@ -252,7 +252,7 @@ impl MinerApp {
             }
         }
         let mut status_msg = if mining_kind == MiningKind::Hacd {
-            "HACD CPU miner ready — OpenCL is not used.".to_string()
+            "HACD CPU miner ready: OpenCL is not used.".to_string()
         } else if opencl_status.has_usable_device() {
             format!("OpenCL: {}", opencl_status.device_summary())
         } else {
@@ -529,7 +529,7 @@ impl MinerApp {
         }
         self.status_msg = match kind {
             MiningKind::Hac => "HAC OpenCL miner ready.".to_string(),
-            MiningKind::Hacd => "HACD CPU miner ready — OpenCL is not used.".to_string(),
+            MiningKind::Hacd => "HACD CPU miner ready: OpenCL is not used.".to_string(),
         };
         save_mining_kind(&self.work_dir, kind);
     }

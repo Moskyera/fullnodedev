@@ -176,7 +176,7 @@ impl MinerApp {
 
     pub(super) fn format_stats_age(ms: u64) -> String {
         if ms == 0 {
-            return "—".to_string();
+            return "-".to_string();
         }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
