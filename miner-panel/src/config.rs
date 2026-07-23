@@ -41,6 +41,10 @@ pub struct PanelSettings {
     pub nonce_max: u32,
     /// poworker: seconds to wait for a new-block notice (default 45).
     pub notice_wait: u64,
+    /// Payout address announced to a pool (`pool_worker`). Set only in Pool
+    /// mode; empty for solo so the worker's requests stay identical to a plain
+    /// fullnode's.
+    pub pool_worker: String,
 }
 
 const BENCHMARK_BACKUP_PRESENT: &str = "HACASH_MINER_PANEL_AUTOTUNE_BACKUP_V1:PRESENT\n";
@@ -447,6 +451,7 @@ connect = {connect}
 supervene = {sv}
 nonce_max = {nonce_max}
 notice_wait = {notice_wait}
+pool_worker = {pool_worker}
 
 {efficiency}
 [gpu]
@@ -468,6 +473,7 @@ debug = 0
         sv = s.cpu.supervene,
         nonce_max = s.nonce_max,
         notice_wait = s.notice_wait,
+        pool_worker = s.pool_worker,
         // Thermal cap must be below full load; half of WG (min 1) actually reduces heat.
         efficiency = efficiency_section(
             s,
@@ -586,6 +592,7 @@ mod write_tuning_tests {
             unit_size: us,
             nonce_max: u32::MAX,
             notice_wait: 45,
+            pool_worker: String::new(),
         }
     }
 
@@ -723,6 +730,32 @@ mod write_tuning_tests {
     }
 
     #[test]
+    fn pool_mode_announces_the_payout_address_and_solo_stays_empty() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rx9070xt")
+            .unwrap();
+        let mut s = panel_with_wg(&gpu, 64, 64);
+        let path =
+            std::env::temp_dir().join(format!("hacash-panel-poolw-{}.ini", std::process::id()));
+
+        // Pool mode: the address the user already typed is announced to the pool
+        // so it can credit and pay this miner automatically.
+        s.pool_worker = "1NVYv5jmr9JRF3usPZJQmJFJhbQhrPESTP".to_string();
+        write_poworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("pool_worker = 1NVYv5jmr9JRF3usPZJQmJFJhbQhrPESTP"));
+
+        // Solo: left empty, so the worker's URLs stay identical to a plain node.
+        s.pool_worker = String::new();
+        write_poworker_config(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(raw.contains("pool_worker ="));
+        assert!(!raw.contains("pool_worker = 1"));
+    }
+
+    #[test]
     fn hacd_config_is_strictly_cpu_only() {
         let gpu = gpu_presets()
             .into_iter()
@@ -830,6 +863,7 @@ impl PanelSettings {
             unit_size: self.unit_size,
             nonce_max: self.nonce_max,
             notice_wait: self.notice_wait,
+            pool_worker: self.pool_worker.clone(),
         }
     }
 }

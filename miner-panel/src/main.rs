@@ -535,6 +535,13 @@ impl MinerApp {
             unit_size: self.unit_size,
             nonce_max: self.nonce_max,
             notice_wait: self.notice_wait,
+            // In Pool mode the address the user already typed doubles as the
+            // pool payout address, so payouts need no extra step. Solo leaves it
+            // empty, keeping worker requests identical to a plain fullnode's.
+            pool_worker: match self.connect_mode {
+                ConnectMode::Pool => self.wallet.trim().to_string(),
+                ConnectMode::Solo => String::new(),
+            },
         }
     }
 
