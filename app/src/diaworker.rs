@@ -118,6 +118,9 @@ mod config_tests {
 /*************************************/
 
 const HASH_WIDTH: usize = 32;
+// Length of a diamond hash string (x16rs DMD_M): 10 leading '0' chars followed by
+// the 6-char diamond name. This is a fixed mainnet consensus constant.
+pub(crate) const DIAMOND_HASH_LEN: usize = 16;
 const MINING_INTERVAL: f64 = 3.0; // 3 secs
 
 // current mining diamond number
@@ -138,7 +141,7 @@ pub(crate) struct DiamondMiningResult {
     nonce_space: u64,
     u64_nonce: u64,
     msg_nonce: Vec<u8>,
-    dia_str: [u8; 10],
+    dia_str: [u8; DIAMOND_HASH_LEN],
     is_success: Option<DiamondMint>,
     use_secs: f64,
     is_gpu: bool,
@@ -220,7 +223,7 @@ pub fn diaworker() {
     // deal results
     let cnf1 = cnf.clone();
     spawn(move || {
-        let mut most_dia_str = [b'W'; 10];
+        let mut most_dia_str = [b'W'; DIAMOND_HASH_LEN];
         let mut rstx = res_rx;
         loop {
             deal_diamond_mining_results(&cnf1, &mut most_dia_str, &mut rstx, vene);
@@ -331,13 +334,13 @@ pub fn diaworker() {
 
 fn deal_diamond_mining_results(
     cnf: &DiaWorkConf,
-    most_dia_str: &mut [u8; 10],
+    most_dia_str: &mut [u8; DIAMOND_HASH_LEN],
     result_ch_rx: &mut mpsc::Receiver<DiamondMiningResult>,
     vene: u32,
 ) {
     let mut deal_number = 0u32;
     let mut most = DiamondMiningResult::default();
-    most.dia_str = [b'w'; 10];
+    most.dia_str = [b'w'; DIAMOND_HASH_LEN];
     let mut total_nonce_space = 0u64;
     let mut gpu_nonce_space = 0u64;
     let mut cpu_nonce_space = 0u64;
@@ -432,13 +435,16 @@ fn deal_diamond_mining_results(
     may_print_turn_to_nex_diamond_mining(deal_number, Some(most_dia_str));
 }
 
-fn may_print_turn_to_nex_diamond_mining(curr_number: u32, most_dia_str: Option<&mut [u8; 10]>) {
-    let mining_number = MINING_DIAMOND_NUM.load(Relaxed);
+fn may_print_turn_to_nex_diamond_mining(
+    curr_number: u32,
+    most_dia_str: Option<&mut [u8; DIAMOND_HASH_LEN]>,
+) {
+    let mining_number = MINING_DIAMOND_NUM.load(Acquire);
     if mining_number <= curr_number {
         return; // not turn
     }
     if let Some(most_dia_str) = most_dia_str {
-        *most_dia_str = [b'W'; 10]; // reset 
+        *most_dia_str = [b'W'; DIAMOND_HASH_LEN]; // reset
     }
 
     println!(
@@ -457,7 +463,7 @@ fn run_diamond_worker_thread(
     if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
         delay_return_ms!(2000);
     }
-    let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
+    let cmdn = MINING_DIAMOND_NUM.load(Acquire);
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
     }
@@ -522,7 +528,7 @@ fn run_diamond_worker_thread(
         nonce_space = nonce_space.max(1);
 
         // check next
-        if current_mining_number < MINING_DIAMOND_NUM.load(Relaxed) {
+        if current_mining_number < MINING_DIAMOND_NUM.load(Acquire) {
             return; // turn to next number
         }
     }
@@ -538,7 +544,7 @@ fn run_diamond_worker_thread_opencl(
     if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
         delay_return_ms!(2000);
     }
-    let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
+    let cmdn = MINING_DIAMOND_NUM.load(Acquire);
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
     }
@@ -604,7 +610,7 @@ fn run_diamond_worker_thread_opencl(
         };
         nonce_start = ns;
 
-        if current_mining_number < MINING_DIAMOND_NUM.load(Relaxed) {
+        if current_mining_number < MINING_DIAMOND_NUM.load(Acquire) {
             return;
         }
     }
@@ -632,7 +638,7 @@ fn do_diamond_group_mining(
         nonce_space,
         u64_nonce: 0,
         msg_nonce: custom_nonce.to_vec(),
-        dia_str: [b'W'; 10],
+        dia_str: [b'W'; DIAMOND_HASH_LEN],
         is_success: None,
         use_secs: 0.0,
         is_gpu: false,
@@ -640,7 +646,7 @@ fn do_diamond_group_mining(
     };
     let mut most_firhx = [0u8; HASH_WIDTH];
     let mut most_resxh = [0u8; HASH_WIDTH];
-    let mut most_diastr = [b'W'; 10];
+    let mut most_diastr = [b'W'; DIAMOND_HASH_LEN];
     let mut most_noncebytes = [0u8; 8];
 
     // start mining
@@ -693,11 +699,14 @@ pub(crate) fn check_diamer_success(
     number: u32,
     firhx: [u8; HASH_WIDTH],
     resxh: [u8; HASH_WIDTH],
-    diastr: [u8; 10],
+    diastr: [u8; DIAMOND_HASH_LEN],
 ) -> Option<[u8; 6]> {
-    if let None = x16rs::check_diamond_hash_result(&diastr) {
+    // The 6-char name is derived by x16rs from positions DMD_L..DMD_M of the diamond
+    // string; take its result directly instead of hand-slicing so this stays correct
+    // no matter the leading-zero prefix length (mainnet DMD_L=10, DMD_M=16).
+    let Some(name) = x16rs::check_diamond_hash_result(&diastr) else {
         return None;
-    }
+    };
     if !x16rs::check_diamond_difficulty(number, &firhx, &resxh) {
         return None;
     }
@@ -710,10 +719,6 @@ pub(crate) fn check_diamer_success(
         number
     );
     flush!("\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n");
-    // The 6-char name is the tail after the leading-zero prefix: positions DMD_L..DMD_M of the
-    // diamond string. That prefix is 4 on this reduced-difficulty testnet build (upstream: 10).
-    let mut name = [0u8; 6];
-    name.copy_from_slice(&diastr[4..]);
     Some(name)
 }
 
@@ -764,7 +769,7 @@ fn load_init(cnf: &mut DiaWorkConf) {
 }
 
 fn pull_and_push_diamond(cnf: &DiaWorkConf) {
-    let mining_num = MINING_DIAMOND_NUM.load(Relaxed);
+    let mining_num = MINING_DIAMOND_NUM.load(Acquire);
 
     let urlapi_latest = format!("http://{}/query/latest", &cnf.rpcaddr);
     // get next number
@@ -789,7 +794,9 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
         *MINING_DIAMOND_STUFF
             .write()
             .unwrap_or_else(|e| e.into_inner()) = genesis_block_hash();
-        MINING_DIAMOND_NUM.store(next_num, Relaxed);
+        // Release: publish the STUFF write above before the number, so a reader that
+    // sees this number (with an Acquire load) also sees the matching prev_hash.
+    MINING_DIAMOND_NUM.store(next_num, Release);
         return; // first mining
     }
     if next_num <= mining_num {
@@ -833,7 +840,9 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     *MINING_DIAMOND_STUFF
         .write()
         .unwrap_or_else(|e| e.into_inner()) = Hash::from(hash_bytes);
-    MINING_DIAMOND_NUM.store(next_num, Relaxed);
+    // Release: publish the STUFF write above before the number, so a reader that
+    // sees this number (with an Acquire load) also sees the matching prev_hash.
+    MINING_DIAMOND_NUM.store(next_num, Release);
     // print first req msg
     if mining_num == 0 {
         may_print_turn_to_nex_diamond_mining(mining_num, None);
@@ -844,15 +853,42 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
     let urlapi_success = format!("http://{}/submit/diamondminer/success", &cnf.rpcaddr);
     let actionbody = success.serialize();
     // println!("\n\ncurl {}?hexbody=true -X POST -d '{}'", &urlapi_success, &actionbody.to_hex());
-    let body =
-        match crate::rpc_http::post_text(&HTTP_CLIENT, &urlapi_success, &cnf.api_token, actionbody)
-        {
-            Ok(t) => t,
-            Err(e) => {
-                println!("Error: cannot submit diamond success to {urlapi_success}: {e}");
-                return;
+    // Submitting the mined diamond is the whole payoff, and the result was already
+    // drained from the mining channel, so a single transient network error must not
+    // silently lose it. Retry transport failures with backoff; stop as soon as the
+    // node returns a response (accept or deterministic rejection), mirroring the
+    // block submit path.
+    const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+    let mut body = String::new();
+    let mut got_response = false;
+    for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
+        match crate::rpc_http::post_text(
+            &HTTP_CLIENT,
+            &urlapi_success,
+            &cnf.api_token,
+            actionbody.clone(),
+        ) {
+            Ok(t) => {
+                body = t;
+                got_response = true;
+                break;
             }
-        };
+            Err(e) => {
+                println!(
+                    "Error: attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} cannot submit diamond success to {urlapi_success}: {e}"
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500u64 * attempt as u64));
+                }
+            }
+        }
+    }
+    if !got_response {
+        println!(
+            "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet after {MAX_SUBMIT_ATTEMPTS} attempts (network unreachable). Check the node/connection."
+        );
+        return;
+    }
     let Ok(res) = serde_json::from_str::<JV>(&body) else {
         println!("Error: invalid JSON from {urlapi_success}");
         return;

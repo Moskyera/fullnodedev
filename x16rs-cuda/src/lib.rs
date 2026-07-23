@@ -160,7 +160,12 @@ mod driver {
     unsafe extern "C" {
         fn cudaGetDeviceCount(count: *mut i32) -> CudaError_t;
         fn cudaSetDevice(device: i32) -> CudaError_t;
-        fn cudaGetDeviceProperties(prop: *mut CudaDeviceProp, device: i32) -> CudaError_t;
+        // Layout-independent device queries. Reading fields out of cudaDeviceProp
+        // via a hardcoded byte pad is fragile: the offset of major/minor/MP shifts
+        // across CUDA versions and alignment, yielding bogus values. These two
+        // stable APIs return exactly what we need without any struct layout.
+        fn cudaDeviceGetName(name: *mut i8, len: i32, device: i32) -> CudaError_t;
+        fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> CudaError_t;
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError_t;
         fn cudaFree(ptr: *mut c_void) -> CudaError_t;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32)
@@ -244,14 +249,10 @@ mod driver {
     const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
     const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
-    #[repr(C)]
-    struct CudaDeviceProp {
-        name: [i8; 256],
-        _pad: [u8; 1024],
-        major: i32,
-        minor: i32,
-        multiProcessorCount: i32,
-    }
+    // Stable cudaDeviceAttr enum values (CUDA runtime API).
+    const CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
+    const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+    const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
     unsafe extern "C" {
         fn x16rs_cuda_main(
@@ -288,23 +289,31 @@ mod driver {
         check(unsafe { cudaGetDeviceCount(&mut count) })?;
         let mut out = Vec::new();
         for idx in 0..count {
-            let mut prop = CudaDeviceProp {
-                name: [0; 256],
-                _pad: [0; 1024],
-                major: 0,
-                minor: 0,
-                multiProcessorCount: 0,
-            };
-            check(unsafe { cudaGetDeviceProperties(&mut prop, idx) })?;
-            let name = unsafe { CStr::from_ptr(prop.name.as_ptr()) }
+            let mut name_buf = [0i8; 256];
+            check(unsafe {
+                cudaDeviceGetName(name_buf.as_mut_ptr(), name_buf.len() as i32, idx)
+            })?;
+            let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
+            let mut major = 0i32;
+            let mut minor = 0i32;
+            let mut mp = 0i32;
+            check(unsafe {
+                cudaDeviceGetAttribute(&mut major, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR, idx)
+            })?;
+            check(unsafe {
+                cudaDeviceGetAttribute(&mut minor, CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR, idx)
+            })?;
+            check(unsafe {
+                cudaDeviceGetAttribute(&mut mp, CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT, idx)
+            })?;
             out.push(CudaDeviceInfo {
                 index: idx,
                 name,
-                compute_major: prop.major,
-                compute_minor: prop.minor,
-                multiprocessor_count: prop.multiProcessorCount,
+                compute_major: major,
+                compute_minor: minor,
+                multiprocessor_count: mp,
             });
         }
         Ok(out)

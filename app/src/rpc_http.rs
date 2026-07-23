@@ -77,8 +77,22 @@ fn read_limited<R: Read>(reader: R, declared_length: Option<u64>) -> Result<Stri
 }
 
 pub fn read_body_limited(resp: Response) -> Result<String, String> {
+    let status = resp.status();
     let declared_length = resp.content_length();
-    read_limited(resp, declared_length)
+    let body = read_limited(resp, declared_length)?;
+    // reqwest returns Ok for ANY HTTP status. A 5xx (or 408/429) is a transient
+    // server/proxy failure, NOT an application reply — surface it as an error so
+    // callers retry (e.g. a winning block submit) instead of mistaking a 502
+    // error page for a response and dropping the block. Deterministic 4xx replies
+    // are passed through so the caller can read the node's error body.
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("upstream HTTP {status}: {snippet}"));
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

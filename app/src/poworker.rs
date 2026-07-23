@@ -177,7 +177,7 @@ pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
         if cnf.runtime.paused_unprofitable.load(Relaxed) {
             delay_continue_ms!(3000);
         }
-        pull_pending_block_stuff(&cnf);
+        pull_pending_block_stuff(&cnf, &stop_flag);
         delay_continue_ms!(25);
     }
 }
@@ -188,7 +188,12 @@ fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
 
 ///////////////////////////////
 
-fn pull_pending_block_stuff(cnf: &PoWorkConf) {
+/// Hex of the last block_intro we installed, so a same-height reorg (the tip
+/// block replaced at the same height) is detected and picked up, not ignored.
+static LAST_PENDING_INTRO: LazyLock<std::sync::Mutex<String>> =
+    LazyLock::new(|| std::sync::Mutex::new(String::new()));
+
+fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>>) {
     let curr_hei = block_mining_runtime::current_mining_height();
 
     // query pending
@@ -224,9 +229,21 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
         delay_return!(15);
     };
     let pending_height = jnum("height");
+    let new_intro = res["block_intro"].as_str().unwrap_or("").to_string();
 
-    // set pending block stuff
-    if pending_height > curr_hei {
+    // Install on a height advance, OR a same-height reorg: if the node returns a
+    // different block_intro at the SAME height, the tip was replaced and the old
+    // template is now orphaned, so refresh instead of grinding dead work.
+    let intro_changed = {
+        let mut g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
+        if *g != new_intro {
+            *g = new_intro.clone();
+            true
+        } else {
+            false
+        }
+    };
+    if pending_height > curr_hei || (pending_height == curr_hei && intro_changed) {
         if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
             println!("Error: invalid block data from {urlapi_pending}: {e}");
             delay_return!(10);
@@ -239,6 +256,11 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
     // with notice
     let mut rpid = vec![0].repeat(16);
     loop {
+        // Exit promptly on shutdown instead of blocking up to the long-poll
+        // timeout (~300s) inside the notice request below.
+        if should_stop(stop_flag) {
+            return;
+        }
         if let Err(e) = getrandom::fill(&mut rpid) {
             println!("Error: cannot generate request id: {e}");
             delay_return!(1);
@@ -306,19 +328,37 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
             Ok(body) => {
                 let parsed = serde_json::from_str::<JV>(&body).ok();
                 let ret = parsed.as_ref().and_then(|j| j["ret"].as_i64());
-                last = body;
-                if ret == Some(0) {
-                    accepted = true;
-                } else if ret.is_some() {
-                    // Deterministic node rejection (stale height, invalid, etc.):
-                    // retrying will not help, so stop and report it honestly.
-                    let err = parsed
-                        .as_ref()
-                        .and_then(|j| j["err"].as_str())
-                        .unwrap_or("");
-                    println!("[submit] node rejected height {}: {}", success.height, err);
+                last = body.clone();
+                match ret {
+                    Some(0) => {
+                        accepted = true;
+                        break;
+                    }
+                    Some(_) => {
+                        // Deterministic node rejection (stale height, invalid,
+                        // etc.): retrying will not help, so stop and report it.
+                        let err = parsed
+                            .as_ref()
+                            .and_then(|j| j["err"].as_str())
+                            .unwrap_or("");
+                        println!("[submit] node rejected height {}: {}", success.height, err);
+                        break;
+                    }
+                    None => {
+                        // HTTP 200 but no parseable `ret` (proxy/load-balancer error
+                        // page, truncated or non-JSON body). This is NOT a node
+                        // decision — treat it as transient and retry, so a winning
+                        // block is not discarded on a front-end hiccup.
+                        let snippet: String = body.chars().take(120).collect();
+                        println!(
+                            "[submit] attempt {}/{} unrecognized response, retrying: {}",
+                            attempt, MAX_SUBMIT_ATTEMPTS, snippet
+                        );
+                        if attempt < MAX_SUBMIT_ATTEMPTS {
+                            std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
+                        }
+                    }
                 }
-                break;
             }
             Err(e) => {
                 last = format!("transport error: {e}");

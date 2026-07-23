@@ -50,12 +50,26 @@ pub async fn serve(
         .map_err(|e| e.to_string())
 }
 
+/// Constant-time compare so a timing side-channel cannot leak the token byte by
+/// byte. (Length is not treated as secret.)
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn auth_ok(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
     if state.pool_token.is_empty() {
         return true;
     }
     if let Some(v) = headers.get("x-api-token").and_then(|v| v.to_str().ok()) {
-        if v.trim() == state.pool_token {
+        if ct_eq(v.trim(), &state.pool_token) {
             return true;
         }
     }
@@ -68,12 +82,14 @@ fn auth_ok(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String
             .or_else(|| v.strip_prefix("bearer "))
             .unwrap_or(v)
             .trim();
-        if t == state.pool_token {
+        if ct_eq(t, &state.pool_token) {
             return true;
         }
     }
-    if query.get("api_token").map(|s| s.as_str()) == Some(state.pool_token.as_str()) {
-        return true;
+    if let Some(v) = query.get("api_token") {
+        if ct_eq(v, &state.pool_token) {
+            return true;
+        }
     }
     false
 }
@@ -160,11 +176,14 @@ async fn submit(
         .await
     {
         Ok(body) => {
-            // Pass through upstream JSON if possible
+            // Pass through upstream JSON if possible. A non-JSON body is an
+            // unexpected/error response (HTML error page, proxy notice, truncated
+            // reply), so it must NOT be reported as success (ret:0) to the miner:
+            // treat it as a failure so the miner does not count a lost block as won.
             if let Ok(v) = serde_json::from_str::<JV>(&body) {
                 (StatusCode::OK, Json(v))
             } else {
-                (StatusCode::OK, Json(json!({"ret": 0, "msg": body})))
+                (StatusCode::OK, Json(json!({"ret": 1, "msg": body})))
             }
         }
         Err(e) => (

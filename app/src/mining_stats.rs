@@ -229,8 +229,23 @@ pub fn write_mining_stats(path: &str, stats: &MiningStatsSnapshot) {
     if path.is_empty() {
         return;
     }
-    if let Ok(json) = serde_json::to_vec_pretty(stats) {
-        let _ = atomic_write_private(Path::new(path), &json);
+    // This runs on every stats update, so surface failures WITHOUT spamming: log
+    // the first error of a failing streak and stay quiet until it recovers. A
+    // silently unwritten stats file is why a panel would show a frozen miner.
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let result = serde_json::to_vec_pretty(stats)
+        .map_err(|e| format!("serialize: {e}"))
+        .and_then(|json| {
+            atomic_write_private(Path::new(path), &json).map_err(|e| format!("write {path}: {e}"))
+        });
+    match result {
+        Ok(()) => WARNED.store(false, Relaxed),
+        Err(e) => {
+            if !WARNED.swap(true, Relaxed) {
+                eprintln!("[stats] cannot update stats file ({e}); suppressing until it recovers");
+            }
+        }
     }
 }
 

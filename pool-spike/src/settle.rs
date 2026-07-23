@@ -22,9 +22,22 @@ fn main() {
         .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
     let base = base.trim_end_matches('/').to_string();
 
+    // This is a LOCAL TESTNET demo: it spends from and pays to well-known
+    // deterministic accounts ([1..4;32]) whose private keys are public. It must
+    // NEVER be pointed at mainnet or any chain holding real value. Require an
+    // explicit `testnet` confirmation so it cannot be run against real money by
+    // accident.
+    if env::args().nth(2).as_deref() != Some("testnet") {
+        eprintln!(
+            "settle-spike is a TESTNET-ONLY demo that uses well-known public keys ([1..4;32]).\n\
+             It must never touch mainnet. Re-run as:  settle-spike <node_base_url> testnet"
+        );
+        std::process::exit(2);
+    }
+
     let client = http_client();
 
-    // Deterministic accounts we control.
+    // Deterministic accounts we control (public keys — testnet demo only).
     let sender = Account::create_by_secret_key_value([1u8; 32]).expect("sender account");
     let recipients: Vec<(Account, &str)> = vec![
         (Account::create_by_secret_key_value([2u8; 32]).unwrap(), "2:247"), // 0.2 HAC

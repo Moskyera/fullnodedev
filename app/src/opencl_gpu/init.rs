@@ -232,7 +232,9 @@ pub fn initialize_opencl(
                 wg = clamped;
             }
         }
-        let num_work_items = wg * localsize;
+        // Saturate rather than overflow: a large configured work_groups * localsize
+        // could wrap a u32, producing a tiny/zero global size and silent misconfig.
+        let num_work_items = wg.saturating_mul(*localsize);
         let global_work_size = num_work_items;
 
         println!("-----------------------------------------");

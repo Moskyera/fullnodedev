@@ -17,7 +17,14 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn new(host_port: String, token: String, hub: Arc<JobHub>) -> Self {
-        let base = host_port.trim().trim_start_matches("http://").to_string();
+        // Accept http:// or https:// prefixes and a trailing slash; we rebuild the
+        // URL as http://{base}/... so a bare host:port is what we keep.
+        let base = host_port
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
         Self {
             base,
             token: token.trim().to_string(),
@@ -58,6 +65,15 @@ impl Upstream {
         block_nonce: &str,
         coinbase_nonce: &str,
     ) -> Result<String, String> {
+        // These come from an untrusted stratum client and are interpolated into
+        // the upstream query string. A valid nonce is hex; rejecting anything else
+        // both preserves correctness and closes a query-injection vector (a `&` or
+        // space could otherwise inject/alter upstream query parameters).
+        if !is_hex_nonce(block_nonce) || !is_hex_nonce(coinbase_nonce) {
+            return Err(format!(
+                "invalid nonce (hex only): block_nonce={block_nonce:?} coinbase_nonce={coinbase_nonce:?}"
+            ));
+        }
         let url = format!(
             "http://{}/submit/miner/success?height={height}&block_nonce={block_nonce}&coinbase_nonce={coinbase_nonce}&t={}",
             self.base,
@@ -99,6 +115,12 @@ impl Upstream {
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
     }
+}
+
+/// A valid PoW nonce is a non-empty, reasonably short hex string. Used to reject
+/// injection attempts before interpolating into the upstream URL.
+fn is_hex_nonce(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn now_ms() -> u128 {

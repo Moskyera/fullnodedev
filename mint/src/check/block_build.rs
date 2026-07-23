@@ -149,8 +149,9 @@ fn append_valid_tx_pick_from_txpool(
         };
     }
 
-    // pick one diamond mint tx
-    if true { // TESTNET: was pending_hei % 5 == 0
+    // pick one diamond mint tx, only in a block whose height is divisible by 5
+    // (the consensus rule diamond mints are validated against).
+    if pending_hei % 5 == 0 {
         let mut pick_dmint = |a: &TxPkg| {
             let txsz = a.data().len();
             if txsz + *txallsz > txmaxsz {

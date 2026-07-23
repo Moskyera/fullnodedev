@@ -14,7 +14,7 @@ use crate::opencl_gpu::OpenclGpuHandle;
 #[cfg(feature = "ocl")]
 use crate::opencl_gpu::block::do_group_block_mining_opencl;
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 const GPU_ERROR_CPU_RECOVERY_NONCES: u32 = 100_000;
 
 /// Inputs for one block-mining batch across CPU / CUDA / OpenCL backends.
@@ -176,7 +176,7 @@ pub fn cpu_batch_fallback(
 }
 
 /// Recover a bounded prefix after an OpenCL failure and skip the rest of the failed window.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn cpu_gpu_error_recovery(
     height: u64,
     block_intro: Vec<u8>,
@@ -338,7 +338,15 @@ impl BlockMinerBackend for CudaBlockBackend {
         ctx: &BatchCtx,
         cpu_mine: &dyn Fn(u64, Vec<u8>, u32, u32) -> (u32, [u8; 32]),
     ) -> BatchResult {
-        let wg_cap = self.cuda.workgroups.min(self.configured_wg);
+        // Honor the OOM/error backoff AND the thermal governor's graded cap, so a
+        // hot or memory-pressured NVIDIA card steps down smoothly instead of
+        // running full tilt until the hard thermal pause.
+        let wg_cap = self
+            .cuda
+            .effective_wg()
+            .min(self.configured_wg)
+            .min(ctx.thermal_wg_cap.unwrap_or(u32::MAX))
+            .max(1);
         let localsize = x16rs_cuda::DEFAULT_LOCAL_SIZE;
         let Some(plan) = plan_gpu_batch(ctx.nonce_space, wg_cap, localsize, self.cuda.unit_size)
         else {
@@ -361,7 +369,13 @@ impl BlockMinerBackend for CudaBlockBackend {
             Err(e) => {
                 eprintln!("[CUDA] batch failed: {e}");
                 self.runtime.record_gpu_error_event();
-                cpu_batch_fallback(
+                // Back off the effective work-groups so the next batch tries a
+                // smaller, likely-runnable size instead of failing forever.
+                let reduced = self.cuda.record_error();
+                eprintln!("[CUDA] reducing work_groups to {reduced} after error");
+                // Cap CPU recovery like the OpenCL path so a CUDA error cannot
+                // make one CPU thread grind the whole GPU-sized nonce window.
+                cpu_gpu_error_recovery(
                     ctx.height,
                     ctx.block_intro.clone(),
                     ctx.nonce_start,
@@ -369,15 +383,39 @@ impl BlockMinerBackend for CudaBlockBackend {
                     cpu_mine,
                 )
             }
-            Ok(best) => finish_gpu_batch(
-                ctx.height,
-                ctx.block_intro.clone(),
-                ctx.nonce_start,
-                ctx.nonce_space,
-                best,
-                plan.gpu_nonce_space,
-                cpu_mine,
-            ),
+            Ok(best) => {
+                // Re-verify the GPU's best hash on the CPU, like OpenCL, so a
+                // faulty card cannot make us submit a wrong solution.
+                if let Err(message) = verify_gpu_best_result(
+                    ctx.height,
+                    &ctx.block_intro,
+                    ctx.nonce_start,
+                    plan.gpu_nonce_space,
+                    &best,
+                ) {
+                    eprintln!("[CUDA] GPU integrity error: {message}");
+                    self.runtime.record_gpu_error_event();
+                    self.cuda.record_error();
+                    return cpu_gpu_error_recovery(
+                        ctx.height,
+                        ctx.block_intro.clone(),
+                        ctx.nonce_start,
+                        ctx.nonce_space,
+                        cpu_mine,
+                    );
+                }
+                // Clean batch: ramp effective work-groups back toward the max.
+                self.cuda.record_success();
+                finish_gpu_batch(
+                    ctx.height,
+                    ctx.block_intro.clone(),
+                    ctx.nonce_start,
+                    ctx.nonce_space,
+                    best,
+                    plan.gpu_nonce_space,
+                    cpu_mine,
+                )
+            }
         }
     }
 }

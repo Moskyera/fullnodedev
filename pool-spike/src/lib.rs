@@ -70,6 +70,35 @@ pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> St
     find_str(&j, "hacash").unwrap_or_default()
 }
 
+/// A node "mantissa:unit" balance expressed in whole units of 0.1 HAC (unit 247).
+///
+/// Hacash stores amounts normalized (trailing zeros stripped, unit raised), so a
+/// balance like 4.9 HAC comes back as "49:246", not "490:247". FLOOR to 0.1-HAC
+/// granularity, keeping the whole part, rather than discarding a balance just
+/// because it is finer than 0.1 HAC. Shared by the pool server and the payout
+/// tool so both value a balance identically.
+pub fn balance_units(bal: &str) -> u64 {
+    let Some((m, u)) = bal.split_once(':') else {
+        return 0;
+    };
+    let (Ok(m), Ok(u)) = (m.trim().parse::<u64>(), u.trim().parse::<i64>()) else {
+        return 0;
+    };
+    if u >= 247 {
+        let exp = (u - 247) as u32;
+        if exp > 18 {
+            return u64::MAX;
+        }
+        m.saturating_mul(10u64.pow(exp))
+    } else {
+        let exp = (247 - u) as u32;
+        if exp > 18 {
+            return 0;
+        }
+        m / 10u64.pow(exp)
+    }
+}
+
 /// Is this string a payable Hacash address (normal single-key PRIVAKEY)?
 /// Workers announce one as `&worker=<address>`; the pool then uses the address
 /// itself as the share-accounting key, so payouts need no name->address map.
@@ -117,8 +146,10 @@ pub fn load_or_create_wallet(path: &str) -> Account {
     }
 }
 
-/// Write the private key owner-only (0600 on Unix) via a temp file + atomic
-/// rename, so a concurrent reader never sees an empty or half-written key file.
+/// Write the private key owner-only via a temp file + atomic rename, so a
+/// concurrent reader never sees an empty or half-written key file. This file
+/// controls ALL pool funds, so it is restricted to the owner on BOTH platforms:
+/// 0600 on Unix, and an owner-only ACL (inheritance stripped) on Windows.
 fn write_key_file(path: &str, key_hex: &str) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = format!("{path}.tmp.{}", std::process::id());
@@ -134,7 +165,47 @@ fn write_key_file(path: &str, key_hex: &str) -> std::io::Result<()> {
         writeln!(f, "{key_hex}")?;
         let _ = f.sync_all();
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    restrict_key_file_permissions(path);
+    Ok(())
+}
+
+/// Lock the wallet key down to the current user only. On Windows the default ACL
+/// is inherited and readable by other local accounts; without this the plaintext
+/// key controlling the pool balance is exposed to any local user or process.
+fn restrict_key_file_permissions(path: &str) {
+    #[cfg(windows)]
+    {
+        // Best-effort: remove inherited ACEs and grant only the current user
+        // Full control. icacls ships with every supported Windows version.
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.arg(path).arg("/inheritance:r");
+        if !user.is_empty() {
+            cmd.arg("/grant:r").arg(format!("{user}:F"));
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "[wallet] WARNING: could not restrict {path} ACL (icacls: {}). \
+                 Other local users may be able to read the pool key — secure it manually.",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!(
+                "[wallet] WARNING: could not run icacls to restrict {path} ({e}). \
+                 Secure the pool key file manually.",
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        eprintln!("[wallet] WARNING: cannot restrict {path} permissions on this platform.");
+    }
+    #[cfg(unix)]
+    {
+        let _ = path; // already created with 0600 above
+    }
 }
 
 /// Everything the pool needs to build and verify blocks for the current tip.

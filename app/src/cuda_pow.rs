@@ -4,6 +4,45 @@ pub struct CudaMiningResources {
     pub miner: CudaMiner,
     pub workgroups: u32,
     pub unit_size: u32,
+    /// Effective work-groups after OOM/error backoff. Starts at `workgroups` and
+    /// is halved on a batch error, ramped back up on success — mirroring the
+    /// OpenCL GpuOomState so a CUDA card that fails at its configured size adapts
+    /// down to one that runs instead of failing every batch forever.
+    pub eff_wg: std::sync::atomic::AtomicU32,
+    /// Never back off below this many work-groups.
+    pub floor_wg: u32,
+}
+
+impl CudaMiningResources {
+    /// Current effective work-groups, clamped to [floor, configured].
+    pub fn effective_wg(&self) -> u32 {
+        let max = self.workgroups.max(1);
+        let floor = self.floor_wg.max(1).min(max);
+        self.eff_wg
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(floor, max)
+    }
+
+    /// Halve the effective work-groups toward the floor after a batch error/OOM.
+    pub fn record_error(&self) -> u32 {
+        let floor = self.floor_wg.max(1);
+        let cur = self.eff_wg.load(std::sync::atomic::Ordering::Relaxed);
+        let next = (cur / 2).max(floor);
+        self.eff_wg
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+        next
+    }
+
+    /// Ramp the effective work-groups back up toward the configured maximum after
+    /// a clean batch, so throughput recovers once memory pressure clears.
+    pub fn record_success(&self) {
+        let cur = self.eff_wg.load(std::sync::atomic::Ordering::Relaxed);
+        if cur < self.workgroups {
+            let next = cur.saturating_add((cur / 4).max(1)).min(self.workgroups);
+            self.eff_wg
+                .store(next, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 pub fn initialize_cuda(
@@ -42,6 +81,8 @@ pub fn initialize_cuda(
                 miner,
                 workgroups,
                 unit_size,
+                eff_wg: std::sync::atomic::AtomicU32::new(workgroups),
+                floor_wg: (workgroups / 16).max(1),
             })]
         }
         Err(e) => {

@@ -11,7 +11,7 @@ use crate::opencl_gpu::{
     OpenCLResources, enqueue_diamond_kernel, read_diamond_gpu_results, write_stuff_to_gpu,
 };
 
-use super::{DiamondMiningResult, HASH_WIDTH, check_diamer_success};
+use super::{DIAMOND_HASH_LEN, DiamondMiningResult, HASH_WIDTH, check_diamer_success};
 
 pub(crate) fn do_diamond_group_mining_opencl(
     opencl: &OpenCLResources,
@@ -38,7 +38,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
         nonce_space,
         u64_nonce: 0,
         msg_nonce: custom_nonce.to_vec(),
-        dia_str: [b'W'; 10],
+        dia_str: [b'W'; DIAMOND_HASH_LEN],
         is_success: None,
         use_secs: 0.0,
         is_gpu: true,
@@ -90,11 +90,16 @@ pub(crate) fn do_diamond_group_mining_opencl(
         let hash_bytes = &hashes[i * 32..(i * 32) + 32].try_into().unwrap();
         let dia_str = diamond_hash(hash_bytes);
         let nonce_bytes = nonces[i].to_be_bytes();
+        // Re-hash with the SAME custom-message bytes the GPU kernel was fed:
+        // `custom_nonce` is gated by number (empty at or below the custom-message
+        // threshold, matching node consensus). Using the raw `custom_message` here
+        // would make the verification hash disagree with the GPU result and reject
+        // otherwise-valid low-number diamonds.
         let stuff = [
             prevblockhash.as_slice(),
             nonce_bytes.as_slice(),
             address.as_slice(),
-            custom_message.as_ref(),
+            custom_nonce,
         ]
         .concat();
         let ssshash: [u8; 32] = calculate_hash(stuff);

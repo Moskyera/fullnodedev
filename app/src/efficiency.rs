@@ -109,10 +109,15 @@ impl EfficiencyConf {
             return 0;
         }
         let mut sv = configured.max(1);
-        if self.supervene_max > 0 {
-            sv = sv.min(self.supervene_max);
-        }
-        sv.max(self.supervene_min)
+        let hi = if self.supervene_max > 0 {
+            self.supervene_max
+        } else {
+            u32::MAX
+        };
+        sv = sv.min(hi);
+        // Apply the floor, but never let a misconfigured min exceed the max: a
+        // `supervene_min > supervene_max` must not spawn more threads than the cap.
+        sv.max(self.supervene_min.min(hi))
     }
 
     pub fn spawn_supervene(&self, configured: u32) -> u32 {

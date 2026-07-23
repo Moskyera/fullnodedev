@@ -73,7 +73,10 @@ debug = false       # for RUST_BACKTRACE=1
 opt-level = 3       # Optimize for size.
 lto = true          # Enable Link Time Optimization
 codegen-units = 1   # Reduce number of codegen units to increase optimizations.
-panic = 'abort'     # Abort on panic
+panic = 'unwind'    # Unwind (not abort): a panic in one request/mining thread must
+                    # become an error/skip, not kill the whole 24/7 pool or miner.
+                    # Handlers wrap panic-prone work in catch_unwind; abort would
+                    # make that impossible and turn any panic into full downtime.
 strip = true        # Strip symbols from binary
 
 [profile.wasm-release]

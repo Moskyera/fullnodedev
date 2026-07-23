@@ -102,9 +102,21 @@ impl MiningRuntimeState {
     }
 
     fn store_workgroup_stat(target: &AtomicU32, value: u32) {
-        if value > 0 {
-            target.store(value, Relaxed);
+        if value == 0 {
+            return;
         }
+        // These are the MINIMUM (worst-case) work_groups reached, aggregated across
+        // every GPU. A plain store would overwrite with whichever device reported
+        // last, hiding a more constrained device; keep the smallest non-zero value
+        // seen instead. The live/current value is tracked separately in
+        // `reported_effective_wg`.
+        let _ = target.fetch_update(Relaxed, Relaxed, |cur| {
+            if cur == 0 || value < cur {
+                Some(value)
+            } else {
+                None
+            }
+        });
     }
 
     /// Report per-GPU OOM work_groups; aggregates latest across devices for panel stats.
@@ -338,6 +350,11 @@ fn hottest_sensor_reading(sensors: &[crate::efficiency::GpuTempSensorBackend]) -
     hottest
 }
 
+/// How many times to retry spawning the thermal monitor thread before giving up
+/// and fail-closing. A working sensor is already detected by this point, so a
+/// spawn failure is a transient OS resource problem worth retrying.
+const THERMAL_SPAWN_ATTEMPTS: u32 = 4;
+
 /// Start a vendor-specific cached GPU sensor monitor before mining workers run.
 pub fn start_thermal_monitor(
     runtime: &Arc<MiningRuntimeState>,
@@ -413,55 +430,80 @@ pub fn start_thermal_monitor(
         initial_hottest.unwrap_or(eff.max_temp_c as f32 + 5.0),
     );
 
-    let monitor_runtime = runtime.clone();
     let max_temp_c = eff.max_temp_c;
     let throttle_wg = eff.throttle_workgroups;
-    let monitor_guard = runtime.track_mining_thread();
-    let spawn_result = std::thread::Builder::new()
-        .name("hac-thermal-monitor".to_string())
-        .spawn(move || {
-            let _monitor_guard = monitor_guard;
-            let mut consecutive_misses = 0u32;
-            loop {
-                if wait_for_thermal_poll(&stop_flag) {
-                    return;
+    // Share the sensors across retry attempts without moving them into a spawn
+    // that might fail (which would consume them).
+    let sensors = std::sync::Arc::new(sensors);
+
+    let mut spawned = false;
+    for attempt in 1..=THERMAL_SPAWN_ATTEMPTS {
+        let monitor_runtime = runtime.clone();
+        let guard_runtime = runtime.clone();
+        let sensors = sensors.clone();
+        let stop_flag = stop_flag.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("hac-thermal-monitor".to_string())
+            .spawn(move || {
+                let _monitor_guard = guard_runtime.track_mining_thread();
+                let mut consecutive_misses = 0u32;
+                loop {
+                    if wait_for_thermal_poll(&stop_flag) {
+                        return;
+                    }
+                    match hottest_sensor_reading(&sensors) {
+                        Some(temp) => {
+                            if consecutive_misses > 0 {
+                                println!(
+                                    "[Thermal] Sensor recovered after {} missed sample(s)",
+                                    consecutive_misses
+                                );
+                            }
+                            consecutive_misses = 0;
+                            monitor_runtime.observe_thermal_temperature(
+                                max_temp_c,
+                                throttle_wg,
+                                configured_wg,
+                                temp,
+                            );
+                        }
+                        None => {
+                            consecutive_misses = consecutive_misses.saturating_add(1);
+                            if consecutive_misses == 1 {
+                                eprintln!(
+                                    "[Thermal] Sensor read failed; preserving the current safety state"
+                                );
+                            }
+                            monitor_runtime.observe_thermal_sensor_miss(
+                                consecutive_misses,
+                                throttle_wg,
+                                configured_wg,
+                            );
+                        }
+                    }
                 }
-                match hottest_sensor_reading(&sensors) {
-                    Some(temp) => {
-                        if consecutive_misses > 0 {
-                            println!(
-                                "[Thermal] Sensor recovered after {} missed sample(s)",
-                                consecutive_misses
-                            );
-                        }
-                        consecutive_misses = 0;
-                        monitor_runtime.observe_thermal_temperature(
-                            max_temp_c,
-                            throttle_wg,
-                            configured_wg,
-                            temp,
-                        );
-                    }
-                    None => {
-                        consecutive_misses = consecutive_misses.saturating_add(1);
-                        if consecutive_misses == 1 {
-                            eprintln!(
-                                "[Thermal] Sensor read failed; preserving the current safety state"
-                            );
-                        }
-                        monitor_runtime.observe_thermal_sensor_miss(
-                            consecutive_misses,
-                            throttle_wg,
-                            configured_wg,
-                        );
-                    }
+            });
+        match spawn_result {
+            Ok(_) => {
+                spawned = true;
+                break;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Thermal] monitor spawn attempt {attempt}/{THERMAL_SPAWN_ATTEMPTS} failed: {error}"
+                );
+                if attempt < THERMAL_SPAWN_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(250u64 * attempt as u64));
                 }
             }
-        });
-    if let Err(error) = spawn_result {
+        }
+    }
+    // Only fail-close (pause all mining) after exhausting retries — a single
+    // transient spawn failure must not permanently halt a working miner.
+    if !spawned {
         runtime.fail_closed_thermal(
             configured_wg,
-            &format!("cannot start thermal monitor thread: {error}"),
+            "cannot start thermal monitor thread after all retries",
         );
     }
 }

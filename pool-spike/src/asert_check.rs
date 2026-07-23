@@ -18,7 +18,8 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let node = node.trim_end_matches('/').to_string();
-    let count: u64 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    // Clamp to >=1: `count - 1` below would otherwise underflow at count==0.
+    let count: u64 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(10).max(1);
     let chain = a.get(3).cloned().unwrap_or_else(|| "mainnet".to_string());
     let params = ChainParams::from_name(&chain);
 

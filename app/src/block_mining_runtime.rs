@@ -40,6 +40,10 @@ const TARGET_BLOCK_TIME: f64 = 300.0;
 const ONEDAY_BLOCK_NUM: f64 = 288.0;
 
 static MINING_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// Bumped every time the template actually changes, INCLUDING a same-height reorg
+/// (a new block replacing the tip at the same height). Workers watch this in
+/// addition to the height so they stop grinding an orphaned template promptly.
+static MINING_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 static MINING_BLOCK_STUFF: LazyLock<RwLock<Arc<BlockMiningStuff>>> =
     LazyLock::new(|| RwLock::default());
 
@@ -310,7 +314,12 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String
         .map_err(|e| format!("mining state lock poisoned: {e}"))?;
     *guard = new_stuff.into();
     MINING_BLOCK_HEIGHT.store(height, Relaxed);
+    MINING_BLOCK_EPOCH.fetch_add(1, Relaxed);
     Ok(())
+}
+
+pub(crate) fn current_mining_epoch() -> u64 {
+    MINING_BLOCK_EPOCH.load(Relaxed)
 }
 
 fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
@@ -410,9 +419,9 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
     }
 
     if backends.is_empty() {
-        if cnf.useopencl {
+        if cnf.useopencl || cnf.usecuda {
             eprintln!(
-                "[Fatal] OpenCL was requested but no usable GPU backend initialized; refusing silent CPU fallback."
+                "[Fatal] a GPU miner was requested but no usable GPU backend initialized; refusing silent CPU fallback (you would pay for GPU power while mining slowly on the CPU). Check the driver/CUDA runtime, or set the backend to CPU."
             );
             return backends;
         }
@@ -441,7 +450,18 @@ fn backend_nonce_space(_cnf: &PoWorkConf, backend: &MinerBackend) -> u32 {
         }
         #[cfg(feature = "cuda")]
         MinerBackend::Cuda(res) => {
-            let wg = res.workgroups.min(_cnf.workgroups);
+            // Match run_batch: the planned window must reflect the same effective
+            // work-groups (OOM/error backoff) and thermal cap the batch will use,
+            // otherwise the nonce accounting overstates what the GPU covered.
+            let thermal = _cnf
+                .runtime
+                .thermal_workgroups_cap()
+                .unwrap_or(u32::MAX);
+            let wg = res
+                .effective_wg()
+                .min(_cnf.workgroups)
+                .min(thermal)
+                .max(1);
             wg.saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
                 .saturating_mul(res.unit_size)
                 .max(1)
@@ -474,6 +494,7 @@ fn run_block_mining_item(
     }
 
     let mining_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
+    let mining_epoch = current_mining_epoch();
     if mining_hei == 0 {
         std::thread::sleep(Duration::from_millis(111));
         return;
@@ -521,6 +542,10 @@ fn run_block_mining_item(
         coinbase_tx.hash(),
         &stuff.mkrl_list,
     ));
+    // The header bytes are invariant across batches at this height (the kernel
+    // varies only the nonce field), so serialize ONCE and clone per batch instead
+    // of re-serializing every iteration.
+    let block_intro_bin = block_intro.serialize();
     loop {
         if super::should_stop(stop_flag) || _cnf.runtime.thermal_pause_active() {
             return;
@@ -536,11 +561,10 @@ fn run_block_mining_item(
         let remain = nonce_limit.saturating_sub(nonce_start);
         let current_nonce_space = nonce_space.min(remain).max(1);
         let ctn = Instant::now();
-        let block_intro_bin = block_intro.serialize();
 
         let batch_ctx = BatchCtx {
             height,
-            block_intro: block_intro_bin,
+            block_intro: block_intro_bin.clone(),
             nonce_start,
             nonce_space: current_nonce_space,
             configured_wg: _cnf.workgroups,
@@ -596,13 +620,27 @@ fn run_block_mining_item(
 
         nonce_space = next_nonce_space(current_nonce_space, use_secs, is_gpu_backend);
 
-        let Some(nst) = nonce_start.checked_add(current_nonce_space) else {
+        // Advance by the nonces actually mined, not the planned window. After a GPU
+        // error/OOM the bounded recovery only covers a prefix of the window, so
+        // skipping the whole planned span would leave large unmined nonce holes.
+        // Advancing by the covered count keeps coverage contiguous (the next batch
+        // re-tries the remainder). For a normal batch the covered count equals the
+        // planned window, so this is a no-op there.
+        let mined = gpu_ns.saturating_add(cpu_ns);
+        let advance = if mined > 0 {
+            mined.min(current_nonce_space)
+        } else {
+            current_nonce_space
+        };
+        let Some(nst) = nonce_start.checked_add(advance) else {
             return;
         };
         nonce_start = nst;
 
         let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-        if check_hei > mining_hei {
+        // Roll over on a height advance OR a same-height reorg (epoch bump): both
+        // mean the template we are grinding is no longer the one to mine.
+        if check_hei > mining_hei || current_mining_epoch() != mining_epoch {
             return;
         }
     }
@@ -643,6 +681,11 @@ fn deal_block_mining_results(
     let mut gpu_nonce_space = 0u64;
     let mut cpu_nonce_space = 0u64;
     let mut recv_count = 0;
+    // Every result that independently meets its own PoW target is a real winning
+    // block (real money). Draining keeps only the single strongest hash for stats,
+    // so collect the winners separately and keep the best one per height, otherwise
+    // a second valid block landing in the same drain window would be silently lost.
+    let mut winners: Vec<Arc<BlockMiningResult>> = Vec::new();
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_hei = res.height;
         total_nonce_space += res.nonce_space as u64;
@@ -657,6 +700,20 @@ fn deal_block_mining_results(
         rate_tracker.record_result(&res, now_ms);
         if hash_more_power(&res.result_hash, &most.result_hash) {
             most = res.clone();
+        }
+        // The node accepts a block whose hash <= target (equal-inclusive), so use
+        // the same equal-inclusive test here rather than the strict "more power"
+        // comparison, which would drop a hash landing exactly on target.
+        if !res.target_hash.is_empty() && !hash_more_power(&res.target_hash, &res.result_hash)
+        {
+            match winners.iter_mut().find(|w| w.height == res.height) {
+                Some(slot) => {
+                    if hash_more_power(&res.result_hash, &slot.result_hash) {
+                        *slot = res.clone();
+                    }
+                }
+                None => winners.push(res.clone()),
+            }
         }
         recv_count += 1;
         if recv_count >= vene as usize * 4 {
@@ -736,7 +793,14 @@ fn deal_block_mining_results(
         "",
         &cnf.efficiency.stats_file,
     );
-    if cnf.debug == 1 || hash_more_power(&most.result_hash, &most.target_hash) {
+    if !winners.is_empty() {
+        // Submit every distinct winning block (one per height); each is a payout we
+        // must not drop just because another result had a numerically stronger hash.
+        for w in &winners {
+            super::push_block_mining_success(cnf, w);
+        }
+    } else if cnf.debug == 1 {
+        // Debug mode exercises the submit path even without a genuine winner.
         super::push_block_mining_success(cnf, &most);
     }
     may_print_turn_to_nex_block_mining(deal_hei, Some(most_hash));
