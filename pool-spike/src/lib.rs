@@ -67,6 +67,15 @@ pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> St
     find_str(&j, "hacash").unwrap_or_default()
 }
 
+/// Is this string a payable Hacash address (normal single-key PRIVAKEY)?
+/// Workers announce one as `&worker=<address>`; the pool then uses the address
+/// itself as the share-accounting key, so payouts need no name->address map.
+pub fn is_payout_address(s: &str) -> bool {
+    Address::from_readable(s)
+        .map(|a| a.is_privakey())
+        .unwrap_or(false)
+}
+
 /// Load the pool wallet from `path` (a file holding a 64-hex secp256k1 private
 /// key), creating a fresh random one if the file does not exist. The private key
 /// only ever lives in that file — it is never printed or logged; only the

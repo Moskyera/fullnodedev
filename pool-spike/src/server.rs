@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use pool_spike::pool_core::{self, Pplns};
 use pool_spike::{
     Template, assemble_block, coinbase_body_hex, coinbase_with_extranonce, fetch_template,
-    http_client, intro_bytes, load_or_create_wallet, submit_block_bytes,
+    http_client, intro_bytes, is_payout_address, load_or_create_wallet, submit_block_bytes,
 };
 
 use serde_json::json;
@@ -260,8 +260,16 @@ fn route(
             let Some(cn) = parse32(params.get("coinbase_nonce")) else {
                 return json!({"ret":1,"err":"bad coinbase_nonce"}).to_string();
             };
+            // Credit the announced payout address when the worker sends one
+            // (&worker=<addr>); otherwise fall back to the source IP, which the
+            // operator would have to map by hand at payout time.
+            let worker = params
+                .get("worker")
+                .filter(|w| is_payout_address(w))
+                .cloned()
+                .unwrap_or_else(|| peer.to_string());
             let mut p = pool.lock().unwrap();
-            let r = accept_share(&mut p, peer, height, cn, block_nonce);
+            let r = accept_share(&mut p, &worker, height, cn, block_nonce);
             let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             if ok {

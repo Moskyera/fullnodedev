@@ -33,6 +33,10 @@ pub struct PoWorkConf {
     pub rpcaddr: String,
     /// Optional fullnode API token (`X-Api-Token`) when server requires auth.
     pub api_token: String,
+    /// Optional payout address announced to a POOL as `&worker=<address>` so it
+    /// can credit this miner's shares. Empty (default) = solo mining: the URLs
+    /// stay byte-identical to what a plain fullnode expects.
+    pub pool_worker: String,
     pub supervene: u32, // cpu core (configured)
     pub noncemax: u32,
     pub noticewait: u64,   // new block notice wait
@@ -55,6 +59,16 @@ pub struct PoWorkConf {
 }
 
 impl PoWorkConf {
+    /// `&worker=<payout address>` suffix appended to pool requests so the pool
+    /// can credit shares to us. Empty string when solo mining.
+    pub fn worker_param(&self) -> String {
+        if self.pool_worker.is_empty() {
+            String::new()
+        } else {
+            format!("&worker={}", self.pool_worker)
+        }
+    }
+
     pub fn new(ini: &IniObj) -> PoWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let sec_gpu = &ini_section(ini, "gpu");
@@ -66,6 +80,7 @@ impl PoWorkConf {
         let cnf = PoWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
+            pool_worker: ini_must(sec, "pool_worker", "").trim().to_string(),
             supervene: configured_supervene,
             noncemax: ini_must_u64(sec, "nonce_max", u32::MAX as u64) as u32,
             noticewait: ini_must_u64(sec, "notice_wait", 45),
@@ -178,9 +193,10 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
 
     // query pending
     let urlapi_pending = format!(
-        "http://{}/query/miner/pending?stuff=true&t={}",
+        "http://{}/query/miner/pending?stuff=true&t={}{}",
         &cnf.rpcaddr,
-        sys::curtimes()
+        sys::curtimes(),
+        cnf.worker_param()
     );
     let jsdata =
         match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
@@ -270,12 +286,13 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
 
 fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::BlockMiningResult) {
     let urlapi_success = format!(
-        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}",
+        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
         &cnf.rpcaddr,
         success.height,
         success.head_nonce,
         success.coinbase_nonce.to_hex(),
-        sys::curtimes()
+        sys::curtimes(),
+        cnf.worker_param()
     );
     // Submitting the winning block is the entire payoff of solo mining, and the
     // result was already drained from the channel — so a single transient network

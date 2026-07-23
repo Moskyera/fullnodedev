@@ -15,19 +15,9 @@ use sys::*;
 
 use pool_spike::pool_core::split_payout;
 use pool_spike::{
-    balance, get_json, http_client, load_or_create_wallet, mine_and_submit_block, post_hex,
+    balance, get_json, http_client, is_payout_address, load_or_create_wallet,
+    mine_and_submit_block, post_hex,
 };
-
-/// Demo mapping worker name -> the account it gets paid into. A real pool takes
-/// this from the worker's registration instead.
-fn payout_account(worker: &str) -> Option<Account> {
-    let secret: [u8; 32] = match worker {
-        "alice" => [2u8; 32],
-        "bob" => [3u8; 32],
-        _ => return None,
-    };
-    Account::create_by_secret_key_value(secret).ok()
-}
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -85,20 +75,22 @@ fn main() {
     let main = Address::from(*pool_acc.address());
     let fee = Amount::from("1:246").expect("tx fee"); // 0.01 HAC
     let mut tx = TransactionType2::new_by(main, fee, curtimes());
-    let mut paid: Vec<(String, Account, u64)> = Vec::new();
+    // PPLNS keys ARE payout addresses when the worker announced one via
+    // &worker=<address>; anything else (an IP fallback) cannot be auto-paid.
+    let mut paid: Vec<(String, u64)> = Vec::new();
     for (worker, units) in &split {
-        let Some(acc) = payout_account(worker) else {
-            println!("  (skip {worker}: no payout address registered)");
+        if !is_payout_address(worker) {
+            println!("  (skip {worker}: no payout address announced by that worker)");
             continue;
-        };
-        let to = Address::from_readable(acc.readable()).expect("payout address");
+        }
+        let to = Address::from_readable(worker).expect("payout address");
         let amt = Amount::from(&format!("{units}:247")).expect("amount");
         let mut act = HacToTrs::new();
         act.to = AddrOrPtr::from_addr(to);
         act.hacash = amt;
         tx.push_action(Box::new(act)).expect("push action");
-        println!("  -> {worker} {} = {units}:247", acc.readable());
-        paid.push((worker.clone(), acc, *units));
+        println!("  -> {worker} = {units}:247");
+        paid.push((worker.clone(), *units));
     }
     if paid.is_empty() {
         println!("nothing payable");
@@ -106,8 +98,8 @@ fn main() {
     }
 
     println!("\nbefore:");
-    for (w, acc, _) in &paid {
-        println!("  {w} {} = {}", acc.readable(), balance(&client, &node, acc.readable()));
+    for (addr, _) in &paid {
+        println!("  {addr} = {}", balance(&client, &node, addr));
     }
 
     tx.fill_sign(&pool_acc).expect("fill_sign");
@@ -132,17 +124,16 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(700));
         if paid
             .iter()
-            .all(|(_, acc, _)| !balance(&client, &node, acc.readable()).starts_with("0:"))
+            .all(|(addr, _)| !balance(&client, &node, addr).starts_with("0:"))
         {
             break;
         }
     }
     println!("\nafter:");
-    for (w, acc, units) in &paid {
+    for (addr, units) in &paid {
         println!(
-            "  {w} {} = {}   (paid {units}:247)",
-            acc.readable(),
-            balance(&client, &node, acc.readable())
+            "  {addr} = {}   (paid {units}:247)",
+            balance(&client, &node, addr)
         );
     }
     println!("  pool wallet = {}", balance(&client, &node, pool_acc.readable()));
