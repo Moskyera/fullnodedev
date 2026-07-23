@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use pool_spike::pool_core::{self, Pplns};
 use pool_spike::{
-    Template, assemble_block, coinbase_with_extranonce, fetch_template, http_client, intro_bytes,
-    load_or_create_wallet, submit_block_bytes,
+    Template, assemble_block, coinbase_body_hex, coinbase_with_extranonce, fetch_template,
+    http_client, intro_bytes, load_or_create_wallet, submit_block_bytes,
 };
 
 use serde_json::json;
@@ -138,7 +138,12 @@ fn handle(mut s: TcpStream, pool: Arc<Mutex<Pool>>) {
         None => (target, String::new()),
     };
     let params = parse_query(&query);
-    let body = route(&path, &params, &pool);
+    // The standard miner API carries no worker id, so attribute by source IP.
+    let peer = s
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let body = route(&path, &params, &pool, &peer);
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -155,8 +160,119 @@ fn parse_query(q: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn route(path: &str, params: &HashMap<String, String>, pool: &Arc<Mutex<Pool>>) -> String {
+/// Validate one submitted solution, record it, and on a network-target hit
+/// assemble + submit the real block. Shared by our own protocol and the
+/// standard miner API.
+fn accept_share(
+    p: &mut Pool,
+    worker: &str,
+    height: u64,
+    coinbase_nonce: [u8; 32],
+    block_nonce: u32,
+) -> serde_json::Value {
+    if height != p.tpl.height {
+        return json!({"ok":false,"kind":"stale","height":p.tpl.height});
+    }
+    // Rebuild exactly what the worker hashed: coinbase carrying ITS miner_nonce,
+    // merkle root = coinbase hash (coinbase-only block), intro with its nonce.
+    let cb = coinbase_with_extranonce(&p.tpl, &coinbase_nonce);
+    let intro = intro_bytes(&p.tpl, &cb, block_nonce);
+    if !pool_core::meets_target(p.tpl.height, &intro, &p.share_target) {
+        return json!({"ok":false,"kind":"invalid","err":"above share target"});
+    }
+    p.pplns.record(worker);
+    p.accepted += 1;
+    if !pool_core::meets_target(p.tpl.height, &intro, &p.network_target) {
+        return json!({"ok":true,"kind":"share","accepted":p.accepted});
+    }
+    let blk = assemble_block(&p.tpl, &cb, block_nonce);
+    let submit = submit_block_bytes(&p.client, &p.node, &blk);
+    p.blocks += 1;
+    let solved = p.tpl.height;
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        p.refresh();
+        if p.tpl.height > solved {
+            break;
+        }
+    }
+    json!({"ok":true,"kind":"block","solved_height":solved,"submit":submit,
+           "next_height":p.tpl.height,"blocks":p.blocks})
+}
+
+fn parse32(s: Option<&String>) -> Option<[u8; 32]> {
+    let v = hex::decode(s?).ok()?;
+    if v.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    Some(out)
+}
+
+fn route(
+    path: &str,
+    params: &HashMap<String, String>,
+    pool: &Arc<Mutex<Pool>>,
+    peer: &str,
+) -> String {
     match path {
+        // ---- standard Hacash miner API: an UNMODIFIED poworker can mine here.
+        // The only difference from a real node is that target_hash carries the
+        // POOL's share target, so the worker submits shares, not just blocks.
+        "/query/miner/pending" => {
+            let p = pool.lock().unwrap();
+            let cb = coinbase_with_extranonce(&p.tpl, &[0u8; 32]);
+            let intro = intro_bytes(&p.tpl, &cb, 0);
+            json!({
+                "ret": 0,
+                "height": p.tpl.height,
+                "block_intro": hex::encode(intro),
+                "target_hash": hex::encode(p.share_target),
+                "coinbase_body": coinbase_body_hex(&cb),
+                "mkrl_modify_list": [],
+            })
+            .to_string()
+        }
+        "/query/miner/notice" => {
+            let want: u64 = params.get("height").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let wait: u64 = params
+                .get("wait")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(45)
+                .clamp(1, 300);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                // brief lock only — never hold it while sleeping
+                let h = pool.lock().unwrap().tpl.height;
+                if h > want || std::time::Instant::now() >= deadline {
+                    return json!({"ret":0,"height":h}).to_string();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+        "/submit/miner/success" => {
+            let height: u64 = params.get("height").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let block_nonce: u32 = params
+                .get("block_nonce")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let Some(cn) = parse32(params.get("coinbase_nonce")) else {
+                return json!({"ret":1,"err":"bad coinbase_nonce"}).to_string();
+            };
+            let mut p = pool.lock().unwrap();
+            let r = accept_share(&mut p, peer, height, cn, block_nonce);
+            let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if ok {
+                println!("[{peer}] {kind} at height {height}");
+                json!({"ret":0,"kind":kind}).to_string()
+            } else {
+                json!({"ret":1,"kind":kind,"err":r.get("err")}).to_string()
+            }
+        }
+
+        // ---- our own simple protocol (test-miner) ----
         "/work" => {
             let worker = params.get("worker").cloned().unwrap_or_else(|| "anon".into());
             let mut p = pool.lock().unwrap();
@@ -178,45 +294,10 @@ fn route(path: &str, params: &HashMap<String, String>, pool: &Arc<Mutex<Pool>>) 
             let height: u64 = params.get("height").and_then(|v| v.parse().ok()).unwrap_or(0);
             let nonce: u32 = params.get("nonce").and_then(|v| v.parse().ok()).unwrap_or(0);
             let mut p = pool.lock().unwrap();
-
-            if height != p.tpl.height {
-                return json!({"ok":false,"kind":"stale","height":p.tpl.height}).to_string();
-            }
             let Some(en) = p.workers.get(&worker).copied() else {
                 return json!({"ok":false,"kind":"invalid","err":"unknown worker"}).to_string();
             };
-
-            let cb = coinbase_with_extranonce(&p.tpl, &en);
-            let intro = intro_bytes(&p.tpl, &cb, nonce);
-            if !pool_core::meets_target(p.tpl.height, &intro, &p.share_target) {
-                return json!({"ok":false,"kind":"invalid","err":"above share target"}).to_string();
-            }
-
-            p.pplns.record(&worker);
-            p.accepted += 1;
-            let is_block = pool_core::meets_target(p.tpl.height, &intro, &p.network_target);
-            if !is_block {
-                return json!({"ok":true,"kind":"share","accepted":p.accepted}).to_string();
-            }
-
-            // Full network solution: assemble and submit the real block.
-            let blk = assemble_block(&p.tpl, &cb, nonce);
-            let submit = submit_block_bytes(&p.client, &p.node, &blk);
-            p.blocks += 1;
-            let solved = p.tpl.height;
-            // Move to the next template once the node has committed it.
-            for _ in 0..6 {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                p.refresh();
-                if p.tpl.height > solved {
-                    break;
-                }
-            }
-            json!({
-                "ok": true, "kind": "block", "solved_height": solved,
-                "submit": submit, "next_height": p.tpl.height, "blocks": p.blocks
-            })
-            .to_string()
+            accept_share(&mut p, &worker, height, en, nonce).to_string()
         }
         "/stats" => {
             let p = pool.lock().unwrap();

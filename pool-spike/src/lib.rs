@@ -174,6 +174,14 @@ pub fn intro_bytes(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -
     build_intro(tpl, cb, nonce).serialize()
 }
 
+/// Hex of the serialized coinbase tx — the `coinbase_body` a worker receives.
+/// Its optional `extend` block must be present or the worker's own
+/// `set_mining_nonce` becomes a silent no-op (all threads would then share one
+/// coinbase hash); `create_coinbase_tx` always emits it.
+pub fn coinbase_body_hex(cb: &mint::TransactionCoinbase) -> String {
+    hex::encode(cb.serialize())
+}
+
 /// Serialized full block for a winning (extranonce, nonce).
 pub fn assemble_block(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> Vec<u8> {
     let mut txs = DynVecTransaction::default();
