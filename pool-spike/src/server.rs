@@ -20,7 +20,7 @@
 //! Usage: pool-server [node] [wallet_file] [listen] [share_bits] [chain] [settle_secs]
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,48 +62,23 @@ struct Pool {
     seen: HashSet<(u64, [u8; 32], u32)>,
     /// Blocks we submitted, awaiting confirmation that they stuck.
     submitted: Vec<(u64, [u8; 32])>,
+    /// Accepted shares not yet flushed to disk (debounces state writes).
+    unsaved: u32,
+    /// The confirmed balance an unconfirmed payout was drawn from. While the
+    /// live balance is still at or above this, the payout has not landed yet, so
+    /// we must not settle again (which would double spend the same funds).
+    settle_pending_from: Option<u64>,
 }
 
 impl Pool {
-    fn refresh(&mut self) {
-        let before = self.tpl.height;
-        self.tpl = fetch_template(&self.client, &self.node, &self.payout, &self.params);
-        // Use the template's EXACT target, not u32_to_hash(difficulty).
-        self.network_target = self.tpl.target;
-        if self.tpl.height != before {
-            // A share is only valid against the template it was mined for.
-            self.seen.clear();
+    /// Flush accounting to disk at most every 16 shares. Block events call
+    /// save_state directly, so a crash loses at worst a handful of shares.
+    fn note_share_saved(&mut self) {
+        self.unsaved += 1;
+        if self.unsaved >= 16 {
+            self.save_state();
+            self.unsaved = 0;
         }
-        self.confirm_submitted();
-    }
-
-    /// Count a submitted block only once the chain still holds OUR hash at that
-    /// height. Anything else lost a reorg and must not be paid for.
-    fn confirm_submitted(&mut self) {
-        let tip = self.tpl.height.saturating_sub(1);
-        let mut pending = Vec::new();
-        for (h, ours) in std::mem::take(&mut self.submitted) {
-            if h > tip {
-                pending.push((h, ours));
-                continue;
-            }
-            let j = get_json(
-                &self.client,
-                &format!("{}/query/block/intro?height={h}", self.node),
-            );
-            match find_str(&j, "hash") {
-                Some(chain_hash) => {
-                    if chain_hash == hex::encode(ours) {
-                        self.blocks += 1;
-                    } else {
-                        self.orphaned += 1;
-                        println!("[reorg] our block {h} was orphaned (chain holds {chain_hash})");
-                    }
-                }
-                None => pending.push((h, ours)), // node has not stored it yet
-            }
-        }
-        self.submitted = pending;
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
@@ -175,7 +150,13 @@ fn target_leading_zero_bits(bits: u32) -> [u8; 32] {
     t
 }
 
-/// A "mantissa:unit" balance expressed in units of 0.1 HAC (unit 247).
+/// A node "mantissa:unit" balance expressed in units of 0.1 HAC (unit 247).
+///
+/// Hacash stores amounts normalized (trailing zeros stripped, unit raised), so a
+/// balance like 4.9 HAC comes back as "49:246", not "490:247". We must FLOOR to
+/// 0.1-HAC granularity, keeping the whole part, rather than discarding a balance
+/// just because it is finer than 0.1 HAC (that used to freeze all payouts once
+/// the wallet held any sub-0.1-HAC change).
 fn balance_units(bal: &str) -> u64 {
     let Some((m, u)) = bal.split_once(':') else {
         return 0;
@@ -183,14 +164,20 @@ fn balance_units(bal: &str) -> u64 {
     let (Ok(m), Ok(u)) = (m.trim().parse::<u64>(), u.trim().parse::<i64>()) else {
         return 0;
     };
-    if u < 247 {
-        return 0; // below our accounting granularity
+    if u >= 247 {
+        let exp = (u - 247) as u32;
+        if exp > 18 {
+            return u64::MAX;
+        }
+        m.saturating_mul(10u64.pow(exp))
+    } else {
+        // Finer than 0.1 HAC: floor to whole 0.1-HAC units, keeping the value.
+        let exp = (247 - u) as u32;
+        if exp > 18 {
+            return 0; // finer than 1 zhu is impossible; nothing to keep
+        }
+        m / 10u64.pow(exp)
     }
-    let exp = (u - 247) as u32;
-    if exp > 18 {
-        return u64::MAX;
-    }
-    m.saturating_mul(10u64.pow(exp))
 }
 
 fn main() {
@@ -219,7 +206,8 @@ fn main() {
     let payout = wallet.readable().to_string();
 
     let client = http_client();
-    let tpl = fetch_template(&client, &node, &payout, &params);
+    let tpl = fetch_template(&client, &node, &payout, &params)
+        .expect("could not fetch an initial template — is the node running and synced?");
     let network_target = tpl.target;
 
     println!("listen  = {listen}");
@@ -248,9 +236,68 @@ fn main() {
         orphaned: 0,
         seen: HashSet::new(),
         submitted: Vec::new(),
+        unsaved: 0,
+        settle_pending_from: None,
     };
     pool.load_state();
     let pool = Arc::new(Mutex::new(pool));
+
+    // Background: keep the template current with the chain tip and confirm our
+    // submitted blocks. All node HTTP happens OFF the pool lock, so miners are
+    // never stalled by it. This also advances work when the NETWORK finds a
+    // block, not only when we do.
+    {
+        let pool = pool.clone();
+        let (client, node, payout, params) = {
+            let p = pool.lock().unwrap();
+            (p.client.clone(), p.node.clone(), p.payout.clone(), p.params.clone())
+        };
+        std::thread::spawn(move || {
+            loop {
+                let fresh = fetch_template(&client, &node, &payout, &params);
+                let pending: Vec<(u64, [u8; 32])> = pool.lock().unwrap().submitted.clone();
+                let tip = fresh.as_ref().map(|t| t.height.saturating_sub(1));
+                let mut confirmed = Vec::new();
+                let mut orphaned = Vec::new();
+                for (h, ours) in &pending {
+                    if tip.map(|t| *h > t).unwrap_or(true) {
+                        continue; // not buried yet, or no tip this cycle
+                    }
+                    let j = get_json(&client, &format!("{node}/query/block/intro?height={h}"));
+                    match find_str(&j, "hash") {
+                        Some(chain_hash) if chain_hash == hex::encode(ours) => {
+                            confirmed.push((*h, *ours))
+                        }
+                        Some(chain_hash) => {
+                            orphaned.push((*h, *ours));
+                            println!("[reorg] our block {h} orphaned (chain holds {chain_hash})");
+                        }
+                        None => {} // node has not stored it yet; keep waiting
+                    }
+                }
+                {
+                    let mut p = pool.lock().unwrap();
+                    if let Some(t) = fresh {
+                        // Replace the template ONLY when the height advances. At
+                        // the same height the timestamp (and thus the ASERT
+                        // difficulty) is fixed, so keeping it valid keeps every
+                        // worker's in-flight share valid; recomputing it would
+                        // reject work the pool just handed out.
+                        if t.height != p.tpl.height {
+                            p.tpl = t;
+                            p.network_target = p.tpl.target;
+                            p.seen.clear();
+                        }
+                    }
+                    p.blocks += confirmed.len() as u64;
+                    p.orphaned += orphaned.len() as u64;
+                    p.submitted
+                        .retain(|e| !confirmed.contains(e) && !orphaned.contains(e));
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
 
     // Automatic settlement on a timer.
     {
@@ -259,7 +306,14 @@ fn main() {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(settle_secs));
-                settle_once(&p, &wf);
+                // One bad settle cycle (poisoned lock, wallet issue, future
+                // refactor) must never permanently kill payouts.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    settle_once(&p, &wf)
+                }));
+                if let Err(e) = r {
+                    eprintln!("[settle] cycle panicked, continuing: {e:?}");
+                }
             }
         });
     }
@@ -280,9 +334,9 @@ fn main() {
 /// Pay every miner their PPLNS share of the pool's spendable balance, in ONE
 /// signed transaction submitted to the node's mempool.
 fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
-    let (node, counts) = {
+    let (node, counts, pending_from) = {
         let p = pool.lock().unwrap();
-        (p.node.clone(), p.pplns.counts())
+        (p.node.clone(), p.pplns.counts(), p.settle_pending_from)
     };
     if counts.is_empty() {
         return;
@@ -291,6 +345,19 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     let client = http_client();
     let bal = balance(&client, &node, acc.readable());
     let units = balance_units(&bal);
+
+    // Idempotency: /query/balance is confirmed-only, so a payout still in the
+    // mempool leaves the balance unchanged. If the last payout has not yet
+    // drained the wallet (balance still at or above the level we paid from),
+    // skip, or we would sign a second payout of the same funds.
+    if let Some(from) = pending_from {
+        if units >= from {
+            return;
+        }
+        // The prior payout confirmed and drained the wallet; clear the marker.
+        pool.lock().unwrap().settle_pending_from = None;
+    }
+
     // Keep a reserve so the wallet can always pay tx fees.
     let reserve = 5u64; // 0.5 HAC
     if units <= reserve + 1 {
@@ -330,6 +397,11 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         &format!("{node}/submit/transaction?hexbody=true"),
         &body,
     );
+    // Mark the balance level this payout drew from, so we do not settle again
+    // until it confirms and the wallet actually drops below it.
+    if resp.contains("\"ret\":0") {
+        pool.lock().unwrap().settle_pending_from = Some(units);
+    }
     println!(
         "[settle] paid {} miner(s) from {} units -> {resp}",
         payable.len(),
@@ -337,56 +409,79 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     );
 }
 
-/// Validate one submitted solution, record it, and on a network-target hit
-/// assemble + submit the real block. Shared by both protocols.
-fn accept_share(
+enum Credit {
+    Reject(serde_json::Value),
+    Share(serde_json::Value),
+    /// A network-target solution: the full block bytes to submit (off-lock).
+    Block { block_bytes: Vec<u8>, solved: u64 },
+}
+
+/// The locked, NO-network-I/O part: validate a solution and credit it. On a
+/// full block it assembles the bytes (pure CPU) and records it as pending; the
+/// actual submit happens off-lock in handle_submission, and the background
+/// thread confirms it. This keeps blocking node calls out of the critical
+/// section so one submission cannot stall every other miner.
+fn credit_share(
     p: &mut Pool,
     worker: &str,
     height: u64,
     coinbase_nonce: [u8; 32],
     block_nonce: u32,
-) -> serde_json::Value {
+) -> Credit {
     if height != p.tpl.height {
-        return json!({"ok":false,"kind":"stale","height":p.tpl.height});
+        return Credit::Reject(json!({"ok":false,"kind":"stale","height":p.tpl.height}));
     }
-    // Reject replays BEFORE any crediting: the same solution must never be
-    // counted twice, or a miner could inflate its share of the payout.
+    // Reject replays BEFORE crediting: the same solution must never be counted
+    // twice, or a miner could inflate its share of the payout.
     let key = (height, coinbase_nonce, block_nonce);
     if p.seen.contains(&key) {
-        return json!({"ok":false,"kind":"duplicate"});
+        return Credit::Reject(json!({"ok":false,"kind":"duplicate"}));
     }
     // Rebuild exactly what the worker hashed.
     let cb = coinbase_with_extranonce(&p.tpl, &coinbase_nonce);
     let intro = intro_bytes(&p.tpl, &cb, block_nonce);
     let hash = pool_core::hash_of(p.tpl.height, &intro);
     if !pool_core::beats(&hash, &p.share_target) {
-        return json!({"ok":false,"kind":"invalid","err":"above share target"});
+        return Credit::Reject(json!({"ok":false,"kind":"invalid","err":"above share target"}));
     }
 
     p.seen.insert(key);
     p.pplns.record(worker);
     p.accepted += 1;
-    p.save_state();
 
     if !pool_core::beats(&hash, &p.network_target) {
-        return json!({"ok":true,"kind":"share","accepted":p.accepted});
+        p.note_share_saved();
+        return Credit::Share(json!({"ok":true,"kind":"share","accepted":p.accepted}));
     }
 
-    let blk = assemble_block(&p.tpl, &cb, block_nonce);
-    let submit = submit_block_bytes(&p.client, &p.node, &blk);
+    let block_bytes = assemble_block(&p.tpl, &cb, block_nonce);
     let solved = p.tpl.height;
-    // Counted only after confirm_submitted() sees it stick.
-    p.submitted.push((solved, hash));
-    for _ in 0..6 {
-        std::thread::sleep(Duration::from_millis(300));
-        p.refresh();
-        if p.tpl.height > solved {
-            break;
+    p.submitted.push((solved, hash)); // counted once the background thread sees it stick
+    p.save_state();
+    Credit::Block { block_bytes, solved }
+}
+
+/// Wraps credit_share: locks only for the credit step, then does the block
+/// submit OUTSIDE the lock.
+fn handle_submission(
+    pool: &Arc<Mutex<Pool>>,
+    worker: &str,
+    height: u64,
+    coinbase_nonce: [u8; 32],
+    block_nonce: u32,
+) -> serde_json::Value {
+    let (credit, client, node) = {
+        let mut p = pool.lock().unwrap();
+        let c = credit_share(&mut p, worker, height, coinbase_nonce, block_nonce);
+        (c, p.client.clone(), p.node.clone())
+    };
+    match credit {
+        Credit::Reject(v) | Credit::Share(v) => v,
+        Credit::Block { block_bytes, solved } => {
+            let submit = submit_block_bytes(&client, &node, &block_bytes);
+            json!({"ok":true,"kind":"block","solved_height":solved,"submit":submit})
         }
     }
-    p.save_state();
-    json!({"ok":true,"kind":"block","solved_height":solved,"submit":submit,
-           "next_height":p.tpl.height,"blocks":p.blocks})
 }
 
 fn parse32(s: Option<&String>) -> Option<[u8; 32]> {
@@ -400,8 +495,13 @@ fn parse32(s: Option<&String>) -> Option<[u8; 32]> {
 }
 
 fn handle(mut s: TcpStream, pool: Arc<Mutex<Pool>>) {
+    // Bound how long a client may hold a connection and how much we read, so a
+    // slow-loris or a socket that never sends a newline cannot pin a thread or
+    // grow memory without limit. The request line we care about is tiny.
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
     let Ok(peek) = s.try_clone() else { return };
-    let mut reader = BufReader::new(peek);
+    let mut reader = BufReader::new(peek.take(16 * 1024));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
@@ -487,8 +587,7 @@ fn route(
                 .filter(|w| is_payout_address(w))
                 .cloned()
                 .unwrap_or_else(|| peer.to_string());
-            let mut p = pool.lock().unwrap();
-            let r = accept_share(&mut p, &worker, height, cn, block_nonce);
+            let r = handle_submission(pool, &worker, height, cn, block_nonce);
             let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             if ok {
@@ -520,11 +619,17 @@ fn route(
             let worker = params.get("worker").cloned().unwrap_or_else(|| "anon".into());
             let height: u64 = params.get("height").and_then(|v| v.parse().ok()).unwrap_or(0);
             let nonce: u32 = params.get("nonce").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let mut p = pool.lock().unwrap();
-            let Some(en) = p.workers.get(&worker).copied() else {
-                return json!({"ok":false,"kind":"invalid","err":"unknown worker"}).to_string();
+            let en = {
+                let p = pool.lock().unwrap();
+                match p.workers.get(&worker).copied() {
+                    Some(en) => en,
+                    None => {
+                        return json!({"ok":false,"kind":"invalid","err":"unknown worker"})
+                            .to_string();
+                    }
+                }
             };
-            accept_share(&mut p, &worker, height, en, nonce).to_string()
+            handle_submission(pool, &worker, height, en, nonce).to_string()
         }
         "/stats" => {
             let p = pool.lock().unwrap();

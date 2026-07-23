@@ -84,31 +84,57 @@ pub fn is_payout_address(s: &str) -> bool {
 /// only ever lives in that file — it is never printed or logged; only the
 /// address is shown.
 pub fn load_or_create_wallet(path: &str) -> Account {
-    if let Ok(txt) = std::fs::read_to_string(path) {
-        let key_hex = txt.trim().to_string();
-        assert_eq!(
-            key_hex.len(),
-            64,
-            "wallet file {path} must hold a 64-hex private key"
-        );
-        let acc = Account::create_by(&key_hex).expect("invalid key in wallet file");
-        println!("pool wallet {} (from {path})", acc.readable());
-        return acc;
-    }
-    // No wallet yet: generate one and persist it.
-    let acc = loop {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("system RNG");
-        if let Ok(a) = Account::create_by_secret_key_value(key) {
-            break a;
+    match std::fs::read_to_string(path) {
+        Ok(txt) => {
+            let key_hex = txt.trim();
+            if key_hex.len() != 64 {
+                panic!("wallet file {path} must hold a 64-hex private key");
+            }
+            let acc = Account::create_by(key_hex).expect("invalid key in wallet file");
+            println!("pool wallet {} (from {path})", acc.readable());
+            acc
         }
-    };
-    std::fs::write(path, format!("{}\n", hex::encode(acc.secret_key().serialize())))
-        .expect("write wallet file");
-    println!("CREATED A NEW POOL WALLET -> {path}");
-    println!("  address: {}", acc.readable());
-    println!("  BACK UP THAT FILE. Whoever holds it controls the pool's funds.");
-    acc
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No wallet yet: generate one and persist it owner-only.
+            let acc = loop {
+                let mut key = [0u8; 32];
+                getrandom::fill(&mut key).expect("system RNG");
+                if let Ok(a) = Account::create_by_secret_key_value(key) {
+                    break a;
+                }
+            };
+            match write_key_file(path, &hex::encode(acc.secret_key().serialize())) {
+                Ok(()) => {}
+                // Lost a create race with another instance: use the winner's key.
+                Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return load_or_create_wallet(path);
+                }
+                Err(e2) => panic!("cannot write wallet file {path}: {e2}"),
+            }
+            println!("CREATED A NEW POOL WALLET -> {path}");
+            println!("  address: {}", acc.readable());
+            println!("  BACK UP THAT FILE. Whoever holds it controls the pool's funds.");
+            acc
+        }
+        // Never generate-and-overwrite on a non-NotFound error: a locked or
+        // transiently-unreadable key file must not be silently replaced.
+        Err(e) => panic!("cannot read wallet file {path}: {e} (refusing to overwrite it)"),
+    }
+}
+
+/// Write the private key to a NEW file, owner-only (0600) on Unix. `create_new`
+/// means it never clobbers an existing key.
+fn write_key_file(path: &str, key_hex: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    writeln!(f, "{key_hex}")
 }
 
 /// Everything the pool needs to build and verify blocks for the current tip.
@@ -130,24 +156,29 @@ pub struct Template {
 
 /// Read the chain tip and build a template for the next block, computing the
 /// next difficulty off-node with the same rule the node will validate against.
+///
+/// Returns `None` on any transient node/HTTP problem instead of panicking, so a
+/// caller holding a lock (the pool server) can skip the cycle and retry rather
+/// than poisoning its mutex and taking the whole pool down.
 pub fn fetch_template(
     client: &reqwest::blocking::Client,
     base: &str,
     coinbase_addr: &str,
     params: &ChainParams,
-) -> Template {
+) -> Option<Template> {
+    let coinbase = Address::from_readable(coinbase_addr).ok()?;
     let latest = get_json(client, &format!("{base}/query/latest"));
-    let prev_hei = find_u64(&latest, "height").expect("no 'height' in /query/latest");
+    let prev_hei = find_u64(&latest, "height")?;
     let height = prev_hei + 1;
     let (prevhash, prev_ts, prev_diff) = if prev_hei == 0 {
         (mint::genesis::genesis_block_hash(), 1549250700u64, 0u32)
     } else {
         let ij = get_json(client, &format!("{base}/query/block/intro?height={prev_hei}"));
-        let ph = find_str(&ij, "hash").expect("no 'hash' in block intro");
+        let ph = find_str(&ij, "hash")?;
         (
-            Hash::from_hex(ph.as_bytes()).expect("bad prevhash hex"),
-            find_u64(&ij, "timestamp").unwrap_or(0),
-            find_u64(&ij, "difficulty").unwrap_or(0) as u32,
+            Hash::from_hex(ph.as_bytes()).ok()?,
+            find_u64(&ij, "timestamp")?,
+            find_u64(&ij, "difficulty")? as u32,
         )
     };
     let timestamp = std::cmp::max(curtimes(), prev_ts.saturating_add(1));
@@ -157,20 +188,20 @@ pub fn fetch_template(
             client,
             &format!("{base}/query/block/intro?height={}", params.asert_height),
         );
-        find_u64(&aj, "timestamp").expect("anchor block timestamp")
+        find_u64(&aj, "timestamp")?
     } else {
         0
     };
     let (diff_num, target) =
         difficulty::next_difficulty(params, height, timestamp, prev_diff, anchor_time);
-    Template {
+    Some(Template {
         height,
         prevhash,
         timestamp,
         difficulty: diff_num,
         target,
-        coinbase_addr: Address::from_readable(coinbase_addr).expect("bad coinbase address"),
-    }
+        coinbase_addr: coinbase,
+    })
 }
 
 /// The template's coinbase carrying `extranonce` in its miner_nonce field.
@@ -249,7 +280,12 @@ pub fn mine_and_submit_block(
     extra_txs: Vec<Box<dyn Transaction>>,
     params: &ChainParams,
 ) -> (u64, String) {
-    let tpl = fetch_template(client, base, coinbase_addr, params);
+    let Some(tpl) = fetch_template(client, base, coinbase_addr, params) else {
+        return (
+            0,
+            "{\"ok\":false,\"err\":\"could not fetch a template from the node\"}".to_string(),
+        );
+    };
     let cbtx = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr.clone());
 
     let mut trshxs: Vec<Hash> = vec![cbtx.hash_with_fee()];

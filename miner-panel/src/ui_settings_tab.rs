@@ -545,6 +545,25 @@ impl MinerApp {
             },
         );
 
+        // HACD diamond mining also needs the bid account password; without it
+        // Start would dead-end. Ask for it here instead of hiding it in Advanced.
+        if self.mining_kind == MiningKind::Hacd {
+            theme::step_card(
+                ui,
+                4,
+                "Diamond bid password",
+                "Diamond mining bids from your full node account. Enter its password. The bid amounts use safe defaults, which you can change under Advanced.",
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.bid_password)
+                            .password(true)
+                            .desired_width(420.0)
+                            .margin(egui::Margin::symmetric(10.0, 8.0)),
+                    );
+                },
+            );
+        }
+
         if self.connect_mode == ConnectMode::Pool {
             theme::note(
                 ui,

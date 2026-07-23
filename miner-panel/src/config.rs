@@ -535,6 +535,9 @@ pub fn write_poworker_benchmark_config(
     let mut bench = s.clone_settings();
     bench.benchmark_seconds = seconds;
     bench.benchmark_fine_sweep = seconds >= 60;
+    // Auto Tune only measures local hashrate; it must not announce a payout
+    // address to any pool (the wallet may be unvalidated mid-edit).
+    bench.pool_worker = String::new();
     write_poworker_config(path, &bench)?;
 
     // Allocate for the full safe range of this preset. The worker will record
