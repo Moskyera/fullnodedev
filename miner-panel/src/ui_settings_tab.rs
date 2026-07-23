@@ -88,7 +88,42 @@ impl MinerApp {
             ui.add_space(12.0);
         }
 
+        // Simple by default: a newcomer sees three steps and one button.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(if self.simple_mode {
+                    "Set up mining"
+                } else {
+                    "All settings"
+                })
+                .strong()
+                .color(theme::colors::TEXT)
+                .size(17.0),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(i) = theme::segmented(
+                    ui,
+                    &["Simple", "Advanced"],
+                    if self.simple_mode { 0 } else { 1 },
+                ) {
+                    self.set_simple_mode(i == 0);
+                }
+            });
+        });
+        ui.add_space(14.0);
+
         ui.add_enabled_ui(!settings_locked, |ui| {
+            if self.simple_mode {
+                self.ui_settings_simple(ui);
+            } else {
+                self.ui_settings_full(ui);
+            }
+        });
+    }
+
+    /// Every setting, for people who want the knobs.
+    fn ui_settings_full(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
         ui.label(
             egui::RichText::new(t.settings_intro)
                 .color(theme::colors::TEXT_MUTED)
@@ -261,25 +296,7 @@ impl MinerApp {
                 .spacing([20.0, 12.0])
                 .show(ui, |ui| {
                     theme::field_label(ui, t.label_connect_mode);
-                    ui.horizontal(|ui| {
-                        let solo = self.connect_mode == ConnectMode::Solo;
-                        let local_label = if self.mining_kind == MiningKind::Hacd {
-                            "Local full node"
-                        } else {
-                            t.connect_solo
-                        };
-                        let remote_label = if self.mining_kind == MiningKind::Hacd {
-                            "LAN / remote full node"
-                        } else {
-                            t.connect_pool
-                        };
-                        if ui.selectable_label(solo, local_label).clicked() {
-                            self.set_connect_mode(ConnectMode::Solo);
-                        }
-                        if ui.selectable_label(!solo, remote_label).clicked() {
-                            self.set_connect_mode(ConnectMode::Pool);
-                        }
-                    });
+                    self.connect_mode_row(ui);
                     ui.end_row();
 
                     theme::field_label(
@@ -290,7 +307,20 @@ impl MinerApp {
                             t.connect_pool
                         },
                     );
-                    ui.vertical(|ui| {
+                    self.connect_target_block(ui);
+                    ui.end_row();
+                });
+        });
+
+        self.ui_settings_advanced_tail(ui);
+    }
+
+    /// Where the miner connects: the pool picker (HAC pool mode), the address
+    /// box, a reachability test and the selected pool's guidance. Shared by the
+    /// simple and advanced views so they can never drift apart.
+    fn connect_target_block(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.vertical(|ui| {
                         let hac_pool = self.connect_mode == ConnectMode::Pool
                             && self.mining_kind == MiningKind::Hac;
                         if hac_pool {
@@ -392,10 +422,153 @@ impl MinerApp {
                                 );
                             }
                         }
-                    });
-                    ui.end_row();
-                });
         });
+    }
+
+    /// Solo or pool, worded for the mining type in play.
+    fn connect_mode_row(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.horizontal(|ui| {
+            let solo = self.connect_mode == ConnectMode::Solo;
+            let local_label = if self.mining_kind == MiningKind::Hacd {
+                "Local full node"
+            } else {
+                t.connect_solo
+            };
+            let remote_label = if self.mining_kind == MiningKind::Hacd {
+                "LAN / remote full node"
+            } else {
+                t.connect_pool
+            };
+            if ui.selectable_label(solo, local_label).clicked() {
+                self.set_connect_mode(ConnectMode::Solo);
+            }
+            ui.add_space(8.0);
+            if ui.selectable_label(!solo, remote_label).clicked() {
+                self.set_connect_mode(ConnectMode::Pool);
+            }
+        });
+    }
+
+    /// The reward address box plus the hint for the current mining type.
+    fn wallet_field(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.wallet)
+                .desired_width(420.0)
+                .hint_text("1LCY6uQS3iNGy2mKSmhFVU2dHgBQLf74Fx")
+                .margin(egui::Margin::symmetric(10.0, 8.0)),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(if self.mining_kind == MiningKind::Hacd {
+                t.hacd_wallet_hint
+            } else {
+                t.wallet_hint
+            })
+            .size(11.5)
+            .color(theme::colors::TEXT_MUTED),
+        );
+    }
+
+    /// Three steps and one button. Everything else lives under Advanced.
+    fn ui_settings_simple(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+
+        theme::step_card(
+            ui,
+            1,
+            "What do you want to mine?",
+            "HAC uses your graphics card. HACD (diamonds) runs on the CPU through a full node.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.mining_kind == MiningKind::Hac, t.mining_hac)
+                        .clicked()
+                    {
+                        self.set_mining_kind(MiningKind::Hac);
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .selectable_label(self.mining_kind == MiningKind::Hacd, t.mining_hacd)
+                        .clicked()
+                    {
+                        self.set_mining_kind(MiningKind::Hacd);
+                    }
+                });
+                if self.mining_kind == MiningKind::Hac {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Graphics card:")
+                                .size(12.5)
+                                .color(theme::colors::TEXT_MUTED),
+                        );
+                        let usable = self.opencl_status.has_usable_device();
+                        ui.label(
+                            egui::RichText::new(self.opencl_status.device_summary())
+                                .size(12.5)
+                                .strong()
+                                .color(if usable {
+                                    theme::colors::GREEN
+                                } else {
+                                    theme::colors::GOLD
+                                }),
+                        );
+                        if !usable && ui.small_button("Detect").clicked() {
+                            self.request_opencl_probe(OpenClAction::AutoDetect);
+                        }
+                    });
+                }
+            },
+        );
+
+        theme::step_card(
+            ui,
+            2,
+            "Where do you connect?",
+            "A pool pays you small amounts often. Solo pays only when you find a whole block yourself.",
+            |ui| {
+                self.connect_mode_row(ui);
+                ui.add_space(12.0);
+                self.connect_target_block(ui);
+            },
+        );
+
+        theme::step_card(
+            ui,
+            3,
+            "Where should your coins go?",
+            "Paste your HAC address. In pool mode this is also the address the pool pays.",
+            |ui| {
+                self.wallet_field(ui);
+            },
+        );
+
+        if self.connect_mode == ConnectMode::Pool {
+            theme::note(
+                ui,
+                theme::colors::ACCENT,
+                "Your address is sent to the pool automatically so it can credit your work and pay you. There is nothing else to set up.",
+            );
+            ui.add_space(14.0);
+        }
+
+        self.action_row(ui);
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(
+                "Want GPU tuning, power limits or to host a shared node? Switch to Advanced at the top.",
+            )
+            .size(11.5)
+            .color(theme::colors::TEXT_MUTED),
+        );
+    }
+
+    /// The sections only an experienced user needs: worker tuning knobs, hosting
+    /// a shared node, the reward address card, fleet settings and the actions.
+    fn ui_settings_advanced_tail(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
 
         // Everything a different pool might need, editable from the GUI so the
         // user never has to open poworker.config.ini. Defaults suit every pool;
@@ -711,17 +884,22 @@ NAT/CGNAT often blocks it). This panel cannot verify external reachability - tes
         self.fleet.show_settings(ui);
 
         ui.add_space(18.0);
+        self.action_row(ui);
+        ui.add_space(8.0);
+    }
+
+    /// Save and Start: the two things every view ends with.
+    fn action_row(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
         ui.horizontal(|ui| {
             if theme::btn_secondary(ui, t.btn_save).clicked() {
                 self.save_config();
             }
-            ui.add_space(8.0);
-            if theme::btn_primary(ui, t.btn_start_mining).clicked() {
+            ui.add_space(10.0);
+            if theme::btn_primary_large(ui, t.btn_start_mining).clicked() {
                 self.start_mining();
                 self.tab = 1;
             }
         });
-        ui.add_space(8.0);
-        }); // end add_enabled_ui(!settings_locked)
     }
 }

@@ -37,6 +37,27 @@ use config::{
 use connect::{
     ConnectMode, PoolInfo, SOLO_DEFAULT, connect_port, load_pool_directory, normalize_connect,
 };
+
+/// Small UI preference file kept next to the panel, so the view a user picked
+/// is still there next time they open it.
+fn ui_prefs_path(work_dir: &std::path::Path) -> std::path::PathBuf {
+    work_dir.join("panel-ui.json")
+}
+
+fn load_simple_mode(work_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(ui_prefs_path(work_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("simple_mode").and_then(|b| b.as_bool()))
+        .unwrap_or(true) // a first-time user starts in the simple view
+}
+
+fn save_simple_mode(work_dir: &std::path::Path, simple: bool) {
+    let _ = std::fs::write(
+        ui_prefs_path(work_dir),
+        format!("{{\n  \"simple_mode\": {simple}\n}}\n"),
+    );
+}
 use currency::{Currency, load_currency, save_currency};
 use eframe::egui;
 use hacash_config::{
@@ -116,6 +137,8 @@ struct MinerApp {
     /// Result text of the last "Test connection" / "Test upstream" reachability probe.
     connect_test_status: String,
     upstream_test_status: String,
+    /// Newcomer view: three steps and one button. Remembered across restarts.
+    simple_mode: bool,
     max_temp_c: u32,
     pause_unprofitable: bool,
     work_groups: u32,
@@ -292,6 +315,7 @@ impl MinerApp {
         }
         let connect_mode = ConnectMode::for_connect(&connect);
         let pool_directory = load_pool_directory(&work_dir);
+        let simple_mode = load_simple_mode(&work_dir);
         let mut app = Self {
             work_dir,
             config_path,
@@ -328,6 +352,7 @@ impl MinerApp {
             notice_wait: 45,
             connect_test_status: String::new(),
             upstream_test_status: String::new(),
+            simple_mode,
             max_temp_c,
             pause_unprofitable,
             work_groups,
@@ -742,6 +767,15 @@ impl MinerApp {
             OpenClAction::StartMining => self.start_mining_after_opencl(),
             OpenClAction::AutoTune => self.run_benchmark_after_opencl(),
         }
+    }
+
+    /// Switch between the newcomer view and the full settings, and remember it.
+    fn set_simple_mode(&mut self, simple: bool) {
+        if self.simple_mode == simple {
+            return;
+        }
+        self.simple_mode = simple;
+        save_simple_mode(&self.work_dir, simple);
     }
 
     fn set_connect_mode(&mut self, mode: ConnectMode) {

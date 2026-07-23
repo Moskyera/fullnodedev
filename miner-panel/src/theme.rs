@@ -159,6 +159,138 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(TEXT).size(13.5));
 }
 
+/// A numbered step: gold badge, title, a quiet one line explanation, then the
+/// controls for that step. Used to turn the settings page into a short,
+/// readable sequence for people who have never mined before.
+pub fn step_card(ui: &mut Ui, num: u8, title: &str, hint: &str, content: impl FnOnce(&mut Ui)) {
+    Frame::none()
+        .fill(BG_CARD)
+        .stroke(Stroke::new(1.0, BORDER_SOFT))
+        .rounding(Rounding::same(14.0))
+        .inner_margin(Margin::symmetric(20.0, 18.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                let c = rect.center();
+                ui.painter().circle_filled(
+                    c,
+                    15.0,
+                    Color32::from_rgba_premultiplied(255, 122, 0, 32),
+                );
+                ui.painter()
+                    .circle_stroke(c, 15.0, Stroke::new(1.4, ACCENT_DIM));
+                ui.painter().text(
+                    c,
+                    egui::Align2::CENTER_CENTER,
+                    num.to_string(),
+                    FontId::new(15.0, FontFamily::Proportional),
+                    ACCENT,
+                );
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).strong().color(TEXT).size(16.0));
+                    if !hint.is_empty() {
+                        ui.add_space(3.0);
+                        ui.label(egui::RichText::new(hint).color(TEXT_MUTED).size(12.5));
+                    }
+                });
+            });
+            ui.add_space(14.0);
+            content(ui);
+        });
+    ui.add_space(12.0);
+}
+
+/// Compact segmented control, e.g. "Simple | Advanced". Returns the index the
+/// user picked, if any.
+pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize) -> Option<usize> {
+    let mut picked = None;
+    Frame::none()
+        .fill(Color32::from_rgba_premultiplied(8, 8, 8, 190))
+        .stroke(Stroke::new(1.0, BORDER_SOFT))
+        .rounding(Rounding::same(11.0))
+        .inner_margin(Margin::same(4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (i, label) in options.iter().enumerate() {
+                    let on = i == selected;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(Vec2::new(108.0, 30.0), Sense::click());
+                    if ui.is_rect_visible(rect) {
+                        let hover = resp.hovered();
+                        let fill = if on {
+                            Color32::from_rgba_premultiplied(255, 122, 0, 52)
+                        } else if hover {
+                            Color32::from_rgba_premultiplied(104, 48, 4, 80)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let text = if on {
+                            TEXT
+                        } else if hover {
+                            ACCENT
+                        } else {
+                            TEXT_MUTED
+                        };
+                        ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+                        if on {
+                            ui.painter().rect_stroke(
+                                rect,
+                                Rounding::same(8.0),
+                                Stroke::new(1.2, ACCENT),
+                            );
+                        }
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            *label,
+                            FontId::new(13.5, FontFamily::Proportional),
+                            text,
+                        );
+                    }
+                    if resp.clicked() {
+                        picked = Some(i);
+                    }
+                }
+            });
+        });
+    picked
+}
+
+/// The one obvious action on a page.
+pub fn btn_primary_large(ui: &mut Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        [210.0, 46.0],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(BG_DEEP)
+                .strong()
+                .size(15.5),
+        )
+        .fill(GREEN)
+        .stroke(Stroke::new(1.0, GREEN_DIM))
+        .rounding(Rounding::same(12.0)),
+    )
+}
+
+/// A quiet framed note, for the one thing a beginner must understand on a page.
+pub fn note(ui: &mut Ui, accent: Color32, text: &str) {
+    Frame::none()
+        .fill(Color32::from_rgba_premultiplied(20, 12, 4, 150))
+        .stroke(Stroke::new(1.0, BORDER_SOFT))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                ui.painter().rect_filled(bar, Rounding::same(2.0), accent);
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(text).color(TEXT_MUTED).size(12.5));
+            });
+        });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TabIcon {
     Settings,
