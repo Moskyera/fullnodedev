@@ -103,13 +103,8 @@ pub fn load_or_create_wallet(path: &str) -> Account {
                     break a;
                 }
             };
-            match write_key_file(path, &hex::encode(acc.secret_key().serialize())) {
-                Ok(()) => {}
-                // Lost a create race with another instance: use the winner's key.
-                Err(e2) if e2.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return load_or_create_wallet(path);
-                }
-                Err(e2) => panic!("cannot write wallet file {path}: {e2}"),
+            if let Err(e2) = write_key_file(path, &hex::encode(acc.secret_key().serialize())) {
+                panic!("cannot write wallet file {path}: {e2}");
             }
             println!("CREATED A NEW POOL WALLET -> {path}");
             println!("  address: {}", acc.readable());
@@ -122,19 +117,24 @@ pub fn load_or_create_wallet(path: &str) -> Account {
     }
 }
 
-/// Write the private key to a NEW file, owner-only (0600) on Unix. `create_new`
-/// means it never clobbers an existing key.
+/// Write the private key owner-only (0600 on Unix) via a temp file + atomic
+/// rename, so a concurrent reader never sees an empty or half-written key file.
 fn write_key_file(path: &str, key_hex: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
+    let tmp = format!("{path}.tmp.{}", std::process::id());
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        writeln!(f, "{key_hex}")?;
+        let _ = f.sync_all();
     }
-    let mut f = opts.open(path)?;
-    writeln!(f, "{key_hex}")
+    std::fs::rename(&tmp, path)
 }
 
 /// Everything the pool needs to build and verify blocks for the current tip.
@@ -204,9 +204,16 @@ pub fn fetch_template(
     })
 }
 
+/// The 16-byte message stamped into every block this pool mines, tagging it as
+/// HBIT. Fixed16 needs exactly 16 bytes, so the tag is space-padded.
+pub fn coinbase_message() -> Fixed16 {
+    Fixed16::from_readable(b"HBIT pool       ").unwrap_or_default()
+}
+
 /// The template's coinbase carrying `extranonce` in its miner_nonce field.
 pub fn coinbase_with_extranonce(tpl: &Template, extranonce: &[u8; 32]) -> mint::TransactionCoinbase {
-    let mut cb = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr.clone());
+    let mut cb =
+        mint::create_coinbase_tx(tpl.height, coinbase_message(), tpl.coinbase_addr.clone());
     let en = Hash::from_hex(hex::encode(extranonce).as_bytes()).expect("extranonce");
     cb.extend = mint::CoinbaseExtend::must(mint::CoinbaseExtendDataV1 {
         miner_nonce: en,

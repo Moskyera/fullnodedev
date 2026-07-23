@@ -281,7 +281,7 @@ impl MinerApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.bid_step)
                                 .desired_width(160.0)
-                                .hint_text("0:5"),
+                                .hint_text("0.5"),
                         );
                         ui.end_row();
                     });

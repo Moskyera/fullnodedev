@@ -35,8 +35,8 @@ use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::{self, Pplns, split_payout};
 use pool_spike::{
     Template, assemble_block, balance, coinbase_body_hex, coinbase_with_extranonce, fetch_template,
-    find_str, get_json, http_client, intro_bytes, is_payout_address, load_or_create_wallet,
-    post_hex, submit_block_bytes,
+    find_str, find_u64, get_json, http_client, intro_bytes, is_payout_address,
+    load_or_create_wallet, post_hex, submit_block_bytes,
 };
 
 use serde_json::json;
@@ -64,10 +64,11 @@ struct Pool {
     submitted: Vec<(u64, [u8; 32])>,
     /// Accepted shares not yet flushed to disk (debounces state writes).
     unsaved: u32,
-    /// The confirmed balance an unconfirmed payout was drawn from. While the
-    /// live balance is still at or above this, the payout has not landed yet, so
-    /// we must not settle again (which would double spend the same funds).
-    settle_pending_from: Option<u64>,
+    /// The hash of the last payout transaction that has not yet confirmed. While
+    /// it is still in the mempool we must not settle again (double spend); we
+    /// clear it only once the node reports it confirmed or gone. This is robust
+    /// to a lost submit ACK and to the wallet also earning coinbase income.
+    settle_pending_tx: Option<String>,
 }
 
 impl Pool {
@@ -82,9 +83,20 @@ impl Pool {
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
+    /// The /work protocol is anonymous, so cap the map: past the cap, hand out a
+    /// deterministic extranonce derived from the name instead of storing it, so a
+    /// flood of unique names cannot grow memory without bound.
     fn extranonce_for(&mut self, worker: &str) -> [u8; 32] {
         if let Some(en) = self.workers.get(worker) {
             return *en;
+        }
+        if self.workers.len() >= 100_000 {
+            let mut en = [0u8; 32];
+            en[0..8].copy_from_slice(&(worker.len() as u64).to_be_bytes());
+            for (i, b) in worker.bytes().enumerate() {
+                en[8 + (i % 24)] ^= b;
+            }
+            return en;
         }
         self.next_en += 1;
         let mut en = [0u8; 32];
@@ -237,7 +249,7 @@ fn main() {
         seen: HashSet::new(),
         submitted: Vec::new(),
         unsaved: 0,
-        settle_pending_from: None,
+        settle_pending_tx: None,
     };
     pool.load_state();
     let pool = Arc::new(Mutex::new(pool));
@@ -320,11 +332,23 @@ fn main() {
 
     let listener = TcpListener::bind(&listen).expect("bind");
     println!("listening...\n");
+    // Cap live connections so unauthenticated long-poll / slow clients cannot
+    // spawn unbounded threads.
+    let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const MAX_CONNS: usize = 1024;
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                if conns.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNS {
+                    continue; // drop: s closes as it goes out of scope
+                }
+                conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let p = pool.clone();
-                std::thread::spawn(move || handle(s, p));
+                let c = conns.clone();
+                std::thread::spawn(move || {
+                    handle(s, p);
+                    c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
@@ -334,38 +358,47 @@ fn main() {
 /// Pay every miner their PPLNS share of the pool's spendable balance, in ONE
 /// signed transaction submitted to the node's mempool.
 fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
-    let (node, counts, pending_from) = {
+    let (node, counts, pending_tx) = {
         let p = pool.lock().unwrap();
-        (p.node.clone(), p.pplns.counts(), p.settle_pending_from)
+        (p.node.clone(), p.pplns.counts(), p.settle_pending_tx.clone())
     };
     if counts.is_empty() {
         return;
     }
-    let acc = load_or_create_wallet(wallet_file);
     let client = http_client();
+
+    // Resolve any outstanding payout FIRST, using the node's own view of the tx
+    // rather than the wallet balance. This is correct even if a submit ACK was
+    // lost and even though the same wallet keeps earning coinbase income.
+    if let Some(hx) = pending_tx {
+        let j = get_json(&client, &format!("{node}/query/transaction?hash={hx}"));
+        let ret_ok = find_u64(&j, "ret") == Some(0);
+        let still_pending = j
+            .get("data")
+            .and_then(|d| d.get("pending"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| j.get("pending").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        if ret_ok && still_pending {
+            return; // last payout is still in the mempool; do not settle again
+        }
+        // Either confirmed on-chain (ret ok, not pending) or gone (not found):
+        // clear the marker and allow a fresh settle of new income.
+        pool.lock().unwrap().settle_pending_tx = None;
+    }
+
+    let acc = load_or_create_wallet(wallet_file);
     let bal = balance(&client, &node, acc.readable());
     let units = balance_units(&bal);
 
-    // Idempotency: /query/balance is confirmed-only, so a payout still in the
-    // mempool leaves the balance unchanged. If the last payout has not yet
-    // drained the wallet (balance still at or above the level we paid from),
-    // skip, or we would sign a second payout of the same funds.
-    if let Some(from) = pending_from {
-        if units >= from {
-            return;
-        }
-        // The prior payout confirmed and drained the wallet; clear the marker.
-        pool.lock().unwrap().settle_pending_from = None;
-    }
-
-    // Keep a reserve so the wallet can always pay tx fees.
+    // Keep a reserve so the wallet always has enough for the tx fee. No pool fee
+    // is skimmed: this is a community pool, and the reserve covers the tiny fee.
     let reserve = 5u64; // 0.5 HAC
     if units <= reserve + 1 {
         return;
     }
     let distributable = units - reserve;
-    let fee_units = (distributable / 10).max(1); // 10% pool fee
-    let split = split_payout(distributable, fee_units, 1, &counts);
+    let split = split_payout(distributable, 0, 1, &counts);
     let payable: Vec<(String, u64)> = split
         .into_iter()
         .filter(|(w, _)| is_payout_address(w))
@@ -375,7 +408,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     }
 
     let main = Address::from(*acc.address());
-    let fee = Amount::from("1:246").expect("fee");
+    let fee = Amount::from("1:246").expect("fee"); // 0.01 HAC tx fee (from reserve)
     let mut tx = TransactionType2::new_by(main, fee, curtimes());
     for (addr, u) in &payable {
         let to = Address::from_readable(addr).expect("payout address");
@@ -391,21 +424,22 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         println!("[settle] signing failed");
         return;
     }
+    // Record the payout tx hash BEFORE submitting, so a lost ACK still blocks a
+    // second settle: next cycle we poll this hash and only retry if it is gone.
+    let txhash = hex::encode(tx.hash().serialize());
+    pool.lock().unwrap().settle_pending_tx = Some(txhash.clone());
+
     let body = hex::encode(tx.serialize());
     let resp = post_hex(
         &client,
         &format!("{node}/submit/transaction?hexbody=true"),
         &body,
     );
-    // Mark the balance level this payout drew from, so we do not settle again
-    // until it confirms and the wallet actually drops below it.
-    if resp.contains("\"ret\":0") {
-        pool.lock().unwrap().settle_pending_from = Some(units);
-    }
     println!(
-        "[settle] paid {} miner(s) from {} units -> {resp}",
+        "[settle] paid {} miner(s) {} units, tx {} -> {resp}",
         payable.len(),
-        distributable
+        distributable,
+        &txhash[..16]
     );
 }
 
