@@ -58,14 +58,32 @@ pub struct PoWorkConf {
     pub runtime: Arc<MiningRuntimeState>,
 }
 
+/// Percent-encode a query-string component, leaving only the RFC 3986 unreserved
+/// characters. HAC addresses are already safe, but this guards against a
+/// misconfigured worker id breaking or injecting into the request URL.
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 impl PoWorkConf {
     /// `&worker=<payout address>` suffix appended to pool requests so the pool
-    /// can credit shares to us. Empty string when solo mining.
+    /// can credit shares to us. Empty string when solo mining. The value is
+    /// percent-encoded so a misconfigured worker id cannot break or inject into
+    /// the query string.
     pub fn worker_param(&self) -> String {
         if self.pool_worker.is_empty() {
             String::new()
         } else {
-            format!("&worker={}", self.pool_worker)
+            format!("&worker={}", percent_encode_component(&self.pool_worker))
         }
     }
 

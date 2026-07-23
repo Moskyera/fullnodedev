@@ -61,7 +61,21 @@ impl DiaWorkConf {
         let active = efficiency.initial_active_supervene(configured_supervene);
         let runtime = MiningRuntimeState::new(0, active);
         // HACD is officially CPU/full-node mining. Legacy GPU keys are ignored
-        // so a stale or hand-edited config cannot activate the OpenCL path.
+        // so a stale or hand-edited config cannot activate the OpenCL path. Warn
+        // loudly if the config still carries GPU keys, so it is clear they do
+        // nothing here (rather than silently forcing CPU).
+        let wants_gpu = ["useopencl", "usecuda"].iter().any(|k| {
+            matches!(
+                ini_must(sec, k, "").trim().to_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        }) || ini_must_u64(sec, "workgroups", 0) > 0;
+        if wants_gpu {
+            println!(
+                "[diamond] NOTE: HACD (diamond) mining is CPU / full-node only; the GPU keys \
+                 in this config (useopencl / usecuda / workgroups) are ignored."
+            );
+        }
         DiaWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
@@ -377,9 +391,14 @@ fn deal_diamond_mining_results(
     // print hashrate
     let diastr = String::from_utf8_lossy(&most.dia_str).into_owned();
     let most_diastr = String::from_utf8_lossy(most_dia_str).into_owned();
-    let avg_use_secs = total_use_secs / recv_count as f64;
-    let nonce_rates = if avg_use_secs.is_finite() && avg_use_secs > 0.0 {
-        total_nonce_space as f64 / avg_use_secs
+    // Aggregate hashrate = total nonces / wall-clock. The workers run in parallel,
+    // so wall-clock ~= total_use_secs / (parallel workers). Dividing by recv_count
+    // (batches drained) instead would multiply the rate by the number of batches
+    // each worker sent per drain, wildly overcounting for sequential batches.
+    let parallelism = (vene.max(1)) as f64;
+    let wall_secs = total_use_secs / parallelism;
+    let nonce_rates = if wall_secs.is_finite() && wall_secs > 0.0 {
+        total_nonce_space as f64 / wall_secs
     } else {
         0.0
     };
@@ -650,7 +669,7 @@ fn do_diamond_group_mining(
     let mut most_noncebytes = [0u8; 8];
 
     // start mining
-    for nonce in nonce_start..nonce_start + nonce_space {
+    for nonce in nonce_start..nonce_start.saturating_add(nonce_space) {
         // std::thread::sleep(std::time::Duration::from_micros(333)); // test
         let nonce_bytes = nonce.to_be_bytes();
         let (firhx, resxh, diastr) =

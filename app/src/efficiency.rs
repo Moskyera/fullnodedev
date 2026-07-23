@@ -76,7 +76,9 @@ impl EfficiencyConf {
         let sec = sys::ini_section(ini, "efficiency");
         let mode_raw = ini_must(sec, "mode", "profit");
         let supervene_max = ini_must_u64(sec, "supervene_max", 0) as u32;
-        let supervene_min = ini_must_u64(sec, "supervene_min", 2) as u32;
+        // Default floor of 1, not 2: an explicit `supervene=1` must mean one
+        // thread, not be silently bumped to two by the minimum.
+        let supervene_min = ini_must_u64(sec, "supervene_min", 1) as u32;
         EfficiencyConf {
             mode: EfficiencyMode::from_str(&mode_raw),
             power_cost_kwh: ini_must_f64(sec, "power_cost_kwh", 0.15),
