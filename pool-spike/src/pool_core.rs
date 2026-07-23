@@ -36,9 +36,19 @@ pub fn network_target_hash(network_difficulty: u32) -> [u8; 32] {
     DifficultyTarget::from_num(network_difficulty).hash
 }
 
+/// The PoW hash of a serialized 89-byte block header.
+pub fn hash_of(height: u64, header: &[u8]) -> [u8; 32] {
+    x16rs::block_hash(height, header)
+}
+
+/// Does an already-computed hash meet `target`?
+pub fn beats(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    !hash_bigger_than(hash, target)
+}
+
 /// True if the solved 89-byte block header meets `target` (x16rs hash <= target).
 pub fn meets_target(height: u64, header: &[u8], target: &[u8; 32]) -> bool {
-    !hash_bigger_than(&x16rs::block_hash(height, header), target)
+    beats(&hash_of(height, header), target)
 }
 
 /// PPLNS accounting over a rolling window of the last `window` accepted shares.
@@ -77,6 +87,21 @@ impl Pplns {
     /// Number of shares currently in the window.
     pub fn total(&self) -> u64 {
         self.order.len() as u64
+    }
+
+    /// The raw window (oldest first) — enough to persist and restore accounting
+    /// so a pool restart never loses a miner's credited work.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+
+    /// Rebuild from a snapshot produced by [`Pplns::snapshot`].
+    pub fn restore(window: usize, order: Vec<String>) -> Self {
+        let mut p = Self::new(window);
+        for w in order {
+            p.record(&w);
+        }
+        p
     }
 
     /// worker -> share count in the current window, descending by count then id.
@@ -173,6 +198,21 @@ mod tests {
         assert_eq!(counts.iter().map(|(_, c)| *c).sum::<u64>(), 4);
         let a = counts.iter().find(|(w, _)| w == "a").map(|(_, c)| *c).unwrap();
         assert_eq!(a, 1);
+    }
+
+    #[test]
+    fn pplns_survives_a_snapshot_restore_round_trip() {
+        let mut p = Pplns::new(8);
+        for w in ["a", "b", "a", "c", "a"] {
+            p.record(w);
+        }
+        let restored = Pplns::restore(8, p.snapshot());
+        assert_eq!(restored.total(), p.total());
+        assert_eq!(restored.counts(), p.counts());
+        assert_eq!(
+            restored.counts().iter().find(|(w, _)| w == "a").unwrap().1,
+            3
+        );
     }
 
     #[test]
