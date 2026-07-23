@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use pool_spike::pool_core::{self, Pplns};
 use pool_spike::{
     Template, assemble_block, coinbase_with_extranonce, fetch_template, http_client, intro_bytes,
-    submit_block_bytes,
+    load_or_create_wallet, submit_block_bytes,
 };
 
 use serde_json::json;
@@ -77,20 +77,23 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
     let node = node.trim_end_matches('/').to_string();
-    let payout = a
+    let wallet_file = a
         .get(2)
         .cloned()
-        .unwrap_or_else(|| "1MzNY1oA3kfgYi75zquj3SRUPYztzXHzK9".to_string());
+        .unwrap_or_else(|| "pool-wallet.key".to_string());
     let listen = a.get(3).cloned().unwrap_or_else(|| "127.0.0.1:9777".to_string());
     let share_bits: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+
+    println!("== pool-server ==");
+    println!("node    = {node}");
+    // The pool's coinbase + settlement wallet. Key stays in the file.
+    let wallet = load_or_create_wallet(&wallet_file);
+    let payout = wallet.readable().to_string();
 
     let client = http_client();
     let tpl = fetch_template(&client, &node, &payout);
     let network_target = pool_core::network_target_hash(tpl.difficulty);
 
-    println!("== pool-server ==");
-    println!("node    = {node}");
-    println!("payout  = {payout}");
     println!("listen  = {listen}");
     println!("share   = {share_bits} leading zero bits");
     println!("height  = {} (template)", tpl.height);

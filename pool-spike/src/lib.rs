@@ -67,6 +67,38 @@ pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> St
     find_str(&j, "hacash").unwrap_or_default()
 }
 
+/// Load the pool wallet from `path` (a file holding a 64-hex secp256k1 private
+/// key), creating a fresh random one if the file does not exist. The private key
+/// only ever lives in that file — it is never printed or logged; only the
+/// address is shown.
+pub fn load_or_create_wallet(path: &str) -> Account {
+    if let Ok(txt) = std::fs::read_to_string(path) {
+        let key_hex = txt.trim().to_string();
+        assert_eq!(
+            key_hex.len(),
+            64,
+            "wallet file {path} must hold a 64-hex private key"
+        );
+        let acc = Account::create_by(&key_hex).expect("invalid key in wallet file");
+        println!("pool wallet {} (from {path})", acc.readable());
+        return acc;
+    }
+    // No wallet yet: generate one and persist it.
+    let acc = loop {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("system RNG");
+        if let Ok(a) = Account::create_by_secret_key_value(key) {
+            break a;
+        }
+    };
+    std::fs::write(path, format!("{}\n", hex::encode(acc.secret_key().serialize())))
+        .expect("write wallet file");
+    println!("CREATED A NEW POOL WALLET -> {path}");
+    println!("  address: {}", acc.readable());
+    println!("  BACK UP THAT FILE. Whoever holds it controls the pool's funds.");
+    acc
+}
+
 /// Everything the pool needs to build and verify blocks for the current tip.
 /// The pool serves one template to all workers; each worker gets its own
 /// extranonce (the coinbase `miner_nonce`), which changes the merkle root and

@@ -14,7 +14,9 @@ use protocol::transaction::TransactionType2;
 use sys::*;
 
 use pool_spike::pool_core::split_payout;
-use pool_spike::{balance, get_json, http_client, mine_and_submit_block, post_hex};
+use pool_spike::{
+    balance, get_json, http_client, load_or_create_wallet, mine_and_submit_block, post_hex,
+};
 
 /// Demo mapping worker name -> the account it gets paid into. A real pool takes
 /// this from the worker's registration instead.
@@ -42,12 +44,15 @@ fn main() {
     let total_units: u64 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(50); // 5.0 HAC
     let fee_units: u64 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(5); // 0.5 HAC pool fee
     let dust_units: u64 = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let wallet_file = a
+        .get(6)
+        .cloned()
+        .unwrap_or_else(|| "pool-wallet.key".to_string());
 
     let client = http_client();
-    let pool_acc = Account::create_by_secret_key_value([1u8; 32]).expect("pool account");
-
     println!("== pool-payout ==");
-    println!("pool wallet = {}", pool_acc.readable());
+    // Same wallet file the pool server mines to; its key signs the payout tx.
+    let pool_acc = load_or_create_wallet(&wallet_file);
     println!("balance     = {}", balance(&client, &node, pool_acc.readable()));
 
     // 1) live PPLNS counts from the pool server
