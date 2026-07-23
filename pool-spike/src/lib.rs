@@ -67,6 +67,105 @@ pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> St
     find_str(&j, "hacash").unwrap_or_default()
 }
 
+/// Everything the pool needs to build and verify blocks for the current tip.
+/// The pool serves one template to all workers; each worker gets its own
+/// extranonce (the coinbase `miner_nonce`), which changes the merkle root and
+/// therefore gives every worker a private search space.
+#[derive(Clone)]
+pub struct Template {
+    pub height: u64,
+    pub prevhash: Hash,
+    pub timestamp: u64,
+    pub difficulty: u32,
+    pub coinbase_addr: Address,
+}
+
+/// Read the chain tip and build a template for the next block.
+pub fn fetch_template(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    coinbase_addr: &str,
+) -> Template {
+    let latest = get_json(client, &format!("{base}/query/latest"));
+    let prev_hei = find_u64(&latest, "height").expect("no 'height' in /query/latest");
+    let height = prev_hei + 1;
+    let (prevhash, prev_ts) = if prev_hei == 0 {
+        (mint::genesis::genesis_block_hash(), 1549250700u64)
+    } else {
+        let ij = get_json(client, &format!("{base}/query/block/intro?height={prev_hei}"));
+        let ph = find_str(&ij, "hash").expect("no 'hash' in block intro");
+        (
+            Hash::from_hex(ph.as_bytes()).expect("bad prevhash hex"),
+            find_u64(&ij, "timestamp").unwrap_or(0),
+        )
+    };
+    Template {
+        height,
+        prevhash,
+        timestamp: std::cmp::max(curtimes(), prev_ts.saturating_add(1)),
+        difficulty: LOWEST_DIFFICULTY,
+        coinbase_addr: Address::from_readable(coinbase_addr).expect("bad coinbase address"),
+    }
+}
+
+/// The template's coinbase carrying `extranonce` in its miner_nonce field.
+pub fn coinbase_with_extranonce(tpl: &Template, extranonce: &[u8; 32]) -> mint::TransactionCoinbase {
+    let mut cb = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr.clone());
+    let en = Hash::from_hex(hex::encode(extranonce).as_bytes()).expect("extranonce");
+    cb.extend = mint::CoinbaseExtend::must(mint::CoinbaseExtendDataV1 {
+        miner_nonce: en,
+        witness_count: Uint1::from(0),
+    });
+    cb
+}
+
+fn build_intro(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> BlockIntro {
+    BlockIntro {
+        head: BlockHead {
+            version: Uint1::from(1),
+            height: BlockHeight::from(tpl.height),
+            timestamp: Timestamp::from(tpl.timestamp),
+            prevhash: tpl.prevhash.clone(),
+            mrklroot: calculate_mrklroot(&vec![cb.hash_with_fee()]),
+            transaction_count: Uint4::from(1u32),
+        },
+        meta: BlockMeta {
+            nonce: Uint4::from(nonce),
+            difficulty: Uint4::from(tpl.difficulty),
+            witness_stage: Fixed2::default(),
+        },
+    }
+}
+
+/// The 89-byte block header a worker hashes (nonce lives at bytes 79..83).
+pub fn intro_bytes(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> Vec<u8> {
+    build_intro(tpl, cb, nonce).serialize()
+}
+
+/// Serialized full block for a winning (extranonce, nonce).
+pub fn assemble_block(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> Vec<u8> {
+    let mut txs = DynVecTransaction::default();
+    txs.push(Box::new(cb.clone())).expect("push coinbase");
+    BlockV1 {
+        intro: build_intro(tpl, cb, nonce),
+        transactions: txs,
+    }
+    .serialize()
+}
+
+/// Submit already-serialized block bytes.
+pub fn submit_block_bytes(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    bytes: &[u8],
+) -> String {
+    post_hex(
+        client,
+        &format!("{base}/submit/block?hexbody=true"),
+        &hex::encode(bytes),
+    )
+}
+
 /// Assemble a block whose coinbase pays `coinbase_addr`, plus `extra_txs`,
 /// CPU-mine it at bootstrap difficulty, and submit via /submit/block.
 /// Returns (next_height, submit_response).

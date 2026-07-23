@@ -12,6 +12,18 @@ path = "src/main.rs"
 name = "settle-spike"
 path = "src/settle.rs"
 
+[[bin]]
+name = "pool-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "test-miner"
+path = "src/miner.rs"
+
+[[bin]]
+name = "pool-payout"
+path = "src/payout.rs"
+
 [dependencies]
 field    = { path = "../field" }
 basis    = { path = "../basis" }
