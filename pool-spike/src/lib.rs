@@ -3,6 +3,8 @@
 //! coinbase plus optional extra transactions. Targets a fresh local testnet
 //! (bootstrap LOWEST_DIFFICULTY); does not reproduce mainnet ASERT difficulty.
 
+pub mod pool_core;
+
 use basis::difficulty::*;
 use basis::interface::*;
 use field::*;
