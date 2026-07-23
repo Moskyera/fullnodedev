@@ -8,6 +8,10 @@ description = "P1 feasibility spike: assemble a coinbase-only block off-node wit
 name = "pool-spike"
 path = "src/main.rs"
 
+[[bin]]
+name = "settle-spike"
+path = "src/settle.rs"
+
 [dependencies]
 field    = { path = "../field" }
 basis    = { path = "../basis" }
