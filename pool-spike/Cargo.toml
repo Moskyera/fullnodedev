@@ -1,0 +1,20 @@
+[package]
+name = "pool-spike"
+version = "0.1.0"
+edition = "2024"
+description = "P1 feasibility spike: assemble a coinbase-only block off-node with a chosen coinbase and submit via /submit/block"
+
+[[bin]]
+name = "pool-spike"
+path = "src/main.rs"
+
+[dependencies]
+field    = { path = "../field" }
+basis    = { path = "../basis" }
+protocol = { path = "../protocol" }
+mint     = { path = "../mint" }
+sys      = { path = "../sys" }
+x16rs    = { path = "../x16rs" }
+reqwest  = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+serde_json = "1.0"
+hex = "0.4.3"
