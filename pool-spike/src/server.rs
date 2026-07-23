@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::{self, Pplns};
 use pool_spike::{
     Template, assemble_block, coinbase_body_hex, coinbase_with_extranonce, fetch_template,
@@ -26,6 +27,7 @@ struct Pool {
     node: String,
     payout: String,
     client: reqwest::blocking::Client,
+    params: ChainParams,
     tpl: Template,
     share_target: [u8; 32],
     network_target: [u8; 32],
@@ -39,8 +41,9 @@ struct Pool {
 impl Pool {
     /// Re-read the tip and rebuild the template (after a block, or when stale).
     fn refresh(&mut self) {
-        self.tpl = fetch_template(&self.client, &self.node, &self.payout);
-        self.network_target = pool_core::network_target_hash(self.tpl.difficulty);
+        self.tpl = fetch_template(&self.client, &self.node, &self.payout, &self.params);
+        // Use the template's EXACT target, not u32_to_hash(difficulty).
+        self.network_target = self.tpl.target;
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
@@ -83,6 +86,8 @@ fn main() {
         .unwrap_or_else(|| "pool-wallet.key".to_string());
     let listen = a.get(3).cloned().unwrap_or_else(|| "127.0.0.1:9777".to_string());
     let share_bits: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let chain = a.get(5).cloned().unwrap_or_else(|| "testnet".to_string());
+    let params = ChainParams::from_name(&chain);
 
     println!("== pool-server ==");
     println!("node    = {node}");
@@ -91,17 +96,22 @@ fn main() {
     let payout = wallet.readable().to_string();
 
     let client = http_client();
-    let tpl = fetch_template(&client, &node, &payout);
-    let network_target = pool_core::network_target_hash(tpl.difficulty);
+    let tpl = fetch_template(&client, &node, &payout, &params);
+    let network_target = tpl.target;
 
     println!("listen  = {listen}");
+    println!("chain   = {chain} (ASERT at height {})", params.asert_height);
     println!("share   = {share_bits} leading zero bits");
-    println!("height  = {} (template)", tpl.height);
+    println!(
+        "height  = {} (template, difficulty {})",
+        tpl.height, tpl.difficulty
+    );
 
     let pool = Arc::new(Mutex::new(Pool {
         node,
         payout,
         client,
+        params,
         tpl,
         share_target: target_leading_zero_bits(share_bits),
         network_target,

@@ -3,7 +3,10 @@
 //! coinbase plus optional extra transactions. Targets a fresh local testnet
 //! (bootstrap LOWEST_DIFFICULTY); does not reproduce mainnet ASERT difficulty.
 
+pub mod difficulty;
 pub mod pool_core;
+
+use difficulty::ChainParams;
 
 use basis::difficulty::*;
 use basis::interface::*;
@@ -117,34 +120,55 @@ pub struct Template {
     pub height: u64,
     pub prevhash: Hash,
     pub timestamp: u64,
+    /// Header `difficulty` field (u32) — must equal what the node recomputes.
     pub difficulty: u32,
+    /// The exact PoW target for this block. NOT interchangeable with
+    /// u32_to_hash(difficulty): on the from_big path it is more precise.
+    pub target: [u8; 32],
     pub coinbase_addr: Address,
 }
 
-/// Read the chain tip and build a template for the next block.
+/// Read the chain tip and build a template for the next block, computing the
+/// next difficulty off-node with the same rule the node will validate against.
 pub fn fetch_template(
     client: &reqwest::blocking::Client,
     base: &str,
     coinbase_addr: &str,
+    params: &ChainParams,
 ) -> Template {
     let latest = get_json(client, &format!("{base}/query/latest"));
     let prev_hei = find_u64(&latest, "height").expect("no 'height' in /query/latest");
     let height = prev_hei + 1;
-    let (prevhash, prev_ts) = if prev_hei == 0 {
-        (mint::genesis::genesis_block_hash(), 1549250700u64)
+    let (prevhash, prev_ts, prev_diff) = if prev_hei == 0 {
+        (mint::genesis::genesis_block_hash(), 1549250700u64, 0u32)
     } else {
         let ij = get_json(client, &format!("{base}/query/block/intro?height={prev_hei}"));
         let ph = find_str(&ij, "hash").expect("no 'hash' in block intro");
         (
             Hash::from_hex(ph.as_bytes()).expect("bad prevhash hex"),
             find_u64(&ij, "timestamp").unwrap_or(0),
+            find_u64(&ij, "difficulty").unwrap_or(0) as u32,
         )
     };
+    let timestamp = std::cmp::max(curtimes(), prev_ts.saturating_add(1));
+    // ASERT anchors on the activation block's timestamp; only needed above it.
+    let anchor_time = if params.needs_anchor(height) {
+        let aj = get_json(
+            client,
+            &format!("{base}/query/block/intro?height={}", params.asert_height),
+        );
+        find_u64(&aj, "timestamp").expect("anchor block timestamp")
+    } else {
+        0
+    };
+    let (diff_num, target) =
+        difficulty::next_difficulty(params, height, timestamp, prev_diff, anchor_time);
     Template {
         height,
         prevhash,
-        timestamp: std::cmp::max(curtimes(), prev_ts.saturating_add(1)),
-        difficulty: LOWEST_DIFFICULTY,
+        timestamp,
+        difficulty: diff_num,
+        target,
         coinbase_addr: Address::from_readable(coinbase_addr).expect("bad coinbase address"),
     }
 }
@@ -223,27 +247,10 @@ pub fn mine_and_submit_block(
     base: &str,
     coinbase_addr: &str,
     extra_txs: Vec<Box<dyn Transaction>>,
+    params: &ChainParams,
 ) -> (u64, String) {
-    let latest = get_json(client, &format!("{base}/query/latest"));
-    let prev_hei = find_u64(&latest, "height").expect("no 'height' in /query/latest");
-    let next_hei = prev_hei + 1;
-
-    let (prevhash, prev_ts) = if prev_hei == 0 {
-        (mint::genesis::genesis_block_hash(), 1549250700u64)
-    } else {
-        let ij = get_json(client, &format!("{base}/query/block/intro?height={prev_hei}"));
-        let ph = find_str(&ij, "hash").expect("no 'hash' in block intro");
-        (
-            Hash::from_hex(ph.as_bytes()).expect("bad prevhash hex"),
-            find_u64(&ij, "timestamp").unwrap_or(0),
-        )
-    };
-
-    let diff: u32 = LOWEST_DIFFICULTY;
-    let next_ts = std::cmp::max(curtimes(), prev_ts.saturating_add(1));
-
-    let adr = Address::from_readable(coinbase_addr).expect("bad coinbase address");
-    let cbtx = mint::create_coinbase_tx(next_hei, Fixed16::default(), adr);
+    let tpl = fetch_template(client, base, coinbase_addr, params);
+    let cbtx = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr.clone());
 
     let mut trshxs: Vec<Hash> = vec![cbtx.hash_with_fee()];
     let mut transactions = DynVecTransaction::default();
@@ -257,30 +264,35 @@ pub fn mine_and_submit_block(
     let mut intro = BlockIntro {
         head: BlockHead {
             version: Uint1::from(1),
-            height: BlockHeight::from(next_hei),
-            timestamp: Timestamp::from(next_ts),
-            prevhash,
+            height: BlockHeight::from(tpl.height),
+            timestamp: Timestamp::from(tpl.timestamp),
+            prevhash: tpl.prevhash.clone(),
             mrklroot: calculate_mrklroot(&trshxs),
             transaction_count: Uint4::from(count),
         },
         meta: BlockMeta {
             nonce: Uint4::default(),
-            difficulty: Uint4::from(diff),
+            difficulty: Uint4::from(tpl.difficulty),
             witness_stage: Fixed2::default(),
         },
     };
 
-    let target = DifficultyTarget::from_num(diff).hash;
     let mut nonce: u32 = 0;
     loop {
         intro.meta.nonce = Uint4::from(nonce);
-        let ph = x16rs::block_hash(next_hei, &intro.serialize());
-        if !hash_bigger_than(&ph, &target) {
+        let ph = x16rs::block_hash(tpl.height, &intro.serialize());
+        if !hash_bigger_than(&ph, &tpl.target) {
             break;
         }
         nonce = nonce.wrapping_add(1);
         if nonce == 0 {
-            intro.head.timestamp = Timestamp::from(curtimes());
+            // Never roll the timestamp here: under ASERT the difficulty is a
+            // function of this block's own timestamp, so changing it would make
+            // the header's difficulty field wrong. Ask for a fresh template.
+            return (
+                tpl.height,
+                "{\"ok\":false,\"err\":\"nonce space exhausted; re-fetch template\"}".to_string(),
+            );
         }
     }
 
@@ -290,5 +302,5 @@ pub fn mine_and_submit_block(
         &format!("{base}/submit/block?hexbody=true"),
         &hex::encode(block.serialize()),
     );
-    (next_hei, resp)
+    (tpl.height, resp)
 }

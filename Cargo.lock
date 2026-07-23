@@ -3769,6 +3769,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "mint",
+ "num-bigint",
  "protocol",
  "reqwest",
  "serde_json",

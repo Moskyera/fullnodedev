@@ -7,6 +7,7 @@
 
 use std::env;
 
+use pool_spike::difficulty::ChainParams;
 use pool_spike::{balance, http_client, mine_and_submit_block};
 
 fn main() {
@@ -25,8 +26,9 @@ fn main() {
     println!("node   = {base}");
     println!("payout = {payout}");
 
+    let params = ChainParams::from_name(&args.get(3).cloned().unwrap_or_else(|| "testnet".into()));
     let client = http_client();
-    let (h, resp) = mine_and_submit_block(&client, &base, &payout, vec![]);
+    let (h, resp) = mine_and_submit_block(&client, &base, &payout, vec![], &params);
     println!("mined + submitted block {h} -> {resp}");
 
     std::thread::sleep(std::time::Duration::from_millis(900));

@@ -117,6 +117,7 @@ fn main() {
         &node,
         pool_acc.readable(),
         vec![Box::new(tx) as Box<dyn Transaction>],
+        &pool_spike::difficulty::ChainParams::from_name("testnet"),
     );
     println!("mined confirming block {h} -> {blkresp}");
 

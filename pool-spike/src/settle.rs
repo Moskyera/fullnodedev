@@ -85,6 +85,7 @@ fn main() {
         &base,
         sender.readable(),
         vec![Box::new(tx) as Box<dyn Transaction>],
+        &pool_spike::difficulty::ChainParams::from_name("testnet"),
     );
     println!("mined confirming block {h} (coinbase+transfer) -> {blkresp}");
 
