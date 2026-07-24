@@ -160,11 +160,14 @@ mod driver {
     unsafe extern "C" {
         fn cudaGetDeviceCount(count: *mut i32) -> CudaError_t;
         fn cudaSetDevice(device: i32) -> CudaError_t;
-        // Layout-independent device queries. Reading fields out of cudaDeviceProp
-        // via a hardcoded byte pad is fragile: the offset of major/minor/MP shifts
-        // across CUDA versions and alignment, yielding bogus values. These two
-        // stable APIs return exactly what we need without any struct layout.
-        fn cudaDeviceGetName(name: *mut i8, len: i32, device: i32) -> CudaError_t;
+        fn cudaGetDeviceProperties(prop: *mut CudaDeviceProp, device: i32) -> CudaError_t;
+        // cudaDeviceGetAttribute is a stable runtime API: it returns the compute
+        // capability and MP count by enum, without depending on the byte offset of
+        // those fields inside cudaDeviceProp (which shifts across CUDA versions and
+        // yielded bogus values when read via a hardcoded pad). The device NAME is
+        // still read from cudaGetDeviceProperties (name is at offset 0, always safe
+        // with an oversized struct); cudaDeviceGetName is a DRIVER-API symbol not
+        // present in cudart, so it must not be used here.
         fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> CudaError_t;
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError_t;
         fn cudaFree(ptr: *mut c_void) -> CudaError_t;
@@ -254,6 +257,15 @@ mod driver {
     const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
+    // Oversized tail so cudaGetDeviceProperties (which writes the FULL struct)
+    // never overflows across CUDA versions. Only `name` (offset 0) is read from
+    // it; compute capability + MP count come from cudaDeviceGetAttribute.
+    #[repr(C)]
+    struct CudaDeviceProp {
+        name: [i8; 256],
+        _rest: [u8; 2048],
+    }
+
     unsafe extern "C" {
         fn x16rs_cuda_main(
             input_stuff_89: *const c_void,
@@ -289,11 +301,12 @@ mod driver {
         check(unsafe { cudaGetDeviceCount(&mut count) })?;
         let mut out = Vec::new();
         for idx in 0..count {
-            let mut name_buf = [0i8; 256];
-            check(unsafe {
-                cudaDeviceGetName(name_buf.as_mut_ptr(), name_buf.len() as i32, idx)
-            })?;
-            let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
+            let mut prop = CudaDeviceProp {
+                name: [0; 256],
+                _rest: [0; 2048],
+            };
+            check(unsafe { cudaGetDeviceProperties(&mut prop, idx) })?;
+            let name = unsafe { CStr::from_ptr(prop.name.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
             let mut major = 0i32;
