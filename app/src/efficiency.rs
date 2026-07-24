@@ -86,7 +86,7 @@ impl EfficiencyConf {
             cpu_watts_per_thread: ini_must_f64(sec, "cpu_watts_per_thread", 8.0),
             hac_price: ini_must_f64(sec, "hac_price", 0.0),
             dynamic_supervene: ini_must_bool(sec, "dynamic_supervene", true),
-            supervene_min: supervene_min.max(0),
+            supervene_min,
             supervene_max,
             oom_fallback: ini_must_bool(sec, "oom_fallback", true),
             max_temp_c: ini_must_u64(sec, "max_temp_c", 0) as u32,

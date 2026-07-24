@@ -1,4 +1,4 @@
-fn create_coin_transfer(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
+fn create_coin_transfer(_ctx: &ApiExecCtx, mut req: ApiRequest) -> ApiResponse {
     use basis::interface::Transaction;
     use protocol::action::*;
     let fee = q_string(&req, "fee", "");
@@ -22,11 +22,11 @@ fn create_coin_transfer(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
     };
 
     if tx_type == TransactionType4::TYPE as u64 {
-        return create_coin_transfer_type4(&req, toaddr, fee, hac, timestamp, gas_max);
+        return create_coin_transfer_type4(&mut req, toaddr, fee, hac, timestamp, gas_max);
     }
 
-    let main_prikey = q_string(&req, "main_prikey", "");
-    let from_prikey = q_string(&req, "from_prikey", "");
+    let main_prikey = take_secret_query(&mut req, "main_prikey");
+    let from_prikey = take_secret_query(&mut req, "from_prikey");
     let satoshi = req.query_u64("satoshi", 0);
     let diamonds = q_string(&req, "diamonds", "");
 
@@ -122,7 +122,10 @@ fn create_coin_transfer(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
 
     api_data(serde_json::Map::from_iter([
         ("hash".to_owned(), json!(tx.hash().to_hex())),
-        ("hash_with_fee".to_owned(), json!(tx.hash_with_fee().to_hex())),
+        (
+            "hash_with_fee".to_owned(),
+            json!(tx.hash_with_fee().to_hex()),
+        ),
         ("timestamp".to_owned(), json!(tx.timestamp().uint())),
         ("type".to_owned(), json!(tx.ty())),
         ("body".to_owned(), json!(tx.serialize().to_hex())),
@@ -130,7 +133,7 @@ fn create_coin_transfer(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
 }
 
 fn create_coin_transfer_type4(
-    req: &ApiRequest,
+    req: &mut ApiRequest,
     toaddr: Address,
     fee: Amount,
     hac: Amount,
@@ -138,12 +141,12 @@ fn create_coin_transfer_type4(
     gas_max: u8,
 ) -> ApiResponse {
     use protocol::action::*;
-    let keystore = hybrid_keystore_from_req(req);
-    let pass = q_string(req, "keystore_pass", "");
+    let keystore = take_hybrid_keystore_from_req(req);
+    let pass = take_secret_query(req, "keystore_pass");
     if keystore.is_empty() {
         return api_error("type 4 transfer requires hybrid_keystore (query param or JSON body)");
     }
-    let Ok(blob) = sdk_unlock_hybrid_keystore_blob(&keystore, &pass) else {
+    let Ok(blob) = sdk::keystore_unlock_blob(&keystore, &pass) else {
         return api_error("hybrid keystore unlock failed");
     };
     let Ok(hybrid) = HybridAccount::from_key_blob(&blob) else {
@@ -166,7 +169,10 @@ fn create_coin_transfer_type4(
 
     api_data(serde_json::Map::from_iter([
         ("hash".to_owned(), json!(tx.hash().to_hex())),
-        ("hash_with_fee".to_owned(), json!(tx.hash_with_fee().to_hex())),
+        (
+            "hash_with_fee".to_owned(),
+            json!(tx.hash_with_fee().to_hex()),
+        ),
         ("timestamp".to_owned(), json!(tx.timestamp().uint())),
         ("type".to_owned(), json!(tx.ty())),
         ("main_address".to_owned(), json!(mainaddr.to_readable())),
@@ -175,7 +181,7 @@ fn create_coin_transfer_type4(
     ]))
 }
 
-fn create_coin_transfer_v4(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
+fn create_coin_transfer_v4(_ctx: &ApiExecCtx, mut req: ApiRequest) -> ApiResponse {
     let fee = q_string(&req, "fee", "");
     let to_address = q_string(&req, "to_address", "");
     let timestamp = req.query_u64("timestamp", 0);
@@ -195,5 +201,5 @@ fn create_coin_transfer_v4(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
         return api_error("hacash amount format invalid");
     };
 
-    create_coin_transfer_type4(&req, toaddr, fee, hac, timestamp, gas_max)
+    create_coin_transfer_type4(&mut req, toaddr, fee, hac, timestamp, gas_max)
 }

@@ -17,35 +17,115 @@ pub struct CudaDeviceInfo {
     pub multiprocessor_count: i32,
 }
 
+/// The device allocations one miner instance owns. Kept together behind a mutex
+/// inside `CudaMiner` so a sticky-fault recovery can destroy the CUDA context and
+/// swap in a freshly allocated set without the caller having to rebuild the miner.
+#[cfg_attr(not(cuda_available), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct DeviceBuffers {
+    stuff: *mut c_void,
+    best_hashes: *mut c_void,
+    best_nonces: *mut c_void,
+    global_hashes: *mut c_void,
+    global_order: *mut c_void,
+}
+
+#[cfg_attr(not(cuda_available), allow(dead_code))]
+impl DeviceBuffers {
+    fn null() -> Self {
+        DeviceBuffers {
+            stuff: std::ptr::null_mut(),
+            best_hashes: std::ptr::null_mut(),
+            best_nonces: std::ptr::null_mut(),
+            global_hashes: std::ptr::null_mut(),
+            global_order: std::ptr::null_mut(),
+        }
+    }
+
+    /// True when any buffer is missing, i.e. the set must not be handed to a kernel.
+    fn is_incomplete(&self) -> bool {
+        self.stuff.is_null()
+            || self.best_hashes.is_null()
+            || self.best_nonces.is_null()
+            || self.global_hashes.is_null()
+            || self.global_order.is_null()
+    }
+}
+
 #[derive(Debug)]
 pub struct CudaMiner {
     device: i32,
-    stuff_buf: *mut c_void,
-    best_hashes_buf: *mut c_void,
-    best_nonces_buf: *mut c_void,
-    global_hashes_buf: *mut c_void,
-    global_order_buf: *mut c_void,
+    buffers: std::sync::Mutex<DeviceBuffers>,
+    /// Sticky-fault context rebuilds not yet followed by a clean batch. Bounds the
+    /// automatic recovery so a permanently broken card cannot reset the device in a
+    /// tight loop.
+    sticky_resets: std::sync::atomic::AtomicU32,
     workgroups: u32,
     local_size: u32,
     unit_size: u32,
 }
 
-// Device pointers are owned exclusively; each launch calls cudaSetDevice first.
+// Device pointers are owned exclusively and are only reachable through the mutex;
+// each launch calls cudaSetDevice first.
 unsafe impl Send for CudaMiner {}
 unsafe impl Sync for CudaMiner {}
 
 #[derive(Debug)]
 pub enum CudaError {
     NotCompiled,
-    Driver(String),
+    Driver { code: i32, message: String },
     InvalidArgs(String),
+}
+
+/// CUDA runtime error codes that poison the whole device context: once one is
+/// raised, every later runtime call on that device returns the same code until the
+/// context is destroyed, so shrinking the launch size cannot help - only a
+/// cudaDeviceReset plus a full reallocation can. Values are the stable
+/// `cudaError_t` enumerants.
+const STICKY_CUDA_ERROR_CODES: [i32; 13] = [
+    214, // cudaErrorECCUncorrectable
+    220, // cudaErrorNvlinkUncorrectable
+    700, // cudaErrorIllegalAddress
+    702, // cudaErrorLaunchTimeout
+    709, // cudaErrorContextIsDestroyed
+    710, // cudaErrorAssert
+    714, // cudaErrorHardwareStackError
+    715, // cudaErrorIllegalInstruction
+    716, // cudaErrorMisalignedAddress
+    717, // cudaErrorInvalidAddressSpace
+    718, // cudaErrorInvalidPc
+    719, // cudaErrorLaunchFailure
+    999, // cudaErrorUnknown
+];
+
+impl CudaError {
+    /// Raw `cudaError_t` code of a driver failure, so a caller can tell a per-launch
+    /// failure (where the work-group backoff is the right answer) from one that
+    /// killed the context.
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            CudaError::Driver { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// True when the fault destroyed the CUDA context, so only a device reset can
+    /// bring the card back. Non-sticky failures such as cudaErrorMemoryAllocation
+    /// (2), cudaErrorInvalidConfiguration (9) and cudaErrorLaunchOutOfResources
+    /// (701) leave the context usable and must NOT trigger a reset.
+    pub fn is_sticky(&self) -> bool {
+        match self.code() {
+            Some(code) => STICKY_CUDA_ERROR_CODES.contains(&code),
+            None => false,
+        }
+    }
 }
 
 impl std::fmt::Display for CudaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CudaError::NotCompiled => write!(f, "x16rs-cuda built without CUDA kernels"),
-            CudaError::Driver(msg) => write!(f, "CUDA: {msg}"),
+            CudaError::Driver { code, message } => write!(f, "CUDA: {message} (code {code})"),
             CudaError::InvalidArgs(msg) => write!(f, "{msg}"),
         }
     }
@@ -174,6 +254,10 @@ mod driver {
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32)
         -> CudaError_t;
         fn cudaDeviceSynchronize() -> CudaError_t;
+        // Destroys the primary context of the CURRENT device (and with it every
+        // allocation on it). The only way back from a sticky fault short of
+        // restarting the process.
+        fn cudaDeviceReset() -> CudaError_t;
         fn cudaGetErrorString(err: CudaError_t) -> *const i8;
         fn cudaFuncGetAttributes(attr: *mut CudaFuncAttributes, func: *const c_void)
         -> CudaError_t;
@@ -252,6 +336,10 @@ mod driver {
     const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
     const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
+    // cudaErrorDeviceUninitialized: reported when a context rebuild left the miner
+    // without device buffers, so no launch may be attempted.
+    const CUDA_ERROR_DEVICE_UNINITIALIZED: i32 = 201;
+
     // Stable cudaDeviceAttr enum values (CUDA runtime API).
     const CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
     const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
@@ -291,7 +379,12 @@ mod driver {
         } else {
             unsafe {
                 let cstr = CStr::from_ptr(cudaGetErrorString(err));
-                Err(CudaError::Driver(cstr.to_string_lossy().into_owned()))
+                // Carry the raw code, not just the text, so sticky context faults can
+                // be told apart from per-launch failures (see CudaError::is_sticky).
+                Err(CudaError::Driver {
+                    code: err,
+                    message: cstr.to_string_lossy().into_owned(),
+                })
             }
         }
     }
@@ -332,6 +425,65 @@ mod driver {
         Ok(out)
     }
 
+    /// Never rebuild the context more than this many times in a row without a clean
+    /// batch in between; past that the card is broken, not hiccuping.
+    const MAX_STICKY_CONTEXT_RESETS: u32 = 5;
+
+    /// Allocate the full buffer set for one miner instance. On a partial failure
+    /// every buffer already obtained is freed, so a failed init (or a failed realloc
+    /// after a context rebuild) leaves nothing stranded on the card.
+    unsafe fn alloc_device_buffers(
+        wg: u32,
+        local_size: u32,
+        unit_size: u32,
+    ) -> CudaResult<DeviceBuffers> {
+        let mut bufs = DeviceBuffers::null();
+        let global_slots = (wg as usize) * (local_size as usize) * (unit_size as usize);
+        let allocated = (|| -> CudaResult<()> {
+            check(unsafe { cudaMalloc(&mut bufs.stuff, STUFF_BYTES) })?;
+            check(unsafe { cudaMalloc(&mut bufs.best_hashes, (wg as usize) * HASH_BYTES) })?;
+            check(unsafe { cudaMalloc(&mut bufs.best_nonces, (wg as usize) * 4) })?;
+            check(unsafe { cudaMalloc(&mut bufs.global_hashes, global_slots * HASH_BYTES) })?;
+            check(unsafe { cudaMalloc(&mut bufs.global_order, global_slots * 4) })?;
+            Ok(())
+        })();
+        if let Err(e) = allocated {
+            unsafe { free_device_buffers(&mut bufs) };
+            return Err(e);
+        }
+        Ok(bufs)
+    }
+
+    /// Free every non-null buffer and null the handles, so a second free (Drop after
+    /// an explicit teardown) cannot touch a released pointer.
+    unsafe fn free_device_buffers(bufs: &mut DeviceBuffers) {
+        unsafe {
+            if !bufs.stuff.is_null() {
+                cudaFree(bufs.stuff);
+            }
+            if !bufs.best_hashes.is_null() {
+                cudaFree(bufs.best_hashes);
+            }
+            if !bufs.best_nonces.is_null() {
+                cudaFree(bufs.best_nonces);
+            }
+            if !bufs.global_hashes.is_null() {
+                cudaFree(bufs.global_hashes);
+            }
+            if !bufs.global_order.is_null() {
+                cudaFree(bufs.global_order);
+            }
+        }
+        *bufs = DeviceBuffers::null();
+    }
+
+    /// Lock the buffer set, ignoring poisoning: a panic in another thread must not
+    /// take the GPU down for the rest of a 24/7 run - the pointers behind the mutex
+    /// are plain handles and cannot be left half-updated.
+    fn lock_buffers(miner: &CudaMiner) -> std::sync::MutexGuard<'_, DeviceBuffers> {
+        miner.buffers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn cuda_init_miner(
         device_index: i32,
         workgroups: u32,
@@ -340,51 +492,67 @@ mod driver {
         check(unsafe { cudaSetDevice(device_index) })?;
         let local_size = DEFAULT_LOCAL_SIZE;
         let wg = workgroups;
-        let mut stuff_buf = ptr::null_mut();
-        let mut best_hashes_buf = ptr::null_mut();
-        let mut best_nonces_buf = ptr::null_mut();
-        let mut global_hashes_buf = ptr::null_mut();
-        let mut global_order_buf = ptr::null_mut();
 
-        check(unsafe { cudaMalloc(&mut stuff_buf, STUFF_BYTES) })?;
-        check(unsafe { cudaMalloc(&mut best_hashes_buf, (wg as usize) * HASH_BYTES) })?;
-        check(unsafe { cudaMalloc(&mut best_nonces_buf, (wg as usize) * 4) })?;
-        let global_slots = (wg as usize) * (local_size as usize) * (unit_size as usize);
-        check(unsafe { cudaMalloc(&mut global_hashes_buf, global_slots * HASH_BYTES) })?;
-        check(unsafe { cudaMalloc(&mut global_order_buf, global_slots * 4) })?;
+        // The batch kernel's shared `local_nonces[256]` and its power-of-two tree
+        // reduction make DEFAULT_LOCAL_SIZE a hard structural requirement: unlike the
+        // single-hash path it cannot simply be clamped to the kernel's own
+        // maxThreadsPerBlock without corrupting the reduction. So check here that a
+        // 256-thread block is launchable and refuse the device loudly if it is not,
+        // instead of letting every runtime batch fail with
+        // cudaErrorInvalidConfiguration (9) and silently degrade to CPU recovery
+        // forever. This also logs the batch kernel's numRegs/shared/maxThreadsPerBlock,
+        // the same visibility the single-hash kernel already gets.
+        let batch_block =
+            unsafe { clamped_block_size(x16rs_cuda_main as *const c_void, local_size, "batch") };
+        if batch_block < local_size {
+            return Err(CudaError::InvalidArgs(format!(
+                "device #{}: x16rs_cuda_main supports only {} threads/block but the batch reduction requires {}; this device/build is unsupported",
+                device_index, batch_block, local_size
+            )));
+        }
 
-        Ok(CudaMiner {
+        let buffers = unsafe { alloc_device_buffers(wg, local_size, unit_size) }?;
+
+        let miner = CudaMiner {
             device: device_index,
-            stuff_buf,
-            best_hashes_buf,
-            best_nonces_buf,
-            global_hashes_buf,
-            global_order_buf,
+            buffers: std::sync::Mutex::new(buffers),
+            sticky_resets: std::sync::atomic::AtomicU32::new(0),
             workgroups: wg,
             local_size,
             unit_size,
-        })
+        };
+
+        // cudaMalloc succeeding proves nothing about whether the kernel actually
+        // launches, so run one real batch before handing the miner out. A card that
+        // would fail every batch is rejected at startup, where the caller's
+        // no-silent-fallback guard reports it, instead of grinding capped CPU recovery
+        // for the life of the process. On the error path `miner` drops here and its
+        // Drop frees the buffers.
+        if let Err(e) = cuda_self_test(&miner) {
+            eprintln!("[cuda] batch kernel self-test failed on device #{device_index}: {e}");
+            return Err(e);
+        }
+
+        Ok(miner)
+    }
+
+    /// One small real batch launch, used at init to prove the kernel runs. It calls
+    /// the launch path directly so the sticky-fault auto-recovery does not kick in:
+    /// at startup a broken device must be reported, not reset and retried.
+    fn cuda_self_test(miner: &CudaMiner) -> CudaResult<()> {
+        let stuff = [0u8; STUFF_BYTES];
+        let guard = lock_buffers(miner);
+        let bufs = *guard;
+        unsafe { mine_batch_inner(miner, &bufs, &stuff, 0, 1, 1) }.map(|_| ())
     }
 
     pub fn cuda_free_miner(miner: &CudaMiner) -> CudaResult<()> {
-        check(unsafe { cudaSetDevice(miner.device) })?;
-        unsafe {
-            if !miner.stuff_buf.is_null() {
-                cudaFree(miner.stuff_buf);
-            }
-            if !miner.best_hashes_buf.is_null() {
-                cudaFree(miner.best_hashes_buf);
-            }
-            if !miner.best_nonces_buf.is_null() {
-                cudaFree(miner.best_nonces_buf);
-            }
-            if !miner.global_hashes_buf.is_null() {
-                cudaFree(miner.global_hashes_buf);
-            }
-            if !miner.global_order_buf.is_null() {
-                cudaFree(miner.global_order_buf);
-            }
-        }
+        // Best effort: if the context is already poisoned cudaSetDevice returns the
+        // sticky code, but the frees must still be attempted (and the handles nulled)
+        // rather than leaving them dangling behind an early return.
+        let _ = check(unsafe { cudaSetDevice(miner.device) });
+        let mut bufs = lock_buffers(miner);
+        unsafe { free_device_buffers(&mut bufs) };
         Ok(())
     }
 
@@ -442,8 +610,106 @@ mod driver {
         })
     }
 
+    /// Rebuild the CUDA context after a sticky fault and reallocate the buffers, so
+    /// the next batch runs on a healthy device instead of returning the same poisoned
+    /// error forever. Bounded by MAX_STICKY_CONTEXT_RESETS consecutive attempts; the
+    /// counter is cleared by the first clean batch.
+    unsafe fn recover_sticky_context(miner: &CudaMiner, bufs: &mut DeviceBuffers) {
+        use std::sync::atomic::Ordering;
+        let attempt = miner.sticky_resets.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempt > MAX_STICKY_CONTEXT_RESETS {
+            if attempt == MAX_STICKY_CONTEXT_RESETS + 1 {
+                eprintln!(
+                    "[cuda] ALERT device #{} still faults after {} context rebuilds; GPU mining is OFF until this process restarts - mining continues on CPU recovery only, so check the card (ECC, overclock, driver) now",
+                    miner.device, MAX_STICKY_CONTEXT_RESETS
+                );
+            }
+            return;
+        }
+        eprintln!(
+            "[cuda] sticky device fault on #{}; rebuilding the CUDA context (attempt {}/{})",
+            miner.device, attempt, MAX_STICKY_CONTEXT_RESETS
+        );
+        // A sticky fault has already destroyed the context, so cudaFree on the old
+        // pointers would only return the same error. cudaDeviceReset tears down the
+        // context together with every allocation on it: drop the stale handles first
+        // so nothing can be used after the reset, then allocate from scratch.
+        *bufs = DeviceBuffers::null();
+        let rc = unsafe { cudaDeviceReset() };
+        if rc != CUDA_SUCCESS {
+            eprintln!(
+                "[cuda] cudaDeviceReset on #{} failed rc={}; GPU stays unavailable",
+                miner.device, rc
+            );
+            return;
+        }
+        if let Err(e) = check(unsafe { cudaSetDevice(miner.device) }) {
+            eprintln!("[cuda] re-selecting device #{} after reset failed: {e}", miner.device);
+            return;
+        }
+        match unsafe { alloc_device_buffers(miner.workgroups, miner.local_size, miner.unit_size) } {
+            Ok(fresh) => {
+                *bufs = fresh;
+                eprintln!(
+                    "[cuda] device #{} context rebuilt; GPU mining resumes on the next batch",
+                    miner.device
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cuda] reallocating device #{} buffers after the reset failed: {e}",
+                    miner.device
+                );
+            }
+        }
+    }
+
     pub fn cuda_mine_batch(
         miner: &CudaMiner,
+        block_intro: &[u8],
+        nonce_start: u32,
+        repeat: u32,
+        workgroups: u32,
+    ) -> CudaResult<(u32, [u8; HASH_BYTES])> {
+        use std::sync::atomic::Ordering;
+        // Hold the buffer lock for the whole batch: a concurrent sticky-fault rebuild
+        // must never swap the pointers out from under a running launch.
+        let mut bufs = lock_buffers(miner);
+        if bufs.is_incomplete() {
+            // An earlier rebuild could not reallocate. Retry it (still bounded by the
+            // reset budget) rather than launching the kernel against null pointers.
+            unsafe { recover_sticky_context(miner, &mut bufs) };
+            if bufs.is_incomplete() {
+                return Err(CudaError::Driver {
+                    code: CUDA_ERROR_DEVICE_UNINITIALIZED,
+                    message: format!(
+                        "device #{} has no usable buffers after a sticky fault; GPU mining stays disabled",
+                        miner.device
+                    ),
+                });
+            }
+        }
+        let snapshot = *bufs;
+        match unsafe {
+            mine_batch_inner(miner, &snapshot, block_intro, nonce_start, repeat, workgroups)
+        } {
+            Ok(best) => {
+                miner.sticky_resets.store(0, Ordering::Relaxed);
+                Ok(best)
+            }
+            Err(e) => {
+                if e.is_sticky() {
+                    unsafe { recover_sticky_context(miner, &mut bufs) };
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The batch launch itself. `bufs` must be a complete set for `miner`.
+    unsafe fn mine_batch_inner(
+        miner: &CudaMiner,
+        bufs: &DeviceBuffers,
         block_intro: &[u8],
         nonce_start: u32,
         repeat: u32,
@@ -452,22 +718,26 @@ mod driver {
         check(unsafe { cudaSetDevice(miner.device) })?;
         check(unsafe {
             cudaMemcpy(
-                miner.stuff_buf,
+                bufs.stuff,
                 block_intro.as_ptr() as *const c_void,
                 STUFF_BYTES,
                 CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         })?;
 
-        let mut stuff_ptr = miner.stuff_buf;
+        let mut stuff_ptr = bufs.stuff;
         let mut nonce_val = nonce_start;
         let mut repeat_val = repeat;
         let mut unit_val = miner.unit_size;
-        let mut hashes_ptr = miner.global_hashes_buf;
-        let mut order_ptr = miner.global_order_buf;
-        let mut best_hashes_ptr = miner.best_hashes_buf;
-        let mut best_nonces_ptr = miner.best_nonces_buf;
+        let mut hashes_ptr = bufs.global_hashes;
+        let mut order_ptr = bufs.global_order;
+        let mut best_hashes_ptr = bufs.best_hashes;
+        let mut best_nonces_ptr = bufs.best_nonces;
 
+        // The block size is fixed, NOT clamped like the single-hash path: the kernel's
+        // shared local_nonces[256] and its power-of-two tree reduction require exactly
+        // DEFAULT_LOCAL_SIZE threads. cuda_init_miner already proved the kernel accepts
+        // that block size on this device, so a launch cannot fail on block size here.
         unsafe {
             launch_kernel(
                 x16rs_cuda_main as *const c_void,
@@ -492,7 +762,7 @@ mod driver {
         check(unsafe {
             cudaMemcpy(
                 hashes.as_mut_ptr() as *mut c_void,
-                miner.best_hashes_buf,
+                bufs.best_hashes,
                 hashes.len(),
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             )
@@ -500,7 +770,7 @@ mod driver {
         check(unsafe {
             cudaMemcpy(
                 nonces.as_mut_ptr() as *mut c_void,
-                miner.best_nonces_buf,
+                bufs.best_nonces,
                 nonces.len() * 4,
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             )
@@ -528,19 +798,32 @@ mod driver {
         block_intro: &[u8],
         repeat: u32,
     ) -> CudaResult<[u8; HASH_BYTES]> {
+        // Hold the lock for the whole launch so a concurrent rebuild cannot free the
+        // buffers this call is using.
+        let guard = lock_buffers(miner);
+        let bufs = *guard;
+        if bufs.is_incomplete() {
+            return Err(CudaError::Driver {
+                code: CUDA_ERROR_DEVICE_UNINITIALIZED,
+                message: format!(
+                    "device #{} has no usable buffers after a sticky fault",
+                    miner.device
+                ),
+            });
+        }
         check(unsafe { cudaSetDevice(miner.device) })?;
         check(unsafe {
             cudaMemcpy(
-                miner.stuff_buf,
+                bufs.stuff,
                 block_intro.as_ptr() as *const c_void,
                 STUFF_BYTES,
                 CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         })?;
         let mut out = [0u8; HASH_BYTES];
-        let mut stuff_ptr = miner.stuff_buf;
+        let mut stuff_ptr = bufs.stuff;
         let mut repeat_val = repeat;
-        let mut out_ptr = miner.best_hashes_buf;
+        let mut out_ptr = bufs.best_hashes;
         // The single-hash kernel does its work on thread 0; the rest only cooperatively
         // fill the shared tables (the fill loop strides by blockDim.x, so any block size
         // is correct). Clamp to the kernel's own maxThreadsPerBlock to avoid
@@ -566,7 +849,7 @@ mod driver {
             check(cudaDeviceSynchronize())?;
             check(cudaMemcpy(
                 out.as_mut_ptr() as *mut c_void,
-                miner.best_hashes_buf,
+                bufs.best_hashes,
                 HASH_BYTES,
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             ))?;
@@ -619,4 +902,67 @@ fn cuda_mine_batch(
 #[cfg(not(cuda_available))]
 fn cuda_block_hash_single(_: &CudaMiner, _: &[u8], _: u32) -> CudaResult<[u8; HASH_BYTES]> {
     Err(CudaError::NotCompiled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver_error(code: i32) -> CudaError {
+        CudaError::Driver {
+            code,
+            message: "test".into(),
+        }
+    }
+
+    #[test]
+    fn sticky_faults_are_recognized() {
+        // These poison the CUDA context: every later runtime call returns the same
+        // code, so only a device reset can bring the card back. Missing one of them
+        // means a 24/7 rig silently mines on capped CPU recovery until restarted.
+        for code in [214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 999] {
+            assert!(
+                driver_error(code).is_sticky(),
+                "cuda code {code} must be treated as sticky"
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_faults_are_not_sticky() {
+        // cudaErrorMemoryAllocation (2), cudaErrorInvalidConfiguration (9) and
+        // cudaErrorLaunchOutOfResources (701) leave the context intact; resetting the
+        // device for them would throw away a working context for nothing.
+        for code in [2, 9, 701] {
+            assert!(
+                !driver_error(code).is_sticky(),
+                "cuda code {code} must not trigger a context rebuild"
+            );
+        }
+        assert!(!CudaError::NotCompiled.is_sticky());
+        assert!(!CudaError::InvalidArgs("bad".into()).is_sticky());
+    }
+
+    #[test]
+    fn driver_error_carries_the_raw_code() {
+        assert_eq!(driver_error(700).code(), Some(700));
+        assert_eq!(CudaError::NotCompiled.code(), None);
+        assert_eq!(CudaError::InvalidArgs("bad".into()).code(), None);
+        // The operator-visible text keeps the driver message and adds the code so a
+        // support log identifies the exact fault class.
+        assert_eq!(driver_error(700).to_string(), "CUDA: test (code 700)");
+    }
+
+    #[test]
+    fn buffer_set_is_incomplete_until_every_pointer_is_present() {
+        let mut bufs = DeviceBuffers::null();
+        assert!(bufs.is_incomplete());
+        bufs.stuff = 1usize as *mut c_void;
+        bufs.best_hashes = 1usize as *mut c_void;
+        bufs.best_nonces = 1usize as *mut c_void;
+        bufs.global_hashes = 1usize as *mut c_void;
+        assert!(bufs.is_incomplete(), "one missing buffer must still be incomplete");
+        bufs.global_order = 1usize as *mut c_void;
+        assert!(!bufs.is_incomplete());
+    }
 }

@@ -3764,8 +3764,11 @@ dependencies = [
 name = "pool-spike"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "basis",
  "field",
+ "fs2",
  "getrandom 0.3.4",
  "hex",
  "mint",
@@ -3775,6 +3778,7 @@ dependencies = [
  "serde_json",
  "sys",
  "x16rs",
+ "zeroize",
 ]
 
 [[package]]

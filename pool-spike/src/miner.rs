@@ -2,7 +2,9 @@
 //! against the pool's share target, submits shares. This is the worker side
 //! that the real poworker will later speak.
 //!
-//! Usage: test-miner [pool_base] [worker_name] [shares_to_find]
+//! Usage: test-miner [pool_base] [worker_address] [shares_to_find]
+//!   The worker id must be a payable HAC address: the pool credits shares under
+//!   that key and refuses one it could never pay, exactly as on the paid path.
 
 use pool_spike::pool_core;
 use pool_spike::{find_str, find_u64, get_json, http_client};

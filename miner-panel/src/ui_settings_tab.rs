@@ -702,6 +702,18 @@ individually paid. No share accounting or payouts (v1).",
                             }
                             ui.end_row();
 
+                            theme::field_label(ui, "Max connections per IP");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.public_pool.max_conns_per_ip)
+                                        .range(0..=100000),
+                                )
+                                .changed()
+                            {
+                                self.save_public_pool_settings();
+                            }
+                            ui.end_row();
+
                             theme::field_label(ui, "Pool token (optional)");
                             if ui
                                 .add(
@@ -715,6 +727,15 @@ individually paid. No share accounting or payouts (v1).",
                             }
                             ui.end_row();
                         });
+
+                    ui.label(
+                        egui::RichText::new(
+                            "Max connections per IP: 0 = unlimited. A large farm behind one NAT \
+or router may need this raised.",
+                        )
+                        .size(11.0)
+                        .color(theme::colors::TEXT_MUTED),
+                    );
 
                     if ui
                         .checkbox(

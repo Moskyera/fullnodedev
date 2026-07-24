@@ -1,7 +1,8 @@
 use ml_dsa::{
-    ExpandedSigningKey, ExpandedSigningKeyBytes, Generate, KeyExport, KeyInit, Keypair,
-    MlDsa65, Signature as MlDsaSignature, SignatureEncoding, SigningKey, VerifyingKey,
+    ExpandedSigningKey, ExpandedSigningKeyBytes, KeyExport, KeyInit, Keypair, MlDsa65,
+    Signature as MlDsaSignature, SignatureEncoding, SigningKey, VerifyingKey,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const SECP_PK_SIZE: usize = 33;
 const SECP_SIG_SIZE: usize = 64;
@@ -15,6 +16,7 @@ pub type MldsaSecretKey = ExpandedSigningKey<MlDsa65>;
 const MLDSA65_PK_BYTES: usize = 1952;
 const MLDSA65_SIG_BYTES: usize = 3309;
 const MLDSA65_SK_BYTES: usize = 4032;
+const MLDSA65_SEED_BYTES: usize = 32;
 
 #[derive(Clone, PartialEq)]
 pub enum HybridAccountKind {
@@ -78,8 +80,7 @@ impl HybridAccount {
     }
 
     pub fn create_pqc_randomly(randomfill: &dyn Fn(&mut [u8]) -> Rerr) -> Ret<HybridAccount> {
-        let _ = randomfill;
-        let signing = SigningKey::<MlDsa65>::generate();
+        let signing = mldsa_signing_key_by(randomfill)?;
         let mldsa_sk = ExpandedSigningKey::from_seed(signing.as_seed());
         let mldsa_pk = signing.verifying_key().clone();
         let mldsa_pk_bytes = pk_to_vec(&mldsa_pk);
@@ -98,14 +99,14 @@ impl HybridAccount {
 
     pub fn create_hybrid_randomly(randomfill: &dyn Fn(&mut [u8]) -> Rerr) -> Ret<HybridAccount> {
         let secp = Account::create_randomly(randomfill)?;
-        let signing = SigningKey::<MlDsa65>::generate();
+        let signing = mldsa_signing_key_by(randomfill)?;
         let mldsa_sk = ExpandedSigningKey::from_seed(signing.as_seed());
         let mldsa_pk = signing.verifying_key().clone();
         Self::from_secp_and_mldsa(secp, mldsa_sk, mldsa_pk)
     }
 
     pub fn create_hybrid_from_secp(secp: Account) -> Ret<HybridAccount> {
-        let signing = SigningKey::<MlDsa65>::generate();
+        let signing = mldsa_signing_key_by(&os_randomfill)?;
         let mldsa_sk = ExpandedSigningKey::from_seed(signing.as_seed());
         let mldsa_pk = signing.verifying_key().clone();
         Self::from_secp_and_mldsa(secp, mldsa_sk, mldsa_pk)
@@ -181,10 +182,7 @@ impl HybridAccount {
     pub fn export_key_blob(&self) -> Ret<HybridKeyBlob> {
         let kind = self.sign_alg_id();
         let mldsa_sk = expanded_sk_to_vec(&self.mldsa_sk);
-        let secp_sk = match &self.secp {
-            Some(acc) => Some(acc.secret_key().serialize()),
-            None => None,
-        };
+        let secp_sk = self.secp.as_ref().map(|acc| acc.secret_key().serialize());
         Ok(HybridKeyBlob {
             kind,
             mldsa_sk,
@@ -209,8 +207,8 @@ impl HybridAccount {
             );
         }
         let mldsa_sk = expanded_sk_from_bytes(&blob.mldsa_sk)?;
-        let mldsa_pk = VerifyingKey::<MlDsa65>::new_from_slice(&blob.mldsa_pk)
-            .map_err(|e| e.to_string())?;
+        let mldsa_pk =
+            VerifyingKey::<MlDsa65>::new_from_slice(&blob.mldsa_pk).map_err(|e| e.to_string())?;
         let mldsa_pk_bytes = pk_to_vec(&mldsa_pk);
         if pk_to_vec(&mldsa_sk.verifying_key()) != mldsa_pk_bytes {
             return errf!("hybrid key blob mldsa pk/sk mismatch");
@@ -229,10 +227,11 @@ impl HybridAccount {
                 })
             }
             3 => {
-                let secp_sk = blob
-                    .secp_sk
-                    .ok_or_else(|| "hybrid key blob missing secp secret".to_string())?;
-                let secp = Account::create_by_secret_key_value(secp_sk)?;
+                let secp_sk = zeroize::Zeroizing::new(
+                    blob.secp_sk
+                        .ok_or_else(|| "hybrid key blob missing secp secret".to_string())?,
+                );
+                let secp = Account::create_by_secret_key_value(*secp_sk)?;
                 Self::from_secp_and_mldsa(secp, mldsa_sk, mldsa_pk)
             }
             _ => errf!("hybrid key blob kind {} not supported", blob.kind),
@@ -240,7 +239,7 @@ impl HybridAccount {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HybridKeyBlob {
     pub kind: u8,
     pub mldsa_sk: Vec<u8>,
@@ -248,12 +247,56 @@ pub struct HybridKeyBlob {
     pub mldsa_pk: Vec<u8>,
 }
 
+impl Zeroize for HybridKeyBlob {
+    fn zeroize(&mut self) {
+        self.mldsa_sk.zeroize();
+        self.secp_sk.zeroize();
+    }
+}
+
+impl Drop for HybridKeyBlob {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for HybridKeyBlob {}
+
+impl std::fmt::Debug for HybridKeyBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HybridKeyBlob")
+            .field("kind", &self.kind)
+            .field("mldsa_sk", &"[REDACTED]")
+            .field("secp_sk", &self.secp_sk.as_ref().map(|_| "[REDACTED]"))
+            .field("mldsa_pk_len", &self.mldsa_pk.len())
+            .finish()
+    }
+}
+
 pub fn mldsa65_secret_key_size() -> usize {
     secret_key_bytes()
 }
 
+pub fn mldsa65_public_key_size() -> usize {
+    public_key_bytes()
+}
+
 fn pk_to_vec(pk: &MldsaPublicKey) -> Vec<u8> {
     pk.to_bytes().into_iter().collect()
+}
+
+// Build the ML-DSA-65 key from the caller supplied entropy source, so a vetted
+// RNG is really used and an RNG failure comes back as Err instead of a panic
+// from inside the ml-dsa crate.
+fn mldsa_signing_key_by(randomfill: &dyn Fn(&mut [u8]) -> Rerr) -> Ret<SigningKey<MlDsa65>> {
+    let mut seed = zeroize::Zeroizing::new([0u8; MLDSA65_SEED_BYTES]);
+    randomfill(&mut seed[..])?;
+    SigningKey::<MlDsa65>::new_from_slice(&seed[..]).map_err(|e| e.to_string())
+}
+
+// System RNG used when the caller has no entropy source of its own.
+fn os_randomfill(buf: &mut [u8]) -> Rerr {
+    getrandom::fill(buf).map_err(|e| e.to_string())
 }
 
 fn secret_key_bytes() -> usize {
@@ -271,7 +314,8 @@ fn signature_bytes() -> usize {
 fn expanded_sk_to_vec(sk: &MldsaSecretKey) -> Vec<u8> {
     #[allow(deprecated)]
     {
-        sk.to_expanded().into_iter().collect()
+        let encoded = zeroize::Zeroizing::new(sk.to_expanded());
+        encoded.iter().copied().collect()
     }
 }
 
@@ -283,13 +327,14 @@ fn expanded_sk_from_bytes(bytes: &[u8]) -> Ret<MldsaSecretKey> {
             secret_key_bytes()
         );
     }
-    let mut enc: ExpandedSigningKeyBytes<MlDsa65> = Default::default();
+    let mut enc = zeroize::Zeroizing::<ExpandedSigningKeyBytes<MlDsa65>>::default();
     for (dst, src) in enc.iter_mut().zip(bytes.iter()) {
         *dst = *src;
     }
     #[allow(deprecated)]
     {
-        Ok(ExpandedSigningKey::from_expanded(&enc))
+        std::panic::catch_unwind(|| ExpandedSigningKey::from_expanded(&enc))
+            .map_err(|_| "mldsa expanded secret key invalid".to_string())
     }
 }
 
@@ -396,6 +441,52 @@ mod pqc_tests {
     }
 
     #[test]
+    fn pqc_key_comes_from_the_caller_entropy() {
+        let make = || {
+            HybridAccount::create_pqc_randomly(&|buf| {
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(5).wrapping_add(11);
+                }
+                Ok(())
+            })
+            .unwrap()
+        };
+        let one = make();
+        let two = make();
+        assert_eq!(one.address(), two.address());
+        assert_eq!(one.mldsa_public_key_bytes(), two.mldsa_public_key_bytes());
+
+        let other = HybridAccount::create_pqc_randomly(&|buf| {
+            for b in buf.iter_mut() {
+                *b = 0xA7;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(one.address(), other.address());
+    }
+
+    #[test]
+    fn hybrid_key_comes_from_the_caller_entropy() {
+        let make = || {
+            HybridAccount::create_hybrid_randomly(&|buf| {
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_add(23);
+                }
+                Ok(())
+            })
+            .unwrap()
+        };
+        assert_eq!(make().address(), make().address());
+    }
+
+    #[test]
+    fn entropy_failure_returns_error_not_panic() {
+        let res = HybridAccount::create_pqc_randomly(&|_| errf!("rng unavailable"));
+        assert!(res.is_err(), "an RNG failure must surface as Err");
+    }
+
+    #[test]
     fn pqc_roundtrip_sign_verify() {
         let acc = HybridAccount::create_pqc_randomly(&|buf| {
             for (i, b) in buf.iter_mut().enumerate() {
@@ -428,12 +519,13 @@ mod pqc_tests {
         let mldsa_off = SECP_PK_SIZE + SECP_SIG_SIZE;
         let mldsa_pk = &body[mldsa_off..mldsa_off + public_key_bytes()];
         let mldsa_sig = &body[mldsa_off + public_key_bytes()..];
-        assert!(Account::verify_signature(&msg, &secp_pk, secp_sig.try_into().unwrap()));
+        assert!(Account::verify_signature(
+            &msg,
+            &secp_pk,
+            secp_sig.try_into().unwrap()
+        ));
         assert!(verify_mldsa65_detached(&msg, mldsa_pk, mldsa_sig));
-        assert_eq!(
-            acc.address(),
-            &get_hybrid_address(&secp_pk, mldsa_pk)
-        );
+        assert_eq!(acc.address(), &get_hybrid_address(&secp_pk, mldsa_pk));
     }
 
     #[test]
@@ -446,5 +538,70 @@ mod pqc_tests {
         let body1 = acc.sign_hash(&msg).unwrap();
         let body2 = acc2.sign_hash(&msg).unwrap();
         assert_eq!(body1, body2);
+    }
+
+    #[test]
+    fn secret_holders_are_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<MldsaSecretKey>();
+        assert_zeroize_on_drop::<HybridKeyBlob>();
+        assert!(std::mem::needs_drop::<HybridAccount>());
+        assert!(std::mem::needs_drop::<HybridKeyBlob>());
+    }
+
+    #[test]
+    fn key_blob_debug_redacts_secrets() {
+        let acc = HybridAccount::create_hybrid_randomly(&|buf| {
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_add(1);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let blob = acc.export_key_blob().unwrap();
+        let debug = format!("{blob:?}");
+
+        assert_eq!(
+            debug,
+            format!(
+                "HybridKeyBlob {{ kind: 3, mldsa_sk: \"[REDACTED]\", secp_sk: Some(\"[REDACTED]\"), mldsa_pk_len: {} }}",
+                public_key_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_expanded_secret_is_rejected_without_unwinding() {
+        let blob = HybridKeyBlob {
+            kind: 1,
+            mldsa_sk: vec![0xFF; secret_key_bytes()],
+            secp_sk: None,
+            mldsa_pk: vec![0; public_key_bytes()],
+        };
+
+        let result = std::panic::catch_unwind(|| HybridAccount::from_key_blob(&blob));
+
+        assert!(
+            result.is_ok(),
+            "malformed key escaped the parser as a panic"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn key_blob_explicit_zeroize_clears_only_private_material() {
+        let mut blob = HybridKeyBlob {
+            kind: 3,
+            mldsa_sk: vec![0xA5; secret_key_bytes()],
+            secp_sk: Some([0x5A; 32]),
+            mldsa_pk: vec![0x11; public_key_bytes()],
+        };
+
+        blob.zeroize();
+
+        assert!(blob.mldsa_sk.is_empty());
+        assert!(blob.secp_sk.is_none());
+        assert_eq!(blob.mldsa_pk, vec![0x11; public_key_bytes()]);
     }
 }

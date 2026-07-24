@@ -77,6 +77,25 @@ pub fn validate_hacd_wallet(wallet: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The password every Hacash tutorial uses. Its private key is public, so any
+/// balance held there can be swept by anyone. `sys::ini::ini_must_account_required`
+/// panics on it at node startup, so the panel must refuse it first and say why.
+pub const WELL_KNOWN_BID_PASSWORD: &str = "123456";
+
+/// Same rule as the node: the bid account password must be present and must not
+/// be the publicly known one. `Err("empty")` and `Err("well_known")` are marker
+/// codes the caller maps to a localized message.
+pub fn validate_bid_password(password: &str) -> Result<(), String> {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return Err("empty".to_string());
+    }
+    if trimmed == WELL_KNOWN_BID_PASSWORD {
+        return Err("well_known".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct DiamondMinerSettings {
     pub reward: String,
@@ -158,6 +177,17 @@ pub fn write_diamond_miner(
     d: &DiamondMinerSettings,
     rpc_port: Option<u16>,
 ) -> std::io::Result<()> {
+    // Last line of defence: never persist a bid password the node refuses. A
+    // config written with a blank or well known password makes hacash panic at
+    // startup, and "123456" would put the bid funds on a public private key.
+    if let Err(reason) = validate_bid_password(&d.bid_password) {
+        let detail = if reason == "well_known" {
+            "the bid account password must not be the publicly known '123456'"
+        } else {
+            "the bid account password is required"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, detail));
+    }
     let content = ensure_mainnet_node_section(&read_or_empty(path));
     let mut updated = upsert_section_fields(
         &content,
@@ -491,6 +521,50 @@ mod tests {
     }
 
     #[test]
+    fn bid_password_must_be_present_and_not_well_known() {
+        // The node panics at startup on both of these, so the panel has to catch
+        // them while the user can still read a message.
+        assert_eq!(validate_bid_password(""), Err("empty".to_string()));
+        assert_eq!(validate_bid_password("   "), Err("empty".to_string()));
+        assert_eq!(validate_bid_password("123456"), Err("well_known".to_string()));
+        assert_eq!(
+            validate_bid_password("  123456  "),
+            Err("well_known".to_string()),
+            "the node trims before comparing, so padding must not sneak it through"
+        );
+        assert!(validate_bid_password("a-real-wallet-password").is_ok());
+        assert!(
+            validate_bid_password("1234567").is_ok(),
+            "only the exact well known password is refused"
+        );
+    }
+
+    #[test]
+    fn diamond_config_is_never_written_with_a_refused_bid_password() {
+        let path = std::env::temp_dir().join(format!(
+            "hacash-bidpass-cfg-{}-{}.ini",
+            std::process::id(),
+            TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        for bad in ["", "   ", "123456"] {
+            let settings = DiamondMinerSettings {
+                bid_password: bad.into(),
+                ..Default::default()
+            };
+            let err = write_diamond_miner(
+                &path,
+                "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v",
+                &settings,
+                Some(8080),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "password '{bad}'");
+            assert!(!path.exists(), "a refused password must leave no config: '{bad}'");
+        }
+    }
+
+    #[test]
     fn local_rpc_settings_are_written() {
         let path =
             std::env::temp_dir().join(format!("hacash-fullnode-config-{}.ini", std::process::id()));
@@ -521,7 +595,11 @@ mod tests {
         write_diamond_miner(
             &path,
             "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v",
-            &DiamondMinerSettings::default(),
+            &DiamondMinerSettings {
+                // A real password: the writer refuses a blank or well known one.
+                bid_password: "a-real-wallet-password".into(),
+                ..Default::default()
+            },
             Some(8080),
         )
         .unwrap();

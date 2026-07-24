@@ -108,6 +108,7 @@ pub struct Strings {
     pub hacd_wallet_hint: &'static str,
     pub diaworker_not_found: &'static str,
     pub bid_password_required: &'static str,
+    pub bid_password_insecure: &'static str,
     pub label_connect_mode: &'static str,
     pub connect_solo: &'static str,
     pub connect_pool: &'static str,
@@ -268,6 +269,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "PRIVAKEY address (3x...) for diamond rewards.",
             diaworker_not_found: "diaworker.exe not found: build first.\nSearched:",
             bid_password_required: "Enter bid account password for HACD mining.",
+            bid_password_insecure: "The password 123456 is public: anyone can take those funds. Choose a different bid account password.",
             label_connect_mode: "Connection:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -380,6 +382,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "Διεύθυνση PRIVAKEY (3x...) για ανταμοιβές diamond.",
             diaworker_not_found: "Δεν βρέθηκε diaworker.exe: κάνε build πρώτα.\nΑναζήτηση:",
             bid_password_required: "Βάλε κωδικό bid account για HACD mining.",
+            bid_password_insecure: "Ο κωδικός 123456 είναι δημόσιος: οποιοσδήποτε μπορεί να πάρει αυτά τα χρήματα. Βάλε άλλον κωδικό bid account.",
             label_connect_mode: "Σύνδεση:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -492,6 +495,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "Elmas ödülleri için PRIVAKEY adresi (3x...).",
             diaworker_not_found: "diaworker.exe bulunamadı: önce derleyin.\nAranan:",
             bid_password_required: "HACD için teklif hesap şifresi girin.",
+            bid_password_insecure: "123456 şifresi herkes tarafından bilinir: oradaki parayı herkes alabilir. Farklı bir teklif hesap şifresi girin.",
             label_connect_mode: "Bağlantı:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -604,6 +608,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "钻石奖励用 PRIVAKEY 地址 (3x...)。",
             diaworker_not_found: "未找到 diaworker.exe: 请先编译。\n搜索路径:",
             bid_password_required: "请输入 HACD 竞价账户密码。",
+            bid_password_insecure: "密码 123456 是公开的，任何人都能取走其中的资金。请换一个竞价账户密码。",
             label_connect_mode: "连接:",
             connect_solo: "Solo (全节点)",
             connect_pool: "矿池 (RPC)",
@@ -716,6 +721,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "ダイヤ報酬用 PRIVAKEY アドレス (3x...)。",
             diaworker_not_found: "diaworker.exe が見つかりません: 先にビルド。\n検索:",
             bid_password_required: "HACD 用の入札パスワードを入力してください。",
+            bid_password_insecure: "パスワード 123456 は公開されており、誰でもその資金を持ち出せます。別の入札パスワードを設定してください。",
             label_connect_mode: "接続:",
             connect_solo: "Solo (フルノード)",
             connect_pool: "プール (RPC)",
@@ -828,6 +834,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "Dirección PRIVAKEY (3x...) para recompensas diamond.",
             diaworker_not_found: "No se encontró diaworker.exe: compila primero.\nBuscado:",
             bid_password_required: "Introduce la contraseña de puja para HACD.",
+            bid_password_insecure: "La contraseña 123456 es pública: cualquiera puede llevarse esos fondos. Elige otra contraseña de puja.",
             label_connect_mode: "Conexión:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -940,6 +947,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "Adresse PRIVAKEY (3x...) pour récompenses diamond.",
             diaworker_not_found: "diaworker.exe introuvable: compilez d'abord.\nRecherché :",
             bid_password_required: "Entrez le mot de passe d'enchère pour HACD.",
+            bid_password_insecure: "Le mot de passe 123456 est public : n'importe qui peut prendre ces fonds. Choisissez un autre mot de passe d'enchère.",
             label_connect_mode: "Connexion :",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -1052,6 +1060,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "ที่อยู่ PRIVAKEY (3x...) สำหรับรางวัลเพชร",
             diaworker_not_found: "ไม่พบ diaworker.exe: กรุณา build ก่อน\nค้นหา:",
             bid_password_required: "กรอกรหัสบัญชีประมูลสำหรับ HACD",
+            bid_password_insecure: "รหัส 123456 เป็นรหัสสาธารณะ ใครก็นำเงินในบัญชีนั้นไปได้ กรุณาใช้รหัสบัญชีประมูลอื่น",
             label_connect_mode: "การเชื่อมต่อ:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
@@ -1164,6 +1173,7 @@ pub fn strings(lang: Lang) -> Strings {
             hacd_wallet_hint: "PRIVAKEY адрес (3x...) для наград за алмазы.",
             diaworker_not_found: "diaworker.exe не найден: сначала соберите.\nПоиск:",
             bid_password_required: "Введите пароль bid-аккаунта для HACD.",
+            bid_password_insecure: "Пароль 123456 общеизвестен: любой может забрать эти средства. Выберите другой пароль bid-аккаунта.",
             label_connect_mode: "Подключение:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Пул (RPC)",
@@ -1250,4 +1260,34 @@ pub fn load_lang(work_dir: &std::path::Path) -> Lang {
 pub fn save_lang(work_dir: &std::path::Path, lang: Lang) {
     let path = work_dir.join("miner-panel.lang");
     let _ = std::fs::write(path, lang.code());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_language_explains_the_refused_bid_password() {
+        // The node panics on bid_password = 123456. A user who cannot read the
+        // reason in their own language would only see the node die at startup.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            let msg = s.bid_password_insecure;
+            assert!(
+                !msg.trim().is_empty(),
+                "{} has no insecure bid password message",
+                lang.code()
+            );
+            assert!(
+                msg.contains("123456"),
+                "{} must name the refused password: {msg}",
+                lang.code()
+            );
+            assert_ne!(
+                msg, s.bid_password_required,
+                "{} must not reuse the blank password message",
+                lang.code()
+            );
+        }
+    }
 }

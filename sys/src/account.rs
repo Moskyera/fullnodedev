@@ -1,5 +1,6 @@
 use base58check::*;
-use libsecp256k1::{ util, SecretKey, PublicKey, Signature, Message };
+use libsecp256k1::{ SecretKey, PublicKey, Signature, Message };
+use zeroize::Zeroizing;
 // use rand::{self, RngCore};
 
 
@@ -14,6 +15,13 @@ pub struct Account {
     public_key: PublicKey,
     address: [u8; ADDRESS_SIZE],
     address_readable: String,
+}
+
+
+impl Drop for Account {
+    fn drop(&mut self) {
+        self.secret_key.clear();
+    }
 }
 
 
@@ -50,14 +58,14 @@ impl Account {
     
     pub fn create_randomly(randomfill: &dyn Fn(&mut [u8]) -> Rerr) -> Ret<Account> {
         loop {
-            let mut data = [0u8; PRIVATE_SIZE];
+            let mut data = Zeroizing::new([0u8; PRIVATE_SIZE]);
             /*if let Err(e) = getrandom::fill(&mut data) {
                 return Err(e.to_string())
             }*/
-            randomfill(&mut data)?;
+            randomfill(&mut data[..])?;
             // println!("{:?}", data)
             if data[0] < 255 {
-                return Account::create_by_secret_key_value(data)
+                return Account::create_by_secret_key_value(*data)
             }
         }
     }
@@ -67,28 +75,35 @@ impl Account {
         // is private key
         if pass.len() == PRIVATE_SIZE * 2
             && let Ok(bts) = hex::decode(pass)
-            && bts.len() == PRIVATE_SIZE
-            && let Ok(key) = bts.try_into()
         {
-            return Account::create_by_secret_key_value(key);
+            let bts = Zeroizing::new(bts);
+            if bts.len() == PRIVATE_SIZE {
+                let mut key = Zeroizing::new([0u8; PRIVATE_SIZE]);
+                key.copy_from_slice(&bts);
+                return Account::create_by_secret_key_value(*key);
+            }
         }
         // is passward
         Account::create_by_password(pass)
     }
 
     pub fn create_by_password(pass: &str) -> Ret<Account> {
-        let dt = sha2(pass);
-        Account::create_by_secret_key_value(dt)
+        let dt = Zeroizing::new(sha2(pass));
+        Account::create_by_secret_key_value(*dt)
     }
 
     pub fn create_by_secret_key_value(key32: [u8; PRIVATE_SIZE]) -> Ret<Account> {
+        let key32 = Zeroizing::new(key32);
         if key32[0] == 255 && key32[1] == 255 && key32[2] == 255 && key32[3] == 255 {
             return Err("secret_key not supported; try a different one".to_string());
         }
-        let pk: [u8; util::SECRET_KEY_SIZE] = key32;
-        match SecretKey::parse(&pk) {
+        match SecretKey::parse(&key32) {
             Err(e) => Err(e.to_string()),
-            Ok(sk) => Ok(Account::create_by_secret_key(&sk)),
+            Ok(mut sk) => {
+                let account = Account::create_by_secret_key(&sk);
+                sk.clear();
+                Ok(account)
+            }
         }
     }
 
@@ -155,4 +170,27 @@ impl Account {
     }
 
 }
-        
+
+
+#[cfg(test)]
+mod account_secret_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn account_has_drop_glue_for_secret_erasure() {
+        assert!(std::mem::needs_drop::<Account>());
+    }
+
+    #[test]
+    fn dropping_one_clone_does_not_invalidate_another() {
+        let account = Account::create_by_secret_key_value([1u8; PRIVATE_SIZE]).unwrap();
+        let clone = account.clone();
+        let message = [7u8; 32];
+
+        drop(account);
+
+        let signature = clone.do_sign(&message);
+        let public_key = clone.public_key().serialize_compressed();
+        assert!(Account::verify_signature(&message, &public_key, &signature));
+    }
+}

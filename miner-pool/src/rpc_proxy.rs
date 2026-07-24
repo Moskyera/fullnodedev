@@ -21,6 +21,9 @@ struct AppState {
     hub: Arc<JobHub>,
     upstream: Upstream,
     pool_token: String,
+    /// How old a mirrored job may be before it counts as absent. Serving a frozen
+    /// height during an upstream outage would burn every worker's hashrate.
+    job_ttl: Duration,
 }
 
 pub async fn serve(
@@ -28,11 +31,13 @@ pub async fn serve(
     hub: Arc<JobHub>,
     upstream: Upstream,
     pool_token: String,
+    job_ttl: Duration,
 ) -> Result<(), String> {
     let state = AppState {
         hub,
         upstream,
         pool_token,
+        job_ttl,
     };
     let app = Router::new()
         .route("/_server_", get(|| async { "Hacash Pool (miner RPC)" }))
@@ -105,8 +110,14 @@ async fn pending(
             Json(json!({"err": "unauthorized"})),
         );
     }
-    match state.hub.current() {
+    match state.hub.current_fresh(state.job_ttl) {
         Some(job) => (StatusCode::OK, Json(job.raw)),
+        // A job upstream has stopped refreshing is dead work: the network has
+        // moved past that height, so report the outage instead of handing it out.
+        None if state.hub.height() > 0 => (
+            StatusCode::OK,
+            Json(json!({"err": "upstream stale; work is not being refreshed"})),
+        ),
         None => (
             StatusCode::OK,
             Json(json!({"err": "no job yet; wait for upstream fullnode"})),
@@ -136,11 +147,23 @@ async fn notice(
         .min(120);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_s.max(1));
     loop {
-        let h = state.hub.height();
+        // Only a fresh job advertises new work. When it is stale the long-poller
+        // is told so explicitly, instead of silently echoing a frozen height it
+        // cannot distinguish from a quiet chain.
+        let h = state.hub.height_fresh(state.job_ttl);
         if h > want {
             return (StatusCode::OK, Json(json!({"height": h})));
         }
         if tokio::time::Instant::now() >= deadline {
+            if h == 0 && state.hub.height() > 0 {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "err": "upstream stale; work is not being refreshed",
+                        "height": state.hub.height()
+                    })),
+                );
+            }
             return (StatusCode::OK, Json(json!({"height": h})));
         }
         tokio::time::sleep(Duration::from_millis(400)).await;

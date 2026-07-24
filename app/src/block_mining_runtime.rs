@@ -11,6 +11,9 @@ use serde_json::Value as JV;
 
 use crate::efficiency::*;
 use crate::hash_util::{hash_left_zero_pad3, hash_more_power};
+// The panic firewall is shared with the diamond (HACD) worker, which has exactly
+// the same "one result thread owns every submission" shape.
+use crate::mining_guard::guard_mining_iteration;
 #[cfg(feature = "cuda")]
 use crate::mining_batch::CudaBlockBackend;
 #[cfg(feature = "ocl")]
@@ -33,6 +36,17 @@ use super::CudaMiningResources;
 use crate::opencl_gpu::{OpenclGpuHandle, initialize_opencl, opencl_snapshot_from_resource};
 
 const HASH_WIDTH: usize = 32;
+/// A real difficulty target never comes anywhere near this many leading zero
+/// bytes (that would leave under 2^32 of the hash space). Refuse such a template
+/// instead of installing an unmineable target from a hostile or buggy upstream.
+const MAX_TARGET_LEADING_ZERO_BYTES: usize = 28;
+/// Bounded result channel: an unbounded queue grows without limit whenever the
+/// drain thread stalls. Under backpressure a statistics-only batch may be
+/// dropped, but a result meeting its target is real money and always waits.
+const RESULT_CHANNEL_CAPACITY: usize = 1024;
+/// Winning results queued for the dedicated submit thread. Deep enough that a
+/// burst of pool shares never blocks the result drain.
+const SUBMIT_QUEUE_CAPACITY: usize = 256;
 const MINING_INTERVAL: f64 = 3.0;
 const WORKER_RATE_STALE_MS: u64 = 15_000;
 const HASHRATE_EWMA_NEW_WEIGHT: f64 = 0.25;
@@ -40,6 +54,10 @@ const TARGET_BLOCK_TIME: f64 = 300.0;
 const ONEDAY_BLOCK_NUM: f64 = 288.0;
 
 static MINING_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// Set while the upstream (pool bridge or fullnode) tells us the work it is
+/// serving is no longer being refreshed. The installed template can no longer win
+/// anything, so the workers idle instead of burning power on dead work.
+static UPSTREAM_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Bumped every time the template actually changes, INCLUDING a same-height reorg
 /// (a new block replacing the tip at the same height). Workers watch this in
 /// addition to the height so they stop grinding an orphaned template promptly.
@@ -180,11 +198,81 @@ impl HashrateTracker {
     }
 }
 
+/// True when this result independently meets its own PoW target. The node
+/// accepts a block whose hash <= target (equal-inclusive), so use the same
+/// equal-inclusive test rather than the strict "more power" comparison, which
+/// would drop a hash landing exactly on target.
+fn result_meets_target(res: &BlockMiningResult) -> bool {
+    !res.target_hash.is_empty() && !hash_more_power(&res.target_hash, &res.result_hash)
+}
+
+/// Keep EVERY distinct winning result. Against a pool each submission is an
+/// independent PPLNS share keyed by (height, coinbase_nonce, block_nonce), so
+/// collapsing winners by height alone would throw away earned shares (real
+/// money). Only an exact repeat of that triple is a true duplicate.
+fn record_winner(winners: &mut Vec<Arc<BlockMiningResult>>, res: &Arc<BlockMiningResult>) {
+    let already_queued = winners.iter().any(|w| {
+        w.height == res.height
+            && w.head_nonce == res.head_nonce
+            && w.coinbase_nonce == res.coinbase_nonce
+    });
+    if !already_queued {
+        winners.push(res.clone());
+    }
+}
+
+/// Hand a batch result to the drain thread. Returns false only when the drain
+/// side is gone, so the worker knows to exit. Under backpressure a
+/// statistics-only result is dropped with a log, but a result meeting its own
+/// target is a payout and waits for space instead.
+fn send_mining_result(
+    result_ch_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+    res: Arc<BlockMiningResult>,
+) -> bool {
+    match result_ch_tx.try_send(res) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(res)) => {
+            if result_meets_target(&res) {
+                return result_ch_tx.send(res).is_ok();
+            }
+            eprintln!(
+                "[Mining] Result queue full, dropped a statistics-only batch at height {}.",
+                res.height
+            );
+            true
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Queue a winning result for the submit thread. If the queue is full or the
+/// thread is gone we submit inline rather than drop it: a dropped winner is
+/// lost money.
+fn queue_block_mining_success(
+    cnf: &PoWorkConf,
+    submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+    win: &Arc<BlockMiningResult>,
+) {
+    match submit_tx.try_send(win.clone()) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(win)) => {
+            eprintln!(
+                "[Mining] Submit queue full, submitting height {} inline.",
+                win.height
+            );
+            super::push_block_mining_success(cnf, &win);
+        }
+        Err(mpsc::TrySendError::Disconnected(win)) => {
+            super::push_block_mining_success(cnf, &win);
+        }
+    }
+}
+
 pub(crate) fn start_block_mining_workers(
     cnf: &PoWorkConf,
     stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> bool {
-    let (res_tx, res_rx) = mpsc::channel();
+    let (res_tx, res_rx) = mpsc::sync_channel(RESULT_CHANNEL_CAPACITY);
     let miner_backends = build_miner_backends(cnf);
     if miner_backends.is_empty() {
         return false;
@@ -213,11 +301,29 @@ pub(crate) fn start_block_mining_workers(
         );
     }
 
+    // Submitting a winner is a blocking HTTP round-trip (with retries), so it runs
+    // on a dedicated thread: doing it inline would stall the 123ms result drain and
+    // back the result channel up whenever a pool serves an easy share target.
+    let (submit_tx, submit_rx) =
+        mpsc::sync_channel::<Arc<BlockMiningResult>>(SUBMIT_QUEUE_CAPACITY);
+    let cnf_submit = cnf.clone();
+    let submit_thread_guard = cnf.runtime.track_mining_thread();
+    spawn(move || {
+        let _submit_thread_guard = submit_thread_guard;
+        while let Ok(win) = submit_rx.recv() {
+            guard_mining_iteration("block submit thread", || {
+                super::push_block_mining_success(&cnf_submit, &win);
+            });
+        }
+    });
+
     let cnf1 = cnf.clone();
     let worker_qty = miner_backends.len();
     let stop_flag_res = stop_flag.clone();
     let result_thread_guard = cnf.runtime.track_mining_thread();
     spawn(move || {
+        // submit_tx lives in this thread: when the drain loop returns on shutdown it
+        // drops, which is what tells the submit thread to finish and exit.
         let _result_thread_guard = result_thread_guard;
         let rate_clock = Instant::now();
         let mut rate_tracker = HashrateTracker::default();
@@ -228,14 +334,19 @@ pub(crate) fn start_block_mining_workers(
                 return;
             }
             let now_ms = rate_clock.elapsed().as_millis() as u64;
-            deal_block_mining_results(
-                &cnf1,
-                &mut most_hash,
-                &mut rstx,
-                worker_qty,
-                &mut rate_tracker,
-                now_ms,
-            );
+            // A panic here must never end the thread: this is the only path that
+            // submits winning blocks, so losing it means silent total payout loss.
+            guard_mining_iteration("block result thread", || {
+                deal_block_mining_results(
+                    &cnf1,
+                    &mut most_hash,
+                    &mut rstx,
+                    worker_qty,
+                    &mut rate_tracker,
+                    now_ms,
+                    &submit_tx,
+                );
+            });
             std::thread::sleep(Duration::from_millis(123));
         }
     });
@@ -251,13 +362,15 @@ pub(crate) fn start_block_mining_workers(
                 if super::should_stop(&stop_flag_miner) {
                     return;
                 }
-                run_block_mining_item(
-                    &cnf2,
-                    thrid,
-                    rstx.clone(),
-                    backend.clone(),
-                    &stop_flag_miner,
-                );
+                guard_mining_iteration("block mining worker", || {
+                    run_block_mining_item(
+                        &cnf2,
+                        thrid,
+                        rstx.clone(),
+                        backend.clone(),
+                        &stop_flag_miner,
+                    );
+                });
                 std::thread::sleep(Duration::from_millis(9));
             }
         });
@@ -279,6 +392,15 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String
     let target_array: [u8; HASH_WIDTH] = target_bytes
         .try_into()
         .map_err(|v: Vec<u8>| format!("invalid target_hash length: {}", v.len()))?;
+    // Defense in depth: an upstream (pool or node) that hands us an absurd target
+    // would install an unmineable template and drive the display math into
+    // pathological ranges. Reject it so the pull loop simply retries.
+    let leading_zero_bytes = target_array.iter().take_while(|byte| **byte == 0).count();
+    if leading_zero_bytes >= MAX_TARGET_LEADING_ZERO_BYTES {
+        return Err(format!(
+            "implausible target_hash with {leading_zero_bytes} leading zero bytes"
+        ));
+    }
     let target_hash = Hash::from(target_array);
 
     let intro_bytes = decode("block_intro")?;
@@ -320,6 +442,18 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String
 
 pub(crate) fn current_mining_epoch() -> u64 {
     MINING_BLOCK_EPOCH.load(Relaxed)
+}
+
+/// Record whether the upstream is serving stale (no longer refreshed) work.
+/// Returns true when the state actually changed, so the caller can log the
+/// transition once instead of on every poll.
+pub(crate) fn set_upstream_stale(stale: bool) -> bool {
+    UPSTREAM_STALE.swap(stale, Relaxed) != stale
+}
+
+/// True while the installed template is known to be dead work.
+pub(crate) fn upstream_is_stale() -> bool {
+    UPSTREAM_STALE.load(Relaxed)
 }
 
 fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
@@ -481,7 +615,7 @@ fn next_nonce_space(current: u32, use_secs: f64, is_gpu_backend: bool) -> u32 {
 fn run_block_mining_item(
     _cnf: &PoWorkConf,
     thrid: usize,
-    result_ch_tx: mpsc::Sender<Arc<BlockMiningResult>>,
+    result_ch_tx: mpsc::SyncSender<Arc<BlockMiningResult>>,
     backend: MinerBackend,
     stop_flag: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -490,6 +624,13 @@ fn run_block_mining_item(
     }
     if mining_is_gated(&_cnf.runtime, &_cnf.efficiency) {
         std::thread::sleep(Duration::from_millis(2000));
+        return;
+    }
+    // The upstream told us it can no longer refresh this template. Hashing it
+    // cannot win a block or earn a share, so idle until fresh work arrives
+    // instead of paying for power that buys nothing.
+    if upstream_is_stale() {
+        std::thread::sleep(Duration::from_millis(1000));
         return;
     }
 
@@ -547,7 +688,10 @@ fn run_block_mining_item(
     // of re-serializing every iteration.
     let block_intro_bin = block_intro.serialize();
     loop {
-        if super::should_stop(stop_flag) || _cnf.runtime.thermal_pause_active() {
+        if super::should_stop(stop_flag)
+            || _cnf.runtime.thermal_pause_active()
+            || upstream_is_stale()
+        {
             return;
         }
         if nonce_start >= nonce_limit {
@@ -614,7 +758,7 @@ fn run_block_mining_item(
             use_secs,
             is_gpu: is_gpu_backend,
         };
-        if result_ch_tx.send(mlres.into()).is_err() {
+        if !send_mining_result(&result_ch_tx, mlres.into()) {
             return;
         }
 
@@ -673,6 +817,7 @@ fn deal_block_mining_results(
     worker_qty: usize,
     rate_tracker: &mut HashrateTracker,
     now_ms: u64,
+    submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
 ) {
     let vene = worker_qty.max(1) as u32;
     let mut deal_hei = 0u64;
@@ -681,10 +826,10 @@ fn deal_block_mining_results(
     let mut gpu_nonce_space = 0u64;
     let mut cpu_nonce_space = 0u64;
     let mut recv_count = 0;
-    // Every result that independently meets its own PoW target is a real winning
-    // block (real money). Draining keeps only the single strongest hash for stats,
-    // so collect the winners separately and keep the best one per height, otherwise
-    // a second valid block landing in the same drain window would be silently lost.
+    // Every result that independently meets its own target is real money: a winning
+    // block when solo, a creditable PPLNS share when pooled. Draining keeps only the
+    // single strongest hash for stats, so collect ALL of them separately, otherwise
+    // every winner but one in this drain window would be silently lost.
     let mut winners: Vec<Arc<BlockMiningResult>> = Vec::new();
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_hei = res.height;
@@ -701,19 +846,8 @@ fn deal_block_mining_results(
         if hash_more_power(&res.result_hash, &most.result_hash) {
             most = res.clone();
         }
-        // The node accepts a block whose hash <= target (equal-inclusive), so use
-        // the same equal-inclusive test here rather than the strict "more power"
-        // comparison, which would drop a hash landing exactly on target.
-        if !res.target_hash.is_empty() && !hash_more_power(&res.target_hash, &res.result_hash)
-        {
-            match winners.iter_mut().find(|w| w.height == res.height) {
-                Some(slot) => {
-                    if hash_more_power(&res.result_hash, &slot.result_hash) {
-                        *slot = res.clone();
-                    }
-                }
-                None => winners.push(res.clone()),
-            }
+        if result_meets_target(&res) {
+            record_winner(&mut winners, &res);
         }
         recv_count += 1;
         if recv_count >= vene as usize * 4 {
@@ -752,7 +886,7 @@ fn deal_block_mining_results(
     if should_pause_for_profit(&cnf.efficiency, hac1day, &cnf.gpu_profile, active_cpu) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
         println!(
-            "\n[efficiency] Mining paused — estimated cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw."
+            "\n[efficiency] Mining paused: estimated cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw."
         );
     } else {
         cnf.runtime.paused_unprofitable.store(false, Relaxed);
@@ -794,14 +928,15 @@ fn deal_block_mining_results(
         &cnf.efficiency.stats_file,
     );
     if !winners.is_empty() {
-        // Submit every distinct winning block (one per height); each is a payout we
-        // must not drop just because another result had a numerically stronger hash.
+        // Submit every distinct winner. Each is a payout we must not drop just
+        // because another result in this window had a stronger hash: a pool credits
+        // each (height, coinbase_nonce, block_nonce) as its own share.
         for w in &winners {
-            super::push_block_mining_success(cnf, w);
+            queue_block_mining_success(cnf, submit_tx, w);
         }
     } else if cnf.debug == 1 {
         // Debug mode exercises the submit path even without a genuine winner.
-        super::push_block_mining_success(cnf, &most);
+        queue_block_mining_success(cnf, submit_tx, &most);
     }
     may_print_turn_to_nex_block_mining(deal_hei, Some(most_hash));
 }
@@ -836,6 +971,107 @@ mod tests {
         assert!(set_pending_block_stuff(1, serde_json::json!({})).is_err());
         let invalid_hex = serde_json::json!({"target_hash": "zz"});
         assert!(set_pending_block_stuff(1, invalid_hex).is_err());
+    }
+
+    fn winner_for_test(
+        height: u64,
+        coinbase_nonce: u8,
+        head_nonce: u32,
+        hash: u8,
+    ) -> Arc<BlockMiningResult> {
+        let mut res = BlockMiningResult::default();
+        res.height = height;
+        res.head_nonce = head_nonce;
+        res.coinbase_nonce = vec![coinbase_nonce; HASH_WIDTH];
+        res.result_hash = vec![hash; HASH_WIDTH];
+        res.target_hash = vec![0x0f; HASH_WIDTH];
+        Arc::new(res)
+    }
+
+    #[test]
+    fn every_distinct_share_at_one_height_is_kept_for_submission() {
+        // A pool credits each (height, coinbase_nonce, block_nonce) separately, so
+        // keeping only the strongest hash per height silently loses earned shares.
+        let mut winners = Vec::new();
+        let strong = winner_for_test(7, 1, 100, 0x01);
+        let weak = winner_for_test(7, 2, 200, 0x0e);
+        let same_worker_next_batch = winner_for_test(7, 1, 300, 0x05);
+        record_winner(&mut winners, &strong);
+        record_winner(&mut winners, &weak);
+        record_winner(&mut winners, &same_worker_next_batch);
+        assert_eq!(winners.len(), 3);
+
+        // Only an exact repeat of the same triple is a true duplicate.
+        record_winner(&mut winners, &winner_for_test(7, 2, 200, 0x0e));
+        assert_eq!(winners.len(), 3);
+    }
+
+    #[test]
+    fn a_hash_landing_exactly_on_target_still_counts_as_a_winner() {
+        let mut res = BlockMiningResult::default();
+        res.target_hash = vec![0x0f; HASH_WIDTH];
+        res.result_hash = res.target_hash.clone();
+        assert!(result_meets_target(&res));
+        res.result_hash = vec![0x10; HASH_WIDTH];
+        assert!(!result_meets_target(&res));
+        res.target_hash = Vec::new();
+        assert!(!result_meets_target(&res));
+    }
+
+    #[test]
+    fn a_panicking_iteration_never_ends_the_mining_thread() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut iterations = 0u32;
+        for round in 0..3 {
+            guard_mining_iteration("test loop", || {
+                if round == 1 {
+                    panic!("simulated result thread panic");
+                }
+            });
+            iterations += 1;
+        }
+        std::panic::set_hook(previous_hook);
+        assert_eq!(iterations, 3);
+    }
+
+    #[test]
+    fn an_implausible_upstream_target_is_rejected() {
+        let mut degenerate = [0u8; HASH_WIDTH];
+        degenerate[31] = 1;
+        let stuff = serde_json::json!({"target_hash": hex::encode(degenerate)});
+        assert!(set_pending_block_stuff(1, stuff).is_err());
+        let all_zero = serde_json::json!({"target_hash": hex::encode([0u8; HASH_WIDTH])});
+        assert!(set_pending_block_stuff(1, all_zero).is_err());
+    }
+
+    #[test]
+    fn a_full_result_queue_drops_statistics_but_never_a_winner() {
+        let (tx, rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(1);
+        let mut losing = BlockMiningResult::new();
+        losing.target_hash = vec![0x0f; HASH_WIDTH];
+        assert!(send_mining_result(&tx, Arc::new(losing.clone())));
+        // Queue is full now: a statistics-only batch is dropped, not blocked.
+        assert!(send_mining_result(&tx, Arc::new(losing)));
+        assert_eq!(rx.try_recv().map(|r| r.height), Ok(0));
+
+        let winner = winner_for_test(9, 1, 5, 0x01);
+        assert!(send_mining_result(&tx, winner));
+        assert_eq!(rx.try_recv().map(|r| r.height), Ok(9));
+        drop(rx);
+        assert!(!send_mining_result(&tx, winner_for_test(9, 1, 6, 0x01)));
+    }
+
+    #[test]
+    fn stale_upstream_work_is_flagged_and_reported_once_per_transition() {
+        assert!(!upstream_is_stale());
+        assert!(set_upstream_stale(true));
+        assert!(upstream_is_stale());
+        // Repeating the same state is not a transition, so the operator gets one
+        // message per outage instead of one per poll.
+        assert!(!set_upstream_stale(true));
+        assert!(set_upstream_stale(false));
+        assert!(!upstream_is_stale());
     }
 
     #[test]

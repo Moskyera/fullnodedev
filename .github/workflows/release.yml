@@ -23,21 +23,33 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-windows-ocl
 
       - name: Install OpenCL.lib (vcpkg)
         shell: pwsh
         run: |
+          # Pinned vcpkg release: the OpenCL import library is linked into every
+          # shipped GPU binary, so it must not come from a moving upstream head.
+          $vcpkgCommit = "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"  # tag 2026.06.24
           $vcpkgRoot = "$env:GITHUB_WORKSPACE\vcpkg-ci"
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          git init $vcpkgRoot
+          if ($LASTEXITCODE -ne 0) { throw "git init failed for $vcpkgRoot" }
+          git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
+          if ($LASTEXITCODE -ne 0) { throw "git remote add failed for $vcpkgRoot" }
+          git -C $vcpkgRoot fetch --depth 1 origin $vcpkgCommit
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of pinned vcpkg commit $vcpkgCommit failed" }
+          git -C $vcpkgRoot checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout of pinned vcpkg commit $vcpkgCommit failed" }
+          $head = (git -C $vcpkgRoot rev-parse HEAD).Trim()
+          if ($head -ne $vcpkgCommit) { throw "vcpkg is at $head, expected pinned $vcpkgCommit" }
           & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
           & "$vcpkgRoot\vcpkg.exe" install opencl:x64-windows
           $lib = "$vcpkgRoot\installed\x64-windows\lib"
@@ -68,6 +80,15 @@ jobs:
       - name: Build miner panel
         run: cargo build --locked --release -p miner-panel
 
+      - name: Build public free-IP pool (hac-pool)
+        run: cargo build --locked --release -p miner-pool
+
+      # Payout pool: pool-server, settle-spike and pool-payout hold the pool
+      # wallet and compute real payouts, so they must compile in the release
+      # pipeline even though they are not packaged (operators self-build).
+      - name: Build payout pool server (pool-spike)
+        run: cargo build --locked --release -p pool-spike
+
       - name: Run Windows release tests
         run: |
           cargo test --locked -p x16rs
@@ -76,6 +97,7 @@ jobs:
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
+          cargo test --locked -p pool-spike
 
       - name: Package release ZIPs
         shell: pwsh
@@ -138,7 +160,7 @@ jobs:
           }
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hacash-miner-windows-x64
           path: |
@@ -154,13 +176,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-linux-ocl
 
@@ -180,15 +202,21 @@ jobs:
             --bin poworker --bin list_opencl --bin diagnose_opencl
           cargo build --locked --release --bin hacash --bin diaworker
 
-      - name: Build and test miner panel
+      - name: Build and test miner panel, public pool and payout pool
         run: |
           cargo build --locked --release -p miner-panel
+          cargo build --locked --release -p miner-pool
+          # pool-spike holds the payout pool wallet and the money math
+          # (split_payout, balance_units, off-node ASERT difficulty).
+          cargo build --locked --release -p pool-spike
+          cargo test --locked -p miner-pool
           cargo test --locked -p x16rs
           cargo test --locked --release -p x16rs
           cargo test --locked -p sys
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
+          cargo test --locked -p pool-spike
 
       - name: Verify HACD CPU-only and release preset completeness
         run: bash scripts/verify-mining-presets.sh
@@ -265,7 +293,7 @@ jobs:
           grep -Fxq 'connect = pool.example.test:9000' "$full/poworker.config.ini"
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hacash-miner-linux-x86_64
           path: |
@@ -281,6 +309,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      # Build provenance is signed through GitHub's OIDC identity, so no
+      # maintainer key is stored in the repository.
+      id-token: write
+      attestations: write
     steps:
       - name: Validate release tag
         run: |
@@ -291,13 +323,25 @@ jobs:
           fi
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: release-assets
           merge-multiple: true
 
+      # Runs BEFORE the release is created: a package that cannot be attested
+      # must never reach a user. The .sha256 files ship next to the archives and
+      # therefore only detect corruption, not tampering; the attestation is the
+      # tamper-evident check because it is signed by GitHub, not by whoever
+      # serves the download.
+      - name: Attest release artifact provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            release-assets/*.zip
+            release-assets/*.tar.gz
+
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           files: release-assets/*
@@ -315,10 +359,30 @@ jobs:
             | `hacash-miner-only-linux-x86_64*.tar.gz` | Linux fullnode already exists |
 
             Windows: extract and run `SETUP.bat` or `SETUP-MINER.bat`.
-            Verify a ZIP with `Get-FileHash .\<file>.zip -Algorithm SHA256` and compare it with `<file>.zip.sha256`.
-
             Linux: extract and run `./SETUP-LINUX.sh` (or `bash SETUP-LINUX.sh`).
-            Verify an archive with `sha256sum -c <file>.tar.gz.sha256`.
+
+            ### Check the download before you run it
+
+            These binaries can hold mining rewards and wallet keys, so verify the
+            build provenance first. This is the only check that detects tampering,
+            because the signature is produced by GitHub and not by whoever serves
+            the file:
+
+            ```
+            gh attestation verify <file> --repo ${{ github.repository }}
+            ```
+
+            (`gh` is the GitHub CLI, available for Windows and Linux.)
+
+            The `.sha256` files detect a truncated or corrupted download only.
+            They are NOT tamper protection: they are published from the same place
+            as the archives, so anyone able to replace an archive can replace its
+            checksum too. Do not treat a matching checksum as proof the file is
+            genuine.
+
+            Corruption check, Windows: `Get-FileHash .\<file>.zip -Algorithm SHA256`
+            and compare with `<file>.zip.sha256`.
+            Corruption check, Linux: `sha256sum -c <file>.tar.gz.sha256`.
 
             HAC uses OpenCL GPU mining and supports automatic GPU detection/Auto Tune.
             Auto Tune supports one selected GPU per poworker config; use separate instances/configs for heterogeneous GPUs.

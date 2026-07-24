@@ -30,6 +30,16 @@ pub struct PoolArgs {
     /// How often to refresh pending work from upstream (ms)
     #[arg(long, env = "HAC_POOL_POLL_MS", default_value_t = 2000)]
     pub poll_ms: u64,
+
+    /// Max concurrent stratum connections from one source IP (0 = unlimited).
+    /// Stops one peer pinning every connection slot; raise it for a large farm
+    /// behind a single NAT.
+    #[arg(
+        long,
+        env = "HAC_POOL_MAX_CONNS_PER_IP",
+        default_value_t = 128
+    )]
+    pub max_conns_per_ip: usize,
 }
 
 impl PoolArgs {
@@ -41,5 +51,29 @@ impl PoolArgs {
             return Err("poll_ms must be >= 200".into());
         }
         Ok(())
+    }
+
+    /// How old a mirrored job may be before workers are told upstream is stale.
+    pub fn job_ttl(&self) -> std::time::Duration {
+        crate::job::job_ttl(self.poll_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_bad_input_and_job_ttl_follows_poll_ms() {
+        let mut a = PoolArgs::parse_from(["hac-pool"]);
+        assert!(a.validate().is_ok());
+        assert_eq!(a.job_ttl(), std::time::Duration::from_secs(15));
+        a.poll_ms = 10_000;
+        assert_eq!(a.job_ttl(), std::time::Duration::from_secs(40));
+        a.poll_ms = 100;
+        assert!(a.validate().is_err());
+        a.poll_ms = 2000;
+        a.upstream = "  ".into();
+        assert!(a.validate().is_err());
     }
 }

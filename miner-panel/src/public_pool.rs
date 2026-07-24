@@ -25,6 +25,9 @@ pub struct PublicPoolSettings {
     /// Empty = open free pool.
     #[serde(default)]
     pub token: String,
+    /// Max concurrent stratum connections from one source IP (0 = unlimited).
+    #[serde(default = "default_max_conns_per_ip")]
+    pub max_conns_per_ip: u32,
 }
 
 fn default_true() -> bool {
@@ -39,6 +42,9 @@ fn default_stratum_port() -> u16 {
 fn default_upstream() -> String {
     "127.0.0.1:8080".into()
 }
+fn default_max_conns_per_ip() -> u32 {
+    128
+}
 
 impl Default for PublicPoolSettings {
     fn default() -> Self {
@@ -49,6 +55,7 @@ impl Default for PublicPoolSettings {
             stratum_port: default_stratum_port(),
             upstream: default_upstream(),
             token: String::new(),
+            max_conns_per_ip: default_max_conns_per_ip(),
         }
     }
 }
@@ -108,6 +115,8 @@ pub fn start_pool(work_dir: &Path, s: &PublicPoolSettings) -> Result<Child, Stri
     if !s.token.trim().is_empty() {
         cmd.arg("--pool-token").arg(s.token.trim());
     }
+    cmd.arg("--max-conns-per-ip")
+        .arg(s.max_conns_per_ip.to_string());
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     platform::configure_background_command(&mut cmd);
     cmd.spawn()
@@ -142,5 +151,16 @@ mod tests {
     #[test]
     fn local_connect_format() {
         assert_eq!(local_pool_connect(3333), "127.0.0.1:3333");
+    }
+
+    #[test]
+    fn old_settings_file_without_max_conns_still_loads() {
+        // public-pool.json written by an earlier build has no max_conns_per_ip;
+        // it must keep loading and fall back to the hac-pool default of 128.
+        let raw = r#"{"host_enabled":true,"http_port":3333,"stratum_port":3334,
+            "upstream":"127.0.0.1:8080","token":""}"#;
+        let s: PublicPoolSettings = serde_json::from_str(raw).expect("old settings must parse");
+        assert_eq!(s.max_conns_per_ip, 128);
+        assert_eq!(s.max_conns_per_ip, PublicPoolSettings::default().max_conns_per_ip);
     }
 }

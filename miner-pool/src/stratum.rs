@@ -12,8 +12,9 @@
 //! dropped, a single malformed line replies with an error instead of killing the
 //! session, and one accept() error never tears down the whole listener.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value as JV, json};
@@ -33,7 +34,72 @@ const MAX_CONNS: usize = 1024;
 const MAX_LINE: usize = 64 * 1024;
 /// Drop a connection that sends nothing for this long (slow-loris / dead peer).
 /// Generous so a legitimately slow miner between shares is not disconnected.
+/// Measured from the last byte actually received from the client: outbound job
+/// pushes must not renew it, or a silent peer would hold its slot forever on an
+/// active chain.
 const READ_IDLE: Duration = Duration::from_secs(600);
+
+/// Tracks concurrent connections per source IP so a single peer cannot pin every
+/// slot of the global cap and lock legitimate miners out. `max` of 0 disables the
+/// per-IP limit.
+struct IpLimiter {
+    inner: Mutex<HashMap<IpAddr, usize>>,
+    max: usize,
+}
+
+/// Releases the per-IP slot when the connection ends.
+struct IpGuard {
+    limiter: Arc<IpLimiter>,
+    ip: IpAddr,
+    counted: bool,
+}
+
+impl IpLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpGuard> {
+        if self.max == 0 {
+            return Some(IpGuard {
+                limiter: self.clone(),
+                ip,
+                counted: false,
+            });
+        }
+        // Poison-tolerant: a poisoned counter must never stop the pool accepting
+        // miners. The guarded value is a plain counter map.
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = g.entry(ip).or_insert(0);
+        if *n >= self.max {
+            return None;
+        }
+        *n += 1;
+        Some(IpGuard {
+            limiter: self.clone(),
+            ip,
+            counted: true,
+        })
+    }
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut g = self.limiter.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                g.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Constant-time string compare for the pool token, so a timing side-channel does
 /// not leak it byte by byte. (Length is not secret.)
@@ -96,12 +162,15 @@ pub async fn serve(
     hub: Arc<JobHub>,
     upstream: Upstream,
     pool_token: String,
+    job_ttl: Duration,
+    max_conns_per_ip: usize,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("stratum bind {addr}: {e}"))?;
     info!("Stratum listening on {addr}");
     let sem = Arc::new(Semaphore::new(MAX_CONNS));
+    let ip_limiter = Arc::new(IpLimiter::new(max_conns_per_ip));
     loop {
         let (sock, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -119,12 +188,19 @@ pub async fn serve(
             drop(sock);
             continue;
         };
+        // Refuse past the per-IP cap so one peer cannot monopolise every slot.
+        let Some(ip_guard) = ip_limiter.try_acquire(peer.ip()) else {
+            warn!("stratum per-IP cap ({max_conns_per_ip}) reached; dropping {peer}");
+            drop(sock);
+            continue;
+        };
         let hub = hub.clone();
         let upstream = upstream.clone();
         let token = pool_token.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when the connection ends
-            if let Err(e) = handle_client(sock, peer, hub, upstream, token).await {
+            let _ip_guard = ip_guard; // ditto for the per-IP slot
+            if let Err(e) = handle_client(sock, peer, hub, upstream, token, job_ttl).await {
                 warn!("stratum {peer}: {e}");
             }
         });
@@ -137,6 +213,7 @@ async fn handle_client(
     hub: Arc<JobHub>,
     upstream: Upstream,
     pool_token: String,
+    job_ttl: Duration,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = sock.into_split();
     let mut authorized = pool_token.is_empty();
@@ -152,7 +229,9 @@ async fn handle_client(
     let _push_guard = AbortOnDrop(tokio::spawn(async move {
         let mut last = String::new();
         loop {
-            if let Some(job) = hub_push.current() {
+            // Only push work upstream is still refreshing: a frozen height would
+            // burn the miner's hashrate for the whole outage.
+            if let Some(job) = hub_push.current_fresh(job_ttl) {
                 if job.job_id != last {
                     last = job.job_id.clone();
                     if push_tx.send(notify_line(&job)).await.is_err() {
@@ -166,6 +245,10 @@ async fn handle_client(
 
     let mut framer = LineFramer::new(MAX_LINE);
     let mut read_buf = [0u8; 8 * 1024];
+    // Inbound-idle clock. Advanced only by bytes actually received from the
+    // client, never by an outbound job push, so a peer that merely drains the
+    // socket is still reaped after READ_IDLE.
+    let mut last_read = tokio::time::Instant::now();
 
     loop {
         // Drain any complete lines already buffered before reading more.
@@ -181,9 +264,9 @@ async fn handle_client(
                     &pool_token,
                     &tx,
                     &mut authorized,
-                    &mut last_job,
                     &mut worker,
                     &mut writer,
+                    job_ttl,
                 )
                 .await?
                 {
@@ -195,8 +278,17 @@ async fn handle_client(
             Err(e) => return Err(e.to_string()), // oversized line: drop peer
         }
 
+        // Remaining idle budget since the last byte from the client. Recomputed
+        // every iteration so a push that restarts the loop cannot reset it.
+        let idle_left = READ_IDLE
+            .checked_sub(last_read.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if idle_left.is_zero() {
+            break; // idle timeout
+        }
+
         tokio::select! {
-            r = tokio::time::timeout(READ_IDLE, reader.read(&mut read_buf)) => {
+            r = tokio::time::timeout(idle_left, reader.read(&mut read_buf)) => {
                 let n = match r {
                     Ok(Ok(n)) => n,
                     Ok(Err(e)) => return Err(e.to_string()),
@@ -205,6 +297,7 @@ async fn handle_client(
                 if n == 0 {
                     break; // EOF
                 }
+                last_read = tokio::time::Instant::now();
                 framer.buf.extend_from_slice(&read_buf[..n]);
             }
             Some(push) = rx.recv() => {
@@ -266,9 +359,9 @@ async fn process_line(
     pool_token: &str,
     tx: &tokio::sync::mpsc::Sender<String>,
     authorized: &mut bool,
-    last_job: &mut String,
     worker: &mut String,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    job_ttl: Duration,
 ) -> Result<bool, String> {
     let req: JV = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -304,8 +397,11 @@ async fn process_line(
             *worker = user.to_string();
             if pool_token.is_empty() || ct_eq(pass, pool_token) {
                 *authorized = true;
-                if let Some(job) = hub.current() {
-                    *last_job = job.job_id.clone();
+                if let Some(job) = hub.current_fresh(job_ttl) {
+                    // Enqueue only. The deduped push channel owns `last_job`;
+                    // pre-seeding it here would make the reader drop this very
+                    // notify (and the push task's copy of it), leaving a
+                    // just-authorized miner idle until the next height change.
                     let _ = tx.send(notify_line(&job)).await;
                 }
                 json!({"id": id, "result": true, "error": null})
@@ -316,7 +412,7 @@ async fn process_line(
         "mining.get_job" => {
             if !*authorized {
                 json!({"id": id, "result": null, "error": [24, "unauthorized", null]})
-            } else if let Some(job) = hub.current() {
+            } else if let Some(job) = hub.current_fresh(job_ttl) {
                 json!({"id": id, "result": job.raw, "error": null})
             } else {
                 json!({"id": id, "result": null, "error": [20, "no job", null]})
@@ -375,5 +471,151 @@ async fn write_line(
     match writer.write_all(out.as_bytes()).await {
         Ok(()) => Ok(true),
         Err(_) => Ok(false), // writer closed: end the session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    fn test_hub(height: u64) -> Arc<JobHub> {
+        let hub = Arc::new(JobHub::new());
+        hub.update(
+            height,
+            json!({
+                "height": height,
+                "block_intro": "aa",
+                "target_hash": "ff",
+                "coinbase_body": "bb"
+            }),
+        );
+        hub
+    }
+
+    /// Spawn a pool on an ephemeral port and return a connected client socket.
+    async fn connect_to_pool(hub: Arc<JobHub>, job_ttl: Duration) -> TcpStream {
+        let upstream = Upstream::new("127.0.0.1:1".to_string(), String::new(), hub.clone());
+        // Reserve an ephemeral port, then let serve() bind it.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        tokio::spawn(serve(addr, hub, upstream, String::new(), job_ttl, 0));
+        for _ in 0..100 {
+            if let Ok(s) = TcpStream::connect(addr).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stratum never came up");
+    }
+
+    /// Collect mining.notify job ids for `window`, returning what the client
+    /// actually received on the wire.
+    async fn drain_notifies(
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+        window: Duration,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(200), lines.next_line()).await;
+            let Ok(Ok(Some(line))) = next else {
+                continue;
+            };
+            let v: JV = serde_json::from_str(&line).expect("server sent valid json");
+            if v.get("method").and_then(|m| m.as_str()) == Some("mining.notify") {
+                seen.push(v["params"][0].as_str().unwrap_or("").to_string());
+            }
+        }
+        seen
+    }
+
+    /// A miner that authorizes just after a height change must be given the new
+    /// job exactly once. Pre-fix the authorize handler pre-seeded `last_job` with
+    /// the id it was about to enqueue, so the reader deduped away both its own
+    /// notify and the push task's copy, and the miner sat idle until the NEXT
+    /// height change.
+    #[tokio::test]
+    async fn authorize_after_a_height_change_delivers_exactly_one_notify() {
+        let hub = test_hub(100);
+        let sock = connect_to_pool(hub.clone(), Duration::from_secs(60)).await;
+        let (r, mut w) = sock.into_split();
+        let mut lines = BufReader::new(r).lines();
+
+        // Wait for the connect-time push, which leaves the push task sleeping out
+        // its 500ms cycle with last=h100.
+        let first = drain_notifies(&mut lines, Duration::from_millis(400)).await;
+        assert_eq!(first, vec!["h100".to_string()]);
+
+        // New block arrives, then the miner authorizes before the push task wakes.
+        hub.update(
+            101,
+            json!({"height": 101, "block_intro": "aa", "target_hash": "ff", "coinbase_body": "bb"}),
+        );
+        w.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"w\",\"\"]}\n")
+            .await
+            .unwrap();
+
+        // Long enough for the push task's copy to arrive as well, so a duplicate
+        // would also be caught.
+        let after = drain_notifies(&mut lines, Duration::from_secs(2)).await;
+        assert_eq!(after, vec!["h101".to_string()]);
+    }
+
+    /// A miner that pipelines subscribe+authorize in one segment must still get
+    /// its first job exactly once.
+    #[tokio::test]
+    async fn pipelined_subscribe_and_authorize_delivers_exactly_one_notify() {
+        let hub = test_hub(100);
+        let sock = connect_to_pool(hub, Duration::from_secs(60)).await;
+        let (r, mut w) = sock.into_split();
+        w.write_all(
+            b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n\
+              {\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"w\",\"\"]}\n",
+        )
+        .await
+        .unwrap();
+
+        let mut lines = BufReader::new(r).lines();
+        let seen = drain_notifies(&mut lines, Duration::from_secs(2)).await;
+        assert_eq!(seen, vec!["h100".to_string()]);
+    }
+
+    /// A job upstream has stopped refreshing must not be handed out as work.
+    #[tokio::test]
+    async fn stale_job_is_not_pushed_to_a_new_miner() {
+        let hub = test_hub(100);
+        // A ttl of 1ms means the job is already stale by the time anyone connects.
+        let sock = connect_to_pool(hub, Duration::from_millis(1)).await;
+        let (r, mut w) = sock.into_split();
+        w.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"w\",\"\"]}\n")
+            .await
+            .unwrap();
+
+        let mut lines = BufReader::new(r).lines();
+        let seen = drain_notifies(&mut lines, Duration::from_secs(2)).await;
+        assert!(seen.is_empty(), "stale work must not be pushed: {seen:?}");
+    }
+
+    #[test]
+    fn ip_limiter_caps_and_releases_per_source_ip() {
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+        let other: IpAddr = "10.0.0.8".parse().unwrap();
+        let lim = Arc::new(IpLimiter::new(2));
+        let a = lim.try_acquire(ip).expect("first slot");
+        let b = lim.try_acquire(ip).expect("second slot");
+        assert!(lim.try_acquire(ip).is_none(), "third slot must be refused");
+        // A different peer is unaffected by one IP hitting its cap.
+        assert!(lim.try_acquire(other).is_some());
+        drop(a);
+        assert!(lim.try_acquire(ip).is_some(), "slot freed on drop");
+        drop(b);
+
+        // 0 disables the cap entirely.
+        let open = Arc::new(IpLimiter::new(0));
+        for _ in 0..100 {
+            assert!(open.try_acquire(ip).is_some());
+        }
     }
 }

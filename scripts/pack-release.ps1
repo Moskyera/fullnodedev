@@ -52,11 +52,18 @@ $minerOnlyExes = @(
     "diagnose_opencl.exe",
     "miner-panel.exe"
 )
+# Optional public pool binary (all-in-one panel host)
+$optionalExes = @("hac-pool.exe")
 $fullExes = @("hacash.exe") + $minerOnlyExes
 
 foreach ($e in $fullExes) {
     if (-not (Test-Path (Join-Path $Release $e))) {
         throw "Missing binary: $(Join-Path $Release $e)"
+    }
+}
+foreach ($e in $optionalExes) {
+    if (-not (Test-Path (Join-Path $Release $e))) {
+        Write-Warning "Optional binary missing (public pool UI needs it): $(Join-Path $Release $e)"
     }
 }
 
@@ -129,6 +136,11 @@ function Pack-Flavor {
 
     foreach ($e in $Exes) {
         Copy-Item (Join-Path $Release $e) (Join-Path $Stage $e)
+    }
+    # Ship public pool when built (panel all-in-one host)
+    $hacPool = Join-Path $Release "hac-pool.exe"
+    if (Test-Path -LiteralPath $hacPool -PathType Leaf) {
+        Copy-Item -LiteralPath $hacPool -Destination (Join-Path $Stage "hac-pool.exe")
     }
     Copy-OpenClKernels $Stage
     Copy-Logo $Stage

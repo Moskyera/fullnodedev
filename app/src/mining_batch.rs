@@ -17,6 +17,36 @@ use crate::opencl_gpu::block::do_group_block_mining_opencl;
 #[cfg(any(feature = "ocl", feature = "cuda", test))]
 const GPU_ERROR_CPU_RECOVERY_NONCES: u32 = 100_000;
 
+/// Consecutive failed CUDA batches tolerated before the card is declared dead for
+/// this session. Twenty is far past any transient hiccup (a driver reset, one hot
+/// spike) but still reached in seconds, so the operator is told early instead of
+/// reading the same per-batch error forever.
+#[cfg(any(feature = "cuda", test))]
+const CUDA_MAX_CONSECUTIVE_BATCH_ERRORS: u32 = 20;
+
+/// What a failed CUDA batch should do besides falling back to the CPU.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CudaFailureAction {
+    /// Halve the effective work groups. Skipped for a sticky context fault: that
+    /// fault is grid independent and x16rs-cuda rebuilds the context itself, so
+    /// shrinking the launch would only cost throughput once the card recovers.
+    pub halve_workgroups: bool,
+    /// This failure crossed the budget: alert once, loudly, and stop using the
+    /// card for the rest of the session.
+    pub disable_gpu: bool,
+}
+
+/// Decide what to do about a failed CUDA batch from the fault class and how many
+/// batches have failed back to back.
+#[cfg(any(feature = "cuda", test))]
+pub fn cuda_failure_action(sticky: bool, consecutive_failures: u32) -> CudaFailureAction {
+    CudaFailureAction {
+        halve_workgroups: !sticky,
+        disable_gpu: consecutive_failures >= CUDA_MAX_CONSECUTIVE_BATCH_ERRORS,
+    }
+}
+
 /// Inputs for one block-mining batch across CPU / CUDA / OpenCL backends.
 pub struct BatchCtx {
     pub height: u64,
@@ -87,10 +117,6 @@ pub fn merge_cpu_tail(
     }
 }
 
-/// Compare two 32-byte hashes; returns true if `candidate` beats `current`.
-pub fn hash_beats(candidate: &[u8; 32], current: &[u8; 32]) -> bool {
-    hash_more_power(candidate, current)
-}
 /// Verify the GPU's best nonce/hash pair before it can reach submission.
 pub fn verify_gpu_best_result(
     height: u64,
@@ -341,6 +367,18 @@ impl BlockMinerBackend for CudaBlockBackend {
         // Honor the OOM/error backoff AND the thermal governor's graded cap, so a
         // hot or memory-pressured NVIDIA card steps down smoothly instead of
         // running full tilt until the hard thermal pause.
+        if self.cuda.gpu_is_disabled() {
+            // The card was given up on earlier in this session (see the alert
+            // below). Do not launch again: keep the bounded CPU recovery so the
+            // miner still makes progress without hammering a dead device.
+            return cpu_gpu_error_recovery(
+                ctx.height,
+                ctx.block_intro.clone(),
+                ctx.nonce_start,
+                ctx.nonce_space,
+                cpu_mine,
+            );
+        }
         let wg_cap = self
             .cuda
             .effective_wg()
@@ -369,10 +407,19 @@ impl BlockMinerBackend for CudaBlockBackend {
             Err(e) => {
                 eprintln!("[CUDA] batch failed: {e}");
                 self.runtime.record_gpu_error_event();
-                // Back off the effective work-groups so the next batch tries a
-                // smaller, likely-runnable size instead of failing forever.
-                let reduced = self.cuda.record_error();
-                eprintln!("[CUDA] reducing work_groups to {reduced} after error");
+                let failures = self.cuda.note_batch_failure();
+                let action = cuda_failure_action(e.is_sticky(), failures);
+                if action.halve_workgroups {
+                    // Back off the effective work-groups so the next batch tries a
+                    // smaller, likely-runnable size instead of failing forever.
+                    let reduced = self.cuda.record_error();
+                    eprintln!("[CUDA] reducing work_groups to {reduced} after error");
+                }
+                if action.disable_gpu && self.cuda.disable_gpu_for_session() {
+                    eprintln!(
+                        "[CUDA] ALERT {failures} consecutive failed batches; GPU mining is now OFF for this process and the miner continues on capped CPU recovery only. Last error: {e}. Check the driver, cooling, power and PCIe riser, then restart the miner."
+                    );
+                }
                 // Cap CPU recovery like the OpenCL path so a CUDA error cannot
                 // make one CPU thread grind the whole GPU-sized nonce window.
                 cpu_gpu_error_recovery(
@@ -395,7 +442,17 @@ impl BlockMinerBackend for CudaBlockBackend {
                 ) {
                     eprintln!("[CUDA] GPU integrity error: {message}");
                     self.runtime.record_gpu_error_event();
+                    // A card returning hashes the CPU cannot reproduce is as dead
+                    // as one that fails to launch, so it shares the same budget.
+                    let failures = self.cuda.note_batch_failure();
                     self.cuda.record_error();
+                    if cuda_failure_action(false, failures).disable_gpu
+                        && self.cuda.disable_gpu_for_session()
+                    {
+                        eprintln!(
+                            "[CUDA] ALERT {failures} consecutive bad batches; GPU mining is now OFF for this process and the miner continues on capped CPU recovery only. The card is returning hashes the CPU cannot reproduce. Check for an overclock, bad memory or a failing driver, then restart the miner."
+                        );
+                    }
                     return cpu_gpu_error_recovery(
                         ctx.height,
                         ctx.block_intro.clone(),
@@ -458,6 +515,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_sticky_cuda_fault_does_not_halve_the_grid() {
+        // A sticky context fault is grid independent and x16rs-cuda rebuilds the
+        // context itself, so halving the work groups would only cost throughput.
+        assert!(!cuda_failure_action(true, 1).halve_workgroups);
+        assert!(cuda_failure_action(false, 1).halve_workgroups);
+    }
+
+    #[test]
+    fn a_run_of_failed_cuda_batches_disables_the_gpu_exactly_once() {
+        for failures in 1..CUDA_MAX_CONSECUTIVE_BATCH_ERRORS {
+            assert!(
+                !cuda_failure_action(false, failures).disable_gpu,
+                "{failures} failures must not disable the GPU yet"
+            );
+        }
+        assert!(cuda_failure_action(false, CUDA_MAX_CONSECUTIVE_BATCH_ERRORS).disable_gpu);
+        assert!(cuda_failure_action(true, CUDA_MAX_CONSECUTIVE_BATCH_ERRORS + 5).disable_gpu);
     }
 
     #[test]

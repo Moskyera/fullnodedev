@@ -56,11 +56,37 @@ impl ChainParams {
             bootstrap_max: adjust_blocks + 1,
         }
     }
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "mainnet" => Self::mainnet(),
-            _ => Self::testnet(288, 10),
+    /// Parse a chain selector into real parameters, or None if it names no chain
+    /// this builder can mine.
+    ///
+    /// `mainnet` is consensus-fixed (anchor 738654, 300s). A testnet is NOT: the
+    /// node reads `difficulty_adjust_blocks` and `each_block_target_time` from
+    /// its own config file, and a pool that assumes a different pair computes a
+    /// different target for every block, so the node rejects all of them. Bare
+    /// `testnet` keeps the documented 288/10 pair; spell the real pair out as
+    /// `testnet:<adjust_blocks>:<target_time>` for any node configured
+    /// otherwise. Either way the caller must PROVE the choice against the node
+    /// (`pool_spike::verify_chain_params`) instead of trusting the label.
+    pub fn parse(name: &str) -> Option<Self> {
+        if name == "mainnet" {
+            return Some(Self::mainnet());
         }
+        let rest = name.strip_prefix("testnet")?;
+        if rest.is_empty() {
+            return Some(Self::testnet(288, 10));
+        }
+        let mut fields = rest.strip_prefix(':')?.split(':');
+        let adjust_blocks: u64 = fields.next()?.trim().parse().ok()?;
+        let target_time: u64 = fields.next()?.trim().parse().ok()?;
+        if fields.next().is_some() || adjust_blocks == 0 || target_time == 0 {
+            return None;
+        }
+        Some(Self::testnet(adjust_blocks, target_time))
+    }
+    /// [`ChainParams::parse`] for the demo/testnet spikes, which have no operator
+    /// to report a bad selector to. Never use it on the money path.
+    pub fn from_name(name: &str) -> Self {
+        Self::parse(name).unwrap_or_else(|| Self::testnet(288, 10))
     }
     /// Does computing this height's difficulty need the anchor block's timestamp?
     pub fn needs_anchor(&self, height: u64) -> bool {
@@ -137,6 +163,28 @@ pub fn next_difficulty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_testnet_selector_can_carry_the_nodes_real_parameters() {
+        // The node takes difficulty_adjust_blocks and each_block_target_time from
+        // its own config; assuming 288/10 against a node using anything else made
+        // every template wrong, with no way for the operator to say otherwise.
+        let p = ChainParams::parse("testnet:8:10").expect("explicit testnet params");
+        assert_eq!(p.asert_height, 10);
+        assert_eq!(p.bootstrap_max, 9);
+        assert_eq!(p.target_time, 10);
+        // Documented defaults and mainnet still parse.
+        let d = ChainParams::parse("testnet").expect("bare testnet");
+        assert_eq!((d.asert_height, d.target_time), (290, 10));
+        assert_eq!(ChainParams::parse("mainnet").expect("mainnet").asert_height, 738654);
+        // Anything we cannot mine is refused rather than silently guessed.
+        assert!(ChainParams::parse("regtest").is_none());
+        assert!(ChainParams::parse("testnet:8").is_none());
+        assert!(ChainParams::parse("testnet:8:10:2").is_none());
+        assert!(ChainParams::parse("testnet:0:10").is_none());
+        assert!(ChainParams::parse("testnet:8:0").is_none());
+        assert!(ChainParams::parse("testnet:eight:10").is_none());
+    }
 
     #[test]
     fn bootstrap_heights_use_lowest_difficulty() {

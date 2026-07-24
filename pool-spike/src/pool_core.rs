@@ -71,7 +71,16 @@ impl Pplns {
     /// Record one accepted share from `worker`, evicting the oldest when full.
     pub fn record(&mut self, worker: &str) {
         self.order.push_back(worker.to_string());
-        *self.counts.entry(worker.to_string()).or_insert(0) += 1;
+        // `counts.entry(k)` takes the key BY VALUE, so it would allocate a second
+        // copy of the worker id on every share even when the worker is already
+        // tracked. This runs under the pool's global lock on the hottest path, so
+        // look the worker up by borrow and only allocate for a brand-new one.
+        match self.counts.get_mut(worker) {
+            Some(c) => *c += 1,
+            None => {
+                self.counts.insert(worker.to_string(), 1);
+            }
+        }
         while self.order.len() > self.window {
             if let Some(old) = self.order.pop_front() {
                 if let Some(c) = self.counts.get_mut(&old) {

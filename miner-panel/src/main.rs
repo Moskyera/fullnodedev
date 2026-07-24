@@ -62,8 +62,8 @@ use currency::{Currency, load_currency, save_currency};
 use eframe::egui;
 use hacash_config::{
     DiamondMinerSettings, find_hacash_config, read_diamond_miner, read_reward_wallet,
-    validate_diamond_settings, validate_hacd_wallet, validate_wallet, write_diamond_miner,
-    write_hac_miner_only,
+    validate_bid_password, validate_diamond_settings, validate_hacd_wallet, validate_wallet,
+    write_diamond_miner, write_hac_miner_only,
 };
 use i18n::{Lang, Strings, load_lang, save_lang, strings};
 use mining_kind::{MiningKind, load_mining_kind, save_mining_kind};
@@ -1106,9 +1106,18 @@ impl MinerApp {
             };
             return false;
         }
-        if self.mining_kind == MiningKind::Hacd && self.bid_password.trim().is_empty() {
-            self.status_msg = t.bid_password_required.to_string();
-            return false;
+        if self.mining_kind == MiningKind::Hacd {
+            // The node refuses a blank password AND the publicly known "123456"
+            // (its private key is public). Catching both here keeps the user in
+            // the panel with a readable message instead of a startup panic.
+            if let Err(reason) = validate_bid_password(&self.bid_password) {
+                self.status_msg = if reason == "well_known" {
+                    t.bid_password_insecure.to_string()
+                } else {
+                    t.bid_password_required.to_string()
+                };
+                return false;
+            }
         }
         if self.mining_kind == MiningKind::Hacd {
             if let Err(e) = validate_diamond_settings(&self.diamond_settings()) {
@@ -1346,7 +1355,7 @@ impl MinerApp {
                     self.connect = public_pool::local_pool_connect(self.public_pool.http_port);
                 }
                 self.public_pool_status = format!(
-                    "Public pool running — HTTP 0.0.0.0:{} · Stratum 0.0.0.0:{} · upstream {}",
+                    "Public pool running - HTTP 0.0.0.0:{} · Stratum 0.0.0.0:{} · upstream {}",
                     self.public_pool.http_port,
                     self.public_pool.stratum_port,
                     self.public_pool.upstream

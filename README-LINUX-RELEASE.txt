@@ -4,6 +4,21 @@ By Mosky
 
 FOR: A new Ubuntu/Debian PC. Fullnode, miners and panel are included.
 
+CHECK THE DOWNLOAD BEFORE YOU RUN IT
+------------------------------------
+These binaries can hold mining rewards and wallet keys. Every release is signed
+by GitHub with build provenance attestation, and verifying it is the only check
+that detects tampering. With the GitHub CLI (gh) installed, run this in the
+folder holding the downloaded hacash-miner-full-linux-x86_64 .tar.gz:
+
+  gh attestation verify <file>.tar.gz --repo Moskyera/fullnodedev
+
+If verification fails, delete the file and do not run it.
+
+The .sha256 files are NOT a signature. They only catch a truncated or corrupted
+download, and they come from the same place as the archives, so a matching
+checksum is not proof the file is genuine. The attestation is the real check.
+
 QUICK START
 -----------
 1. Extract the .tar.gz archive.

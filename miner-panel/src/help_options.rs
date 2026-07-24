@@ -89,7 +89,8 @@ static EN: &[HelpSection] = &[
         lines: &[
             "enable: true for diamond auto-bidding.",
             "reward: PRIVAKEY address (3x...) for diamond rewards.",
-            "bid_password: wallet password for automatic bids.",
+            "bid_password: wallet password for automatic bids. Must NOT be '123456': \
+that private key is publicly known, so the node refuses it and anyone could take the funds.",
             "bid_min / bid_max / bid_step: bid range in mei (1 = 1 HAC).",
             "Fullnode also needs diamond_form = true in node config.",
         ],
@@ -183,7 +184,8 @@ static EL: &[HelpSection] = &[
         lines: &[
             "enable: true για αυτόματα diamond bids.",
             "reward: PRIVAKEY (3x...) για diamond rewards.",
-            "bid_password: κωδικός wallet για bids.",
+            "bid_password: κωδικός wallet για bids. ΔΕΝ επιτρέπεται '123456': \
+το private key του είναι δημόσιο, ο κόμβος το απορρίπτει και οποιοσδήποτε μπορεί να πάρει τα χρήματα.",
             "bid_min / bid_max / bid_step: εύρος bid σε mei (1 = 1 HAC).",
             "Το fullnode χρειάζεται επίσης diamond_form = true.",
         ],

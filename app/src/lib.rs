@@ -5,6 +5,7 @@ pub mod gpu_arch;
 pub mod gpu_oom;
 pub mod hash_util;
 pub mod mining_batch;
+pub mod mining_guard;
 pub mod mining_runtime;
 pub mod mining_stats;
 pub mod panel_tuning;

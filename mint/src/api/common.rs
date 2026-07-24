@@ -59,16 +59,20 @@ fn q_string(req: &ApiRequest, key: &str, dv: &str) -> String {
         .map_or_else(|| dv.to_owned(), |s| s.to_owned())
 }
 
+fn take_secret_query(req: &mut ApiRequest, key: &str) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(req.query.remove(key).unwrap_or_default())
+}
+
 /// Type 4 keystore: query `hybrid_keystore` or raw JSON POST body (browser/wallet friendly).
-fn hybrid_keystore_from_req(req: &ApiRequest) -> String {
-    let from_query = q_string(req, "hybrid_keystore", "");
+fn take_hybrid_keystore_from_req(req: &mut ApiRequest) -> zeroize::Zeroizing<String> {
+    let from_query = req.query.remove("hybrid_keystore").unwrap_or_default();
     if !from_query.is_empty() {
-        return from_query;
+        return zeroize::Zeroizing::new(from_query);
     }
     if req.body.is_empty() {
-        return String::new();
+        return zeroize::Zeroizing::new(String::new());
     }
-    String::from_utf8_lossy(&req.body).trim().to_string()
+    zeroize::Zeroizing::new(String::from_utf8_lossy(&req.body).trim().to_string())
 }
 
 fn q_u32(req: &ApiRequest, key: &str, dv: u32) -> u32 {
@@ -157,22 +161,48 @@ fn read_mint_state(ctx: &ApiExecCtx) -> Arc<Box<dyn State>> {
     ctx.engine.state()
 }
 
+/// Push a freshly packed template and keep the deque consistent.
+///
+/// A new template is only ever packed on top of the current chain tip, so its
+/// parent is by definition the live one. A reorg-triggered repack therefore
+/// produces a template at the SAME height as the one already held but with a
+/// DIFFERENT parent, and the old entry is now built on an orphaned block: it can
+/// never yield a main chain block. It is dropped here, together with any other
+/// entry at that height, so the deque holds at most one template per height.
+///
+/// Dropping them cannot reject a submission that would otherwise have been
+/// accepted: `miner_success` matches by height and takes the lowest index, which
+/// after `push_front` is always the new entry, so every older same-height entry
+/// was already unreachable. All the eviction changes is that a worker holding a
+/// superseded template now gets the plain "pending block height not found" reply
+/// instead of a misleading "difficulty check failed" one.
+///
+/// Entries at OTHER heights are deliberately kept: they still serve
+/// slightly-late submissions from workers that were mining an earlier height.
+fn push_miner_pending_block(stfs: &mut VecDeque<MinerBlockStuff>, stuff: MinerBlockStuff) {
+    let height = *stuff.height;
+    stfs.retain(|it| *it.height != height);
+    stfs.push_front(stuff);
+    if stfs.len() > 3 {
+        stfs.pop_back();
+    }
+}
 
 fn update_miner_pending_block(block: BlockV1, cbtx: crate::TransactionCoinbase) {
     let mkrluphxs = calculate_mrkl_prelude_modify(&block.transaction_hash_list(true));
     let mut stfs = MINER_PENDING_BLOCK.lock().unwrap();
-    stfs.push_front(MinerBlockStuff {
-        height: block.height().clone(),
-        block_nonce: Uint4::default(),
-        coinbase_nonce: Hash::default(),
-        target_hash: Hash::from(u32_to_hash(block.difficulty().uint())),
-        coinbase_tx: cbtx,
-        block,
-        mrklrts: mkrluphxs,
-    });
-    if stfs.len() > 3 {
-        stfs.pop_back();
-    }
+    push_miner_pending_block(
+        &mut stfs,
+        MinerBlockStuff {
+            height: block.height().clone(),
+            block_nonce: Uint4::default(),
+            coinbase_nonce: Hash::default(),
+            target_hash: Hash::from(u32_to_hash(block.difficulty().uint())),
+            coinbase_tx: cbtx,
+            block,
+            mrklrts: mkrluphxs,
+        },
+    );
 }
 
 fn miner_reset_next_new_block(engine: Arc<dyn Engine>, txpool: &dyn TxPool) {
@@ -200,13 +230,16 @@ fn get_miner_pending_block_stuff(
     let stuff = &mut stuff[0];
 
     if let Err(e) = stuff.coinbase_nonce.increase() {
-        return api_error(&e)
+        return api_error(&e);
     }
     stuff.coinbase_tx.set_mining_nonce(stuff.coinbase_nonce);
     let cbhx = stuff.coinbase_tx.hash();
     let mkrl = calculate_mrkl_prelude_update(cbhx, &stuff.mrklrts);
     stuff.block.set_mrklroot(mkrl);
-    stuff.block.replace_transaction(0, Box::new(stuff.coinbase_tx.clone())).unwrap();
+    stuff
+        .block
+        .replace_transaction(0, Box::new(stuff.coinbase_tx.clone()))
+        .unwrap();
     let intro_data = stuff.block.intro.serialize().to_hex();
 
     let mut tg_hash = stuff.target_hash.to_vec();
@@ -275,8 +308,6 @@ fn get_miner_pending_block_stuff(
     ApiResponse::json(Value::Object(out).to_string())
 }
 
-
-
 fn hash_diff(dst: &Hash, tar: &Hash) -> i8 {
     for i in 0..Hash::SIZE {
         if dst[i] > tar[i] {
@@ -287,10 +318,6 @@ fn hash_diff(dst: &Hash, tar: &Hash) -> i8 {
     }
     0
 }
-
-
-
-
 
 fn load_block_by_height(ctx: &ApiExecCtx, height: u64) -> Ret<Arc<BlkPkg>> {
     let store = ctx.engine.store();
@@ -350,19 +377,12 @@ fn query_hashrate(ctx: &ApiExecCtx) -> serde_json::Map<String, Value> {
     data
 }
 
-
 fn get_blk_rate(ctx: &ApiExecCtx, hei: u64) -> Ret<u128> {
     let difn = load_block_by_height(ctx, hei)?.block().difficulty().uint();
     let mtcnf = ctx.engine.minter().config().downcast::<MintConf>().unwrap();
     let secs = mtcnf.each_block_target_time as f64;
     Ok(u32_to_rates(difn, secs) as u128)
 }
-
-
-
-
-
-
 
 fn get_id_range(max: i64, page: i64, limit: i64, instart: i64, desc: bool) -> Vec<i64> {
     let mut start = 1;
@@ -389,4 +409,78 @@ fn get_id_range(max: i64, page: i64, limit: i64, instart: i64, desc: bool) -> Ve
     }
     rng.retain(|&x| x >= 1 || x <= max);
     rng
+}
+
+#[cfg(test)]
+mod miner_pending_deque_tests {
+    use super::*;
+
+    fn pending_stuff(height: u64, prevhash: Hash) -> MinerBlockStuff {
+        let mut block = BlockV1::default();
+        block.intro.head.height = BlockHeight::from(height);
+        block.intro.head.prevhash = prevhash;
+        MinerBlockStuff {
+            height: BlockHeight::from(height),
+            block_nonce: Uint4::default(),
+            coinbase_nonce: Hash::default(),
+            target_hash: Hash::default(),
+            coinbase_tx: crate::TransactionCoinbase::default(),
+            block,
+            mrklrts: vec![],
+        }
+    }
+
+    fn hx(b: u8) -> Hash {
+        Hash::from([b; Hash::SIZE])
+    }
+
+    #[test]
+    fn a_reorg_repack_evicts_the_superseded_same_height_template() {
+        let old_tip = hx(0x11);
+        let new_tip = hx(0x22);
+        let mut stf = VecDeque::new();
+        push_miner_pending_block(&mut stf, pending_stuff(101, old_tip));
+        push_miner_pending_block(&mut stf, pending_stuff(101, new_tip.clone()));
+        // only the template built on the live tip survives, so a worker holding the
+        // superseded one gets a clean "height not found" instead of a bogus
+        // "difficulty check failed"
+        assert_eq!(stf.len(), 1);
+        assert_eq!(stf[0].block.prevhash(), &new_tip);
+    }
+
+    #[test]
+    fn templates_at_other_heights_are_kept_for_late_submissions() {
+        let mut stf = VecDeque::new();
+        push_miner_pending_block(&mut stf, pending_stuff(100, hx(0x10)));
+        push_miner_pending_block(&mut stf, pending_stuff(101, hx(0x11)));
+        push_miner_pending_block(&mut stf, pending_stuff(102, hx(0x12)));
+        assert_eq!(stf.len(), 3);
+        assert_eq!(*stf[0].height, 102);
+        assert_eq!(*stf[1].height, 101);
+        assert_eq!(*stf[2].height, 100);
+    }
+
+    #[test]
+    fn a_repack_never_leaves_two_entries_at_one_height() {
+        let tip = hx(0x11);
+        let mut stf = VecDeque::new();
+        push_miner_pending_block(&mut stf, pending_stuff(100, hx(0x10)));
+        push_miner_pending_block(&mut stf, pending_stuff(101, tip.clone()));
+        push_miner_pending_block(&mut stf, pending_stuff(101, tip.clone()));
+        // at most one template per height, and the earlier height is untouched
+        assert_eq!(stf.len(), 2);
+        assert_eq!(*stf[0].height, 101);
+        assert_eq!(*stf[1].height, 100);
+    }
+
+    #[test]
+    fn the_deque_capacity_of_three_is_unchanged() {
+        let mut stf = VecDeque::new();
+        for i in 0..6u64 {
+            push_miner_pending_block(&mut stf, pending_stuff(100 + i, hx(i as u8)));
+        }
+        assert_eq!(stf.len(), 3);
+        assert_eq!(*stf[0].height, 105);
+        assert_eq!(*stf[2].height, 103);
+    }
 }
