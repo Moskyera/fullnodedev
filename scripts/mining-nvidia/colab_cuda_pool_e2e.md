@@ -189,7 +189,22 @@ Compare against the AMD gfx1201 baseline (205 MH/s, 333 submits: 281 share,
 - `holding back N unit(s) ... not yet buried 16 deep` is the coinbase maturity
   guard. Payouts lag block discovery by design.
 
-Known open issue at the time of writing: a payout can be accepted by the node
-and still never confirm, because no block produced through the miner API has
-ever contained a transaction. If the worker balances stay at `0:0` after a
-settlement line, that is this issue and not a CUDA problem.
+### About the payout line
+
+Templates do carry mempool transactions, and a block submitted through the miner
+API keeps them. That was checked in the code and is not the reason an earlier run
+saw a payout go nowhere: `/submit/transaction` used to answer ret 0 before the
+node had accepted anything, so the pool was told a transaction had landed when it
+had not. Both halves are fixed, so the settlement lines here can be trusted:
+"the node holds it" means the node really holds it.
+
+What remains true, and is a design property rather than a bug: the pool mines
+coinbase-only blocks, so its payout transaction confirms only when some OTHER
+miner includes it. On this isolated rig the pool is the only miner, so a payout
+can sit in the mempool indefinitely. If worker balances stay at `0:0` while the
+pool keeps logging a pending payout, that is this, not CUDA. After three skipped
+cycles the pool now says so itself in a warning instead of going quiet.
+
+To watch a payout actually confirm, add a second block producer: leave
+`[miner] enable = true` on the node (it is, in Cell 3) and let the node's own
+CPU miner pack the mempool while the CUDA miner races it.
