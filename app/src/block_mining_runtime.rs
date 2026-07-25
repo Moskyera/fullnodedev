@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, RwLock, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, mpsc};
 
 use std::thread::spawn;
 use std::time::*;
@@ -47,6 +47,13 @@ const RESULT_CHANNEL_CAPACITY: usize = 1024;
 /// Winning results queued for the dedicated submit thread. Deep enough that a
 /// burst of pool shares never blocks the result drain.
 const SUBMIT_QUEUE_CAPACITY: usize = 256;
+/// How many recent heights the per-template submit gate remembers. A template
+/// this far behind the tip can no longer be submitted anywhere, so its
+/// bookkeeping is dropped: the gate must never grow for the life of the process.
+const SUBMIT_GATE_HEIGHT_WINDOW: u64 = 8;
+/// Hard ceiling on gate entries, so a burst of same-height reorgs cannot grow the
+/// map even while the height itself stands still.
+const SUBMIT_GATE_MAX_TEMPLATES: usize = 64;
 const MINING_INTERVAL: f64 = 3.0;
 const WORKER_RATE_STALE_MS: u64 = 15_000;
 const HASHRATE_EWMA_NEW_WEIGHT: f64 = 0.25;
@@ -62,6 +69,11 @@ static UPSTREAM_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// (a new block replacing the tip at the same height). Workers watch this in
 /// addition to the height so they stop grinding an orphaned template promptly.
 static MINING_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Bumped on EVERY template install, including a mere re-serialization of the
+/// same job. The submit gate uses it to tell "the upstream served us this exact
+/// job again" from "nothing moved", which is the difference between a template
+/// the upstream still treats as live work and one it has consumed.
+static MINING_TEMPLATE_INSTALL_SEQ: AtomicU64 = AtomicU64::new(0);
 static MINING_BLOCK_STUFF: LazyLock<RwLock<Arc<BlockMiningStuff>>> =
     LazyLock::new(|| RwLock::default());
 
@@ -283,12 +295,360 @@ fn send_mining_result(
     }
 }
 
-/// Queue a winning result for the submit thread. If the queue is full or the
-/// thread is gone we submit inline rather than drop it: a dropped winner is
-/// lost money.
+/// What the NODE said about one submitted winner.
+///
+/// `poworker::push_block_mining_success` returns `()`, so the classification the
+/// per-template gate needs (a definitive node verdict versus never having reached
+/// the node at all) is made here, next to the gate that consumes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitVerdict {
+    /// `ret:0` / `"mining":"success"`. The block was accepted, so the height is
+    /// filled and the node dropped its pending entry for it: no later winner for
+    /// this template can ever be taken.
+    Accepted,
+    /// The node answered, and the answer proves the TEMPLATE is gone or unusable
+    /// ("pending block height N not found", "pending block not ready", a
+    /// difficulty check failure, which means the node rebuilt the hash from a
+    /// template that is not the one we mined). Later winners for it are dead too.
+    TemplateGone,
+    /// The node answered, but about THIS submission only. Nothing is proved about
+    /// the template, so a later winner still deserves its own attempt.
+    SubmissionRejected,
+    /// No node verdict at all: connection refused, timeout, or a body carrying no
+    /// `ret` (proxy error page, truncated reply). A network hiccup must never
+    /// suppress a height.
+    NoNodeVerdict,
+}
+
+impl SubmitVerdict {
+    /// True when the verdict proves nothing more can be won on this template.
+    fn ends_template(self) -> bool {
+        matches!(self, SubmitVerdict::Accepted | SubmitVerdict::TemplateGone)
+    }
+
+    /// Wording for the single per-template operator line.
+    fn outcome_text(self) -> &'static str {
+        match self {
+            SubmitVerdict::Accepted => "settled (accepted)",
+            SubmitVerdict::TemplateGone => "settled (template gone)",
+            SubmitVerdict::SubmissionRejected => "retired after a submission rejection",
+            SubmitVerdict::NoNodeVerdict => "retired without a node verdict",
+        }
+    }
+}
+
+/// A node rejection that is about the TEMPLATE rather than about one submission.
+/// Every text below means the node can no longer rebuild our block at all, so
+/// every further winner for the same template would get the same answer.
+fn node_error_ends_template(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("not found")
+        || err.contains("pending block not ready")
+        || err.contains("difficulty check failed")
+}
+
+/// Classify one `/submit/miner/success` reply, returning the verdict and the node
+/// error text alongside it.
+///
+/// `None` means the body carries no numeric `ret` at all (proxy error page,
+/// truncated or non-JSON body). That is NOT a node decision, so the caller
+/// retries instead of treating a front-end hiccup as a rejection.
+fn classify_submit_response(body: &str) -> Option<(SubmitVerdict, String)> {
+    let parsed = serde_json::from_str::<JV>(body).ok()?;
+    let ret = parsed["ret"].as_i64()?;
+    // The fullnode answers with `err`; the pool relay wraps an unrecognized
+    // upstream body as `msg`. Both carry the reason.
+    let err = parsed["err"]
+        .as_str()
+        .or_else(|| parsed["msg"].as_str())
+        .unwrap_or("")
+        .to_string();
+    if ret == 0 {
+        return Some((SubmitVerdict::Accepted, err));
+    }
+    let verdict = if node_error_ends_template(&err) {
+        SubmitVerdict::TemplateGone
+    } else {
+        SubmitVerdict::SubmissionRejected
+    };
+    Some((verdict, err))
+}
+
+/// Submit one winning result and report what the node said about it.
+///
+/// Same wire behaviour as `poworker::push_block_mining_success` (same URL, same
+/// five attempts, same operator banners); the difference is the return value.
+/// The gate below cannot be driven safely without knowing a definitive node
+/// verdict from a transport failure, and that function returns `()`.
+fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) -> SubmitVerdict {
+    let urlapi_success = format!(
+        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
+        &cnf.rpcaddr,
+        success.height,
+        success.head_nonce,
+        success.coinbase_nonce.to_hex(),
+        sys::curtimes(),
+        cnf.worker_param()
+    );
+    // Submitting the winning block is the entire payoff of solo mining, and the
+    // result was already drained from the channel, so a single transient network
+    // error must not silently lose it. Retry transport failures with backoff, and
+    // only claim SUCCESS once the node confirms acceptance (ret == 0).
+    const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+    let mut verdict = SubmitVerdict::NoNodeVerdict;
+    let mut last = String::new();
+    for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
+        match crate::rpc_http::get_text(&super::HTTP_CLIENT, &urlapi_success, &cnf.api_token, None)
+        {
+            Ok(body) => {
+                last = body.clone();
+                match classify_submit_response(&body) {
+                    Some((node_verdict, err)) => {
+                        verdict = node_verdict;
+                        if node_verdict != SubmitVerdict::Accepted {
+                            // Deterministic node rejection (stale height,
+                            // invalid, etc.): retrying will not help.
+                            println!("[submit] node rejected height {}: {}", success.height, err);
+                        }
+                        break;
+                    }
+                    None => {
+                        // HTTP 200 but no parseable `ret` (proxy/load-balancer
+                        // error page, truncated or non-JSON body). This is NOT a
+                        // node decision, so treat it as transient and retry: a
+                        // winning block is not discarded on a front-end hiccup.
+                        let snippet: String = body.chars().take(120).collect();
+                        println!(
+                            "[submit] attempt {}/{} unrecognized response, retrying: {}",
+                            attempt, MAX_SUBMIT_ATTEMPTS, snippet
+                        );
+                        if attempt < MAX_SUBMIT_ATTEMPTS {
+                            std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                last = format!("transport error: {e}");
+                println!(
+                    "[submit] attempt {}/{} failed: {e}",
+                    attempt, MAX_SUBMIT_ATTEMPTS
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
+                }
+            }
+        }
+    }
+    println!("{} {}", &urlapi_success, last);
+    if verdict == SubmitVerdict::Accepted {
+        println!(
+            "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
+            success.height,
+            success.result_hash.to_hex()
+        );
+    } else {
+        println!(
+            "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
+            success.height,
+            MAX_SUBMIT_ATTEMPTS,
+            success.result_hash.to_hex()
+        );
+    }
+    println!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔");
+    verdict
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateSubmitState {
+    /// Nothing outstanding: the next winner for this template goes to the node.
+    NotSubmitted,
+    /// A winner for this template is with the submit thread right now.
+    InFlight,
+    /// The node gave a definitive verdict: nothing more can be won here.
+    Settled,
+}
+
+struct TemplateGateEntry {
+    state: TemplateSubmitState,
+    /// Winners dropped without any HTTP call, because one was already in flight
+    /// for this template or the node had already settled it.
+    suppressed: u64,
+    outcome: &'static str,
+    /// Template install counter as of the moment this template settled. If the
+    /// upstream serves the very same job again afterwards it has plainly not
+    /// consumed it, and the gate re-opens (see `maintain`).
+    settled_at_install: u64,
+    /// The single operator line for this template has already been printed.
+    reported: bool,
+}
+
+impl TemplateGateEntry {
+    fn new() -> TemplateGateEntry {
+        TemplateGateEntry {
+            state: TemplateSubmitState::NotSubmitted,
+            suppressed: 0,
+            outcome: SubmitVerdict::NoNodeVerdict.outcome_text(),
+            settled_at_install: 0,
+            reported: false,
+        }
+    }
+}
+
+/// Per-template submit gate, keyed by (height, parent hash) - the same identity a
+/// `BlockMiningResult` already carries.
+///
+/// At a low difficulty a fast GPU finds MANY nonces meeting one template's target,
+/// but a height holds exactly ONE block: `mint::api::miner_success` drops the
+/// pending entry for that height the moment it accepts a block, so every later
+/// winner for the same template can only come back as "pending block height N not
+/// found". Submitting them anyway costs one blocking HTTP round trip each, which
+/// is what filled the submit queue, then the result channel, then blocked the
+/// workers and stopped the GPU.
+///
+/// So the FIRST winner for a template is always submitted (that is the payout,
+/// and it must never regress), while later winners for the SAME template are
+/// dropped only once the node has taken it or proved it gone.
+#[derive(Default)]
+struct SubmitGate {
+    templates: HashMap<(u64, Vec<u8>), TemplateGateEntry>,
+}
+
+type SubmitGateHandle = Arc<Mutex<SubmitGate>>;
+
+fn template_key(res: &BlockMiningResult) -> (u64, Vec<u8>) {
+    (res.height, res.prevhash.clone())
+}
+
+impl SubmitGate {
+    /// True when this winner must go to the node. False means it is a redundant
+    /// winner for a template already in flight or already settled, so dropping it
+    /// costs nothing; it is counted for the one summary line.
+    fn admit(&mut self, res: &BlockMiningResult) -> bool {
+        let entry = self
+            .templates
+            .entry(template_key(res))
+            .or_insert_with(TemplateGateEntry::new);
+        if entry.state == TemplateSubmitState::NotSubmitted {
+            entry.state = TemplateSubmitState::InFlight;
+            return true;
+        }
+        entry.suppressed = entry.suppressed.saturating_add(1);
+        false
+    }
+
+    /// Record what the node said about the winner that was in flight.
+    fn record_verdict(
+        &mut self,
+        res: &BlockMiningResult,
+        verdict: SubmitVerdict,
+        install_seq: u64,
+    ) {
+        let Some(entry) = self.templates.get_mut(&template_key(res)) else {
+            // Already pruned: the template is far behind the tip, so there is
+            // nothing left to gate.
+            return;
+        };
+        if verdict.ends_template() {
+            entry.state = TemplateSubmitState::Settled;
+            entry.outcome = verdict.outcome_text();
+            entry.settled_at_install = install_seq;
+        } else if entry.state == TemplateSubmitState::InFlight {
+            // Nothing proves this template is dead, so re-open it: a network
+            // hiccup, or a rejection about one submission, must never permanently
+            // suppress a height.
+            entry.state = TemplateSubmitState::NotSubmitted;
+            entry.outcome = verdict.outcome_text();
+        }
+    }
+
+    /// Re-open a settled template the upstream is STILL serving, print the ONE
+    /// line per template the operator gets, then forget templates too old to
+    /// submit anywhere. A line is emitted only once the miner has moved off that
+    /// template, so the suppressed count in it is the final one.
+    fn maintain(&mut self, live: Option<&(u64, Vec<u8>)>, live_height: u64, install_seq: u64) {
+        for (key, entry) in self.templates.iter_mut() {
+            let still_live =
+                live.is_some_and(|(hei, prevhash)| *hei == key.0 && *prevhash == key.1);
+            if still_live {
+                // A fullnode that took our block moves on, so it never serves that
+                // job again. An upstream that DOES serve it again has not consumed
+                // it (a pool grading work at one height, or a block reorged back
+                // out), and our own bookkeeping must not be what silences a live
+                // height. Re-opening costs at most one submit per template refresh.
+                if entry.state == TemplateSubmitState::Settled
+                    && install_seq > entry.settled_at_install
+                {
+                    entry.state = TemplateSubmitState::NotSubmitted;
+                }
+                continue;
+            }
+            if entry.reported {
+                continue;
+            }
+            // Nothing was dropped for this template, so there is nothing to
+            // report: the submit path already printed its own outcome.
+            if entry.suppressed > 0 {
+                println!(
+                    "\n[Mining] height {} {}, suppressed {} redundant winners.",
+                    key.0, entry.outcome, entry.suppressed
+                );
+            }
+            entry.reported = true;
+        }
+        self.prune(live_height);
+    }
+
+    /// Bound the memory: keep only the last `SUBMIT_GATE_HEIGHT_WINDOW` heights,
+    /// and never more than `SUBMIT_GATE_MAX_TEMPLATES` entries in total.
+    fn prune(&mut self, live_height: u64) {
+        if live_height > 0 {
+            let floor = live_height.saturating_sub(SUBMIT_GATE_HEIGHT_WINDOW);
+            self.templates.retain(|(hei, _), _| *hei >= floor);
+        }
+        while self.templates.len() > SUBMIT_GATE_MAX_TEMPLATES {
+            let Some(oldest) = self.templates.keys().min().cloned() else {
+                break;
+            };
+            self.templates.remove(&oldest);
+        }
+    }
+}
+
+/// A poisoned gate must never stop submissions: recover the state and carry on.
+fn lock_gate(gate: &SubmitGateHandle) -> MutexGuard<'_, SubmitGate> {
+    gate.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn admit_for_submit(gate: &SubmitGateHandle, win: &BlockMiningResult) -> bool {
+    lock_gate(gate).admit(win)
+}
+
+fn record_submit_verdict(gate: &SubmitGateHandle, win: &BlockMiningResult, verdict: SubmitVerdict) {
+    let install_seq = MINING_TEMPLATE_INSTALL_SEQ.load(Relaxed);
+    lock_gate(gate).record_verdict(win, verdict, install_seq);
+}
+
+/// Re-open, retire and prune templates. Runs on the result thread every drain
+/// tick, so the gate cannot grow while mining continues.
+fn maintain_submit_gate(gate: &SubmitGateHandle) {
+    let live = live_template_identity();
+    let live_height = MINING_BLOCK_HEIGHT.load(Relaxed);
+    let install_seq = MINING_TEMPLATE_INSTALL_SEQ.load(Relaxed);
+    lock_gate(gate).maintain(live.as_ref(), live_height, install_seq);
+}
+
+/// Queue a winning result for the submit thread.
+///
+/// With the gate above at most one winner per template is ever outstanding, so
+/// the queue holds a handful of entries and can no longer fill in the redundant
+/// winner case that used to jam the whole pipeline. The inline submit is kept
+/// purely as a last resort (the submit thread is gone, i.e. shutdown), because a
+/// dropped winner is lost money.
 fn queue_block_mining_success(
     cnf: &PoWorkConf,
     submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+    gate: &SubmitGateHandle,
     win: &Arc<BlockMiningResult>,
 ) {
     match submit_tx.try_send(win.clone()) {
@@ -298,12 +658,25 @@ fn queue_block_mining_success(
                 "[Mining] Submit queue full, submitting height {} inline.",
                 win.height
             );
-            super::push_block_mining_success(cnf, &win);
+            submit_inline_without_verdict(cnf, gate, &win);
         }
         Err(mpsc::TrySendError::Disconnected(win)) => {
-            super::push_block_mining_success(cnf, &win);
+            submit_inline_without_verdict(cnf, gate, &win);
         }
     }
+}
+
+/// Last-resort submit on the calling thread. It uses the plain submitter, which
+/// reports nothing back, so the template is re-opened instead of being left in
+/// flight: no height may stay suppressed on the strength of a submit whose
+/// outcome we never learned.
+fn submit_inline_without_verdict(
+    cnf: &PoWorkConf,
+    gate: &SubmitGateHandle,
+    win: &Arc<BlockMiningResult>,
+) {
+    super::push_block_mining_success(cnf, win);
+    record_submit_verdict(gate, win, SubmitVerdict::NoNodeVerdict);
 }
 
 pub(crate) fn start_block_mining_workers(
@@ -344,14 +717,24 @@ pub(crate) fn start_block_mining_workers(
     // back the result channel up whenever a pool serves an easy share target.
     let (submit_tx, submit_rx) =
         mpsc::sync_channel::<Arc<BlockMiningResult>>(SUBMIT_QUEUE_CAPACITY);
+    // One gate shared by the result thread (which admits winners) and the submit
+    // thread (which reports the node verdict back).
+    let submit_gate: SubmitGateHandle = Arc::new(Mutex::new(SubmitGate::default()));
     let cnf_submit = cnf.clone();
     let submit_thread_guard = cnf.runtime.track_mining_thread();
+    let gate_submit = submit_gate.clone();
     spawn(move || {
         let _submit_thread_guard = submit_thread_guard;
         while let Ok(win) = submit_rx.recv() {
+            // A panic inside the submit must not leave the template stuck "in
+            // flight", which would suppress every later winner for it, so the
+            // verdict starts as "no node verdict" (re-open) and is recorded
+            // outside the firewall.
+            let mut verdict = SubmitVerdict::NoNodeVerdict;
             guard_mining_iteration("block submit thread", || {
-                super::push_block_mining_success(&cnf_submit, &win);
+                verdict = submit_block_mining_success(&cnf_submit, &win);
             });
+            record_submit_verdict(&gate_submit, &win, verdict);
         }
     });
 
@@ -359,6 +742,7 @@ pub(crate) fn start_block_mining_workers(
     let worker_qty = miner_backends.len();
     let stop_flag_res = stop_flag.clone();
     let result_thread_guard = cnf.runtime.track_mining_thread();
+    let gate_results = submit_gate;
     spawn(move || {
         // submit_tx lives in this thread: when the drain loop returns on shutdown it
         // drops, which is what tells the submit thread to finish and exit.
@@ -374,7 +758,7 @@ pub(crate) fn start_block_mining_workers(
                 // other body on this thread that can submit, so it gets the same
                 // panic firewall as the drain loop below.
                 guard_mining_iteration("block shutdown drain", || {
-                    drain_winners_for_shutdown(&mut rstx, &submit_tx);
+                    drain_winners_for_shutdown(&mut rstx, &submit_tx, &gate_results);
                 });
                 return;
             }
@@ -390,7 +774,12 @@ pub(crate) fn start_block_mining_workers(
                     &mut rate_tracker,
                     now_ms,
                     &submit_tx,
+                    &gate_results,
                 );
+                // Retire settled templates (one operator line each) and keep the
+                // gate bounded. This runs every tick, so it also happens while no
+                // result at all is coming in.
+                maintain_submit_gate(&gate_results);
             });
             std::thread::sleep(Duration::from_millis(123));
         }
@@ -519,6 +908,9 @@ fn install_block_mining_stuff(mut new_stuff: BlockMiningStuff) -> Result<(), Str
     };
     *guard = new_stuff.into();
     MINING_BLOCK_HEIGHT.store(height, Relaxed);
+    // Every install counts here, re-serializations included: the submit gate needs
+    // to know the upstream handed us this job again, not whether it changed.
+    MINING_TEMPLATE_INSTALL_SEQ.fetch_add(1, Relaxed);
     Ok(())
 }
 
@@ -973,14 +1365,20 @@ fn run_block_mining_item(
 /// submit (up to five attempts at the 30 s RPC timeout) when the queue is full,
 /// and holding shutdown on network I/O would look like a hung miner. The submit
 /// thread drains whatever is queued before it exits, so a successful `try_send`
-/// is still a real submission.
+/// is still a real submission. The per-template gate applies here too, so a
+/// backlog of redundant winners cannot turn shutdown into hundreds of doomed
+/// round trips.
 fn drain_winners_for_shutdown(
     result_ch_rx: &mut mpsc::Receiver<Arc<BlockMiningResult>>,
     submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+    gate: &SubmitGateHandle,
 ) {
     let live_template = live_template_identity();
     while let Ok(res) = result_ch_rx.try_recv() {
-        if result_meets_target(&res) && !result_is_orphaned(&res, live_template.as_ref()) {
+        if result_meets_target(&res)
+            && !result_is_orphaned(&res, live_template.as_ref())
+            && admit_for_submit(gate, &res)
+        {
             if let Err(e) = submit_tx.try_send(res.clone()) {
                 eprintln!(
                     "[Mining] Shutdown could not queue a winning result at height {}: {e}",
@@ -1019,6 +1417,7 @@ fn deal_block_mining_results(
     rate_tracker: &mut HashrateTracker,
     now_ms: u64,
     submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+    gate: &SubmitGateHandle,
 ) {
     let vene = worker_qty.max(1) as u32;
     let mut deal_hei = 0u64;
@@ -1138,15 +1537,23 @@ fn deal_block_mining_results(
         &cnf.efficiency.stats_file,
     );
     if !winners.is_empty() {
-        // Submit every distinct winner. Each is a payout we must not drop just
-        // because another result in this window had a stronger hash: a pool credits
-        // each (height, coinbase_nonce, block_nonce) as its own share.
+        // Submit every distinct winner the node could still take. The gate drops
+        // only the ones it can prove are dead: a second winner for a template the
+        // node has already settled cannot be accepted at any price, because a
+        // height holds exactly one block. Everything else still goes out.
         for w in &winners {
-            queue_block_mining_success(cnf, submit_tx, w);
+            if !admit_for_submit(gate, w) {
+                continue;
+            }
+            queue_block_mining_success(cnf, submit_tx, gate, w);
         }
     } else if cnf.debug == 1 {
-        // Debug mode exercises the submit path even without a genuine winner.
-        queue_block_mining_success(cnf, submit_tx, &most);
+        // Debug mode exercises the submit path even without a genuine winner. It
+        // goes through the same gate, so it submits once per template instead of
+        // once per drain tick.
+        if admit_for_submit(gate, &most) {
+            queue_block_mining_success(cnf, submit_tx, gate, &most);
+        }
     }
     may_print_turn_to_nex_block_mining(deal_hei, Some(most_hash));
 }
@@ -1347,6 +1754,7 @@ mod tests {
             &mut tracker,
             1,
             &submit_tx,
+            &test_gate(),
         );
 
         let submitted = submit_rx
@@ -1388,6 +1796,7 @@ mod tests {
             &mut tracker,
             1,
             &submit_tx,
+            &test_gate(),
         );
         assert!(submit_rx.try_recv().is_err());
     }
@@ -1397,6 +1806,24 @@ mod tests {
         assert!(set_pending_block_stuff(1, serde_json::json!({})).is_err());
         let invalid_hex = serde_json::json!({"target_hash": "zz"});
         assert!(set_pending_block_stuff(1, invalid_hex).is_err());
+    }
+
+    fn test_gate() -> SubmitGateHandle {
+        Arc::new(Mutex::new(SubmitGate::default()))
+    }
+
+    /// A winner for one template identity (height, parent hash).
+    fn winner_for_template(height: u64, prevhash: u8, head_nonce: u32) -> Arc<BlockMiningResult> {
+        let mut res = BlockMiningResult::default();
+        res.height = height;
+        res.prevhash = vec![prevhash; HASH_WIDTH];
+        res.head_nonce = head_nonce;
+        res.nonce_space = 1;
+        res.use_secs = 0.5;
+        res.coinbase_nonce = vec![0x05; HASH_WIDTH];
+        res.target_hash = vec![0x0f; HASH_WIDTH];
+        res.result_hash = vec![0x01; HASH_WIDTH];
+        Arc::new(res)
     }
 
     fn winner_for_test(
@@ -1539,5 +1966,211 @@ mod tests {
         tracker.record_sample(0, 1_000_000, 1_000_000, 0, true, 0.010, 0);
         assert!(tracker.totals(WORKER_RATE_STALE_MS).total_hps() > 0.0);
         assert_eq!(tracker.totals(WORKER_RATE_STALE_MS + 1).total_hps(), 0.0);
+    }
+
+    #[test]
+    fn only_the_first_winner_of_a_template_is_ever_submitted() {
+        let _guard = mining_state_guard();
+        // Reproduced on real hardware: at a low difficulty one GPU finds hundreds
+        // of valid nonces per template, but a height holds exactly ONE block. Every
+        // extra submit cost a blocking HTTP round trip, which filled the submit
+        // queue, then the result channel, then blocked the workers and stopped the
+        // GPU. Only the first one may leave; the rest are provably dead.
+        set_pending_block_stuff(700, pending_template_json(700, 0x11, 0xd1)).unwrap();
+        let cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        let (res_tx, mut res_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(16);
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(16);
+        for head_nonce in 0..9u32 {
+            res_tx
+                .send(winner_for_template(700, 0x11, head_nonce))
+                .unwrap();
+        }
+
+        let gate = test_gate();
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            8,
+            &mut tracker,
+            1,
+            &submit_tx,
+            &gate,
+        );
+
+        assert_eq!(
+            submit_rx.try_recv().map(|w| w.head_nonce),
+            Ok(0),
+            "the first winner for a template is the payout and must always be submitted"
+        );
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "a redundant winner for the same template can only come back as 'pending block height N not found'"
+        );
+        assert_eq!(
+            lock_gate(&gate).templates[&(700u64, vec![0x11u8; HASH_WIDTH])].suppressed,
+            8
+        );
+    }
+
+    #[test]
+    fn a_same_height_reorg_template_still_gets_its_own_submit() {
+        let mut gate = SubmitGate::default();
+        assert!(gate.admit(&winner_for_template(701, 0x11, 1)));
+        assert!(!gate.admit(&winner_for_template(701, 0x11, 2)));
+        // A different parent at the same height is a DIFFERENT template: the node
+        // holds a different pending block for it, so this is a real chance at the
+        // height and must never be gated by the first template.
+        assert!(gate.admit(&winner_for_template(701, 0x22, 3)));
+        assert!(!gate.admit(&winner_for_template(701, 0x22, 4)));
+    }
+
+    #[test]
+    fn a_winner_at_a_new_height_is_never_suppressed() {
+        let mut gate = SubmitGate::default();
+        assert!(gate.admit(&winner_for_template(702, 0x11, 1)));
+        gate.record_verdict(
+            &winner_for_template(702, 0x11, 1),
+            SubmitVerdict::Accepted,
+            1,
+        );
+        assert!(!gate.admit(&winner_for_template(702, 0x11, 2)));
+        assert!(gate.admit(&winner_for_template(703, 0x11, 1)));
+    }
+
+    #[test]
+    fn a_template_the_upstream_keeps_serving_is_re_opened() {
+        // A fullnode that took our block never serves that job again. An upstream
+        // that hands us the SAME job after settling it has not consumed it (a pool
+        // grading work at one height, or a block reorged back out), and our own
+        // bookkeeping must not be what silences a live height.
+        let mut gate = SubmitGate::default();
+        let live = (704u64, vec![0x11u8; HASH_WIDTH]);
+        let win = winner_for_template(704, 0x11, 1);
+        assert!(gate.admit(&win));
+        gate.record_verdict(&win, SubmitVerdict::Accepted, 7);
+        assert!(!gate.admit(&winner_for_template(704, 0x11, 2)));
+
+        // Same job, nothing re-served: it stays settled.
+        gate.maintain(Some(&live), 704, 7);
+        assert!(!gate.admit(&winner_for_template(704, 0x11, 3)));
+
+        // Served again: one more winner gets its chance, and only one.
+        gate.maintain(Some(&live), 704, 8);
+        assert!(gate.admit(&winner_for_template(704, 0x11, 4)));
+        assert!(!gate.admit(&winner_for_template(704, 0x11, 5)));
+    }
+
+    #[test]
+    fn a_transport_failure_re_opens_the_template() {
+        let mut gate = SubmitGate::default();
+        let win = winner_for_template(800, 0x11, 1);
+        assert!(gate.admit(&win));
+        assert!(!gate.admit(&winner_for_template(800, 0x11, 2)));
+
+        // No answer from the node proves nothing about the template.
+        gate.record_verdict(&win, SubmitVerdict::NoNodeVerdict, 1);
+        assert!(
+            gate.admit(&winner_for_template(800, 0x11, 3)),
+            "a network hiccup must never suppress a height for good"
+        );
+        // Neither does a rejection that is about one submission only.
+        gate.record_verdict(&win, SubmitVerdict::SubmissionRejected, 1);
+        assert!(gate.admit(&winner_for_template(800, 0x11, 4)));
+
+        // A definitive verdict does settle it, and keeps it settled.
+        gate.record_verdict(&win, SubmitVerdict::Accepted, 1);
+        assert!(!gate.admit(&winner_for_template(800, 0x11, 5)));
+        gate.record_verdict(&win, SubmitVerdict::NoNodeVerdict, 1);
+        assert!(!gate.admit(&winner_for_template(800, 0x11, 6)));
+    }
+
+    #[test]
+    fn the_submit_gate_stays_bounded_as_the_height_advances() {
+        let mut gate = SubmitGate::default();
+        for height in 1..=500u64 {
+            let win = winner_for_template(height, 0x11, 1);
+            gate.admit(&win);
+            gate.record_verdict(&win, SubmitVerdict::Accepted, height);
+            gate.maintain(Some(&(height, vec![0x11u8; HASH_WIDTH])), height, height);
+            assert!(gate.templates.len() as u64 <= SUBMIT_GATE_HEIGHT_WINDOW + 1);
+        }
+
+        // A reorg storm at one standing height cannot grow it either.
+        let mut gate = SubmitGate::default();
+        for parent in 0..(SUBMIT_GATE_MAX_TEMPLATES as u32 * 3) {
+            let mut res = BlockMiningResult::default();
+            res.height = 900;
+            res.prevhash = parent.to_be_bytes().to_vec();
+            gate.admit(&res);
+            gate.maintain(Some(&(900, Vec::new())), 900, parent as u64);
+        }
+        assert!(gate.templates.len() <= SUBMIT_GATE_MAX_TEMPLATES);
+    }
+
+    #[test]
+    fn a_settled_template_is_reported_once_with_its_final_count() {
+        let mut gate = SubmitGate::default();
+        let key = (900u64, vec![0x11u8; HASH_WIDTH]);
+        let win = winner_for_template(900, 0x11, 1);
+        assert!(gate.admit(&win));
+        for head_nonce in 2..12u32 {
+            assert!(!gate.admit(&winner_for_template(900, 0x11, head_nonce)));
+        }
+        gate.record_verdict(&win, SubmitVerdict::Accepted, 3);
+
+        // Still the live template, so the count is not final yet: no line.
+        gate.maintain(Some(&key), 900, 3);
+        assert!(!gate.templates[&key].reported);
+
+        // The miner moved on: exactly one line, carrying the whole count.
+        gate.maintain(Some(&(901, vec![0x33u8; HASH_WIDTH])), 901, 4);
+        assert!(gate.templates[&key].reported);
+        assert_eq!(gate.templates[&key].suppressed, 10);
+        gate.maintain(Some(&(901, vec![0x33u8; HASH_WIDTH])), 901, 5);
+        assert!(gate.templates[&key].reported);
+    }
+
+    #[test]
+    fn only_a_node_verdict_about_the_template_settles_it() {
+        let verdict = |body: &str| classify_submit_response(body).map(|(v, _)| v);
+        assert_eq!(
+            verdict("{\"ret\":0,\"height\":3,\"mining\":\"success\"}"),
+            Some(SubmitVerdict::Accepted)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"pending block height 3 not found\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"pending block not ready\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict(
+                "{\"ret\":1,\"err\":\"difficulty check failed: expected at least 0f but got ff\"}"
+            ),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        // The pool relay wraps an unrecognized upstream body as `msg`.
+        assert_eq!(
+            verdict("{\"ret\":1,\"msg\":\"pending block height 9 not found\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        // About this submission only: the template still deserves another try.
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"coinbase nonce format invalid\"}"),
+            Some(SubmitVerdict::SubmissionRejected)
+        );
+        // No `ret` at all is a front-end hiccup, not a node decision.
+        assert!(verdict("<html>502 Bad Gateway</html>").is_none());
+        assert!(verdict("{\"msg\":\"gateway timeout\"}").is_none());
+
+        assert!(SubmitVerdict::Accepted.ends_template());
+        assert!(SubmitVerdict::TemplateGone.ends_template());
+        assert!(!SubmitVerdict::SubmissionRejected.ends_template());
+        assert!(!SubmitVerdict::NoNodeVerdict.ends_template());
     }
 }
