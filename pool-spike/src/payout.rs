@@ -37,10 +37,10 @@ use sys::*;
 use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::split_payout;
 use pool_spike::{
-    PayoutTxState, acquire_settle_lock, balance, balance_units, classify_payout_tx,
+    Admission, PayoutTxState, acquire_settle_lock, balance, balance_units, classify_payout_tx,
     distributable_units, find_u64, get_json, http_client, is_payout_address, load_immature_units,
     load_or_create_wallet, load_pending_payout_txs, load_pplns_counts, mine_and_submit_block,
-    pool_state_path, post_hex, save_pending_payout_txs,
+    pool_state_path, post_hex, save_pending_payout_txs, verify_admitted,
 };
 
 /// Recipients per settlement transaction — safely under TX_ACTIONS_MAX (200).
@@ -332,17 +332,50 @@ fn main() {
             .ok()
             .and_then(|v| find_u64(&v, "ret"))
             == Some(0);
-        all_ok &= accepted;
-        println!(
-            "  tx {} paying {pushed} miner(s): {}",
-            &txhash[..txhash.len().min(16)],
-            if accepted { "ACCEPTED".to_string() } else { format!("REJECTED -> {resp}") }
-        );
+        if !accepted {
+            all_ok = false;
+            println!("  tx {} paying {pushed} miner(s): REJECTED -> {resp}", short(&txhash));
+            // Never submitted, so never relayed: drop it so a retry re-issues
+            // this chunk instead of waiting forever on a hash nothing holds.
+            submitted.retain(|h| h != &txhash);
+            let _ = save_pending_payout_txs(&state_file, &submitted);
+            continue;
+        }
+        // ret=0 only means the API took the bytes. The node validates the
+        // transaction synchronously and then inserts it into the mempool on a
+        // background task whose result it DISCARDS, so an accepted response is
+        // no evidence at all. Ask the node what it actually holds.
+        let held = match verify_admitted(&client, &node, &txhash) {
+            Admission::Held => {
+                println!("  tx {} paying {pushed} miner(s): the node holds it", short(&txhash));
+                true
+            }
+            Admission::Missing => {
+                all_ok = false;
+                println!(
+                    "  tx {} paying {pushed} miner(s): the API accepted it but the node does NOT \
+                     hold it - nothing was paid and nothing was relayed",
+                    short(&txhash)
+                );
+                submitted.retain(|h| h != &txhash);
+                let _ = save_pending_payout_txs(&state_file, &submitted);
+                false
+            }
+            Admission::Unresolved => {
+                all_ok = false;
+                println!(
+                    "  tx {} paying {pushed} miner(s): submitted, but the node's verdict could \
+                     not be read - keeping it in the pending ledger",
+                    short(&txhash)
+                );
+                false
+            }
+        };
 
         // On testnet the pool has no other miners, so self-mine a confirming
         // block that includes this tx. On mainnet the tx waits in the mempool for
         // the network to include it (the pool mines coinbase-only blocks).
-        if is_testnet && accepted {
+        if is_testnet && held {
             let (h, blkresp) = mine_and_submit_block(
                 &client,
                 &node,
@@ -355,12 +388,14 @@ fn main() {
     }
 
     if all_ok {
-        println!("\nAll payout tx(s) accepted. They stay in the shared pending ledger until they");
-        println!("are buried deep enough that a reorg cannot undo them; re-running before then is");
-        println!("safe: this tool and the pool server both refuse to double-pay.");
+        println!("\nEvery payout tx is in the node. NOTHING IS PAID until a block includes them:");
+        println!("they stay in the shared pending ledger until they are buried deep enough that a");
+        println!("reorg cannot undo them; re-running before then is safe: this tool and the pool");
+        println!("server both refuse to double-pay.");
     } else {
-        eprintln!("\nSome payout tx(s) were rejected or failed to sign — see above. Ledger keeps the");
-        eprintln!("submitted hashes so a retry will not double-pay the accepted ones.");
+        eprintln!("\nSome payout tx(s) never reached the node, failed to sign, or could not be");
+        eprintln!("verified - see above. Those miners are still owed. The ledger keeps every hash");
+        eprintln!("the node does hold, so a retry will not double-pay them.");
     }
     println!("pool wallet after = {}", balance(&client, &node, &pool_addr));
 }

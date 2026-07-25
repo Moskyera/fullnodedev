@@ -415,6 +415,12 @@ fn get_id_range(max: i64, page: i64, limit: i64, instart: i64, desc: bool) -> Ve
 mod miner_pending_deque_tests {
     use super::*;
 
+    fn scoped_protocol_setup() -> protocol::setup::TestSetupScopeGuard {
+        let mut setup = protocol::setup::new_standard_protocol_setup(x16rs::block_hash);
+        crate::setup::register_protocol_extensions(&mut setup);
+        protocol::setup::install_test_scope(setup)
+    }
+
     fn pending_stuff(height: u64, prevhash: Hash) -> MinerBlockStuff {
         let mut block = BlockV1::default();
         block.intro.head.height = BlockHeight::from(height);
@@ -471,6 +477,56 @@ mod miner_pending_deque_tests {
         assert_eq!(stf.len(), 2);
         assert_eq!(*stf[0].height, 101);
         assert_eq!(*stf[1].height, 100);
+    }
+
+    /// The template is packed FROM the txpool, and `miner_success` rebuilds the
+    /// block it submits by cloning the stored template and recomputing only the
+    /// merkle root from the coinbase plus `mrklrts`. Both halves must keep the
+    /// packed non-coinbase transactions, otherwise every miner served by this node
+    /// would mine coinbase-only blocks and no transaction could ever confirm.
+    #[test]
+    fn a_packed_transaction_survives_the_template_round_trip() {
+        let _setup = scoped_protocol_setup();
+
+        let cbtx = crate::TransactionCoinbase::default();
+        let mut tx = TransactionType3::default();
+        tx.ty = Uint1::from(TransactionType3::TYPE);
+        tx.timestamp = Timestamp::from(1u64);
+        tx.fee = Amount::small_mei(1);
+
+        let mut transactions = DynVecTransaction::default();
+        transactions.push(Box::new(cbtx.clone())).unwrap();
+        transactions.push(Box::new(tx.clone())).unwrap();
+        let trshxs = vec![cbtx.hash_with_fee(), tx.hash_with_fee()];
+
+        let mut block = BlockV1::default();
+        block.intro.head.height = BlockHeight::from(202);
+        block.intro.head.transaction_count = Uint4::from(2u32);
+        block.intro.head.mrklroot = calculate_mrklroot(&trshxs);
+        block.transactions = transactions;
+
+        MINER_PENDING_BLOCK.lock().unwrap().clear();
+        update_miner_pending_block(block, cbtx);
+
+        // what the worker is handed
+        let resp = get_miner_pending_block_stuff(true, true, true, false);
+        let out: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(out["ret"], json!(0));
+        assert_eq!(out["transaction_count"], json!(1)); // excludes the coinbase
+        assert_eq!(out["transaction_body_list"].as_array().unwrap().len(), 2);
+        assert_eq!(out["mkrl_modify_list"].as_array().unwrap().len(), 1);
+
+        // what `miner_success` clones and submits
+        let stf = MINER_PENDING_BLOCK.lock().unwrap();
+        let held = &stf[0];
+        assert_eq!(held.block.transactions().len(), 2);
+        assert_eq!(held.mrklrts.len(), 1);
+        let rebuilt = calculate_mrkl_prelude_update(held.coinbase_tx.hash(), &held.mrklrts);
+        assert_eq!(
+            rebuilt,
+            calculate_mrklroot(&held.block.transaction_hash_list(true))
+        );
+        assert_eq!(*held.block.mrklroot(), rebuilt);
     }
 
     #[test]

@@ -185,6 +185,67 @@ pub fn classify_payout_tx(j: &Value) -> PayoutTxState {
     }
 }
 
+/// How many times to ask the node whether it really holds a payout we just
+/// submitted, and how long to wait between asks. `/submit/transaction` answers
+/// ret=0 the moment the API has validated the transaction and handed it to a
+/// background task, so the node needs a moment before its own view of the hash
+/// means anything.
+pub const ADMIT_POLL_TRIES: u32 = 10;
+pub const ADMIT_POLL_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What the NODE says it holds after we submitted a payout transaction.
+///
+/// `/submit/transaction` returning ret=0 is NOT this answer. The node validates
+/// the transaction synchronously and then performs the mempool insert on a
+/// background task whose result it DISCARDS, so the API reports "ok" for a
+/// transaction the mempool went on to refuse - and the pool then reports a
+/// payout that does not exist. The node's own view of the hash is the only
+/// evidence that a payout is really in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// The node reports the transaction: waiting in its mempool, or already mined.
+    Held,
+    /// The node answered definitively that it does not know this transaction.
+    /// It was never inserted, so it was never relayed either.
+    Missing,
+    /// No usable answer (node unreachable, unparseable reply). NOT a resolution:
+    /// the payout may well be in flight, so it must stay tracked.
+    Unresolved,
+}
+
+/// Map the node's `/query/transaction` answer to an admission verdict.
+pub fn admission_of(j: &Value) -> Admission {
+    match classify_payout_tx(j) {
+        PayoutTxState::Pending | PayoutTxState::Confirming(_) | PayoutTxState::Buried(_) => {
+            Admission::Held
+        }
+        PayoutTxState::Gone => Admission::Missing,
+        PayoutTxState::Unknown => Admission::Unresolved,
+    }
+}
+
+/// Ask the node whether it really holds `txhash`, retrying while it has not made
+/// up its mind. The insert runs on a background task, so an immediate "not
+/// found" only becomes a verdict once the node has had time to do it.
+pub fn verify_admitted(
+    client: &reqwest::blocking::Client,
+    node: &str,
+    txhash: &str,
+) -> Admission {
+    let mut last = Admission::Unresolved;
+    for attempt in 0..ADMIT_POLL_TRIES {
+        let j = get_json(client, &format!("{node}/query/transaction?hash={txhash}"));
+        match admission_of(&j) {
+            Admission::Held => return Admission::Held,
+            other => last = other,
+        }
+        if attempt + 1 < ADMIT_POLL_TRIES {
+            std::thread::sleep(ADMIT_POLL_DELAY);
+        }
+    }
+    last
+}
+
 /// What a settlement may actually pay out: the wallet balance MINUS income a
 /// reorg could still take back, MINUS the fee reserve. `None` means "nothing
 /// spendable, do not settle this cycle".
@@ -1173,6 +1234,35 @@ mod tests {
         // A nonsense reserve must fail the guard, not wrap it open.
         assert_eq!(distributable_units(100, 0, u64::MAX), None);
         assert_eq!(distributable_units(100, 0, 5), Some(95));
+    }
+
+    #[test]
+    fn only_the_nodes_own_view_admits_a_payout() {
+        // `/submit/transaction` validates the tx synchronously and then does the
+        // mempool insert on a background task whose result it discards, so ret=0
+        // is NOT evidence the node took the transaction. Every caller must ask
+        // the node what it holds, and must treat "no answer" as unresolved
+        // rather than as either outcome.
+        let j = |s: &str| serde_json::from_str::<Value>(s).expect("json");
+        assert_eq!(admission_of(&j(r#"{"ret":0,"pending":true}"#)), Admission::Held);
+        assert_eq!(
+            admission_of(&j(&format!(r#"{{"ret":0,"confirm":{PAYOUT_MATURITY_DEPTH}}}"#))),
+            Admission::Held
+        );
+        // Mined but shallow is still the node holding it.
+        assert_eq!(admission_of(&j(r#"{"ret":0,"confirm":1}"#)), Admission::Held);
+        // The node answered: it does not know this transaction.
+        assert_eq!(
+            admission_of(&j(r#"{"ret":1,"err":"transaction not found"}"#)),
+            Admission::Missing
+        );
+        // Not answers: never resolve a payout on these.
+        assert_eq!(
+            admission_of(&j(r#"{"http_error":"connection refused"}"#)),
+            Admission::Unresolved
+        );
+        assert_eq!(admission_of(&j(r#"{"ret":0}"#)), Admission::Unresolved);
+        assert_eq!(admission_of(&Value::String("<html>502</html>".into())), Admission::Unresolved);
     }
 
     #[test]

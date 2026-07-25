@@ -48,11 +48,11 @@ use sys::curtimes;
 use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::{self, Pplns, split_payout};
 use pool_spike::{
-    PAYOUT_MATURITY_DEPTH, PPLNS_WINDOW, PayoutTxState, Template, acquire_settle_lock,
+    Admission, PAYOUT_MATURITY_DEPTH, PPLNS_WINDOW, PayoutTxState, Template, acquire_settle_lock,
     assemble_block, atomic_write, balance, balance_units, block_reward_units, classify_payout_tx,
     coinbase_body_hex, coinbase_with_extranonce, distributable_units, fetch_template, find_str,
     find_u64, get_json, http_client, intro_bytes, is_payout_address, load_or_create_wallet,
-    pool_state_path, post_hex, submit_block_bytes, verify_chain_params,
+    pool_state_path, post_hex, submit_block_bytes, verify_admitted, verify_chain_params,
 };
 
 use serde_json::json;
@@ -72,6 +72,10 @@ const SEEN_CAP: usize = 2_000_000;
 /// Recipients per settlement transaction. The node enforces TX_ACTIONS_MAX = 200
 /// actions; stay safely under it so a large payout is chunked, never rejected.
 const PAYOUT_CHUNK: usize = 190;
+/// After this many consecutive settlement cycles skipped by a payout that is
+/// still sitting in the mempool, escalate from a note to a loud warning: nothing
+/// is being paid, and the operator has to know why.
+const STALLED_PAYOUT_CYCLES: u64 = 3;
 /// How deep one of OUR blocks must be buried before its coinbase may be paid
 /// out. The node treats anything shallower than `unstable_block` (4) as
 /// reorg-able, and settlement runs at roughly one block interval, so without a
@@ -228,6 +232,11 @@ struct Pool {
     /// a restart mid-settlement does not re-pay. Robust to a lost submit ACK and
     /// to the wallet also earning coinbase income.
     settle_pending_txs: Vec<String>,
+    /// Consecutive settlement cycles skipped because a payout was still waiting
+    /// in the mempool. A payout that never confirms silently freezes every later
+    /// payout, so this drives an escalating warning instead of silence. Purely a
+    /// diagnostic, so it is deliberately not persisted.
+    settle_stalls: u64,
 }
 
 impl Pool {
@@ -549,6 +558,7 @@ fn main() {
         unsaved: 0,
         state_seq: 0,
         settle_pending_txs: Vec::new(),
+        settle_stalls: 0,
     };
     pool.load_state();
     pool.rebuild_pending_cache();
@@ -780,6 +790,105 @@ fn prune_seen(seen: &mut HashSet<(u64, [u8; 32], u32)>, height: u64) {
     seen.retain(|(h, _, _)| *h >= height);
 }
 
+/// What became of one settlement chunk. Only `Delivered` is money in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOutcome {
+    /// The node accepted it AND confirms it holds the transaction.
+    Delivered,
+    /// The node refused it, or accepted the bytes and then never took the
+    /// transaction. Nothing was paid and nothing was relayed.
+    Failed,
+    /// Submitted, but we could not get the node's verdict. It may be in flight,
+    /// so it stays in the pending ledger and must NOT be counted as paid.
+    Unresolved,
+}
+
+/// Running tally of one settlement pass.
+///
+/// Only chunks the node actually holds may be reported as paid. Counting an
+/// attempted chunk tells the operator (and anything built on these logs) that
+/// money moved when it did not, which is exactly how a stalled payout goes
+/// unnoticed while miners keep mining for nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SettleTally {
+    recipients: usize,
+    units: u64,
+    txs: usize,
+    failed_txs: usize,
+    failed_units: u64,
+    unresolved_txs: usize,
+    unresolved_units: u64,
+}
+
+impl SettleTally {
+    fn record(&mut self, outcome: ChunkOutcome, pushed: usize, units: u64) {
+        match outcome {
+            ChunkOutcome::Delivered => {
+                self.recipients += pushed;
+                self.units += units;
+                self.txs += 1;
+            }
+            ChunkOutcome::Failed => {
+                self.failed_txs += 1;
+                self.failed_units += units;
+            }
+            ChunkOutcome::Unresolved => {
+                self.unresolved_txs += 1;
+                self.unresolved_units += units;
+            }
+        }
+    }
+
+    /// Did every chunk reach the node? Anything else means money is still owed.
+    fn all_delivered(&self) -> bool {
+        self.failed_txs == 0 && self.unresolved_txs == 0
+    }
+
+    fn attempted(&self) -> bool {
+        self.txs > 0 || self.failed_txs > 0 || self.unresolved_txs > 0
+    }
+
+    /// The closing line. Never claims a payout happened: a transaction the node
+    /// holds is submitted, not paid, until a block includes it.
+    fn summary(&self) -> String {
+        let mut s = format!(
+            "[settle] settlement submitted: {} recipient(s), {} unit(s) across {} tx(s) the node \
+             holds (NOT paid until they confirm on-chain)",
+            self.recipients, self.units, self.txs
+        );
+        if self.failed_txs > 0 {
+            s.push_str(&format!(
+                "; FAILED: {} tx(s) covering {} unit(s) never reached the node and are still owed \
+                 (the next cycle re-issues them)",
+                self.failed_txs, self.failed_units
+            ));
+        }
+        if self.unresolved_txs > 0 {
+            s.push_str(&format!(
+                "; UNVERIFIED: {} tx(s) covering {} unit(s) were submitted but the node's verdict \
+                 could not be read, so they are NOT counted as paid",
+                self.unresolved_txs, self.unresolved_units
+            ));
+        }
+        s
+    }
+}
+
+/// Drop a payout hash the node definitively does not hold from the shared
+/// pending ledger, so the next cycle can re-issue that chunk.
+///
+/// Safe ONLY for `Admission::Missing`: the node inserts into its mempool before
+/// it relays, so a transaction it never inserted was never broadcast either and
+/// cannot come back from another peer to be paid twice.
+fn forget_unadmitted_payout(pool: &Arc<Mutex<Pool>>, txhash: &str) {
+    let shot = {
+        let mut p = plock(pool);
+        p.settle_pending_txs.retain(|h| h != txhash);
+        p.state_shot(true)
+    };
+    flush_state(shot);
+}
+
 /// Pay every miner their PPLNS share of the pool's spendable balance. Splits the
 /// distributable balance over PAYABLE workers only, then submits one or more
 /// transactions (chunked to <=PAYOUT_CHUNK actions each) so a large payout is
@@ -821,7 +930,13 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
                     "[settle] payout tx {short} is unknown to the node (rejected or dropped); \
                      this cycle will re-issue it"
                 ),
-                PayoutTxState::Pending => still.push(hx.clone()),
+                PayoutTxState::Pending => {
+                    println!(
+                        "[settle] payout tx {short} is still waiting in the node's mempool; \
+                         nobody is paid until a block includes it"
+                    );
+                    still.push(hx.clone());
+                }
                 PayoutTxState::Confirming(d) => {
                     println!(
                         "[settle] payout tx {short} is only {d} block(s) deep; \
@@ -840,12 +955,26 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         }
         if !still.is_empty() {
             // Some payout is still in flight (or unresolved); keep those and skip.
-            let shot = {
+            let (shot, stalls) = {
                 let mut p = plock(pool);
                 p.settle_pending_txs = still;
-                p.state_shot(true)
+                p.settle_stalls += 1;
+                (p.state_shot(true), p.settle_stalls)
             };
             flush_state(shot);
+            // A payout that never confirms freezes EVERY later payout, and the
+            // old code said nothing at all about it. Say it, and say what to look
+            // at: this pool mines coinbase-only blocks, so its own transactions
+            // only confirm when some other miner packs them.
+            if stalls >= STALLED_PAYOUT_CYCLES {
+                eprintln!(
+                    "[settle] WARNING: no payout has confirmed for {stalls} settlement cycles, so \
+                     nothing is being paid. The blocks this pool mines carry only their coinbase, \
+                     so a payout confirms only when another miner includes it - on a chain where \
+                     this pool is the only miner it never will. Check that the node is connected \
+                     to peers that are mining."
+                );
+            }
             return;
         }
         // Every prior payout is buried or definitively gone: clear and settle
@@ -853,6 +982,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         let shot = {
             let mut p = plock(pool);
             p.settle_pending_txs.clear();
+            p.settle_stalls = 0;
             p.state_shot(true)
         };
         flush_state(shot);
@@ -907,8 +1037,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     }
 
     let main = Address::from(*acc.address());
-    let mut total_paid = 0u64;
-    let mut recipients = 0usize;
+    let mut tally = SettleTally::default();
     for chunk in split.chunks(PAYOUT_CHUNK) {
         let fee = match Amount::from("1:246") {
             Ok(f) => f, // 0.01 HAC tx fee (from reserve)
@@ -973,29 +1102,61 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
             &body,
         );
         // Surface a node rejection instead of silently reporting success.
+        let short = &txhash[..txhash.len().min(16)];
         let accepted = serde_json::from_str::<serde_json::Value>(&resp)
             .ok()
             .and_then(|v| find_u64(&v, "ret"))
             == Some(0);
         if !accepted {
-            eprintln!(
-                "[settle] node did NOT accept payout tx {} ({} recipients): {resp}",
-                &txhash[..txhash.len().min(16)],
-                pushed
-            );
-        } else {
-            println!(
-                "[settle] submitted payout tx {} paying {pushed} miner(s) {chunk_units} units",
-                &txhash[..txhash.len().min(16)]
-            );
+            eprintln!("[settle] node did NOT accept payout tx {short} ({pushed} recipients): {resp}");
+            // Never submitted, so never relayed: drop it so the next cycle can
+            // re-issue this chunk instead of waiting on a hash nothing holds.
+            forget_unadmitted_payout(pool, &txhash);
+            tally.record(ChunkOutcome::Failed, pushed, chunk_units);
+            continue;
         }
-        total_paid += chunk_units;
-        recipients += pushed;
+        // ret=0 only means the API took the bytes. The node validates
+        // synchronously and then inserts into the mempool on a background task
+        // whose result it DISCARDS, so a transaction that fails there is
+        // reported as accepted and simply never exists. Ask the node what it
+        // actually holds before counting a single unit as sent.
+        match verify_admitted(&client, &node, &txhash) {
+            Admission::Held => {
+                println!(
+                    "[settle] submitted payout tx {short} paying {pushed} miner(s) \
+                     {chunk_units} units; the node holds it"
+                );
+                tally.record(ChunkOutcome::Delivered, pushed, chunk_units);
+            }
+            Admission::Missing => {
+                eprintln!(
+                    "[settle] payout tx {short} was accepted by the API but the node does NOT \
+                     hold it ({pushed} recipients, {chunk_units} units): nothing was paid and \
+                     nothing was relayed. Re-issuing on the next cycle."
+                );
+                forget_unadmitted_payout(pool, &txhash);
+                tally.record(ChunkOutcome::Failed, pushed, chunk_units);
+            }
+            Admission::Unresolved => {
+                eprintln!(
+                    "[settle] could not confirm the node holds payout tx {short} \
+                     ({pushed} recipients, {chunk_units} units); keeping it in the pending \
+                     ledger and NOT counting it as paid"
+                );
+                tally.record(ChunkOutcome::Unresolved, pushed, chunk_units);
+            }
+        }
     }
-    println!(
-        "[settle] settlement done: {recipients} recipient(s), {total_paid} units across {} tx(s)",
-        split.chunks(PAYOUT_CHUNK).len()
-    );
+    if !tally.attempted() {
+        return;
+    }
+    // Loud on anything that did not reach the node: an operator reading only the
+    // closing line must never be told money moved when it did not.
+    if tally.all_delivered() {
+        println!("{}", tally.summary());
+    } else {
+        eprintln!("{}", tally.summary());
+    }
 }
 
 /// Wraps the share-credit path: takes the pool lock only twice (a brief snapshot
@@ -1062,7 +1223,11 @@ fn handle_submission(
         if height != p.tpl.height {
             return json!({"ok":false,"kind":"stale","height":p.tpl.height});
         }
-        if p.seen.len() >= SEEN_CAP {
+        // The rate limiter exists to bound the replay set, not to throw money
+        // away: a submission that beats the NETWORK target is a whole block
+        // reward, so it is evaluated FIRST and is never refused here. Only
+        // ordinary shares are shed at the cap.
+        if share_limiter_rejects(p.seen.len(), is_block) {
             return json!({"ok":false,"kind":"busy","err":"too many shares this height"});
         }
         if !p.seen.insert(key) {
@@ -1099,6 +1264,18 @@ fn handle_submission(
     // Phase 4 — no lock: submit the winning block.
     let submit = submit_block_bytes(&client, &node, &block_bytes);
     json!({"ok":true,"kind":"block","solved_height":height,"submit":submit})
+}
+
+/// Should the per-height share rate limiter refuse this submission?
+///
+/// The cap bounds the replay set for one height. Applying it before the block
+/// check meant that at the cap the pool answered "busy" to a solution that beat
+/// the NETWORK target and threw away a whole block reward - the most valuable
+/// thing a miner can hand it. A network block is one entry, is vanishingly rare
+/// next to the cap, and is worth far more than the memory it costs, so it is
+/// always admitted.
+fn share_limiter_rejects(seen_len: usize, is_block: bool) -> bool {
+    !is_block && seen_len >= SEEN_CAP
 }
 
 /// What phase 3 of a submission decided, carried out of the lock scope so the
@@ -1362,6 +1539,7 @@ fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pool_spike::admission_of;
 
     #[test]
     fn a_same_height_reorg_keeps_already_credited_solutions() {
@@ -1405,6 +1583,96 @@ mod tests {
         assert!(check_share_factor(MIN_SHARE_FACTOR - 1).is_err());
         assert!(check_share_factor(0).is_err());
         assert!(check_share_factor(MAX_SHARE_FACTOR + 1).is_err());
+    }
+
+    #[test]
+    fn a_chunk_the_node_never_took_is_not_reported_as_paid() {
+        // Observed: the pool printed "settlement done: 2 recipient(s), 35 units
+        // across 1 tx(s)" for a payout the node never held. Nobody was paid and
+        // the pool wallet never moved, but the summary said money had gone out.
+        // Only what the node actually holds may be counted.
+        let mut t = SettleTally::default();
+        t.record(ChunkOutcome::Failed, 2, 35);
+        assert_eq!(t.recipients, 0, "a rejected chunk pays nobody");
+        assert_eq!(t.units, 0, "a rejected chunk moves no money");
+        assert_eq!(t.txs, 0, "the tx count is what the node took, not what we tried");
+        assert_eq!((t.failed_txs, t.failed_units), (1, 35));
+        assert!(!t.all_delivered());
+        let s = t.summary();
+        assert!(s.contains("0 recipient(s), 0 unit(s) across 0 tx(s)"), "{s}");
+        assert!(s.contains("FAILED"), "{s}");
+        assert!(s.contains("still owed"), "{s}");
+    }
+
+    #[test]
+    fn a_mixed_settlement_separates_delivered_from_owed() {
+        let mut t = SettleTally::default();
+        t.record(ChunkOutcome::Delivered, 190, 400);
+        t.record(ChunkOutcome::Failed, 12, 30);
+        t.record(ChunkOutcome::Unresolved, 5, 11);
+        assert_eq!((t.recipients, t.units, t.txs), (190, 400, 1));
+        assert_eq!((t.failed_txs, t.failed_units), (1, 30));
+        assert_eq!((t.unresolved_txs, t.unresolved_units), (1, 11));
+        assert!(!t.all_delivered());
+        let s = t.summary();
+        assert!(s.contains("190 recipient(s), 400 unit(s) across 1 tx(s)"), "{s}");
+        assert!(s.contains("FAILED"), "{s}");
+        assert!(s.contains("UNVERIFIED"), "{s}");
+        // Even a fully delivered pass must not claim the money is paid: a
+        // transaction in the mempool is paid only once a block includes it.
+        let mut ok = SettleTally::default();
+        ok.record(ChunkOutcome::Delivered, 2, 35);
+        assert!(ok.all_delivered());
+        let s = ok.summary();
+        assert!(s.contains("NOT paid until they confirm"), "{s}");
+        assert!(!s.contains("FAILED"), "{s}");
+        assert!(!s.contains("UNVERIFIED"), "{s}");
+        // Nothing attempted at all must not print a settlement line.
+        assert!(!SettleTally::default().attempted());
+    }
+
+    #[test]
+    fn an_api_accept_is_not_proof_the_node_holds_the_payout() {
+        // /submit/transaction answers ret=0 as soon as the node has validated the
+        // transaction and handed it to a background task; the mempool insert
+        // result is discarded. So the accept response says nothing, and only the
+        // node's own view of the hash resolves it.
+        let submit_ok: serde_json::Value = serde_json::from_str(r#"{"ret":0,"hash":"ab"}"#).unwrap();
+        assert_eq!(find_u64(&submit_ok, "ret"), Some(0));
+
+        let not_found: serde_json::Value =
+            serde_json::from_str(r#"{"ret":1,"err":"transaction not found"}"#).unwrap();
+        assert_eq!(admission_of(&not_found), Admission::Missing);
+
+        let in_mempool: serde_json::Value =
+            serde_json::from_str(r#"{"ret":0,"pending":true}"#).unwrap();
+        assert_eq!(admission_of(&in_mempool), Admission::Held);
+
+        let mined: serde_json::Value = serde_json::from_str(r#"{"ret":0,"confirm":9}"#).unwrap();
+        assert_eq!(admission_of(&mined), Admission::Held);
+
+        // No answer from the node is NOT a verdict: the payout may be in flight,
+        // so it must stay tracked rather than be re-issued (or counted as paid).
+        let offline: serde_json::Value =
+            serde_json::from_str(r#"{"http_error":"connection refused"}"#).unwrap();
+        assert_eq!(admission_of(&offline), Admission::Unresolved);
+        let garbled: serde_json::Value = serde_json::from_str(r#"{"ret":0}"#).unwrap();
+        assert_eq!(admission_of(&garbled), Admission::Unresolved);
+    }
+
+    #[test]
+    fn the_share_rate_limiter_never_discards_a_network_block() {
+        // At the cap the pool used to answer "busy" before it looked at whether
+        // the submission beat the NETWORK target, throwing away a whole block
+        // reward to save one entry in a 2-million-entry set.
+        assert!(share_limiter_rejects(SEEN_CAP, false), "shares shed at the cap");
+        assert!(
+            !share_limiter_rejects(SEEN_CAP, true),
+            "a network block is never refused by the share limiter"
+        );
+        assert!(!share_limiter_rejects(SEEN_CAP - 1, false));
+        assert!(!share_limiter_rejects(0, false));
+        assert!(!share_limiter_rejects(usize::MAX, true));
     }
 
     #[test]
