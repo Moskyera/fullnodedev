@@ -63,6 +63,24 @@ inline bool diamond_is_valid_name(const uchar *d)
 }
 
 // Return 1 when candidate `a` should replace current best `b`.
+//
+// KNOWN KERNEL-VS-CPU ASYMMETRY. The CPU is the authority and its acceptance test
+// is stricter than this one: app/src/diaworker.rs requires BOTH
+// x16rs::check_diamond_hash_result (the name shape checked below) AND
+// x16rs::check_diamond_difficulty, which is a function of the sha3 pre-hash bytes
+// and the medium-hash bytes, not of the name. This kernel cannot run that second
+// test: it never receives the diamond `number` (so it cannot derive shnumlp /
+// shmaxit / diffnum) and X16RS_RUN_REPEAT_LOOP overwrites the sha3 pre-hash in
+// place with the x16rs result, so the sha3 bytes are gone by the time the
+// reduction runs. Consequence: each work group reports exactly ONE candidate, so
+// a group holding a name-valid-but-difficulty-failing hash at a lower index AND a
+// fully qualifying hash at a higher index reports the former and the real diamond
+// is lost - the host at app/src/opencl_dia.rs can only inspect what was returned.
+// Two name-valid hits inside one work group is astronomically unlikely at mainnet
+// difficulty, so this is accepted for now. To close it properly the kernel needs a
+// `number` argument plus a second output buffer carrying the sha3 pre-hash, which
+// is a host ABI change in app/src/opencl_gpu/. Do NOT assume "kernel best" equals
+// "CPU accept" when re-enabling the GPU diamond path.
 inline bool diamond_better(const uchar *a, const uchar *b)
 {
     bool va = diamond_is_valid_name(a);
@@ -90,7 +108,8 @@ __kernel void x16rs_diamond(
     const unsigned int index = local_id * unit_size;
     hash_32* local_hashes = global_hashes + (group_id * local_size * unit_size);
     __local ulong local_nonces[256];
-    __local diamond_t local_names[256];
+    // No __local diamond_t local_names[256] here: the per-work-item best is the
+    // private `best_name` below, and an unused 4 KB LDS array only costs occupancy.
     __global unsigned int* local_order = global_order + (group_id * local_size * unit_size);
     __local unsigned int ALIGN histogram[16];
     __local unsigned int ALIGN starting_index[16];

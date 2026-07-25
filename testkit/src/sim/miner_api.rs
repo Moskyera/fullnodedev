@@ -10,7 +10,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use basis::interface::{Transaction, TransactionRead};
 use field::*;
-use mint::TransactionCoinbase;
+use mint::{CoinbaseExtend, CoinbaseExtendDataV1, TransactionCoinbase};
 use protocol::block::*;
 use serde_json::{Value as JV, json};
 use sys::ToHex;
@@ -41,6 +41,10 @@ pub struct MinerPendingStuff {
     pub block_intro: BlockIntro,
     pub coinbase_tx: TransactionCoinbase,
     pub mkrl_modify_list: Vec<Hash>,
+    /// Coinbase nonce handed out with the LAST /query/miner/pending answer. The
+    /// real node increments this on every single request, which is what makes the
+    /// served block_intro different every time (see `handle_pending`).
+    pub serve_nonce: u64,
 }
 
 impl MinerPendingStuff {
@@ -53,7 +57,17 @@ impl MinerPendingStuff {
         // self-consistent instead of leaving the defaulted height 0.
         intro.head.height = BlockHeight::from(height);
 
-        let coinbase_tx = TransactionCoinbase::default();
+        // A real node always packs the coinbase with its extend block present:
+        // that is where `miner_nonce` lives, and set_nonce/set_mining_nonce are
+        // silent no-ops without it. A defaulted coinbase therefore made the whole
+        // coinbase-nonce half of the search space invisible to every sim test.
+        let coinbase_tx = TransactionCoinbase {
+            extend: CoinbaseExtend::must(CoinbaseExtendDataV1 {
+                miner_nonce: Hash::default(),
+                witness_count: Uint1::from(0),
+            }),
+            ..TransactionCoinbase::default()
+        };
 
         Self {
             height,
@@ -61,6 +75,7 @@ impl MinerPendingStuff {
             block_intro: intro,
             coinbase_tx,
             mkrl_modify_list: vec![],
+            serve_nonce: 0,
         }
     }
 }
@@ -68,12 +83,14 @@ impl MinerPendingStuff {
 #[derive(Clone)]
 struct MinerApiState {
     pending: Arc<Mutex<MinerPendingStuff>>,
+    pending_count: Arc<AtomicUsize>,
     submit_count: Arc<AtomicUsize>,
     last_submit: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub struct MinerApiSim {
     rpcaddr: String,
+    pending_count: Arc<AtomicUsize>,
     submit_count: Arc<AtomicUsize>,
     last_submit: Arc<Mutex<HashMap<String, String>>>,
     stop_tx: Option<oneshot::Sender<()>>,
@@ -90,10 +107,12 @@ impl MinerApiSim {
 
         let state = MinerApiState {
             pending: Arc::new(Mutex::new(pending)),
+            pending_count: Arc::new(AtomicUsize::new(0)),
             submit_count: Arc::new(AtomicUsize::new(0)),
             last_submit: Arc::new(Mutex::new(HashMap::new())),
         };
 
+        let pending_count = state.pending_count.clone();
         let submit_count = state.submit_count.clone();
         let last_submit = state.last_submit.clone();
 
@@ -124,6 +143,7 @@ impl MinerApiSim {
 
         Self {
             rpcaddr,
+            pending_count,
             submit_count,
             last_submit,
             stop_tx: Some(stop_tx),
@@ -133,6 +153,13 @@ impl MinerApiSim {
 
     pub fn rpcaddr(&self) -> &str {
         &self.rpcaddr
+    }
+
+    /// How many `/query/miner/pending` requests were served. Each one re-serializes
+    /// the template, so this is the number of chances the miner had to mistake a
+    /// refreshed template for a new job.
+    pub fn pending_count(&self) -> usize {
+        self.pending_count.load(Ordering::SeqCst)
     }
 
     pub fn submit_count(&self) -> usize {
@@ -175,28 +202,58 @@ impl Drop for MinerApiSim {
     }
 }
 
+/// Answer `/query/miner/pending` the way the real fullnode does.
+///
+/// `get_miner_pending_block_stuff` (mint/src/api/common.rs) increments the served
+/// coinbase nonce, recomputes the merkle root from it and re-serializes the block
+/// intro on EVERY request, and the merkle root lives inside that intro. So no two
+/// answers for the same job carry the same `block_intro` bytes.
+///
+/// This sim used to return one constant intro, which is precisely why a full green
+/// test suite could not see a miner that reinstalled its template on every poll
+/// and threw away each finished batch, winners included. Any miner change that
+/// treats a re-serialized template as new work now shows up here.
 async fn handle_pending(
     State(state): State<MinerApiState>,
     _query: Query<HashMap<String, String>>,
 ) -> Json<JV> {
-    let pending = state.pending.lock().unwrap().clone();
+    state.pending_count.fetch_add(1, Ordering::SeqCst);
+    let mut pending = state.pending.lock().unwrap();
+    pending.serve_nonce = pending.serve_nonce.wrapping_add(1);
+    let mut nonce = [0u8; Hash::SIZE];
+    nonce[Hash::SIZE - 8..].copy_from_slice(&pending.serve_nonce.to_be_bytes());
+    let mut coinbase_tx = pending.coinbase_tx.clone();
+    coinbase_tx.set_nonce(Hash::from(nonce));
+    let mkrl = calculate_mrkl_prelude_update(coinbase_tx.hash(), &pending.mkrl_modify_list);
+    let mut block_intro = pending.block_intro.clone();
+    block_intro.set_mrklroot(mkrl);
+    // The parent, the height and the transaction set are untouched: only the
+    // fields the miner overwrites itself before hashing move.
     let data = json!({
         "ret": 0,
         "height": pending.height,
         "target_hash": pending.target_hash.to_vec().to_hex(),
-        "block_intro": pending.block_intro.serialize().to_hex(),
-        "coinbase_body": pending.coinbase_tx.serialize().to_hex(),
+        "block_intro": block_intro.serialize().to_hex(),
+        "coinbase_body": coinbase_tx.serialize().to_hex(),
         "mkrl_modify_list": pending.mkrl_modify_list.iter().map(|h| h.to_vec().to_hex()).collect::<Vec<String>>(),
     });
     Json(data)
 }
 
+/// Answer `/query/miner/notice` with the chain TIP height, like the node: the
+/// miner long-polls with the pending (tip+1) height, so the reply only reaches
+/// that height once new work really exists.
+///
+/// This one answers instantly instead of long-polling, deliberately. That is the
+/// adversarial upstream the miner has to survive (a saturated pool bridge, or a
+/// server that does not implement the wait at all), and it is what exercises both
+/// the miner's anti-spin floor and its resistance to per-poll template churn.
 async fn handle_notice(
     State(state): State<MinerApiState>,
     _query: Query<HashMap<String, String>>,
 ) -> Json<JV> {
-    let height = state.pending.lock().unwrap().height;
-    Json(json!({ "ret": 0, "height": height }))
+    let tip = state.pending.lock().unwrap().height.saturating_sub(1);
+    Json(json!({ "ret": 0, "height": tip }))
 }
 
 async fn handle_success(

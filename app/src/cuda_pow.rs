@@ -11,15 +11,14 @@ pub struct CudaMiningResources {
     /// (cudaErrorInvalidConfiguration / LaunchOutOfResources) and a real
     /// out-of-memory failure are NOT fixed by fewer work groups, and a sticky
     /// context fault is grid independent, so those keep failing until the
-    /// consecutive-failure alert disables the card (see mining_batch.rs).
+    /// quarantine parks the card for a backoff window (see `quarantine` below).
     pub eff_wg: std::sync::atomic::AtomicU32,
     /// Never back off below this many work-groups.
     pub floor_wg: u32,
-    /// Failed batches since the last clean one. Bounds how long a dead card may
-    /// keep being retried before the operator is told and the GPU is dropped.
-    pub consecutive_errors: std::sync::atomic::AtomicU32,
-    /// Set once this card has been given up on for the rest of the process.
-    pub gpu_disabled: std::sync::atomic::AtomicBool,
+    /// Time-based quarantine with exponential backoff and automatic re-probe,
+    /// shared with the OpenCL backend so both cards are treated identically. It
+    /// also owns the consecutive-failure count, which only a clean batch resets.
+    pub quarantine: crate::gpu_oom::GpuQuarantine,
 }
 
 impl CudaMiningResources {
@@ -45,8 +44,11 @@ impl CudaMiningResources {
     /// Ramp the effective work-groups back up toward the configured maximum after
     /// a clean batch, so throughput recovers once memory pressure clears.
     pub fn record_success(&self) {
-        self.consecutive_errors
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if self.quarantine.record_success() {
+            println!(
+                "[CUDA] GPU RECOVERED: the re-probe succeeded, quarantine cleared and GPU mining has resumed."
+            );
+        }
         let cur = self.eff_wg.load(std::sync::atomic::Ordering::Relaxed);
         if cur < self.workgroups {
             let next = cur.saturating_add((cur / 4).max(1)).min(self.workgroups);
@@ -55,25 +57,71 @@ impl CudaMiningResources {
         }
     }
 
-    /// Count one failed batch and return the new consecutive-failure total.
-    pub fn note_batch_failure(&self) -> u32 {
-        self.consecutive_errors
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1)
+    /// Count one failed batch and report whether it parked the card.
+    pub fn note_batch_failure(&self) -> crate::gpu_oom::GpuFailureReport {
+        self.quarantine.record_failure(std::time::Instant::now())
     }
 
-    /// Stop using this card for the rest of the process. Returns true only for the
-    /// caller that flipped it, so the loud operator alert is printed exactly once.
-    pub fn disable_gpu_for_session(&self) -> bool {
-        !self
-            .gpu_disabled
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    /// Print the one-time operator alert when a failure armed the quarantine.
+    pub fn announce_quarantine(&self, report: &crate::gpu_oom::GpuFailureReport, detail: &str) {
+        let Some(entry) = report.quarantined else {
+            return;
+        };
+        // Drop straight to the floor so the automatic re-probe runs on the
+        // smallest, most likely to succeed grid.
+        self.eff_wg
+            .store(self.floor_wg.max(1), std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[CUDA] ALERT GPU quarantined after {} consecutive failed batches ({} this session): no GPU work for {}, then the card is re-probed automatically. Mining continues on capped CPU recovery. {} Check the driver, cooling, power and the PCIe riser.",
+            report.consecutive_failures,
+            report.total_failures,
+            crate::gpu_oom::format_backoff(entry.retry_in),
+            detail
+        );
     }
 
-    /// True once the card has been given up on for this session.
-    pub fn gpu_is_disabled(&self) -> bool {
-        self.gpu_disabled
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// Gate one batch. True while the card is quarantined and must not be given
+    /// work. When the backoff expires this lets exactly one re-probe batch through
+    /// at floor work-groups, so the card recovers without a restart.
+    pub fn quarantine_blocks_batch(&self) -> bool {
+        match self.quarantine.gate(std::time::Instant::now()) {
+            crate::gpu_oom::GpuGate::Run => false,
+            crate::gpu_oom::GpuGate::Skip {
+                level,
+                retry_in,
+                total_failures,
+                notify,
+            } => {
+                if notify {
+                    eprintln!(
+                        "[CUDA] GPU QUARANTINED (level {level}, {total_failures} failed batches): no GPU work for another {}, mining continues on capped CPU recovery. The card is re-probed automatically, no restart needed.",
+                        crate::gpu_oom::format_backoff(retry_in)
+                    );
+                }
+                true
+            }
+            crate::gpu_oom::GpuGate::Reprobe {
+                level,
+                total_failures,
+            } => {
+                let wg = self.floor_wg.max(1);
+                self.eff_wg.store(wg, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "[CUDA] GPU quarantine (level {level}, {total_failures} failed batches) expired: re-probing the device at work_groups={wg}."
+                );
+                false
+            }
+        }
+    }
+
+    /// Quarantine state for the panel / stats (None while mining normally).
+    pub fn quarantine_status(&self) -> Option<crate::gpu_oom::GpuQuarantineStatus> {
+        self.quarantine.status(std::time::Instant::now())
+    }
+
+    /// One-line GPU health for a non-technical operator.
+    pub fn quarantine_note(&self) -> String {
+        self.quarantine.describe(std::time::Instant::now())
     }
 }
 
@@ -115,8 +163,7 @@ pub fn initialize_cuda(
                 unit_size,
                 eff_wg: std::sync::atomic::AtomicU32::new(workgroups),
                 floor_wg: (workgroups / 16).max(1),
-                consecutive_errors: std::sync::atomic::AtomicU32::new(0),
-                gpu_disabled: std::sync::atomic::AtomicBool::new(false),
+                quarantine: crate::gpu_oom::GpuQuarantine::new(),
             })]
         }
         Err(e) => {

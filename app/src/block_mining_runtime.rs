@@ -79,6 +79,11 @@ pub(crate) enum MinerBackend {
 #[derive(Clone, Default)]
 struct BlockMiningStuff {
     height: u64,
+    /// Generation of this job. Bumped ONLY when the job really changed (a
+    /// different height, or the same height on a different parent). It is stored
+    /// inside the template so a worker reads height, epoch and the bytes it mines
+    /// from ONE snapshot and can never mislabel its own batch.
+    epoch: u64,
     target_hash: Hash,
     block_intro: BlockIntro,
     coinbase_tx: TransactionCoinbase,
@@ -89,9 +94,10 @@ struct BlockMiningStuff {
 pub(crate) struct BlockMiningResult {
     worker_id: usize,
     pub height: u64,
-    /// Template generation when this result was mined. Dropped on submit if the
-    /// live epoch has moved on (reorg / new pending).
-    epoch: u64,
+    /// Parent hash of the template this result was mined against. Only a template
+    /// replaced at THIS height with a different parent makes the result dead
+    /// work; the tip merely advancing does not (see `result_is_orphaned`).
+    prevhash: Vec<u8>,
     pub nonce_start: u32,
     nonce_space: u32,
     gpu_nonce_space: u32,
@@ -209,6 +215,35 @@ fn result_meets_target(res: &BlockMiningResult) -> bool {
     !res.target_hash.is_empty() && !hash_more_power(&res.target_hash, &res.result_hash)
 }
 
+/// (height, parent hash) of the template currently installed, read from ONE
+/// snapshot so the pair is always consistent. `None` when the state cannot be
+/// read: nothing is treated as dead work in that case, because dropping a winner
+/// costs a whole block reward while submitting a late one costs one HTTP
+/// round-trip and a deterministic rejection.
+fn live_template_identity() -> Option<(u64, Vec<u8>)> {
+    let stuff = MINING_BLOCK_STUFF.read().ok()?;
+    Some((stuff.height, stuff.block_intro.prevhash().to_vec()))
+}
+
+/// A finished result is dead work ONLY when the node replaced the template at the
+/// very height it was mined for with one built on a different parent (a
+/// same-height reorg). That old template is evicted from the node's cache, so the
+/// solution can no longer be reconstructed there.
+///
+/// Every other case is still worth submitting, and the NODE is the authority on
+/// staleness: `miner_success` looks the template up by the SUBMITTED height and
+/// the node deliberately keeps several recent heights, so a solution found a
+/// moment before the tip advanced is still accepted as a competing candidate.
+fn result_is_orphaned(res: &BlockMiningResult, live: Option<&(u64, Vec<u8>)>) -> bool {
+    let Some((live_hei, live_prevhash)) = live else {
+        return false;
+    };
+    res.height == *live_hei
+        && !res.prevhash.is_empty()
+        && !live_prevhash.is_empty()
+        && res.prevhash != *live_prevhash
+}
+
 /// Keep EVERY distinct winning result. Against a pool each submission is an
 /// independent PPLNS share keyed by (height, coinbase_nonce, block_nonce), so
 /// collapsing winners by height alone would throw away earned shares (real
@@ -276,7 +311,7 @@ pub(crate) fn start_block_mining_workers(
     stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> bool {
     let (res_tx, res_rx) = mpsc::sync_channel(RESULT_CHANNEL_CAPACITY);
-    let miner_backends = build_miner_backends(cnf);
+    let miner_backends = build_miner_backends(cnf, &stop_flag);
     if miner_backends.is_empty() {
         return false;
     }
@@ -335,8 +370,12 @@ pub(crate) fn start_block_mining_workers(
         loop {
             if super::should_stop(&stop_flag_res) {
                 // Final drain: do not abandon target-meeting winners still in the
-                // channel just because shutdown was requested.
-                drain_winners_for_shutdown(&cnf1, &mut rstx, &submit_tx);
+                // channel just because shutdown was requested. This is the only
+                // other body on this thread that can submit, so it gets the same
+                // panic firewall as the drain loop below.
+                guard_mining_iteration("block shutdown drain", || {
+                    drain_winners_for_shutdown(&mut rstx, &submit_tx);
+                });
                 return;
             }
             let now_ms = rate_clock.elapsed().as_millis() as u64;
@@ -441,17 +480,45 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String
     }
     let new_stuff = BlockMiningStuff {
         height,
+        epoch: 0,
         target_hash,
         block_intro,
         coinbase_tx,
         mkrl_list,
     };
+    install_block_mining_stuff(new_stuff)
+}
+
+/// Install a freshly fetched template.
+///
+/// The fullnode re-serializes `block_intro` on EVERY `/query/miner/pending`
+/// request: it increments the served coinbase nonce, recomputes the merkle root
+/// and re-serializes the intro, and the merkle root lives INSIDE the intro. So
+/// the raw bytes differ on every poll even when the tip, the parent and the
+/// transaction set are all unchanged. The miner replaces that merkle root itself
+/// from its own coinbase nonce before hashing, so it is not part of the job at
+/// all.
+///
+/// A job is therefore identified by (height, parent hash). Only a change of that
+/// pair means workers must give up what they are doing, so only that bumps the
+/// epoch. The refreshed bytes are installed either way. Bumping on every poll
+/// used to void one finished batch per worker per poll, winners included.
+fn install_block_mining_stuff(mut new_stuff: BlockMiningStuff) -> Result<(), String> {
+    let height = new_stuff.height;
     let mut guard = MINING_BLOCK_STUFF
         .write()
         .map_err(|e| format!("mining state lock poisoned: {e}"))?;
+    let job_changed =
+        guard.height != height || guard.block_intro.prevhash() != new_stuff.block_intro.prevhash();
+    // Keep the epoch inside the template so workers see the same generation the
+    // bytes belong to. The atomic mirrors it for the cheap loop-exit check.
+    new_stuff.epoch = if job_changed {
+        MINING_BLOCK_EPOCH.fetch_add(1, Relaxed).saturating_add(1)
+    } else {
+        guard.epoch
+    };
     *guard = new_stuff.into();
     MINING_BLOCK_HEIGHT.store(height, Relaxed);
-    MINING_BLOCK_EPOCH.fetch_add(1, Relaxed);
     Ok(())
 }
 
@@ -471,7 +538,61 @@ pub(crate) fn upstream_is_stale() -> bool {
     UPSTREAM_STALE.load(Relaxed)
 }
 
-fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
+/// Seconds to wait BEFORE each GPU init attempt after the first. A driver that is
+/// still loading after a boot, a resume, or a TDR reset routinely needs tens of
+/// seconds to become enumerable, and treating the very first probe as final turns
+/// a self-clearing condition into a permanent outage on an unattended rig.
+const GPU_INIT_RETRY_DELAYS_SECS: [u64; 4] = [5, 15, 30, 60];
+
+/// How many GPU init attempts to make. Retrying only helps when the requested
+/// backend is actually compiled in; a missing feature is deterministic, so waiting
+/// two minutes to reach the same answer would only stall startup.
+fn gpu_init_attempts(gpu_requested: bool, gpu_backend_compiled_in: bool) -> usize {
+    if gpu_requested && gpu_backend_compiled_in {
+        GPU_INIT_RETRY_DELAYS_SECS.len() + 1
+    } else {
+        1
+    }
+}
+
+/// CPU-assist threads belong to ANY GPU rig, not only an OpenCL one. This decision
+/// used to live inside the OpenCL arm, so a CUDA rig had no non-GPU backend at
+/// all: once the CUDA session-disable latch quarantined the card, the whole rig
+/// was left with a single bounded recovery thread and earned nothing.
+fn cpu_assist_thread_count(cnf: &PoWorkConf, gpu_backends: usize) -> usize {
+    if !cnf.cpu_assist || cnf.supervene == 0 || gpu_backends == 0 {
+        return 0;
+    }
+    cnf.efficiency.spawn_supervene(cnf.supervene) as usize
+}
+
+/// Sleep, but wake as soon as a supervisor asks us to stop. Returns true when the
+/// wait ended because of a stop request, so startup never holds shutdown.
+fn sleep_unless_stopped(
+    stop_flag: &Option<Arc<std::sync::atomic::AtomicBool>>,
+    total: Duration,
+) -> bool {
+    let deadline = Instant::now() + total;
+    loop {
+        if super::should_stop(stop_flag) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(200)),
+        );
+    }
+}
+
+fn build_gpu_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
+    // Both arms below are cfg-gated, so a build with neither GPU feature enabled
+    // never mutates this.
+    #[allow(unused_mut)]
     let mut backends = Vec::new();
 
     if cnf.usecuda {
@@ -551,26 +672,54 @@ fn build_miner_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
                 "\n[Warn] use_opencl=true but app built without `ocl` feature, fallback to CPU miner."
             );
         }
+    }
 
-        if cnf.cpu_assist && cnf.supervene > 0 && !backends.is_empty() {
-            let thrnum = cnf.efficiency.spawn_supervene(cnf.supervene) as usize;
-            println!(
-                "\n[Start] Create #{} Ryzen CPU assist threads (hybrid GPU+CPU, active={}).",
-                thrnum,
-                cnf.runtime.active_cpu_assist.load(Relaxed)
-            );
-            for i in 0..thrnum {
-                backends.push(MinerBackend::Cpu {
-                    assist_idx: Some(i as u32),
-                });
-            }
+    backends
+}
+
+fn build_miner_backends(
+    cnf: &PoWorkConf,
+    stop_flag: &Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Vec<MinerBackend> {
+    let gpu_requested = cnf.usecuda || cnf.useopencl;
+    let compiled_in =
+        (cnf.usecuda && cfg!(feature = "cuda")) || (cnf.useopencl && cfg!(feature = "ocl"));
+    let attempts = gpu_init_attempts(gpu_requested, compiled_in);
+    let mut backends = Vec::new();
+    for attempt in 1..=attempts {
+        backends = build_gpu_backends(cnf);
+        if !backends.is_empty() || attempt == attempts {
+            break;
+        }
+        let wait = GPU_INIT_RETRY_DELAYS_SECS[attempt - 1];
+        println!(
+            "\n[Start] GPU not ready yet (attempt {attempt}/{attempts}). Waiting {wait}s and trying again - this is normal shortly after a boot, a resume, or a driver reset."
+        );
+        if sleep_unless_stopped(stop_flag, Duration::from_secs(wait)) {
+            return Vec::new();
+        }
+    }
+
+    // Any GPU rig gets CPU-assist threads, so a quarantined card still leaves real
+    // work running instead of taking the whole rig to zero.
+    let assist_threads = cpu_assist_thread_count(cnf, backends.len());
+    if assist_threads > 0 {
+        println!(
+            "\n[Start] Create #{} Ryzen CPU assist threads (hybrid GPU+CPU, active={}).",
+            assist_threads,
+            cnf.runtime.active_cpu_assist.load(Relaxed)
+        );
+        for i in 0..assist_threads {
+            backends.push(MinerBackend::Cpu {
+                assist_idx: Some(i as u32),
+            });
         }
     }
 
     if backends.is_empty() {
-        if cnf.useopencl || cnf.usecuda {
+        if gpu_requested {
             eprintln!(
-                "[Fatal] a GPU miner was requested but no usable GPU backend initialized; refusing silent CPU fallback (you would pay for GPU power while mining slowly on the CPU). Check the driver/CUDA runtime, or set the backend to CPU."
+                "[Fatal] a GPU miner was requested but no usable GPU backend initialized after {attempts} attempt(s); refusing silent CPU fallback (you would pay for GPU power while mining slowly on the CPU). If the GPU works in other software, wait a minute and press Start again; otherwise check the driver/CUDA runtime, or set the backend to CPU."
             );
             return backends;
         }
@@ -649,8 +798,18 @@ fn run_block_mining_item(
         return;
     }
 
-    let mining_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-    let mining_epoch = current_mining_epoch();
+    // Height, epoch and the bytes to mine all come from ONE snapshot. Reading them
+    // separately let a template install land in between, which labelled the batch
+    // with a generation it was not mined under.
+    let stuff = match MINING_BLOCK_STUFF.read() {
+        Ok(stuff) => stuff.clone(),
+        Err(e) => {
+            eprintln!("[Mining] Block state lock failed: {e}");
+            return;
+        }
+    };
+    let mining_hei = stuff.height;
+    let mining_epoch = stuff.epoch;
     if mining_hei == 0 {
         std::thread::sleep(Duration::from_millis(111));
         return;
@@ -683,14 +842,8 @@ fn run_block_mining_item(
         MinerBackend::Cuda(_) => true,
         _ => false,
     };
-    let stuff = match MINING_BLOCK_STUFF.read() {
-        Ok(stuff) => stuff.clone(),
-        Err(e) => {
-            eprintln!("[Mining] Block state lock failed: {e}");
-            return;
-        }
-    };
-    let height = stuff.height;
+    let height = mining_hei;
+    let prevhash = stuff.block_intro.prevhash().to_vec();
     let mut coinbase_tx = stuff.coinbase_tx.clone();
     coinbase_tx.set_nonce(coinbase_nonce);
     let mut block_intro = stuff.block_intro.clone();
@@ -758,18 +911,17 @@ fn run_block_mining_item(
         let gpu_ns = batch.gpu_nonce_space;
         let cpu_ns = batch.cpu_nonce_space;
 
-        // Drop batches whose template already moved before they enter the channel.
-        let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-        let check_epoch = current_mining_epoch();
-        if check_hei != mining_hei || check_epoch != mining_epoch {
-            return;
-        }
-
+        // A FINISHED batch is never thrown away, whatever the template did while it
+        // ran. Those hashes were really computed: the sample keeps the hashrate
+        // display honest, and any nonce that met the target is a payout the node
+        // still accepts at the height it was mined for. Stopping the loop is the
+        // job-switch response (see the re-check at the end of this loop); dropping
+        // the result is not.
         let use_secs = ctn.elapsed().as_secs_f64();
         let mlres = BlockMiningResult {
             worker_id: thrid,
             height,
-            epoch: mining_epoch,
+            prevhash: prevhash.clone(),
             nonce_start,
             nonce_space: current_nonce_space,
             gpu_nonce_space: gpu_ns,
@@ -804,8 +956,10 @@ fn run_block_mining_item(
         };
         nonce_start = nst;
 
-        // Any height change (including reorg to a lower tip) or epoch bump means
-        // this job is done; the next outer loop iteration picks up the new template.
+        // Any height change (including a reorg to a lower tip) or a real job change
+        // means this template is done, so stop starting NEW batches and let the next
+        // outer loop iteration pick the fresh one up. The batch that just finished
+        // was already sent: a job switch ends the loop, it never voids mined work.
         let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
         if check_hei != mining_hei || current_mining_epoch() != mining_epoch {
             return;
@@ -814,16 +968,25 @@ fn run_block_mining_item(
 }
 
 /// On shutdown, still submit any target-meeting results already in the channel.
+///
+/// Hand-off only: `queue_block_mining_success` falls back to a blocking inline
+/// submit (up to five attempts at the 30 s RPC timeout) when the queue is full,
+/// and holding shutdown on network I/O would look like a hung miner. The submit
+/// thread drains whatever is queued before it exits, so a successful `try_send`
+/// is still a real submission.
 fn drain_winners_for_shutdown(
-    cnf: &PoWorkConf,
     result_ch_rx: &mut mpsc::Receiver<Arc<BlockMiningResult>>,
     submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
 ) {
-    let live_epoch = current_mining_epoch();
-    let live_hei = current_mining_height();
+    let live_template = live_template_identity();
     while let Ok(res) = result_ch_rx.try_recv() {
-        if res.epoch == live_epoch && res.height == live_hei && result_meets_target(&res) {
-            queue_block_mining_success(cnf, submit_tx, &res);
+        if result_meets_target(&res) && !result_is_orphaned(&res, live_template.as_ref()) {
+            if let Err(e) = submit_tx.try_send(res.clone()) {
+                eprintln!(
+                    "[Mining] Shutdown could not queue a winning result at height {}: {e}",
+                    res.height
+                );
+            }
         }
     }
 }
@@ -869,8 +1032,7 @@ fn deal_block_mining_results(
     // single strongest hash for stats, so collect ALL of them separately, otherwise
     // every winner but one in this drain window would be silently lost.
     let mut winners: Vec<Arc<BlockMiningResult>> = Vec::new();
-    let live_epoch = current_mining_epoch();
-    let live_hei = current_mining_height();
+    let live_template = live_template_identity();
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_hei = res.height;
         // Prefer actual mined counts when recovery mined only a prefix of the plan.
@@ -889,12 +1051,12 @@ fn deal_block_mining_results(
         if hash_more_power(&res.result_hash, &most.result_hash) {
             most = res.clone();
         }
-        // Only accept winners that still match the live template epoch/height so a
-        // stale same-height reorg result cannot be submitted (or crowd out a live one).
-        if res.epoch == live_epoch
-            && res.height == live_hei
-            && result_meets_target(&res)
-        {
+        // Submit everything that met its own target. The height is NOT a filter:
+        // the node looks the template up by the submitted height and keeps several
+        // recent ones, so a solution found just before the tip advanced is still
+        // money. Only a same-height reorg (a different parent at this very height)
+        // is genuinely unreconstructable, and only that is dropped.
+        if result_meets_target(&res) && !result_is_orphaned(&res, live_template.as_ref()) {
             record_winner(&mut winners, &res);
         }
         recv_count += 1;
@@ -1013,6 +1175,222 @@ pub(crate) fn may_print_turn_to_nex_block_mining(curr_hei: u64, most_hash: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The installed template lives in process-global statics, so every test that
+    /// installs one has to run alone.
+    fn mining_state_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One `/query/miner/pending` body. `mrklroot` is the field the fullnode
+    /// rewrites on every single request, and the one the miner replaces itself.
+    fn pending_template_json(height: u64, prevhash: u8, mrklroot: u8) -> JV {
+        let mut intro = BlockIntro::default();
+        intro.head.height = BlockHeight::from(height);
+        intro.head.prevhash = Hash::from([prevhash; HASH_WIDTH]);
+        intro.head.mrklroot = Hash::from([mrklroot; HASH_WIDTH]);
+        serde_json::json!({
+            "height": height,
+            "target_hash": hex::encode([0x0fu8; HASH_WIDTH]),
+            "block_intro": hex::encode(intro.serialize()),
+            "coinbase_body": hex::encode(TransactionCoinbase::default().serialize()),
+            "mkrl_modify_list": Vec::<String>::new(),
+        })
+    }
+
+    fn installed_mrklroot() -> Vec<u8> {
+        MINING_BLOCK_STUFF
+            .read()
+            .unwrap()
+            .block_intro
+            .mrklroot()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_reserialized_template_is_installed_without_voiding_in_flight_work() {
+        let _guard = mining_state_guard();
+        // The fullnode increments the served coinbase nonce and recomputes the
+        // merkle root on EVERY pending request, and the merkle root sits inside the
+        // serialized intro. Calling that a new job bumped the epoch on every poll,
+        // and every bump destroyed one finished batch per worker, winners included.
+        set_pending_block_stuff(41, pending_template_json(41, 0x11, 0xa1)).unwrap();
+        let installed_epoch = current_mining_epoch();
+
+        set_pending_block_stuff(41, pending_template_json(41, 0x11, 0xa2)).unwrap();
+        assert_eq!(
+            current_mining_epoch(),
+            installed_epoch,
+            "a merely re-serialized template must not count as a new job"
+        );
+        assert_eq!(
+            installed_mrklroot(),
+            vec![0xa2u8; HASH_WIDTH],
+            "the refreshed template must still be installed"
+        );
+
+        // A same-height reorg replaces the parent: that IS a new job.
+        set_pending_block_stuff(41, pending_template_json(41, 0x22, 0xa3)).unwrap();
+        assert_eq!(current_mining_epoch(), installed_epoch + 1);
+
+        // So is the tip advancing.
+        set_pending_block_stuff(42, pending_template_json(42, 0x33, 0xa4)).unwrap();
+        assert_eq!(current_mining_epoch(), installed_epoch + 2);
+        assert_eq!(current_mining_height(), 42);
+    }
+
+    #[test]
+    fn a_cuda_rig_also_gets_cpu_assist_threads() {
+        // The assist block used to live inside the OpenCL arm, so a CUDA rig had no
+        // non-GPU backend at all: when the session-disable latch quarantined the
+        // card, the whole rig produced nothing.
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 2, 16);
+        cnf.cpu_assist = true;
+        cnf.usecuda = true;
+        cnf.useopencl = false;
+        assert!(cpu_assist_thread_count(&cnf, 1) > 0);
+        cnf.usecuda = false;
+        cnf.useopencl = true;
+        assert!(cpu_assist_thread_count(&cnf, 1) > 0);
+
+        // No GPU backend means the CPU-only path below owns the thread count, and
+        // an operator who turned the assist off still gets none.
+        assert_eq!(cpu_assist_thread_count(&cnf, 0), 0);
+        cnf.cpu_assist = false;
+        assert_eq!(cpu_assist_thread_count(&cnf, 1), 0);
+        cnf.cpu_assist = true;
+        cnf.supervene = 0;
+        assert_eq!(cpu_assist_thread_count(&cnf, 1), 0);
+    }
+
+    #[test]
+    fn gpu_init_is_retried_before_it_is_called_fatal() {
+        // A driver still loading after a boot or a TDR reset is self-clearing, so
+        // one failed probe must not stop an unattended rig for good.
+        assert_eq!(gpu_init_attempts(true, true), 5);
+        // Nothing to wait for when the backend is not compiled in, or not wanted.
+        assert_eq!(gpu_init_attempts(true, false), 1);
+        assert_eq!(gpu_init_attempts(false, true), 1);
+        // The waits stay bounded so a genuinely dead GPU is still reported.
+        assert!(GPU_INIT_RETRY_DELAYS_SECS.iter().sum::<u64>() <= 120);
+        assert!(GPU_INIT_RETRY_DELAYS_SECS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn a_startup_retry_wait_never_holds_shutdown() {
+        let stop = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let started = Instant::now();
+        assert!(sleep_unless_stopped(&stop, Duration::from_secs(60)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!sleep_unless_stopped(&None, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn only_a_same_height_reorg_makes_a_solution_dead_work() {
+        let mut res = BlockMiningResult::default();
+        res.height = 100;
+        res.prevhash = vec![0x11u8; HASH_WIDTH];
+        res.target_hash = vec![0x0f; HASH_WIDTH];
+        res.result_hash = vec![0x01; HASH_WIDTH];
+        assert!(result_meets_target(&res));
+
+        // Tip advanced past us: the node looks the template up by the SUBMITTED
+        // height and keeps several recent heights, so this is still a payout.
+        assert!(!result_is_orphaned(
+            &res,
+            Some(&(101u64, vec![0x99u8; HASH_WIDTH]))
+        ));
+        // Same job: obviously live.
+        assert!(!result_is_orphaned(
+            &res,
+            Some(&(100u64, vec![0x11u8; HASH_WIDTH]))
+        ));
+        // Same height, different parent: the node evicted our template, so the
+        // solution cannot be reconstructed there any more.
+        assert!(result_is_orphaned(
+            &res,
+            Some(&(100u64, vec![0x22u8; HASH_WIDTH]))
+        ));
+        // Unknown live template must never cost a payout.
+        assert!(!result_is_orphaned(&res, None));
+    }
+
+    #[test]
+    fn a_winner_mined_just_before_the_tip_advanced_is_still_submitted() {
+        let _guard = mining_state_guard();
+        // Live template is height 501 on parent 0x22; the winner was mined at 500.
+        set_pending_block_stuff(501, pending_template_json(501, 0x22, 0xb1)).unwrap();
+
+        let cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        let (res_tx, mut res_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+
+        let mut win = BlockMiningResult::default();
+        win.height = 500;
+        win.prevhash = vec![0x11u8; HASH_WIDTH];
+        win.nonce_space = 1;
+        win.use_secs = 0.5;
+        win.head_nonce = 77;
+        win.coinbase_nonce = vec![0x05; HASH_WIDTH];
+        win.target_hash = vec![0x0f; HASH_WIDTH];
+        win.result_hash = vec![0x01; HASH_WIDTH];
+        res_tx.send(Arc::new(win)).unwrap();
+
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            1,
+            &mut tracker,
+            1,
+            &submit_tx,
+        );
+
+        let submitted = submit_rx
+            .try_recv()
+            .expect("a solution found a moment before the tip advanced is still accepted by the node at its own height and must be submitted");
+        assert_eq!(submitted.height, 500);
+        assert_eq!(submitted.head_nonce, 77);
+    }
+
+    #[test]
+    fn a_same_height_reorg_winner_is_not_submitted() {
+        let _guard = mining_state_guard();
+        // The node repacked height 600 on a different parent, so our solution can
+        // no longer be rebuilt from its cached template.
+        set_pending_block_stuff(600, pending_template_json(600, 0x22, 0xc1)).unwrap();
+
+        let cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        let (res_tx, mut res_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+
+        let mut orphaned = BlockMiningResult::default();
+        orphaned.height = 600;
+        orphaned.prevhash = vec![0x11u8; HASH_WIDTH];
+        orphaned.nonce_space = 1;
+        orphaned.use_secs = 0.5;
+        orphaned.head_nonce = 5;
+        orphaned.coinbase_nonce = vec![0x07; HASH_WIDTH];
+        orphaned.target_hash = vec![0x0f; HASH_WIDTH];
+        orphaned.result_hash = vec![0x01; HASH_WIDTH];
+        res_tx.send(Arc::new(orphaned)).unwrap();
+
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            1,
+            &mut tracker,
+            1,
+            &submit_tx,
+        );
+        assert!(submit_rx.try_recv().is_err());
+    }
 
     #[test]
     fn malformed_pending_block_is_rejected_without_panicking() {

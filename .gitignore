@@ -95,6 +95,15 @@ hacash_*
 !scripts/mining-amd/presets/diaworker/
 !scripts/mining-amd/presets/poworker/
 !scripts/mining-amd/presets/**/*.ini
+# Same rule for the shipped config TEMPLATES. The blanket *.ini above is meant to
+# keep an operator's own filled-in config (with their address and passwords) out
+# of the repo, but it was also swallowing the templates the docs tell people to
+# copy, so those never reached a clone or a release. These carry no address, no
+# password and no machine-specific path: every such key is left commented out on
+# purpose, so the strict loader fails loudly and names the key instead of letting
+# anyone mine to a value they did not choose.
+!mainnet-configs/*.ini
+!miner-pool/hac-pool.example.ini
 *.exe
 *_ubuntu
 *_windows

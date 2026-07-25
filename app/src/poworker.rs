@@ -206,11 +206,6 @@ fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
 
 ///////////////////////////////
 
-/// Hex of the last block_intro we installed, so a same-height reorg (the tip
-/// block replaced at the same height) is detected and picked up, not ignored.
-static LAST_PENDING_INTRO: LazyLock<std::sync::Mutex<String>> =
-    LazyLock::new(|| std::sync::Mutex::new(String::new()));
-
 /// Per-request long-poll wait for the miner notice. When a supervisor can ask us
 /// to stop, cap it so the loop re-checks the stop flag every few seconds instead
 /// of blocking for the whole configured notice window.
@@ -220,6 +215,25 @@ const NOTICE_POLL_WAIT_WITH_STOP: u64 = 3;
 /// work it can no longer refresh. Long enough not to hammer a struggling pool or
 /// node, short enough to pick mining back up as soon as the outage clears.
 const STALE_UPSTREAM_BACKOFF_SECS: u64 = 10;
+
+/// Minimum period of one pending + notice cycle. A cooperating upstream already
+/// blocks inside the notice long-poll for the configured wait, so this floor never
+/// slows a healthy miner down. It exists only for the pathological upstream: one
+/// that answers the notice immediately (a saturated pool bridge, or a server with
+/// no long-poll at all). The cycle costs TWO requests, so without a floor a single
+/// miner would issue tens of requests per second forever and make the overload it
+/// is suffering from worse.
+const NOTICE_CYCLE_MIN: Duration = Duration::from_millis(200);
+
+/// Anti-spin sleep still owed by a notice cycle. Zero when the notice reported
+/// that the tip reached the height we are mining on top of: genuinely new work is
+/// money and is never delayed.
+fn notice_cycle_backoff(spent: Duration, new_work_ready: bool) -> Duration {
+    if new_work_ready {
+        return Duration::ZERO;
+    }
+    NOTICE_CYCLE_MIN.saturating_sub(spent)
+}
 
 /// Detect the "upstream is serving work it can no longer refresh" answer that the
 /// pool bridge returns on `/query/miner/pending` and `/query/miner/notice` during
@@ -265,6 +279,7 @@ fn notice_poll_wait(notice_wait: u64, can_stop: bool) -> u64 {
 }
 
 fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>>) {
+    let cycle_start = Instant::now();
     let curr_hei = block_mining_runtime::current_mining_height();
 
     // query pending
@@ -304,34 +319,23 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         delay_return!(15);
     };
     let pending_height = jnum("height");
-    let new_intro = res["block_intro"].as_str().unwrap_or("").to_string();
 
-    // Detect template change WITHOUT writing LAST_PENDING_INTRO yet: only commit
-    // the remembered intro after a successful install, otherwise a failed parse
-    // would permanently skip retries at the same height.
-    let intro_changed = {
-        let g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
-        *g != new_intro
-    };
-    // Install on any height change (including reorg to a lower tip) OR a
-    // same-height intro change (tip replaced at the same height).
-    if pending_height != curr_hei || intro_changed {
-        if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
-            println!("Error: invalid block data from {urlapi_pending}: {e}");
-            delay_return!(10);
-        }
-        {
-            let mut g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
-            *g = new_intro;
-        }
-        // Only clear the stale-work pause after a successful install of real work.
-        leave_upstream_stale();
-        if curr_hei == 0 {
-            block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
-        }
-    } else {
-        // Same installed template is still live — resume if we had paused for stale.
-        leave_upstream_stale();
+    // Install the refreshed template unconditionally. Comparing the raw block_intro
+    // hex to decide would call EVERY poll a template change: the fullnode
+    // increments the served coinbase nonce and recomputes the merkle root on every
+    // /query/miner/pending request, and the merkle root lives inside the serialized
+    // intro. Whether this is really a NEW job - and so whether workers must give up
+    // what they are mining - is decided inside set_pending_block_stuff from the
+    // job's identity (height + parent hash), which that re-serialization leaves
+    // untouched. A same-height reorg still changes the parent and is still detected.
+    if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
+        println!("Error: invalid block data from {urlapi_pending}: {e}");
+        delay_return!(10);
+    }
+    // Real work was served and installed, so any stale-work pause lifts.
+    leave_upstream_stale();
+    if curr_hei == 0 {
+        block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
     }
 
     // with notice
@@ -397,7 +401,15 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         // outer loop re-fetches /query/miner/pending: that is how same-height tip
         // reorgs (intro change without tip height advance) are detected. A second
         // tight spin on the same tip would never re-read block_intro.
-        let _ = res_hei;
+        //
+        // Nothing new means the cycle must not be allowed to run free: it costs two
+        // requests, and an upstream that answers the notice instantly would
+        // otherwise be hammered at tens of requests per second (see NOTICE_CYCLE_MIN).
+        let new_work_ready = pending_height > 0 && res_hei >= pending_height;
+        let backoff = notice_cycle_backoff(cycle_start.elapsed(), new_work_ready);
+        if !backoff.is_zero() {
+            std::thread::sleep(backoff);
+        }
         break;
     }
 }
@@ -1255,6 +1267,32 @@ mod tests {
         assert_eq!(
             upstream_stale_reason(&serde_json::json!({"height": 9, "block_intro": "00"})),
             None
+        );
+    }
+
+    #[test]
+    fn the_notice_cycle_has_an_anti_spin_floor_that_never_delays_new_work() {
+        // An upstream that answers the notice immediately must not be hammered:
+        // the cycle costs a pending request plus a notice request, so hold it to a
+        // minimum period instead of running it as fast as the network allows.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_millis(5), false),
+            NOTICE_CYCLE_MIN - Duration::from_millis(5)
+        );
+        assert_eq!(
+            notice_cycle_backoff(Duration::ZERO, false),
+            NOTICE_CYCLE_MIN
+        );
+        // A cooperating upstream already spent the whole notice window, so the
+        // floor costs it nothing.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_secs(45), false),
+            Duration::ZERO
+        );
+        // New work is a payout waiting to be mined and is never delayed.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_millis(5), true),
+            Duration::ZERO
         );
     }
 

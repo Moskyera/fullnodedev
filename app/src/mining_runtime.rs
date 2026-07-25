@@ -1,4 +1,4 @@
-//! Process-wide mining runtime: CPU assist, thermal cap, profit pause — not per-GPU OOM.
+//! Process-wide mining runtime: CPU assist, thermal cap, profit pause - not per-GPU OOM.
 
 use std::sync::Arc;
 use std::sync::atomic::{
@@ -177,7 +177,7 @@ impl MiningRuntimeState {
             self.thermal_cap_wg.store(wg, Relaxed);
             if !self.throttled.swap(true, Relaxed) || prev != wg {
                 println!(
-                    "[efficiency] Thermal {}C >= {}C — cap work_groups to {} (configured {})",
+                    "[efficiency] Thermal {}C >= {}C - cap work_groups to {} (configured {})",
                     temp_c,
                     max_temp_c,
                     wg,
@@ -190,7 +190,7 @@ impl MiningRuntimeState {
             self.thermal_cap_wg.store(0, Relaxed);
             self.throttled.store(false, Relaxed);
             println!(
-                "[efficiency] Thermal OK ({}C) — removed work_groups thermal cap",
+                "[efficiency] Thermal OK ({}C) - removed work_groups thermal cap",
                 temp_c
             );
         }
@@ -498,7 +498,7 @@ pub fn start_thermal_monitor(
             }
         }
     }
-    // Only fail-close (pause all mining) after exhausting retries — a single
+    // Only fail-close (pause all mining) after exhausting retries - a single
     // transient spawn failure must not permanently halt a working miner.
     if !spawned {
         runtime.fail_closed_thermal(

@@ -17,12 +17,12 @@ use crate::opencl_gpu::block::do_group_block_mining_opencl;
 #[cfg(any(feature = "ocl", feature = "cuda", test))]
 const GPU_ERROR_CPU_RECOVERY_NONCES: u32 = 100_000;
 
-/// Consecutive failed CUDA batches tolerated before the card is declared dead for
-/// this session. Twenty is far past any transient hiccup (a driver reset, one hot
-/// spike) but still reached in seconds, so the operator is told early instead of
-/// reading the same per-batch error forever.
-#[cfg(any(feature = "cuda", test))]
-const CUDA_MAX_CONSECUTIVE_BATCH_ERRORS: u32 = 20;
+/// Block intro serialization is a fixed 89-byte layout, shared by the OpenCL
+/// kernel (opencl_gpu/block.rs) and CUDA (`x16rs_cuda::STUFF_BYTES`). The nonce
+/// lives at bytes 79..83, so a shorter or longer intro would be hashed over a
+/// different message length than the kernel used and the resulting mismatch would
+/// be charged to the card as a "GPU integrity error".
+pub const BLOCK_INTRO_BYTES: usize = 89;
 
 /// What a failed CUDA batch should do besides falling back to the CPU.
 #[cfg(any(feature = "cuda", test))]
@@ -32,18 +32,17 @@ pub struct CudaFailureAction {
     /// fault is grid independent and x16rs-cuda rebuilds the context itself, so
     /// shrinking the launch would only cost throughput once the card recovers.
     pub halve_workgroups: bool,
-    /// This failure crossed the budget: alert once, loudly, and stop using the
-    /// card for the rest of the session.
-    pub disable_gpu: bool,
 }
 
-/// Decide what to do about a failed CUDA batch from the fault class and how many
-/// batches have failed back to back.
+/// Decide what to do about a failed CUDA batch from the fault class.
+///
+/// Whether the card is parked is NOT decided here: both backends now defer to the
+/// shared [`crate::gpu_oom::GpuQuarantine`], which needs the failures to persist in
+/// count AND in time, and which re-probes instead of latching the card off.
 #[cfg(any(feature = "cuda", test))]
-pub fn cuda_failure_action(sticky: bool, consecutive_failures: u32) -> CudaFailureAction {
+pub fn cuda_failure_action(sticky: bool) -> CudaFailureAction {
     CudaFailureAction {
         halve_workgroups: !sticky,
-        disable_gpu: consecutive_failures >= CUDA_MAX_CONSECUTIVE_BATCH_ERRORS,
     }
 }
 
@@ -134,8 +133,11 @@ pub fn verify_gpu_best_result(
             best.0, nonce_start, gpu_nonce_space
         ));
     }
-    if block_intro.len() < 83 {
-        return Err("block intro is too short for nonce verification".to_string());
+    if block_intro.len() != BLOCK_INTRO_BYTES {
+        return Err(format!(
+            "block intro must be {BLOCK_INTRO_BYTES} bytes for nonce verification, got {}",
+            block_intro.len()
+        ));
     }
 
     let mut verify_intro = block_intro.to_vec();
@@ -268,7 +270,10 @@ impl BlockMinerBackend for OpenclBlockBackend {
         ctx: &BatchCtx,
         cpu_mine: &dyn Fn(u64, Vec<u8>, u32, u32) -> (u32, [u8; 32]),
     ) -> BatchResult {
-        if self.gpu.gpu_is_disabled() {
+        // Quarantined, not disabled: the card is parked for a growing interval and
+        // re-probed automatically, so a driver reset or a thermal excursion no
+        // longer costs the whole session's GPU income.
+        if self.gpu.quarantine_blocks_batch() {
             return cpu_gpu_error_recovery(
                 ctx.height,
                 ctx.block_intro.clone(),
@@ -376,10 +381,10 @@ impl BlockMinerBackend for CudaBlockBackend {
         // Honor the OOM/error backoff AND the thermal governor's graded cap, so a
         // hot or memory-pressured NVIDIA card steps down smoothly instead of
         // running full tilt until the hard thermal pause.
-        if self.cuda.gpu_is_disabled() {
-            // The card was given up on earlier in this session (see the alert
-            // below). Do not launch again: keep the bounded CPU recovery so the
-            // miner still makes progress without hammering a dead device.
+        if self.cuda.quarantine_blocks_batch() {
+            // The card is parked for a growing backoff (see the alert below) and
+            // will be re-probed automatically. Keep the bounded CPU recovery so
+            // the miner still makes progress without hammering a sick device.
             return cpu_gpu_error_recovery(
                 ctx.height,
                 ctx.block_intro.clone(),
@@ -416,19 +421,16 @@ impl BlockMinerBackend for CudaBlockBackend {
             Err(e) => {
                 eprintln!("[CUDA] batch failed: {e}");
                 self.runtime.record_gpu_error_event();
-                let failures = self.cuda.note_batch_failure();
-                let action = cuda_failure_action(e.is_sticky(), failures);
+                let report = self.cuda.note_batch_failure();
+                let action = cuda_failure_action(e.is_sticky());
                 if action.halve_workgroups {
                     // Back off the effective work-groups so the next batch tries a
                     // smaller, likely-runnable size instead of failing forever.
                     let reduced = self.cuda.record_error();
                     eprintln!("[CUDA] reducing work_groups to {reduced} after error");
                 }
-                if action.disable_gpu && self.cuda.disable_gpu_for_session() {
-                    eprintln!(
-                        "[CUDA] ALERT {failures} consecutive failed batches; GPU mining is now OFF for this process and the miner continues on capped CPU recovery only. Last error: {e}. Check the driver, cooling, power and PCIe riser, then restart the miner."
-                    );
-                }
+                self.cuda
+                    .announce_quarantine(&report, &format!("Last error: {e}"));
                 // Cap CPU recovery like the OpenCL path so a CUDA error cannot
                 // make one CPU thread grind the whole GPU-sized nonce window.
                 cpu_gpu_error_recovery(
@@ -453,15 +455,12 @@ impl BlockMinerBackend for CudaBlockBackend {
                     self.runtime.record_gpu_error_event();
                     // A card returning hashes the CPU cannot reproduce is as dead
                     // as one that fails to launch, so it shares the same budget.
-                    let failures = self.cuda.note_batch_failure();
+                    let report = self.cuda.note_batch_failure();
                     self.cuda.record_error();
-                    if cuda_failure_action(false, failures).disable_gpu
-                        && self.cuda.disable_gpu_for_session()
-                    {
-                        eprintln!(
-                            "[CUDA] ALERT {failures} consecutive bad batches; GPU mining is now OFF for this process and the miner continues on capped CPU recovery only. The card is returning hashes the CPU cannot reproduce. Check for an overclock, bad memory or a failing driver, then restart the miner."
-                        );
-                    }
+                    self.cuda.announce_quarantine(
+                        &report,
+                        "The card is returning hashes the CPU cannot reproduce; check for an overclock, bad memory or a failing driver.",
+                    );
                     return cpu_gpu_error_recovery(
                         ctx.height,
                         ctx.block_intro.clone(),
@@ -530,20 +529,81 @@ mod tests {
     fn a_sticky_cuda_fault_does_not_halve_the_grid() {
         // A sticky context fault is grid independent and x16rs-cuda rebuilds the
         // context itself, so halving the work groups would only cost throughput.
-        assert!(!cuda_failure_action(true, 1).halve_workgroups);
-        assert!(cuda_failure_action(false, 1).halve_workgroups);
+        assert!(!cuda_failure_action(true).halve_workgroups);
+        assert!(cuda_failure_action(false).halve_workgroups);
     }
 
     #[test]
-    fn a_run_of_failed_cuda_batches_disables_the_gpu_exactly_once() {
-        for failures in 1..CUDA_MAX_CONSECUTIVE_BATCH_ERRORS {
+    fn a_run_of_failed_cuda_batches_quarantines_instead_of_killing_the_card() {
+        use crate::gpu_oom::{
+            GPU_QUARANTINE_BASE_BACKOFF, GPU_QUARANTINE_MIN_ELAPSED, GPU_QUARANTINE_MIN_FAILURES,
+            GpuGate, GpuQuarantine,
+        };
+        use std::time::{Duration, Instant};
+
+        // CUDA used to disable the card on a bare count, with no at-floor and no
+        // elapsed-time precondition, and with no way back short of a restart.
+        // Both backends now share this policy, so a fast burst is survivable and a
+        // real fault is only ever a timed quarantine.
+        let quarantine = GpuQuarantine::new();
+        let start = Instant::now();
+        for i in 0..GPU_QUARANTINE_MIN_FAILURES * 2 {
+            let now = start + Duration::from_millis(300 * i as u64);
             assert!(
-                !cuda_failure_action(false, failures).disable_gpu,
-                "{failures} failures must not disable the GPU yet"
+                quarantine.record_failure(now).quarantined.is_none(),
+                "a burst of {} failures in under a minute must not park a CUDA card",
+                i + 1
             );
         }
-        assert!(cuda_failure_action(false, CUDA_MAX_CONSECUTIVE_BATCH_ERRORS).disable_gpu);
-        assert!(cuda_failure_action(true, CUDA_MAX_CONSECUTIVE_BATCH_ERRORS + 5).disable_gpu);
+
+        let quarantine = GpuQuarantine::new();
+        let mut armed = None;
+        for i in 0..GPU_QUARANTINE_MIN_FAILURES {
+            let now = start + Duration::from_secs(10) * i;
+            if let Some(entry) = quarantine.record_failure(now).quarantined {
+                armed = Some((now, entry));
+                break;
+            }
+        }
+        let (armed_at, entry) = armed.expect("a persistent failing run must park the card");
+        assert_eq!(entry.retry_in, GPU_QUARANTINE_BASE_BACKOFF);
+        assert!(armed_at.saturating_duration_since(start) >= GPU_QUARANTINE_MIN_ELAPSED);
+        assert!(matches!(
+            quarantine.gate(armed_at),
+            GpuGate::Skip { level: 1, .. }
+        ));
+        // And it always comes back: the card is re-probed, never latched off.
+        assert!(matches!(
+            quarantine.gate(armed_at + GPU_QUARANTINE_BASE_BACKOFF + Duration::from_secs(1)),
+            GpuGate::Reprobe { .. }
+        ));
+        assert!(quarantine.record_success());
+    }
+
+    #[test]
+    fn nonce_verification_rejects_a_short_intro_instead_of_blaming_the_gpu() {
+        // An 83..88 byte intro used to pass the guard, get bytes 79..83 rewritten
+        // and then be hashed over a different message length than the kernel used.
+        // The guaranteed mismatch was reported as a GPU integrity error and
+        // charged against the card's failure budget for a host-side bug.
+        let height = 1u64;
+        let short_intro = vec![0u8; 85];
+        let err = verify_gpu_best_result(height, &short_intro, 0, 256, &(7, [0u8; 32]))
+            .expect_err("an 85-byte intro must be rejected as a host-side length bug");
+        assert!(
+            err.contains("89 bytes"),
+            "the error must name the 89-byte invariant, got: {err}"
+        );
+        assert!(
+            verify_gpu_best_result(
+                height,
+                &vec![0u8; BLOCK_INTRO_BYTES + 1],
+                0,
+                256,
+                &(7, [0u8; 32])
+            )
+            .is_err()
+        );
     }
 
     #[test]

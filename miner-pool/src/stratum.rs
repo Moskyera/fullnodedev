@@ -175,7 +175,7 @@ pub async fn serve(
         let (sock, peer) = match listener.accept().await {
             Ok(x) => x,
             // A single accept() error (e.g. EMFILE under load) must not kill the
-            // whole listener — log and keep serving.
+            // whole listener: log and keep serving.
             Err(e) => {
                 warn!("stratum accept error: {e}");
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -543,8 +543,12 @@ mod tests {
 
         // Wait for the connect-time push, which leaves the push task sleeping out
         // its 500ms cycle with last=h100.
+        // Assert against the id the hub actually minted rather than a literal: the
+        // job id carries a fingerprint of the template, and what matters here is
+        // that the client got the current job exactly once.
+        let job_100 = hub.current().unwrap().job_id;
         let first = drain_notifies(&mut lines, Duration::from_millis(400)).await;
-        assert_eq!(first, vec!["h100_aa".to_string()]);
+        assert_eq!(first, vec![job_100.clone()]);
 
         // New block arrives, then the miner authorizes before the push task wakes.
         hub.update(
@@ -555,10 +559,12 @@ mod tests {
             .await
             .unwrap();
 
+        let job_101 = hub.current().unwrap().job_id;
+        assert_ne!(job_101, job_100, "a new height must be a new job id");
         // Long enough for the push task's copy to arrive as well, so a duplicate
         // would also be caught.
         let after = drain_notifies(&mut lines, Duration::from_secs(2)).await;
-        assert_eq!(after, vec!["h101_aa".to_string()]);
+        assert_eq!(after, vec![job_101]);
     }
 
     /// A miner that pipelines subscribe+authorize in one segment must still get
@@ -566,6 +572,7 @@ mod tests {
     #[tokio::test]
     async fn pipelined_subscribe_and_authorize_delivers_exactly_one_notify() {
         let hub = test_hub(100);
+        let expected = hub.current().unwrap().job_id;
         let sock = connect_to_pool(hub, Duration::from_secs(60)).await;
         let (r, mut w) = sock.into_split();
         w.write_all(
@@ -577,7 +584,7 @@ mod tests {
 
         let mut lines = BufReader::new(r).lines();
         let seen = drain_notifies(&mut lines, Duration::from_secs(2)).await;
-        assert_eq!(seen, vec!["h100_aa".to_string()]);
+        assert_eq!(seen, vec![expected]);
     }
 
     /// A job upstream has stopped refreshing must not be handed out as work.

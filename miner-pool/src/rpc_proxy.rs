@@ -170,6 +170,42 @@ async fn notice(
     }
 }
 
+/// Cap on the slice of an upstream body echoed back to the miner as `msg`. The
+/// body is already bounded upstream; this keeps the reply itself small and
+/// readable in a worker log.
+const MAX_MSG_CHARS: usize = 512;
+
+/// Char-safe clip. The body is whatever the upstream sent, so it may be non-ASCII
+/// and must never be byte-sliced.
+fn clip_msg(body: &str) -> String {
+    let mut out: String = body.chars().take(MAX_MSG_CHARS).collect();
+    if body.chars().nth(MAX_MSG_CHARS).is_some() {
+        out.push_str("...(truncated)");
+    }
+    out
+}
+
+/// Turn an upstream 2xx body into the reply the miner sees.
+///
+/// Only a body that actually carries a numeric `ret` is the node's verdict, so
+/// only that is passed through verbatim. Everything else - an HTML error page, a
+/// proxy notice, a truncated reply, or valid JSON with no `ret` at all - is
+/// reported as a definite failure. Both consumers key acceptance on `ret == 0`,
+/// and poworker treats a MISSING `ret` as transient and retries up to 5 times,
+/// each of which re-enters `Upstream::submit_success` with its own 5 attempts: up
+/// to 25 upstream submits for one solution, at the worst possible moment.
+/// Answering `ret:1` makes the rejection definite and stops that burst.
+///
+/// This never turns a rejection into a success: the fallback is always `ret:1`.
+fn normalise_submit_body(body: &str) -> JV {
+    if let Ok(v) = serde_json::from_str::<JV>(body) {
+        if v.get("ret").and_then(|r| r.as_i64()).is_some() {
+            return v;
+        }
+    }
+    json!({"ret": 1, "msg": clip_msg(body)})
+}
+
 async fn submit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -198,20 +234,68 @@ async fn submit(
         .submit_success(height, &block_nonce, &coinbase_nonce)
         .await
     {
-        Ok(body) => {
-            // Pass through upstream JSON if possible. A non-JSON body is an
-            // unexpected/error response (HTML error page, proxy notice, truncated
-            // reply), so it must NOT be reported as success (ret:0) to the miner:
-            // treat it as a failure so the miner does not count a lost block as won.
-            if let Ok(v) = serde_json::from_str::<JV>(&body) {
-                (StatusCode::OK, Json(v))
-            } else {
-                (StatusCode::OK, Json(json!({"ret": 1, "msg": body})))
-            }
-        }
+        Ok(body) => (StatusCode::OK, Json(normalise_submit_body(&body))),
         Err(e) => (
             StatusCode::OK,
             Json(json!({"err": e, "ret": 1})),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_real_node_verdict_is_passed_through_untouched() {
+        // ret:0 is an accepted block and ret:1 a definite rejection. Neither may be
+        // rewritten: the miner counts its blocks off exactly this.
+        let ok = normalise_submit_body("{\"ret\":0,\"height\":100,\"mining\":\"success\"}");
+        assert_eq!(ok["ret"].as_i64(), Some(0));
+        assert_eq!(ok["mining"].as_str(), Some("success"));
+        let no = normalise_submit_body("{\"ret\":1,\"err\":\"height passed\"}");
+        assert_eq!(no["ret"].as_i64(), Some(1));
+        assert_eq!(no["err"].as_str(), Some("height passed"));
+    }
+
+    #[test]
+    fn a_2xx_body_without_a_ret_is_reported_as_a_definite_failure() {
+        // Valid JSON with no `ret` is not a node verdict. Relaying it verbatim made
+        // poworker treat it as transient and retry 5 times, each retry costing
+        // another 5 upstream submits. It must come back as ret:1 so the miner stops.
+        for body in [
+            "{\"err\":\"pending block not ready\"}",
+            "{}",
+            "[]",
+            "\"maintenance\"",
+            "<html>502 Bad Gateway</html>",
+            "",
+        ] {
+            let v = normalise_submit_body(body);
+            assert_eq!(v["ret"].as_i64(), Some(1), "body {body:?} was not normalised");
+            assert!(v.get("msg").is_some(), "body {body:?} lost its detail");
+        }
+        // A non-numeric `ret` is not a verdict either: both consumers read it with
+        // as_i64, so a string would land in the same retry loop.
+        assert_eq!(
+            normalise_submit_body("{\"ret\":\"0\"}")["ret"].as_i64(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn an_oversized_upstream_body_is_clipped_before_it_is_echoed() {
+        let body = "x".repeat(MAX_MSG_CHARS * 4);
+        let v = normalise_submit_body(&body);
+        let msg = v["msg"].as_str().unwrap();
+        assert!(
+            msg.chars().count() <= MAX_MSG_CHARS + "...(truncated)".chars().count(),
+            "msg not clipped: {} chars",
+            msg.chars().count()
+        );
+        // Char-safe: an upstream body is not guaranteed ASCII, and clipping it must
+        // not panic on a multi-byte codepoint.
+        let wide = "\u{03b1}".repeat(MAX_MSG_CHARS * 2);
+        assert_eq!(normalise_submit_body(&wide)["ret"].as_i64(), Some(1));
     }
 }

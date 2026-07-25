@@ -20,6 +20,14 @@ const SUBMIT_ATTEMPTS: u32 = 5;
 /// Backoff before the second submit attempt; doubled on each further retry
 /// (250ms, 500ms, 1s, 2s) so the caller still answers the miner promptly.
 const SUBMIT_BACKOFF: Duration = Duration::from_millis(250);
+/// Cap on the submit response body we will buffer. reqwest applies no limit of its
+/// own, and rpc_proxy embeds this body into the reply it sends the miner, so an
+/// uncapped read lets a misbehaving or compromised upstream make the pool buffer
+/// and re-serialise an arbitrarily large payload - five attempts deep, at the exact
+/// moment a block is found. The node's real verdict is a few dozen bytes. The
+/// error path already truncated to 200 characters; this applies the bound to the
+/// 2xx path as well, and applies it while reading so the memory is never taken.
+const MAX_SUBMIT_BODY: usize = 64 * 1024;
 
 /// A failed submit attempt. `retryable` separates transport/5xx failures, where
 /// a retry can still land the block, from a definitive upstream refusal that
@@ -159,9 +167,9 @@ impl Upstream {
             msg: e.to_string(),
         })?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| SubmitError {
+        let body = read_body_capped(resp).await.map_err(|e| SubmitError {
             retryable: true,
-            msg: e.to_string(),
+            msg: e,
         })?;
         if status.is_success() {
             return Ok(body);
@@ -237,6 +245,25 @@ impl Upstream {
     }
 }
 
+/// Read a response body, stopping at `MAX_SUBMIT_BODY` bytes.
+///
+/// Chunk by chunk rather than `text()`, so an oversized body is never fully
+/// buffered. A body that had to be cut is no longer parseable JSON, which is the
+/// right outcome: rpc_proxy then answers `ret:1` rather than treating a flood of
+/// bytes as the node's verdict.
+async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        let room = MAX_SUBMIT_BODY.saturating_sub(buf.len());
+        if chunk.len() >= room {
+            buf.extend_from_slice(&chunk[..room]);
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// A valid PoW nonce is a non-empty, reasonably short hex string. Used to reject
 /// injection attempts before interpolating into the upstream URL.
 fn is_hex_nonce(s: &str) -> bool {
@@ -263,6 +290,16 @@ mod tests {
     /// so every submit attempt is an observable request. Returns the bind
     /// host:port and the request counter.
     async fn fake_upstream(script: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let owned = script
+            .into_iter()
+            .map(|(code, body)| (code, body.to_string()))
+            .collect();
+        fake_upstream_owned(owned).await
+    }
+
+    /// Same, for bodies that cannot be a `&'static str` (e.g. a generated
+    /// oversized reply).
+    async fn fake_upstream_owned(script: Vec<(u16, String)>) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -273,7 +310,7 @@ mod tests {
                     break;
                 };
                 let n = hits_srv.fetch_add(1, Ordering::SeqCst);
-                let (code, body) = script[n.min(script.len() - 1)];
+                let (code, body) = &script[n.min(script.len() - 1)];
                 let mut buf = [0u8; 2048];
                 let _ = sock.read(&mut buf).await;
                 let resp = format!(
@@ -327,6 +364,38 @@ mod tests {
         let body = up.submit_success(100, "aabb", "00").await.unwrap();
         assert_eq!(body, "{\"ret\":1,\"err\":\"height passed\"}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_caps_an_oversized_2xx_body() {
+        // reqwest has no body limit of its own, and rpc_proxy echoes this body back
+        // to the miner. Without a cap, a misbehaving or compromised upstream (or an
+        // intermediary) makes the pool buffer and re-serialise an unbounded payload
+        // per attempt, five attempts deep, exactly when a block is found.
+        let huge = format!(
+            "{{\"ret\":0,\"pad\":\"{}\"}}",
+            "a".repeat(MAX_SUBMIT_BODY * 3)
+        );
+        let (addr, hits) = fake_upstream_owned(vec![(200, huge)]).await;
+        let up = upstream_at(addr);
+        let body = up.submit_success(100, "aabb", "00").await.unwrap();
+        assert!(
+            body.len() <= MAX_SUBMIT_BODY,
+            "2xx body was not capped: {} bytes",
+            body.len()
+        );
+        // One attempt: a 2xx is still the node's answer, capped or not.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_normal_verdict_is_returned_whole() {
+        // The cap must not clip a real reply: the miner reads ret/err out of this.
+        let (addr, _hits) =
+            fake_upstream(vec![(200, "{\"ret\":0,\"height\":100,\"mining\":\"success\"}")]).await;
+        let up = upstream_at(addr);
+        let body = up.submit_success(100, "aabb", "00").await.unwrap();
+        assert_eq!(body, "{\"ret\":0,\"height\":100,\"mining\":\"success\"}");
     }
 
     #[tokio::test]
