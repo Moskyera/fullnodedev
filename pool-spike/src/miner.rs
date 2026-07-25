@@ -23,12 +23,36 @@ use pool_spike::{find_str, find_u64, get_json, http_client};
 /// has EVERY share rejected, forever, however long it keeps trying.
 const MAX_REJECTS: u64 = 8;
 
+/// How many nonces one pass over a template probes before refetching work.
+const SCAN_SPAN: u32 = 3_000_000;
+
+/// Consecutive failed work fetches before giving up. A pool restart, a redeploy
+/// or a moment of packet loss must not end a worker that is otherwise healthy:
+/// exiting on the FIRST transport error is how a soak rig quietly loses half its
+/// miners overnight and nobody notices until the share split looks wrong.
+const MAX_WORK_FAILURES: u32 = 60;
+const WORK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Did the pool credit this submission? The pool answers `{"ok":true,...}` for a
 /// credited share or block and `{"ok":false,"kind":...}` for anything else, so
 /// counting a submission as "found" without reading `ok` reports work that was
 /// never credited - which is exactly what this miner used to print.
 fn accepted(resp: &serde_json::Value) -> bool {
     resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Did the pool answer at all? `get_json` reports a transport failure as
+/// `{"http_error": ...}`, which carries no `ok` and so looks exactly like a
+/// rejection to any check that only reads `ok`.
+///
+/// Keeping the two apart matters: a rejection streak means this worker is
+/// hashing a header the pool does not share and every future share is worthless,
+/// which is worth stopping for. A run of connection errors means the pool is
+/// busy or restarting and the right move is to wait. Counting the second as the
+/// first killed a healthy worker and told its operator, with confidence, that
+/// its merkle root was wrong.
+fn no_answer(resp: &serde_json::Value) -> bool {
+    resp.get("http_error").is_some()
 }
 
 fn reject_kind(resp: &serde_json::Value) -> String {
@@ -58,6 +82,14 @@ fn main() {
     let mut found = 0u64;
     let mut rejected = 0u64;
     let mut streak = 0u64;
+    // Where the next pass starts hashing. Restarting every pass at 0 meant a
+    // second pass over the same template re-found the SAME nonce and submitted
+    // it again, which the pool answers "duplicate" forever: at an easy share
+    // target this worker produced one share and then spun, submitting it
+    // thousands of times. Carrying the cursor makes each pass explore new nonces.
+    let mut scan_from = 0u32;
+    let mut work_failures = 0u32;
+    let mut submit_failures = 0u32;
     while found < want {
         let w = get_json(&client, &format!("{pool}/work?worker={worker}"));
         let (Some(height), Some(intro_hex), Some(st_hex)) = (
@@ -65,9 +97,16 @@ fn main() {
             find_str(&w, "intro"),
             find_str(&w, "share_target"),
         ) else {
-            println!("bad work response: {w}");
-            break;
+            work_failures += 1;
+            if work_failures >= MAX_WORK_FAILURES {
+                println!("bad work response {work_failures} times, giving up: {w}");
+                break;
+            }
+            println!("bad work response ({work_failures}/{MAX_WORK_FAILURES}), retrying: {w}");
+            std::thread::sleep(WORK_RETRY);
+            continue;
         };
+        work_failures = 0;
 
         let mut intro = hex::decode(&intro_hex).expect("intro hex");
         if intro.len() != 89 {
@@ -82,13 +121,18 @@ fn main() {
         // Nothing else in the header is touched, so the merkle root the pool
         // folded from its own coinbase and the node's transactions stays intact.
         let mut hit = None;
-        for nonce in 0u32..3_000_000 {
+        let mut nonce = scan_from;
+        for _ in 0..SCAN_SPAN {
             intro[79..83].copy_from_slice(&nonce.to_be_bytes());
             if pool_core::meets_target(height, &intro, &share_target) {
                 hit = Some(nonce);
                 break;
             }
+            nonce = nonce.wrapping_add(1);
         }
+        // Resume past whatever this pass reached, hit or miss, so the next pass
+        // never re-offers a nonce this one already submitted.
+        scan_from = nonce.wrapping_add(1);
 
         match hit {
             Some(nonce) => {
@@ -102,8 +146,24 @@ fn main() {
                 if accepted(&r) {
                     found += 1;
                     streak = 0;
+                    submit_failures = 0;
                     continue;
                 }
+                if no_answer(&r) {
+                    // The pool said nothing, so it did not reject anything. Wait
+                    // and keep the rejection streak untouched.
+                    submit_failures += 1;
+                    if submit_failures >= MAX_WORK_FAILURES {
+                        eprintln!(
+                            "the pool has not answered {submit_failures} submissions in a row; \
+                             it looks down rather than unhappy with this worker. Stopping."
+                        );
+                        break;
+                    }
+                    std::thread::sleep(WORK_RETRY);
+                    continue;
+                }
+                submit_failures = 0;
                 rejected += 1;
                 streak += 1;
                 if streak >= MAX_REJECTS {
