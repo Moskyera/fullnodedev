@@ -33,6 +33,11 @@ const SCAN_SPAN: u32 = 3_000_000;
 const MAX_WORK_FAILURES: u32 = 60;
 const WORK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Accepted shares are logged in full for the first few, so a run visibly starts
+/// working, and then only every Nth. See the call site for why.
+const ACCEPT_LOG_FIRST: u64 = 5;
+const ACCEPT_LOG_EVERY: u64 = 500;
+
 /// Did the pool credit this submission? The pool answers `{"ok":true,...}` for a
 /// credited share or block and `{"ok":false,"kind":...}` for anything else, so
 /// counting a submission as "found" without reading `ok` reports work that was
@@ -140,15 +145,24 @@ fn main() {
                     &client,
                     &format!("{pool}/share?worker={worker}&height={height}&nonce={nonce}"),
                 );
-                println!("height={height} nonce={nonce} -> {r}");
                 // Only a submission the pool CREDITED counts. Counting every
                 // submission made this miner report shares it was never paid for.
                 if accepted(&r) {
                     found += 1;
                     streak = 0;
                     submit_failures = 0;
+                    // One line per accepted share is fine when a share is real
+                    // work. Against an easy share target it is not: a soak rig
+                    // measured this writing 1 MB/s, rotating a 300 MB log every
+                    // five minutes, which is tens of gigabytes of pointless disk
+                    // wear a day. Rejections and faults still print every time,
+                    // because those are the ones an operator needs to see.
+                    if found <= ACCEPT_LOG_FIRST || found % ACCEPT_LOG_EVERY == 0 {
+                        println!("height={height} nonce={nonce} accepted (total {found}) -> {r}");
+                    }
                     continue;
                 }
+                println!("height={height} nonce={nonce} -> {r}");
                 if no_answer(&r) {
                     // The pool said nothing, so it did not reject anything. Wait
                     // and keep the rejection streak untouched.
