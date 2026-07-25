@@ -34,8 +34,12 @@ against the CPU implementation first.
 
 ```python
 !cd /content/fullnodedev && . "$HOME/.cargo/env" && export CUDA_PATH=/usr/local/cuda && export PATH=$PATH:/usr/local/cuda/bin && \
-  cargo test -p x16rs-cuda --release 2>&1 | tail -12
+  cargo test -p x16rs-cuda --release --features cuda 2>&1 | tail -15
 ```
+
+`--features cuda` is not optional here. Every GPU test is gated behind it, so
+without it the run silently passes with only the one CPU test and proves nothing.
+If the output says `1 passed` you forgot the flag.
 
 Expect 4 passing tests, including `cuda_matches_cpu_across_many_inputs`, which is
 the differential one: every GPU hash must equal the CPU hash byte for byte.

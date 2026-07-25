@@ -9,7 +9,7 @@ pub mod pool_core;
 use difficulty::ChainParams;
 
 use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use basis::difficulty::*;
 use basis::interface::*;
@@ -868,6 +868,41 @@ fn windows_verify_owner_only(path: &str, name: &str, sid: &str) -> std::io::Resu
     Ok(())
 }
 
+/// The transaction set the NODE has packed for the height a template extends,
+/// carried exactly as the node serialized it.
+///
+/// The whole point of a pool is that it pays its OWN wallet, so it cannot reuse
+/// the node's coinbase. It does not have to. `mrklrts` is the node's merkle
+/// "prelude modify" list: the sibling hashes on the path from transaction 0 up
+/// to the root. Not one of those siblings is derived from transaction 0 (at
+/// every level the list takes element 1, which covers original leaves 2 and
+/// above), so folding a DIFFERENT coinbase hash through the same list yields
+/// exactly the merkle root of "our coinbase + the node's transactions". That is
+/// the same arithmetic the node's own `miner_success` performs, and it is what
+/// lets this pool keep the node's transactions while still paying itself.
+///
+/// `bodies` EXCLUDES the node's coinbase: slot 0 of the block is always ours.
+#[derive(Clone, Default, Debug)]
+pub struct PackedTxs {
+    /// Serialized transaction bodies, in the node's packing order, starting at
+    /// the node's transaction 1. Kept as raw bytes on purpose: a block is
+    /// serialized as `intro || tx0 || tx1 || ...` with the count living in the
+    /// intro, so these can be appended verbatim. The pool therefore never has to
+    /// decode a transaction, and cannot drop one whose type it does not know.
+    pub bodies: Vec<Vec<u8>>,
+    /// The node's merkle prelude modify list for this transaction set.
+    pub mrklrts: Vec<Hash>,
+}
+
+impl PackedTxs {
+    /// Transactions in the block this set produces, coinbase included.
+    pub fn block_tx_count(&self) -> u32 {
+        // A block can hold at most `max_block_txs` (1000 by default), so this
+        // cannot truncate in practice; saturate rather than wrap if it ever did.
+        self.bodies.len().saturating_add(1).min(u32::MAX as usize) as u32
+    }
+}
+
 /// Everything the pool needs to build and verify blocks for the current tip.
 /// The pool serves one template to all workers; each worker gets its own
 /// extranonce (the coinbase `miner_nonce`), which changes the merkle root and
@@ -883,6 +918,11 @@ pub struct Template {
     /// u32_to_hash(difficulty): on the from_big path it is more precise.
     pub target: [u8; 32],
     pub coinbase_addr: Address,
+    /// The transactions the node packed for this height, empty when the node
+    /// would not tell us. Behind an `Arc` because the pool clones a whole
+    /// template on every single share submission while holding its global lock,
+    /// and a full block of transaction bodies is up to a megabyte.
+    pub txs: Arc<PackedTxs>,
 }
 
 /// Read the chain tip and build a template for the next block, computing the
@@ -932,7 +972,182 @@ pub fn fetch_template(
         difficulty: diff_num,
         target,
         coinbase_addr: coinbase,
+        // Callers that mine a block of their own choosing (the spike tools) want
+        // exactly the transactions they pass in. `fetch_pool_template` is what
+        // attaches the node's packed set for the pool.
+        txs: Arc::new(PackedTxs::default()),
     })
+}
+
+/// How many sibling hashes `calculate_mrkl_prelude_modify` yields for a block of
+/// `n` transactions: one per merkle level above the leaves, i.e. ceil(log2(n)).
+///
+/// Used as a structural cross-check on what the node sent. A modify list that
+/// does not match the transaction count builds a merkle root the node cannot
+/// reproduce, and the block is thrown away with its entire reward.
+pub fn mrkl_modify_len_for(n: usize) -> usize {
+    let mut levels = 0usize;
+    let mut width = n;
+    while width > 1 {
+        width = width.div_ceil(2);
+        levels += 1;
+    }
+    levels
+}
+
+/// Read a `/query/miner/pending?detail&transaction&stuff` reply into the packed
+/// transaction set for `height` on top of `prevhash`.
+///
+/// Returns `Err` with an operator-readable reason on ANY doubt. The caller then
+/// mines a coinbase-only block, which is always valid, rather than gambling a
+/// whole block reward on a transaction set that may not belong to this height.
+pub fn parse_node_packed_txs(
+    j: &Value,
+    height: u64,
+    prevhash: &Hash,
+) -> Result<PackedTxs, String> {
+    if find_u64(j, "ret") != Some(0) {
+        let err = find_str(j, "err")
+            .or_else(|| find_str(j, "http_error"))
+            .unwrap_or_else(|| j.to_string());
+        return Err(format!("the node would not serve its pending block ({err})"));
+    }
+    let Some(node_hei) = find_u64(j, "height") else {
+        return Err("the node's pending block carries no height".to_string());
+    };
+    if node_hei != height {
+        return Err(format!(
+            "the node is packing height {node_hei} while this template extends {height}"
+        ));
+    }
+    // Height alone is not enough: after a same-height reorg the node repacks on a
+    // DIFFERENT parent, and those transactions were validated against a state
+    // this template does not extend.
+    let Some(node_prev) = find_str(j, "prevhash") else {
+        return Err("the node's pending block carries no prevhash".to_string());
+    };
+    let Ok(node_prev) = Hash::from_hex(node_prev.as_bytes()) else {
+        return Err("the node's pending block carries an unreadable prevhash".to_string());
+    };
+    if node_prev != *prevhash {
+        return Err(format!(
+            "the node is packing on parent {} while this template extends {}",
+            node_prev.to_hex(),
+            prevhash.to_hex()
+        ));
+    }
+    let Some(bodies_json) = find_value(j, "transaction_body_list").and_then(|v| v.as_array()) else {
+        return Err("the node's pending block carries no transaction_body_list".to_string());
+    };
+    let Some(mkrl_json) = find_value(j, "mkrl_modify_list").and_then(|v| v.as_array()) else {
+        return Err("the node's pending block carries no mkrl_modify_list".to_string());
+    };
+    if bodies_json.is_empty() {
+        return Err("the node's pending block holds no transactions at all".to_string());
+    }
+    // Slot 0 is the node's own coinbase, paying the NODE's reward address. It is
+    // dropped: this pool must pay its own wallet, and the modify list below is
+    // exactly what makes that substitution legal.
+    let mut bodies = Vec::with_capacity(bodies_json.len() - 1);
+    for item in bodies_json.iter().skip(1) {
+        let Some(text) = item.as_str() else {
+            return Err("a transaction body in the node's pending block is not a string".to_string());
+        };
+        let Ok(raw) = hex::decode(text) else {
+            return Err("a transaction body in the node's pending block is not hex".to_string());
+        };
+        if raw.is_empty() {
+            return Err("the node's pending block carries an empty transaction body".to_string());
+        }
+        bodies.push(raw);
+    }
+    let mut mrklrts = Vec::with_capacity(mkrl_json.len());
+    for item in mkrl_json {
+        let Some(text) = item.as_str() else {
+            return Err("a mkrl_modify_list entry is not a string".to_string());
+        };
+        let Ok(hx) = Hash::from_hex(text.as_bytes()) else {
+            return Err("a mkrl_modify_list entry is not a 32-byte hash".to_string());
+        };
+        mrklrts.push(hx);
+    }
+    let txn = bodies.len() + 1;
+    let want = mrkl_modify_len_for(txn);
+    if mrklrts.len() != want {
+        return Err(format!(
+            "the node sent {} merkle sibling(s) for {txn} transaction(s) but {want} are needed; \
+             mining on that would build a merkle root the node cannot reproduce",
+            mrklrts.len()
+        ));
+    }
+    Ok(PackedTxs { bodies, mrklrts })
+}
+
+/// Ask the node for the transaction set it packed for `height` on `prevhash`.
+pub fn fetch_node_packed_txs(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    height: u64,
+    prevhash: &Hash,
+) -> Result<PackedTxs, String> {
+    let j = get_json(
+        client,
+        &format!("{base}/query/miner/pending?detail=true&transaction=true&stuff=true"),
+    );
+    parse_node_packed_txs(&j, height, prevhash)
+}
+
+/// May `current`'s packed transactions simply be carried over to `fresh`?
+///
+/// Only when both describe the same block: the same height on the same parent.
+/// The node repacks only when the tip moves, and the pool likewise keeps one
+/// template for the life of a height (swapping it mid-height would change the
+/// merkle root under every worker), so carrying the set over is exactly what the
+/// pool would mine anyway - and it saves re-downloading a block's worth of
+/// transaction bodies every couple of seconds. A set that is empty is always
+/// re-asked for, so a node that starts serving its mempool is picked up and the
+/// "mining without transactions" reason stays current.
+fn packed_txs_still_apply(current: Option<&Template>, fresh: &Template) -> Option<Arc<PackedTxs>> {
+    let cur = current?;
+    if cur.txs.bodies.is_empty() || cur.height != fresh.height || cur.prevhash != fresh.prevhash {
+        return None;
+    }
+    Some(cur.txs.clone())
+}
+
+/// The template a POOL mines on: the chain tip plus the transaction set the node
+/// packed for that same height.
+///
+/// Pass the template the pool is currently serving as `current` so an unchanged
+/// tip does not re-download the node's whole transaction set.
+///
+/// The second element is `None` when the node's transactions really are in the
+/// template, and otherwise an operator-readable reason why they are not. The
+/// caller MUST surface it. A coinbase-only block earns no transaction fees, and
+/// on a chain where this pool is the only miner it also means the pool's OWN
+/// payout transactions can never confirm: they sit in the node's mempool while
+/// block after block is mined carrying nothing.
+pub fn fetch_pool_template(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    coinbase_addr: &str,
+    params: &ChainParams,
+    current: Option<&Template>,
+) -> Option<(Template, Option<String>)> {
+    let mut tpl = fetch_template(client, base, coinbase_addr, params)?;
+    if let Some(txs) = packed_txs_still_apply(current, &tpl) {
+        tpl.txs = txs;
+        return Some((tpl, None));
+    }
+    match fetch_node_packed_txs(client, base, tpl.height, &tpl.prevhash) {
+        Ok(txs) => {
+            tpl.txs = Arc::new(txs);
+            Some((tpl, None))
+        }
+        // Never refuse to mine over this: a coinbase-only block is still a valid
+        // block and still pays the round. Mine it, and say loudly why it is thin.
+        Err(why) => Some((tpl, Some(why))),
+    }
 }
 
 /// Prove the off-node difficulty rule agrees with the node BEFORE mining on it.
@@ -1022,14 +1237,23 @@ pub fn coinbase_with_extranonce(tpl: &Template, extranonce: &[u8; 32]) -> mint::
 }
 
 fn build_intro(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> BlockIntro {
+    // Keep the node's packed transactions and swap ONLY slot 0 for our coinbase,
+    // recomputing the merkle root the way the node's own `miner_success` does:
+    // fold our coinbase hash through the node's prelude modify list. With an
+    // empty list (no packed transactions) this reduces to the coinbase hash,
+    // which is exactly `calculate_mrklroot(&vec![cb.hash_with_fee()])`.
+    //
+    // The node validates `transaction_count == transaction_hash_list().len()`
+    // and `mrklroot == calculate_mrklroot(transaction_hash_list(true))`, so both
+    // fields have to move together with the body `assemble_block` writes.
     BlockIntro {
         head: BlockHead {
             version: Uint1::from(1),
             height: BlockHeight::from(tpl.height),
             timestamp: Timestamp::from(tpl.timestamp),
             prevhash: tpl.prevhash.clone(),
-            mrklroot: calculate_mrklroot(&vec![cb.hash_with_fee()]),
-            transaction_count: Uint4::from(1u32),
+            mrklroot: calculate_mrkl_prelude_update(cb.hash_with_fee(), &tpl.txs.mrklrts),
+            transaction_count: Uint4::from(tpl.txs.block_tx_count()),
         },
         meta: BlockMeta {
             nonce: Uint4::from(nonce),
@@ -1052,15 +1276,22 @@ pub fn coinbase_body_hex(cb: &mint::TransactionCoinbase) -> String {
     hex::encode(cb.serialize())
 }
 
-/// Serialized full block for a winning (extranonce, nonce).
+/// Serialized full block for a winning (extranonce, nonce): OUR coinbase in slot
+/// 0 followed by every transaction the node packed for this height.
+///
+/// A serialized `BlockV1` is exactly `intro || tx0 || tx1 || ...`, with the
+/// count living in the intro's `transaction_count` and never in the body, so
+/// the node's transaction bodies are appended verbatim. That is deliberate: the
+/// pool has no transaction codec registry installed, and decoding would silently
+/// drop (or refuse) any transaction type it did not itself know about, which is
+/// exactly the sort of thing that turns into a rejected block.
 pub fn assemble_block(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> Vec<u8> {
-    let mut txs = DynVecTransaction::default();
-    txs.push(Box::new(cb.clone())).expect("push coinbase");
-    BlockV1 {
-        intro: build_intro(tpl, cb, nonce),
-        transactions: txs,
+    let mut out = intro_bytes(tpl, cb, nonce);
+    out.extend_from_slice(&cb.serialize());
+    for body in &tpl.txs.bodies {
+        out.extend_from_slice(body);
     }
-    .serialize()
+    out
 }
 
 /// Submit already-serialized block bytes.
@@ -1150,6 +1381,8 @@ pub fn mine_and_submit_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use protocol::action::HacToTrs;
 
     /// A scratch path under the system temp dir, unique per test and per run.
     fn tmp_path(tag: &str) -> String {
@@ -1355,5 +1588,259 @@ mod tests {
         let back = decrypt_key_hex(&body, "correct horse battery").expect("decrypt");
         assert_eq!(back.trim(), key_hex);
         assert!(decrypt_key_hex(&body, "wrong passphrase").is_err());
+    }
+
+    /* ---- the pool must mine the node's transactions, not a lone coinbase ---- */
+
+    /// A distinct 32-byte hash per index, so a merkle test can talk about leaves
+    /// without needing real transactions.
+    fn leaf(i: u8) -> Hash {
+        Hash::from([i.wrapping_mul(37).wrapping_add(11); 32])
+    }
+
+    /// A template with no header fields that matter to the merkle arithmetic.
+    fn tpl_with(txs: PackedTxs) -> Template {
+        Template {
+            height: 1234,
+            prevhash: leaf(9),
+            timestamp: 1_700_000_000,
+            difficulty: LOWEST_DIFFICULTY,
+            target: [0xff; 32],
+            coinbase_addr: Address::default(),
+            txs: Arc::new(txs),
+        }
+    }
+
+    /// A real, serializable transaction to sit behind the pool's coinbase.
+    fn a_transaction(nth: u64) -> TransactionType2 {
+        let mut tx = TransactionType2::new_by(
+            Address::default(),
+            Amount::from("1:246").expect("fee"),
+            1_700_000_000 + nth,
+        );
+        let mut act = HacToTrs::new();
+        act.to = AddrOrPtr::from_addr(Address::default());
+        act.hacash = Amount::from(&format!("{}:247", nth + 1)).expect("amount");
+        tx.push_action(Box::new(act)).expect("push action");
+        tx
+    }
+
+    #[test]
+    fn the_nodes_merkle_sibling_list_survives_a_coinbase_swap() {
+        // This is the whole basis of the fix. `calculate_mrkl_prelude_modify`
+        // collects, at every level, the sibling of the leftmost element - and no
+        // sibling is ever derived from leaf 0. So the list the node computes for
+        // ITS block is equally valid for a block with the SAME transactions and a
+        // DIFFERENT transaction 0, which is what lets the pool pay its own wallet
+        // and still carry the node's transactions.
+        for n in 1..=9usize {
+            let node_list: Vec<Hash> = (0..n).map(|i| leaf(i as u8)).collect();
+            let modify = calculate_mrkl_prelude_modify(&node_list);
+            assert_eq!(
+                modify.len(),
+                mrkl_modify_len_for(n),
+                "sibling count for {n} transaction(s)"
+            );
+            // The identity the node relies on: folding leaf 0 back through the
+            // list reproduces the node's own root.
+            assert_eq!(
+                calculate_mrkl_prelude_update(node_list[0], &modify),
+                calculate_mrklroot(&node_list),
+                "prelude update must reproduce the plain root for {n} transaction(s)"
+            );
+            // The identity the POOL relies on: the same list, a different slot 0.
+            let ours = Hash::from([0xa7u8; 32]);
+            let mut swapped = node_list.clone();
+            swapped[0] = ours;
+            assert_eq!(
+                calculate_mrkl_prelude_update(ours, &modify),
+                calculate_mrklroot(&swapped),
+                "a swapped coinbase must still land on the node's root for {n} transaction(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn an_assembled_block_is_byte_identical_to_the_one_the_node_verifies() {
+        // Regression for the defect: every block this pool produced carried
+        // `txs 0`, so it collected no fees and - on a chain where the pool is the
+        // only miner - its own payouts could never confirm. The block below must
+        // now come out byte-for-byte the same as the BlockV1 the node's verifier
+        // reconstructs from those bytes, merkle root and tx count included.
+        let cb = mint::create_coinbase_tx(1234, coinbase_message(), Address::default());
+        let txs: Vec<TransactionType2> = (0..3).map(a_transaction).collect();
+
+        // What the node would build and then verify: hashes WITH fee, in order.
+        let mut hashes: Vec<Hash> = vec![cb.hash_with_fee()];
+        let mut want_txs = DynVecTransaction::default();
+        want_txs.push(Box::new(cb.clone())).expect("push coinbase");
+        for tx in &txs {
+            hashes.push(tx.hash_with_fee());
+            want_txs.push(Box::new(tx.clone())).expect("push tx");
+        }
+        let want = BlockV1 {
+            intro: BlockIntro {
+                head: BlockHead {
+                    version: Uint1::from(1),
+                    height: BlockHeight::from(1234u64),
+                    timestamp: Timestamp::from(1_700_000_000u64),
+                    prevhash: leaf(9),
+                    mrklroot: calculate_mrklroot(&hashes),
+                    transaction_count: Uint4::from(4u32),
+                },
+                meta: BlockMeta {
+                    nonce: Uint4::from(77u32),
+                    difficulty: Uint4::from(LOWEST_DIFFICULTY),
+                    witness_stage: Fixed2::default(),
+                },
+            },
+            transactions: want_txs,
+        };
+
+        // What the pool builds from ONLY the node's raw bodies and sibling list.
+        let tpl = tpl_with(PackedTxs {
+            bodies: txs.iter().map(|t| t.serialize()).collect(),
+            mrklrts: calculate_mrkl_prelude_modify(&hashes),
+        });
+        let got = assemble_block(&tpl, &cb, 77);
+        assert_eq!(
+            hex::encode(&got),
+            hex::encode(want.serialize()),
+            "the pool's block must be exactly the block the node verifies"
+        );
+        let intro = build_intro(&tpl, &cb, 77);
+        assert_eq!(*intro.head.transaction_count, 4, "coinbase plus 3 packed txs");
+        assert_eq!(
+            intro.head.mrklroot,
+            calculate_mrklroot(&hashes),
+            "the merkle root must match the node's own rule"
+        );
+    }
+
+    #[test]
+    fn a_template_with_no_packed_txs_still_builds_the_old_coinbase_only_block() {
+        // The fallback path (node will not serve its pending block) must keep
+        // producing exactly what this pool produced before, or an operator whose
+        // node has the miner disabled would stop mining altogether.
+        let cb = mint::create_coinbase_tx(1234, coinbase_message(), Address::default());
+        let tpl = tpl_with(PackedTxs::default());
+        let intro = build_intro(&tpl, &cb, 5);
+        assert_eq!(*intro.head.transaction_count, 1);
+        assert_eq!(intro.head.mrklroot, calculate_mrklroot(&vec![cb.hash_with_fee()]));
+        let mut only_cb = DynVecTransaction::default();
+        only_cb.push(Box::new(cb.clone())).expect("push coinbase");
+        let want = BlockV1 {
+            intro,
+            transactions: only_cb,
+        };
+        assert_eq!(assemble_block(&tpl, &cb, 5), want.serialize());
+    }
+
+    #[test]
+    fn merkle_sibling_counts_are_one_per_level() {
+        assert_eq!(mrkl_modify_len_for(1), 0);
+        assert_eq!(mrkl_modify_len_for(2), 1);
+        assert_eq!(mrkl_modify_len_for(3), 2);
+        assert_eq!(mrkl_modify_len_for(4), 2);
+        assert_eq!(mrkl_modify_len_for(5), 3);
+        assert_eq!(mrkl_modify_len_for(8), 3);
+        assert_eq!(mrkl_modify_len_for(9), 4);
+        assert_eq!(mrkl_modify_len_for(1000), 10);
+    }
+
+    /// A `/query/miner/pending` reply shaped exactly like the node's.
+    fn pending_reply(height: u64, prevhash: &Hash, bodies: &[&str], mkrl: &[Hash]) -> Value {
+        serde_json::json!({
+            "ret": 0,
+            "height": height,
+            "prevhash": prevhash.to_hex(),
+            "block_intro": "00",
+            "target_hash": "ff",
+            "coinbase_body": bodies.first().copied().unwrap_or("00"),
+            "transaction_body_list": bodies,
+            "mkrl_modify_list": mkrl.iter().map(|h| h.to_hex()).collect::<Vec<String>>(),
+        })
+    }
+
+    #[test]
+    fn a_pending_reply_for_this_very_height_and_parent_is_accepted() {
+        let prev = leaf(9);
+        // Node coinbase + two transactions -> the pool keeps the two, drops the
+        // coinbase, and takes the node's 2 sibling hashes.
+        let j = pending_reply(50, &prev, &["00aa", "0bb0", "0cc0"], &[leaf(1), leaf(2)]);
+        let got = parse_node_packed_txs(&j, 50, &prev).expect("a matching template is usable");
+        assert_eq!(got.bodies, vec![vec![0x0b, 0xb0], vec![0x0c, 0xc0]]);
+        assert_eq!(got.mrklrts, vec![leaf(1), leaf(2)]);
+        assert_eq!(got.block_tx_count(), 3, "our coinbase plus the node's two txs");
+        // An empty mempool is a legitimate answer, not a failure.
+        let empty = pending_reply(50, &prev, &["00aa"], &[]);
+        let got = parse_node_packed_txs(&empty, 50, &prev).expect("an empty mempool is fine");
+        assert!(got.bodies.is_empty());
+        assert_eq!(got.block_tx_count(), 1);
+    }
+
+    #[test]
+    fn a_pending_reply_that_is_not_for_this_block_is_refused() {
+        let prev = leaf(9);
+        let other = leaf(8);
+        let bodies = ["00aa", "0bb0", "0cc0"];
+        let sib = [leaf(1), leaf(2)];
+        // The chain moved under us: those transactions were validated for another
+        // height, and mining them here risks the whole block reward.
+        assert!(parse_node_packed_txs(&pending_reply(51, &prev, &bodies, &sib), 50, &prev).is_err());
+        // Same height, different parent: a reorg repacked against another state.
+        assert!(
+            parse_node_packed_txs(&pending_reply(50, &other, &bodies, &sib), 50, &prev).is_err()
+        );
+        // The node has the miner switched off, so it will not pack at all.
+        let off = serde_json::json!({"ret":1,"err":"miner not enabled"});
+        let err = parse_node_packed_txs(&off, 50, &prev).expect_err("refused");
+        assert!(err.contains("miner not enabled"), "{err}");
+        // The node was unreachable: `get_json` turns that into this shape.
+        let down = serde_json::json!({"http_error":"connection refused"});
+        assert!(parse_node_packed_txs(&down, 50, &prev).is_err());
+    }
+
+    #[test]
+    fn a_packed_set_is_carried_over_only_for_the_very_same_block() {
+        let packed = PackedTxs {
+            bodies: vec![vec![0xaa]],
+            mrklrts: vec![leaf(1)],
+        };
+        let current = tpl_with(packed.clone());
+        // Same height, same parent: the node would serve the same set, and the
+        // pool would not swap the template anyway. Reuse it.
+        let same = tpl_with(PackedTxs::default());
+        assert!(packed_txs_still_apply(Some(&current), &same).is_some());
+        // A new height, or a same-height reorg onto another parent, is a
+        // different block: those transactions were validated against a state
+        // this template does not extend.
+        let mut next = tpl_with(PackedTxs::default());
+        next.height += 1;
+        assert!(packed_txs_still_apply(Some(&current), &next).is_none());
+        let mut reorg = tpl_with(PackedTxs::default());
+        reorg.prevhash = leaf(4);
+        assert!(packed_txs_still_apply(Some(&current), &reorg).is_none());
+        // Nothing to carry over: keep asking, so a node that starts serving its
+        // mempool is picked up and the reason it will not stays current.
+        let empty = tpl_with(PackedTxs::default());
+        assert!(packed_txs_still_apply(Some(&empty), &same).is_none());
+        assert!(packed_txs_still_apply(None, &same).is_none());
+    }
+
+    #[test]
+    fn a_sibling_list_that_does_not_fit_the_transaction_count_is_refused() {
+        // A merkle root built from the wrong sibling list is one the node cannot
+        // reproduce, so the block is thrown away with its entire reward. Refusing
+        // the set costs the fees of one block; accepting it costs the block.
+        let prev = leaf(9);
+        let bodies = ["00aa", "0bb0", "0cc0", "0dd0"]; // 4 txs -> needs 2 siblings
+        let short = pending_reply(50, &prev, &bodies, &[leaf(1)]);
+        let err = parse_node_packed_txs(&short, 50, &prev).expect_err("refused");
+        assert!(err.contains("merkle sibling"), "{err}");
+        let long = pending_reply(50, &prev, &bodies, &[leaf(1), leaf(2), leaf(3)]);
+        assert!(parse_node_packed_txs(&long, 50, &prev).is_err());
+        let right = pending_reply(50, &prev, &bodies, &[leaf(1), leaf(2)]);
+        assert!(parse_node_packed_txs(&right, 50, &prev).is_ok());
     }
 }

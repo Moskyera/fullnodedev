@@ -50,7 +50,7 @@ use pool_spike::pool_core::{self, Pplns, split_payout};
 use pool_spike::{
     Admission, PAYOUT_MATURITY_DEPTH, PPLNS_WINDOW, PayoutTxState, Template, acquire_settle_lock,
     assemble_block, atomic_write, balance, balance_units, block_reward_units, classify_payout_tx,
-    coinbase_body_hex, coinbase_with_extranonce, distributable_units, fetch_template, find_str,
+    coinbase_body_hex, coinbase_with_extranonce, distributable_units, fetch_pool_template, find_str,
     find_u64, get_json, http_client, intro_bytes, is_payout_address, load_or_create_wallet,
     pool_state_path, post_hex, submit_block_bytes, verify_admitted, verify_chain_params,
 };
@@ -98,10 +98,34 @@ const HANDLER_STACK_BYTES: usize = 1024 * 1024;
 /// a network block. See `check_share_factor` for why both ends matter.
 const MIN_SHARE_FACTOR: u32 = 18;
 const MAX_SHARE_FACTOR: u32 = 40;
+/// Consecutive above-target submissions from one worker before the pool shouts.
+/// A worker that hashes the same header the pool reconstructs essentially never
+/// produces one, because it only submits what already beat the target it was
+/// handed. A steady stream of them means the two are hashing DIFFERENT headers,
+/// and every one of that worker's shares is being thrown away.
+const BAD_STREAK_WARN: u64 = 16;
+/// Workers tracked by the above-target streak counter. Bounded so a flood of
+/// invented worker ids cannot grow memory; the diagnostic is for real miners.
+const BAD_STREAK_WORKERS: usize = 4096;
+/// How long the "mining without the node's transactions" warning is suppressed
+/// after being printed with the same reason. The template loop runs every couple
+/// of seconds, so without this the warning would be the whole log.
+const TX_WARN_REPEAT: Duration = Duration::from_secs(300);
+/// Template cycles a submitted block may go unnoticed by the chain before the
+/// pool shouts. `/submit/block` validates ASYNCHRONOUSLY and answers before the
+/// verdict, so the only evidence a block was refused is that the tip never
+/// reaches its height. At roughly one cycle every two seconds this is about two
+/// minutes, far longer than a node needs to insert a block it accepted.
+const BLOCK_STALL_CYCLES: u32 = 60;
 
 static CONNS: AtomicUsize = AtomicUsize::new(0);
 static NOTICE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 static PER_IP: LazyLock<Mutex<HashMap<IpAddr, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Last printed reason (and when) for mining without the node's transactions.
+static TX_WARN: LazyLock<Mutex<Option<(String, Instant)>>> = LazyLock::new(|| Mutex::new(None));
+/// Submitted blocks the chain has not reached yet, and for how many cycles.
+static BLOCK_STALL: LazyLock<Mutex<HashMap<(u64, [u8; 32]), u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Lock the pool, recovering from a poisoned mutex instead of cascading panics.
 /// With panic=unwind a handler that panics under the lock poisons it; recovering
@@ -237,6 +261,13 @@ struct Pool {
     /// payout, so this drives an escalating warning instead of silence. Purely a
     /// diagnostic, so it is deliberately not persisted.
     settle_stalls: u64,
+    /// Consecutive above-target submissions per worker, cleared by that worker's
+    /// next accepted share. The pool never trusts a worker's own header: it
+    /// rebuilds the header from (height, coinbase_nonce, block_nonce) and hashes
+    /// that, so a worker computing a different merkle root is REJECTED rather
+    /// than credited - it cannot steal, but it also cannot earn, and counting
+    /// those rejects in silence is how a worker mines for nothing all day.
+    bad_streak: HashMap<String, u64>,
 }
 
 impl Pool {
@@ -264,17 +295,18 @@ impl Pool {
 
     /// Rebuild the cached standard-API pending response for the current template.
     fn rebuild_pending_cache(&mut self) {
-        let cb = coinbase_with_extranonce(&self.tpl, &[0u8; 32]);
-        let intro = intro_bytes(&self.tpl, &cb, 0);
-        self.pending_cache = json!({
-            "ret": 0,
-            "height": self.tpl.height,
-            "block_intro": hex::encode(intro),
-            "target_hash": hex::encode(self.share_target),
-            "coinbase_body": coinbase_body_hex(&cb),
-            "mkrl_modify_list": [],
-        })
-        .to_string();
+        self.pending_cache = pending_cache_json(&self.tpl, &self.share_target);
+    }
+
+    /// Record one above-target submission. Returns the streak length when the
+    /// pool should shout about it.
+    fn note_bad_share(&mut self, worker: &str) -> Option<u64> {
+        bump_bad_streak(&mut self.bad_streak, worker)
+    }
+
+    /// A share was accepted: this worker and the pool agree on the header again.
+    fn note_good_share(&mut self, worker: &str) {
+        self.bad_streak.remove(worker);
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
@@ -422,6 +454,50 @@ impl Pool {
     }
 }
 
+/// Count one above-target submission from `worker`, returning the streak length
+/// when it is time to shout.
+///
+/// Shouts at `BAD_STREAK_WARN` and at every further multiple, so a worker that
+/// never recovers keeps saying so without turning the log into noise. The map is
+/// bounded: a flood of invented worker ids must not grow memory, and the
+/// diagnostic exists for real miners.
+fn bump_bad_streak(streaks: &mut HashMap<String, u64>, worker: &str) -> Option<u64> {
+    if !streaks.contains_key(worker) && streaks.len() >= BAD_STREAK_WORKERS {
+        return None;
+    }
+    let n = streaks.entry(worker.to_string()).or_insert(0);
+    *n += 1;
+    (*n >= BAD_STREAK_WARN && *n % BAD_STREAK_WARN == 0).then_some(*n)
+}
+
+/// The standard-API `/query/miner/pending` body for a template.
+///
+/// `mkrl_modify_list` is NOT optional once the template carries the node's
+/// transactions. A worker rebuilds the merkle root from its OWN coinbase nonce
+/// folded through this list; serving an empty list while the block holds
+/// transactions makes the worker hash a header the pool never reconstructs, so
+/// every share it finds is rejected. The pool used to hard-code `[]` here, which
+/// was safe only because its blocks were always coinbase-only.
+fn pending_cache_json(tpl: &Template, share_target: &[u8; 32]) -> String {
+    let cb = coinbase_with_extranonce(tpl, &[0u8; 32]);
+    let intro = intro_bytes(tpl, &cb, 0);
+    let mkrl: Vec<String> = tpl
+        .txs
+        .mrklrts
+        .iter()
+        .map(|h| hex::encode(h.serialize()))
+        .collect();
+    json!({
+        "ret": 0,
+        "height": tpl.height,
+        "block_intro": hex::encode(intro),
+        "target_hash": hex::encode(share_target),
+        "coinbase_body": coinbase_body_hex(&cb),
+        "mkrl_modify_list": mkrl,
+    })
+    .to_string()
+}
+
 /// Refuse a share size that would make the equal-weight PPLNS window unfair.
 ///
 /// Every accepted share is credited with weight 1, and the network difficulty in
@@ -522,7 +598,7 @@ fn main() {
         eprintln!("REFUSING to start: {e}");
         std::process::exit(2);
     }
-    let tpl = fetch_template(&client, &node, &payout, &params)
+    let (tpl, txs_note) = fetch_pool_template(&client, &node, &payout, &params, None)
         .expect("could not fetch an initial template — is the node running and synced?");
     let network_target = tpl.target;
 
@@ -531,9 +607,15 @@ fn main() {
     println!("share   = 2^{share_factor} easier than a network block");
     println!("settle  = every {settle_secs}s");
     println!(
-        "height  = {} (template, difficulty {})",
-        tpl.height, tpl.difficulty
+        "height  = {} (template, difficulty {}, {} packed tx(s) from the node)",
+        tpl.height,
+        tpl.difficulty,
+        tpl.txs.bodies.len()
     );
+    // Say at startup, not only on the next cycle, whether this pool will mine the
+    // node's transactions. Mining empty blocks is the failure that leaves the
+    // pool's own payouts stuck in the mempool forever.
+    report_packed_txs(txs_note.as_deref());
 
     let mut pool = Pool {
         node: node.clone(),
@@ -559,6 +641,7 @@ fn main() {
         state_seq: 0,
         settle_pending_txs: Vec::new(),
         settle_stalls: 0,
+        bad_streak: HashMap::new(),
     };
     pool.load_state();
     pool.rebuild_pending_cache();
@@ -668,12 +751,34 @@ fn template_cycle(
     payout: &str,
     params: &ChainParams,
 ) {
-    let fresh = fetch_template(client, node, payout, params);
-    let (pending, immature) = {
+    // Cloning the live template is cheap (its transaction set is behind an Arc)
+    // and lets an unchanged tip skip re-downloading a whole block of bodies.
+    let (current, pending, immature) = {
         let p = plock(pool);
-        (p.submitted.clone(), p.immature.clone())
+        (p.tpl.clone(), p.submitted.clone(), p.immature.clone())
     };
+    let fresh = fetch_pool_template(client, node, payout, params, Some(&current));
+    if let Some((_, why)) = fresh.as_ref() {
+        report_packed_txs(why.as_deref());
+    }
+    let fresh = fresh.map(|(t, _)| t);
     let tip = fresh.as_ref().map(|t| t.height.saturating_sub(1));
+    // A block the node refused leaves no other trace than the tip never reaching
+    // its height, so watch for exactly that and say it out loud.
+    let stalled = {
+        let mut st = BLOCK_STALL.lock().unwrap_or_else(|e| e.into_inner());
+        note_block_stalls(&mut st, &pending, tip)
+    };
+    for (h, hx) in stalled {
+        eprintln!(
+            "[block] the chain has STILL not reached height {h}, long after we submitted our \
+             block {} there. /submit/block validates asynchronously and answers before the \
+             verdict, so a refusal is silent: this block was almost certainly rejected and its \
+             whole reward is lost. If the pool is packing the node's transactions, the likeliest \
+             cause is that one of them was no longer valid by the time the block was submitted.",
+            hex::encode(hx)
+        );
+    }
     // One node query per height, shared by the confirm/orphan tally and by the
     // coinbase-maturity gate below.
     let mut heights: Vec<u64> = pending
@@ -741,6 +846,15 @@ fn template_cycle(
             // a same-height reorg (different prev-hash). At the same height and
             // same prev-hash the timestamp/difficulty are fixed, so keeping the
             // template valid keeps every worker's in-flight share valid.
+            //
+            // The packed transaction set is pinned to the template for exactly
+            // the same reason, and that is now load-bearing: the set determines
+            // the merkle root, so swapping it mid-height would make every share
+            // already found for this height - and every batch still running -
+            // hash a header the pool no longer reconstructs. Every one of them
+            // would be rejected. The node behaves the same way (it repacks only
+            // when its own tip moves), so nothing is lost by waiting: a
+            // transaction that arrives mid-height is packed into the next block.
             let changed = t.height != p.tpl.height || t.prevhash != p.tpl.prevhash;
             if changed {
                 p.tpl = t;
@@ -767,6 +881,86 @@ fn template_cycle(
         }
     }
     flush_state(shot);
+}
+
+/// Report whether this pool is mining the node's transactions or a lone
+/// coinbase, without turning the log into one line every two seconds.
+///
+/// A coinbase-only block is the defect this reporting exists for: it earns no
+/// transaction fees, and on a chain where this pool is the only miner it means
+/// the pool's OWN payout transactions can never confirm. They sit in the node's
+/// mempool while block after block is mined carrying nothing.
+fn report_packed_txs(why: Option<&str>) {
+    let mut st = TX_WARN.lock().unwrap_or_else(|e| e.into_inner());
+    match why {
+        Some(why) => {
+            if should_warn_now(&mut st, why, Instant::now()) {
+                eprintln!(
+                    "[template] mining WITHOUT the node's transactions: {why}.\n\
+                     Every block this pool finds will carry nothing but its coinbase, so it \
+                     collects no transaction fees, and on a chain where this pool is the only \
+                     miner its OWN payouts can never confirm - they wait in the mempool while \
+                     every block is mined with 0 transactions.\n\
+                     Fix: the node must serve /query/miner/pending, which needs `enable = true` \
+                     and a reward address under `[miner]` in the node's config."
+                );
+            }
+        }
+        None => {
+            if st.take().is_some() {
+                println!("[template] the node's packed transactions are available again");
+            }
+        }
+    }
+}
+
+/// Print the packed-transaction warning now? The first occurrence and every
+/// change of reason go out immediately; an unchanged reason repeats at most once
+/// every `TX_WARN_REPEAT` so the operator is reminded without being buried.
+fn should_warn_now(
+    state: &mut Option<(String, Instant)>,
+    why: &str,
+    now: Instant,
+) -> bool {
+    match state {
+        Some((prev, at)) if prev == why && now.duration_since(*at) < TX_WARN_REPEAT => false,
+        _ => {
+            *state = Some((why.to_string(), now));
+            true
+        }
+    }
+}
+
+/// Count how long each submitted block has gone without the chain reaching its
+/// height, and return the ones that just crossed `BLOCK_STALL_CYCLES`.
+///
+/// Counted ONLY while the tip is actually known, so a node that is merely
+/// unreachable never trips it. An entry clears the moment the chain reaches that
+/// height (accepted, or orphaned by someone else's block, which the confirm
+/// tally reports separately) or the moment the pool stops tracking the block.
+fn note_block_stalls(
+    state: &mut HashMap<(u64, [u8; 32]), u32>,
+    pending: &[(u64, [u8; 32])],
+    tip: Option<u64>,
+) -> Vec<(u64, [u8; 32])> {
+    let Some(tip) = tip else {
+        return Vec::new();
+    };
+    state.retain(|key, _| pending.contains(key));
+    let mut shout = Vec::new();
+    for key in pending {
+        if key.0 <= tip {
+            state.remove(key);
+            continue;
+        }
+        let n = state.entry(*key).or_insert(0);
+        *n += 1;
+        // Exactly at the threshold: one loud line per lost block, not a stream.
+        if *n == BLOCK_STALL_CYCLES {
+            shout.push(*key);
+        }
+    }
+    shout
 }
 
 /// Has the chain stacked COINBASE_MATURITY_DEPTH blocks on top of height `h`?
@@ -1210,6 +1404,20 @@ fn handle_submission(
     let intro = intro_bytes(&tpl, &cb, block_nonce);
     let hash = pool_core::hash_of(tpl.height, &intro);
     if !pool_core::beats(&hash, &share_target) {
+        // The pool never trusts a worker's own header: it rebuilds one from
+        // (height, coinbase_nonce, block_nonce) and hashes THAT, so a worker
+        // that computes a different merkle root has its shares rejected rather
+        // than credited. It cannot steal - but it also cannot earn, and a silent
+        // reject counter is how a miner burns a day of hashrate for nothing.
+        if let Some(streak) = plock(pool).note_bad_share(worker) {
+            eprintln!(
+                "[{worker}] {streak} shares IN A ROW hashed above the share target. The pool \
+                 rebuilds every share's header itself, so this worker is hashing a DIFFERENT \
+                 header than the pool: the usual cause is a worker that ignores the \
+                 `mkrl_modify_list` in /query/miner/pending and so builds a different merkle \
+                 root. Nothing this worker submits can be credited until that is fixed."
+            );
+        }
         return json!({"ok":false,"kind":"invalid","err":"above share target"});
     }
     let is_block = pool_core::beats(&hash, &network_target);
@@ -1234,11 +1442,15 @@ fn handle_submission(
             return json!({"ok":false,"kind":"duplicate"});
         }
         p.pplns.record(worker);
+        p.note_good_share(worker);
         p.accepted += 1;
         if !is_block {
             (Commit::Share(p.accepted), p.note_share_saved())
         } else {
-            let bytes = assemble_block(&tpl, &cb, block_nonce);
+            // Serializing the block is deliberately NOT done here: it now copies
+            // the node's whole transaction set, and every other miner's request
+            // is serialized behind this mutex. It needs nothing but the phase-1
+            // snapshot, so phase 4 builds it with the lock released.
             let solved = tpl.height;
             p.submitted.push((solved, hash)); // counted once the bg thread sees it stick
             // Hold this block's coinbase back from settlement until the chain has
@@ -1246,7 +1458,7 @@ fn handle_submission(
             // inserted, so without this the very next settle tick would pay out
             // income that is 0-1 confirmations deep.
             p.immature.push((solved, hash, block_reward_units(solved)));
-            (Commit::Block(bytes), p.state_shot(true))
+            (Commit::Block, p.state_shot(true))
         }
     };
 
@@ -1254,16 +1466,49 @@ fn handle_submission(
     // block goes out, so a crash right after submitting still knows about it.
     flush_state(shot);
 
-    let block_bytes = match commit {
+    match commit {
         Commit::Share(accepted) => {
             return json!({"ok":true,"kind":"share","accepted":accepted});
         }
-        Commit::Block(bytes) => bytes,
-    };
+        Commit::Block => {}
+    }
 
-    // Phase 4 — no lock: submit the winning block.
+    // Phase 4 - no lock: serialize and submit the winning block. This is where
+    // the node's packed transactions are carried into the block: OUR coinbase in
+    // slot 0, then every transaction the node packed for this height, with a
+    // merkle root folded from the node's own sibling list.
+    let block_bytes = assemble_block(&tpl, &cb, block_nonce);
+    let packed = tpl.txs.bodies.len();
     let submit = submit_block_bytes(&client, &node, &block_bytes);
+    // The submit answer used to go only into the JSON the winning worker reads,
+    // so an outright refusal - a whole block reward - never reached the operator.
+    if block_submit_refused(&submit) {
+        eprintln!(
+            "[block] the node REFUSED our block at height {height} ({packed} packed tx(s), {} \
+             bytes): {submit}. That block's entire reward is lost.",
+            block_bytes.len()
+        );
+    } else {
+        println!(
+            "[block] submitted height {height} carrying {packed} packed tx(s) ({} bytes): \
+             {submit}",
+            block_bytes.len()
+        );
+    }
     json!({"ok":true,"kind":"block","solved_height":height,"submit":submit})
+}
+
+/// Did `/submit/block` refuse the block outright?
+///
+/// The node validates asynchronously, so `ret:0` means only "parsed and queued"
+/// and is NOT proof of acceptance - `note_block_stalls` is what catches a later
+/// silent refusal. But `ret:1`, a transport failure, or an unparseable answer
+/// are definitive, and each one costs a whole block reward.
+fn block_submit_refused(resp: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(resp) {
+        Ok(j) => find_u64(&j, "ret") != Some(0),
+        Err(_) => true,
+    }
 }
 
 /// Should the per-height share rate limiter refuse this submission?
@@ -1279,10 +1524,11 @@ fn share_limiter_rejects(seen_len: usize, is_block: bool) -> bool {
 }
 
 /// What phase 3 of a submission decided, carried out of the lock scope so the
-/// answer is built (and the state written) with the pool mutex released.
+/// answer is built (and the state written, and the block serialized) with the
+/// pool mutex released.
 enum Commit {
     Share(u64),
-    Block(Vec<u8>),
+    Block,
 }
 
 fn hash32(s: &str) -> Option<[u8; 32]> {
@@ -1539,7 +1785,8 @@ fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pool_spike::admission_of;
+    use pool_spike::{PackedTxs, admission_of};
+    use std::sync::Arc;
 
     #[test]
     fn a_same_height_reorg_keeps_already_credited_solutions() {
@@ -1673,6 +1920,165 @@ mod tests {
         assert!(!share_limiter_rejects(SEEN_CAP - 1, false));
         assert!(!share_limiter_rejects(0, false));
         assert!(!share_limiter_rejects(usize::MAX, true));
+    }
+
+    /* ---- the pool must mine (and serve) the node's transaction set ---- */
+
+    fn a_template(txs: PackedTxs) -> Template {
+        Template {
+            height: 4321,
+            prevhash: Hash::from([0x5au8; 32]),
+            timestamp: 1_700_000_000,
+            difficulty: 0x2000_0000,
+            target: [0xff; 32],
+            coinbase_addr: Address::default(),
+            txs: Arc::new(txs),
+        }
+    }
+
+    #[test]
+    fn a_worker_is_served_the_merkle_siblings_it_needs() {
+        // Regression: the pool hard-coded `"mkrl_modify_list": []`. That was only
+        // safe while its blocks were coinbase-only. A standard worker rebuilds
+        // the merkle root from its OWN coinbase nonce folded through this list,
+        // so serving an empty list for a block that carries transactions makes
+        // every share that worker finds hash to something the pool never
+        // reconstructs, and be rejected wholesale.
+        let siblings = vec![Hash::from([0x11u8; 32]), Hash::from([0x22u8; 32])];
+        let tpl = a_template(PackedTxs {
+            bodies: vec![vec![0xaa], vec![0xbb], vec![0xcc]],
+            mrklrts: siblings.clone(),
+        });
+        let body: serde_json::Value =
+            serde_json::from_str(&pending_cache_json(&tpl, &[0x7f; 32])).expect("json");
+        let served: Vec<String> = body["mkrl_modify_list"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|v| v.as_str().expect("hex string").to_string())
+            .collect();
+        assert_eq!(
+            served,
+            siblings.iter().map(|h| hex::encode(h.serialize())).collect::<Vec<_>>(),
+            "the worker must get the same siblings the pool folds through"
+        );
+        assert_eq!(body["height"].as_u64(), Some(4321));
+        // The header the worker is handed must already claim all four
+        // transactions, or the node rejects the block it eventually builds.
+        let intro = hex::decode(body["block_intro"].as_str().expect("intro")).expect("hex");
+        assert_eq!(intro.len(), 89);
+        assert_eq!(
+            u32::from_be_bytes(intro[75..79].try_into().unwrap()),
+            4,
+            "coinbase plus the node's three transactions"
+        );
+        // A template with nothing packed still serves an empty list, exactly as
+        // before, so the coinbase-only fallback is unchanged for workers.
+        let bare: serde_json::Value =
+            serde_json::from_str(&pending_cache_json(&a_template(PackedTxs::default()), &[0x7f; 32]))
+                .expect("json");
+        assert_eq!(bare["mkrl_modify_list"].as_array().map(|a| a.len()), Some(0));
+    }
+
+    #[test]
+    fn a_worker_whose_every_share_is_rejected_is_shouted_about() {
+        // The pool rebuilds each share's header itself, so a worker that computes
+        // a different merkle root is REJECTED, never credited - it cannot steal.
+        // But it also cannot earn, and a silent reject counter is how a miner
+        // burns a day of hashrate for nothing.
+        let mut streaks: HashMap<String, u64> = HashMap::new();
+        for _ in 1..BAD_STREAK_WARN {
+            assert_eq!(bump_bad_streak(&mut streaks, "miner-a"), None);
+        }
+        assert_eq!(bump_bad_streak(&mut streaks, "miner-a"), Some(BAD_STREAK_WARN));
+        // It keeps saying so, but only at each further multiple.
+        for _ in 1..BAD_STREAK_WARN {
+            assert_eq!(bump_bad_streak(&mut streaks, "miner-a"), None);
+        }
+        assert_eq!(
+            bump_bad_streak(&mut streaks, "miner-a"),
+            Some(BAD_STREAK_WARN * 2)
+        );
+        // One accepted share means the two agree again: the streak restarts.
+        streaks.remove("miner-a");
+        assert_eq!(bump_bad_streak(&mut streaks, "miner-a"), None);
+        // Streaks are per worker, so one broken miner never accuses another.
+        assert_eq!(bump_bad_streak(&mut streaks, "miner-b"), None);
+        // Bounded: a flood of invented ids must not grow memory without limit.
+        let mut flood: HashMap<String, u64> = (0..BAD_STREAK_WORKERS)
+            .map(|i| (format!("w{i}"), 1u64))
+            .collect();
+        assert_eq!(bump_bad_streak(&mut flood, "one-too-many"), None);
+        assert_eq!(flood.len(), BAD_STREAK_WORKERS);
+        // A worker already tracked still counts once the map is full.
+        assert!(flood.contains_key("w0"));
+        bump_bad_streak(&mut flood, "w0");
+        assert_eq!(flood["w0"], 2);
+    }
+
+    #[test]
+    fn a_block_the_chain_never_reaches_is_reported_once() {
+        // /submit/block validates asynchronously and answers before the verdict,
+        // so a refused block leaves no trace but a tip that never gets there. On
+        // a chain where this pool is the only miner that is total silence.
+        let mut state: HashMap<(u64, [u8; 32]), u32> = HashMap::new();
+        let ours = (100u64, [7u8; 32]);
+        let pending = [ours];
+        // No tip this cycle (node unreachable): never accuse it.
+        for _ in 0..BLOCK_STALL_CYCLES * 2 {
+            assert!(note_block_stalls(&mut state, &pending, None).is_empty());
+        }
+        assert!(state.is_empty());
+        for _ in 1..BLOCK_STALL_CYCLES {
+            assert!(note_block_stalls(&mut state, &pending, Some(99)).is_empty());
+        }
+        assert_eq!(
+            note_block_stalls(&mut state, &pending, Some(99)),
+            vec![ours],
+            "the chain has not reached our height for far too long"
+        );
+        // Exactly once: it must not repeat every two seconds afterwards.
+        for _ in 0..BLOCK_STALL_CYCLES {
+            assert!(note_block_stalls(&mut state, &pending, Some(99)).is_empty());
+        }
+        // The chain reaching that height clears it, whatever block landed there
+        // (accepted, or orphaned - the confirm tally reports that separately).
+        assert!(note_block_stalls(&mut state, &pending, Some(100)).is_empty());
+        assert!(state.is_empty());
+        // A block the pool stopped tracking is dropped rather than leaked.
+        note_block_stalls(&mut state, &pending, Some(99));
+        assert_eq!(state.len(), 1);
+        note_block_stalls(&mut state, &[], Some(99));
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn a_refused_block_submission_is_recognised_as_a_refusal() {
+        // A refusal costs a whole block reward, and it used to reach nobody but
+        // the winning worker's JSON response.
+        assert!(!block_submit_refused(r#"{"ret":0,"ok":true}"#));
+        assert!(block_submit_refused(r#"{"ret":1,"err":"block parse failed"}"#));
+        assert!(block_submit_refused("http_error: connection refused"));
+        assert!(block_submit_refused("<html>502 Bad Gateway</html>"));
+        assert!(block_submit_refused(""));
+    }
+
+    #[test]
+    fn the_empty_block_warning_repeats_without_flooding() {
+        // The template loop runs every couple of seconds. The operator has to be
+        // told, and has to keep being told, without the warning becoming the
+        // entire log.
+        let mut state: Option<(String, Instant)> = None;
+        let t0 = Instant::now();
+        assert!(should_warn_now(&mut state, "miner not enabled", t0));
+        assert!(!should_warn_now(&mut state, "miner not enabled", t0));
+        assert!(
+            !should_warn_now(&mut state, "miner not enabled", t0 + TX_WARN_REPEAT - Duration::from_secs(1))
+        );
+        assert!(should_warn_now(&mut state, "miner not enabled", t0 + TX_WARN_REPEAT));
+        // A different reason is news, whenever it arrives.
+        assert!(should_warn_now(&mut state, "packing another height", t0 + TX_WARN_REPEAT));
+        assert!(!should_warn_now(&mut state, "packing another height", t0 + TX_WARN_REPEAT));
     }
 
     #[test]
