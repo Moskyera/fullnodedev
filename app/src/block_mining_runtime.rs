@@ -54,6 +54,17 @@ const SUBMIT_GATE_HEIGHT_WINDOW: u64 = 8;
 /// Hard ceiling on gate entries, so a burst of same-height reorgs cannot grow the
 /// map even while the height itself stands still.
 const SUBMIT_GATE_MAX_TEMPLATES: usize = 64;
+/// How long one template is left alone after a pool answered `kind:"busy"`.
+///
+/// "Busy" means the pool is shedding load (pool-spike refuses a share once it is
+/// already holding its cap for that height), so the very next winner would be
+/// refused too and hammering it makes the overload worse. Two seconds is an order
+/// of magnitude longer than the 123 ms result drain tick, so the drain cadence
+/// cannot defeat the back-off, and it is a tiny fraction of the 300 s target block
+/// time, so a full network block found while the pool was busy is retried long
+/// before the height can be lost. The template stays ALIVE throughout: this only
+/// spaces the retries out.
+const POOL_BUSY_COOLDOWN: Duration = Duration::from_secs(2);
 const MINING_INTERVAL: f64 = 3.0;
 const WORKER_RATE_STALE_MS: u64 = 15_000;
 const HASHRATE_EWMA_NEW_WEIGHT: f64 = 0.25;
@@ -295,27 +306,55 @@ fn send_mining_result(
     }
 }
 
-/// What the NODE said about one submitted winner.
+/// What the UPSTREAM said about one submitted winner.
 ///
 /// `poworker::push_block_mining_success` returns `()`, so the classification the
-/// per-template gate needs (a definitive node verdict versus never having reached
-/// the node at all) is made here, next to the gate that consumes it.
+/// per-template gate needs (a definitive upstream verdict versus never having
+/// reached the upstream at all) is made here, next to the gate that consumes it.
+///
+/// Two upstreams speak here and they answer in different dialects. A FULLNODE
+/// replies `{"ret":0,"mining":"success"}` or `{"ret":1,"err":"<text>"}`, so its
+/// meaning is carried by the error TEXT. A POOL replies `{"ret":0|1,"kind":"<word>"}`
+/// and carries no `err` at all, so its meaning is carried by the KIND. Both are
+/// classified below; reading only the fullnode dialect made every pool answer look
+/// like "a rejection about this one submission".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubmitVerdict {
-    /// `ret:0` / `"mining":"success"`. The block was accepted, so the height is
-    /// filled and the node dropped its pending entry for it: no later winner for
-    /// this template can ever be taken.
+    /// `ret:0` / `"mining":"success"` (fullnode), or `ret:0` / `"kind":"block"`
+    /// (pool: it relayed a full NETWORK block). The block was accepted, so the
+    /// height is filled and the node dropped its pending entry for it: no later
+    /// winner for this template can ever be taken.
     Accepted,
-    /// The node answered, and the answer proves the TEMPLATE is gone or unusable
-    /// ("pending block height N not found", "pending block not ready", a
-    /// difficulty check failure, which means the node rebuilt the hash from a
-    /// template that is not the one we mined). Later winners for it are dead too.
+    /// `ret:0` / `"kind":"share"` (pool). A PPLNS share was CREDITED and the pool
+    /// wants every further share for the same template. On mainnet the share
+    /// target is orders of magnitude easier than the network target, so this is
+    /// the OVERWHELMINGLY common pool answer and each one of them is paid work.
+    /// It must never settle the template and must never count a later winner as
+    /// redundant, or the miner silently stops submitting the shares it is paid for.
+    ShareCredited,
+    /// The upstream answered, and the answer proves the TEMPLATE is gone or
+    /// unusable: the fullnode's "pending block height N not found", "pending block
+    /// not ready" or a difficulty check failure (it rebuilt the hash from a
+    /// template that is not the one we mined), or a pool's `"kind":"stale"`, which
+    /// says outright that it has moved to another job. Later winners are dead too.
     TemplateGone,
-    /// The node answered, but about THIS submission only. Nothing is proved about
-    /// the template, so a later winner still deserves its own attempt.
+    /// `ret:1` / `"kind":"busy"` (pool). The pool is shedding load, NOT refusing
+    /// the template: it is still live work. Retry, but not immediately, so a miner
+    /// finding hundreds of nonces a second does not hammer an upstream that just
+    /// said it is overloaded (see `POOL_BUSY_COOLDOWN`).
+    UpstreamBusy,
+    /// `ret:1` / `"kind":"duplicate"` (pool). This exact (height, coinbase_nonce,
+    /// block_nonce) was already credited. Nothing is proved about the template and
+    /// a DIFFERENT nonce is still wanted, so it stays open; resending this same
+    /// submission is the one thing that cannot help.
+    DuplicateSubmission,
+    /// The upstream answered, but about THIS submission only (a fullnode error
+    /// text that is not one of the template rules, or a pool's `"kind":"invalid"`).
+    /// Nothing is proved about the template, so a later winner still deserves its
+    /// own attempt.
     SubmissionRejected,
-    /// No node verdict at all: connection refused, timeout, or a body carrying no
-    /// `ret` (proxy error page, truncated reply). A network hiccup must never
+    /// No upstream verdict at all: connection refused, timeout, or a body carrying
+    /// no `ret` (proxy error page, truncated reply). A network hiccup must never
     /// suppress a height.
     NoNodeVerdict,
 }
@@ -326,11 +365,31 @@ impl SubmitVerdict {
         matches!(self, SubmitVerdict::Accepted | SubmitVerdict::TemplateGone)
     }
 
+    /// True when the upstream PAID for this winner and wants the next one. The
+    /// gate stops suppressing redundant winners for such a template: on a pool
+    /// every further share is separately payable, so dropping one is lost income.
+    fn credits_share(self) -> bool {
+        matches!(self, SubmitVerdict::ShareCredited)
+    }
+
+    /// How long to leave this template alone before submitting for it again.
+    /// Only an overloaded upstream asks for that; every other verdict is either
+    /// final or immediately retryable.
+    fn retry_cooldown(self) -> Option<Duration> {
+        match self {
+            SubmitVerdict::UpstreamBusy => Some(POOL_BUSY_COOLDOWN),
+            _ => None,
+        }
+    }
+
     /// Wording for the single per-template operator line.
     fn outcome_text(self) -> &'static str {
         match self {
             SubmitVerdict::Accepted => "settled (accepted)",
-            SubmitVerdict::TemplateGone => "settled (template gone)",
+            SubmitVerdict::ShareCredited => "retired with its last share credited",
+            SubmitVerdict::TemplateGone => "settled (template gone or stale)",
+            SubmitVerdict::UpstreamBusy => "retired while the upstream was busy",
+            SubmitVerdict::DuplicateSubmission => "retired after a duplicate submission",
             SubmitVerdict::SubmissionRejected => "retired after a submission rejection",
             SubmitVerdict::NoNodeVerdict => "retired without a node verdict",
         }
@@ -347,11 +406,36 @@ fn node_error_ends_template(err: &str) -> bool {
         || err.contains("difficulty check failed")
 }
 
-/// Classify one `/submit/miner/success` reply, returning the verdict and the node
-/// error text alongside it.
+/// The POOL dialect of `/submit/miner/success`: `{"ret":0|1,"kind":"<word>"}`,
+/// with no `err` text at all for most kinds (the pool's miner-API arm keeps only
+/// `ret` and `kind`). `None` means no `kind` we know, so the fullnode rules below
+/// decide instead.
+///
+/// The kinds come straight from pool-spike's `handle_submission`:
+///   `block`     the pool relayed a full network block: the template is DEAD.
+///   `share`     a PPLNS share was credited: the template is ALIVE and paying.
+///   `stale`     the pool has moved to another job: DEAD.
+///   `busy`      too many shares held for this height: ALIVE, back off.
+///   `duplicate` this exact (height, coinbase_nonce, block_nonce) was seen: ALIVE.
+///   `invalid`   this one submission is bad (bad nonce, above share target, or an
+///               unknown worker): ALIVE.
+fn pool_kind_verdict(ret: i64, kind: &str) -> Option<SubmitVerdict> {
+    match kind {
+        "block" if ret == 0 => Some(SubmitVerdict::Accepted),
+        "share" if ret == 0 => Some(SubmitVerdict::ShareCredited),
+        "stale" => Some(SubmitVerdict::TemplateGone),
+        "busy" => Some(SubmitVerdict::UpstreamBusy),
+        "duplicate" => Some(SubmitVerdict::DuplicateSubmission),
+        "invalid" => Some(SubmitVerdict::SubmissionRejected),
+        _ => None,
+    }
+}
+
+/// Classify one `/submit/miner/success` reply, returning the verdict and the
+/// upstream's reason text alongside it.
 ///
 /// `None` means the body carries no numeric `ret` at all (proxy error page,
-/// truncated or non-JSON body). That is NOT a node decision, so the caller
+/// truncated or non-JSON body). That is NOT an upstream decision, so the caller
 /// retries instead of treating a front-end hiccup as a rejection.
 fn classify_submit_response(body: &str) -> Option<(SubmitVerdict, String)> {
     let parsed = serde_json::from_str::<JV>(body).ok()?;
@@ -363,7 +447,25 @@ fn classify_submit_response(body: &str) -> Option<(SubmitVerdict, String)> {
         .or_else(|| parsed["msg"].as_str())
         .unwrap_or("")
         .to_string();
+    // A pool states its meaning in `kind` and sends no error text, so this is read
+    // first: falling through to the text rules classified every one of its answers
+    // as a rejection of one submission, which re-opened a template the pool had
+    // already declared stale and let every later winner pay for another round trip.
+    let kind = parsed["kind"].as_str().unwrap_or("");
+    if let Some(verdict) = pool_kind_verdict(ret, kind) {
+        let reason = if err.is_empty() {
+            format!("kind \"{kind}\"")
+        } else {
+            format!("kind \"{kind}\": {err}")
+        };
+        return Some((verdict, reason));
+    }
     if ret == 0 {
+        // An unmarked success keeps the meaning it has always had here: the
+        // fullnode's own success carries `"mining":"success"`, and older or
+        // proxied fullnode builds answer a bare `{"ret":0}` for the same thing.
+        // A wrong settle here is self-healing anyway, because `maintain` re-opens
+        // a settled template the upstream keeps serving.
         return Some((SubmitVerdict::Accepted, err));
     }
     let verdict = if node_error_ends_template(&err) {
@@ -405,10 +507,19 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                 match classify_submit_response(&body) {
                     Some((node_verdict, err)) => {
                         verdict = node_verdict;
-                        if node_verdict != SubmitVerdict::Accepted {
-                            // Deterministic node rejection (stale height,
-                            // invalid, etc.): retrying will not help.
-                            println!("[submit] node rejected height {}: {}", success.height, err);
+                        match node_verdict {
+                            // A taken block and a credited pool share are both
+                            // normal PAID outcomes, not refusals.
+                            SubmitVerdict::Accepted | SubmitVerdict::ShareCredited => {}
+                            // Deterministic upstream rejection (stale template,
+                            // duplicate, busy, invalid): resending this exact
+                            // submission cannot help, so stop attempting.
+                            _ => {
+                                println!(
+                                    "[submit] node rejected height {}: {}",
+                                    success.height, err
+                                );
+                            }
                         }
                         break;
                     }
@@ -441,19 +552,47 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
         }
     }
     println!("{} {}", &urlapi_success, last);
-    if verdict == SubmitVerdict::Accepted {
-        println!(
-            "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
-            success.height,
-            success.result_hash.to_hex()
-        );
-    } else {
-        println!(
-            "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
-            success.height,
-            MAX_SUBMIT_ATTEMPTS,
-            success.result_hash.to_hex()
-        );
+    match verdict {
+        SubmitVerdict::Accepted => {
+            println!(
+                "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
+                success.height,
+                success.result_hash.to_hex()
+            );
+        }
+        // Routine pool traffic, not a rig fault: a credited share is income and a
+        // busy or duplicate answer is the pool's own bookkeeping. Raising the
+        // "check the node/connection" alarm for these would cry wolf on every
+        // single share a pool miner earns.
+        SubmitVerdict::ShareCredited => {
+            println!(
+                "[submit] pool credited a share at height {} (hash {}).",
+                success.height,
+                success.result_hash.to_hex()
+            );
+        }
+        SubmitVerdict::UpstreamBusy => {
+            println!(
+                "[submit] pool is busy at height {}: pausing submits for it for {}s.",
+                success.height,
+                POOL_BUSY_COOLDOWN.as_secs()
+            );
+        }
+        SubmitVerdict::DuplicateSubmission => {
+            println!(
+                "[submit] height {} was already credited for this nonce (hash {}).",
+                success.height,
+                success.result_hash.to_hex()
+            );
+        }
+        _ => {
+            println!(
+                "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
+                success.height,
+                MAX_SUBMIT_ATTEMPTS,
+                success.result_hash.to_hex()
+            );
+        }
     }
     println!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔");
     verdict
@@ -474,6 +613,15 @@ struct TemplateGateEntry {
     /// Winners dropped without any HTTP call, because one was already in flight
     /// for this template or the node had already settled it.
     suppressed: u64,
+    /// The upstream answered `kind:"share"` for this template, so it CREDITS every
+    /// winner instead of holding one block. Redundant-winner suppression stops for
+    /// it: each further share is separately payable work, and dropping one is
+    /// money the miner earned and never gets.
+    share_paying: bool,
+    /// Earliest instant a further winner for this template may be submitted. Set
+    /// only by a `busy` answer, so an overloaded pool is not hammered by a rig
+    /// finding hundreds of nonces a second.
+    cooldown_until: Option<Instant>,
     outcome: &'static str,
     /// Template install counter as of the moment this template settled. If the
     /// upstream serves the very same job again afterwards it has plainly not
@@ -488,6 +636,8 @@ impl TemplateGateEntry {
         TemplateGateEntry {
             state: TemplateSubmitState::NotSubmitted,
             suppressed: 0,
+            share_paying: false,
+            cooldown_until: None,
             outcome: SubmitVerdict::NoNodeVerdict.outcome_text(),
             settled_at_install: 0,
             reported: false,
@@ -509,9 +659,21 @@ impl TemplateGateEntry {
 /// So the FIRST winner for a template is always submitted (that is the payout,
 /// and it must never regress), while later winners for the SAME template are
 /// dropped only once the node has taken it or proved it gone.
+///
+/// None of that holds against a POOL, which credits a PPLNS share for EVERY
+/// winner instead of holding one block, so the gate stops suppressing as soon as
+/// the upstream proves it pays that way.
 #[derive(Default)]
 struct SubmitGate {
     templates: HashMap<(u64, Vec<u8>), TemplateGateEntry>,
+    /// The upstream has credited a share at least once, so it is a pool and it
+    /// pays per winner. Latched for the whole session and inherited by every new
+    /// template: a fresh template starting out "solo" again would suppress the
+    /// burst of shares found before its first verdict comes back, and those are
+    /// earned income. The rpcaddr cannot change while the miner runs, and a
+    /// definitive verdict still settles any template, so an upstream that later
+    /// behaves like a fullnode is still gated from its first answer onwards.
+    upstream_credits_shares: bool,
 }
 
 type SubmitGateHandle = Arc<Mutex<SubmitGate>>;
@@ -521,14 +683,38 @@ fn template_key(res: &BlockMiningResult) -> (u64, Vec<u8>) {
 }
 
 impl SubmitGate {
-    /// True when this winner must go to the node. False means it is a redundant
-    /// winner for a template already in flight or already settled, so dropping it
-    /// costs nothing; it is counted for the one summary line.
+    /// True when this winner must go to the upstream. False means it is a
+    /// redundant winner for a template already in flight or already settled, so
+    /// dropping it costs nothing; it is counted for the one summary line.
     fn admit(&mut self, res: &BlockMiningResult) -> bool {
+        self.admit_at(res, Instant::now())
+    }
+
+    /// `admit` with the clock passed in, so the busy back-off is testable.
+    fn admit_at(&mut self, res: &BlockMiningResult, now: Instant) -> bool {
+        let pays_per_winner = self.upstream_credits_shares;
         let entry = self
             .templates
             .entry(template_key(res))
             .or_insert_with(TemplateGateEntry::new);
+        if entry.state == TemplateSubmitState::Settled {
+            entry.suppressed = entry.suppressed.saturating_add(1);
+            return false;
+        }
+        if entry.cooldown_until.is_some_and(|until| now < until) {
+            // The upstream said it is overloaded moments ago. Submitting again
+            // right now would only be refused again and add to the load.
+            entry.suppressed = entry.suppressed.saturating_add(1);
+            return false;
+        }
+        if entry.share_paying || pays_per_winner {
+            // This upstream PAYS per winner, so there is no such thing as a
+            // redundant one: a height holds a single block, but a pool credits
+            // every share against the same template. Suppressing here is the
+            // miner refusing its own income.
+            entry.state = TemplateSubmitState::InFlight;
+            return true;
+        }
         if entry.state == TemplateSubmitState::NotSubmitted {
             entry.state = TemplateSubmitState::InFlight;
             return true;
@@ -537,26 +723,53 @@ impl SubmitGate {
         false
     }
 
-    /// Record what the node said about the winner that was in flight.
+    /// Record what the upstream said about the winner that was in flight.
     fn record_verdict(
         &mut self,
         res: &BlockMiningResult,
         verdict: SubmitVerdict,
         install_seq: u64,
     ) {
+        self.record_verdict_at(res, verdict, install_seq, Instant::now());
+    }
+
+    /// `record_verdict` with the clock passed in, so the busy back-off is testable.
+    fn record_verdict_at(
+        &mut self,
+        res: &BlockMiningResult,
+        verdict: SubmitVerdict,
+        install_seq: u64,
+        now: Instant,
+    ) {
+        if verdict.credits_share() {
+            // Latched, and outside the entry lookup so it survives even if this
+            // template has already been pruned: an upstream that credited one
+            // share pays for the rest of them too, and the answer to the NEXT
+            // winner cannot arrive before that winner has to be admitted.
+            self.upstream_credits_shares = true;
+        }
         let Some(entry) = self.templates.get_mut(&template_key(res)) else {
             // Already pruned: the template is far behind the tip, so there is
             // nothing left to gate.
             return;
         };
+        if verdict.credits_share() {
+            entry.share_paying = true;
+        }
+        // Any answer that is not "busy" clears the back-off, so a pool that has
+        // recovered is used again at once.
+        entry.cooldown_until = verdict.retry_cooldown().map(|wait| now + wait);
         if verdict.ends_template() {
             entry.state = TemplateSubmitState::Settled;
             entry.outcome = verdict.outcome_text();
             entry.settled_at_install = install_seq;
-        } else if entry.state == TemplateSubmitState::InFlight {
+        } else if entry.state != TemplateSubmitState::Settled {
             // Nothing proves this template is dead, so re-open it: a network
-            // hiccup, or a rejection about one submission, must never permanently
-            // suppress a height.
+            // hiccup, a credited share, a busy or duplicate answer, or a rejection
+            // about one submission, must never permanently suppress a height.
+            // A template that IS settled keeps that outcome: settling is
+            // definitive, and on a share-paying template a second submission can
+            // still be in flight when the first one settles it.
             entry.state = TemplateSubmitState::NotSubmitted;
             entry.outcome = verdict.outcome_text();
         }
@@ -589,10 +802,21 @@ impl SubmitGate {
             // Nothing was dropped for this template, so there is nothing to
             // report: the submit path already printed its own outcome.
             if entry.suppressed > 0 {
-                println!(
-                    "\n[Mining] height {} {}, suppressed {} redundant winners.",
-                    key.0, entry.outcome, entry.suppressed
-                );
+                if entry.state == TemplateSubmitState::Settled {
+                    println!(
+                        "\n[Mining] height {} {}, suppressed {} redundant winners.",
+                        key.0, entry.outcome, entry.suppressed
+                    );
+                } else {
+                    // Never settled, so these were not provably dead: they were
+                    // held back while a submission was in flight or while the
+                    // upstream asked for a pause. Say so instead of calling them
+                    // redundant.
+                    println!(
+                        "\n[Mining] height {} {}, held back {} further winners.",
+                        key.0, entry.outcome, entry.suppressed
+                    );
+                }
             }
             entry.reported = true;
         }
@@ -2172,5 +2396,345 @@ mod tests {
         assert!(SubmitVerdict::TemplateGone.ends_template());
         assert!(!SubmitVerdict::SubmissionRejected.ends_template());
         assert!(!SubmitVerdict::NoNodeVerdict.ends_template());
+    }
+
+    #[test]
+    fn both_upstream_dialects_are_classified() {
+        // Measured against a real pool: 526 submits in 180 seconds, 519 of them
+        // answered {"kind":"stale","ret":1} with NO error text at all. Reading only
+        // the fullnode's error strings turned every one of those into "a rejection
+        // about this one submission", which re-opened a template the pool had
+        // already declared dead and paid for another round trip with the next
+        // winner, and the next, and the next.
+        let verdict = |body: &str| classify_submit_response(body).map(|(v, _)| v);
+
+        // ---- pool dialect, exactly as its miner-API arm wraps it ----
+        assert_eq!(
+            verdict("{\"ret\":0,\"kind\":\"block\"}"),
+            Some(SubmitVerdict::Accepted)
+        );
+        assert_eq!(
+            verdict("{\"ret\":0,\"kind\":\"share\"}"),
+            Some(SubmitVerdict::ShareCredited)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"stale\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"busy\"}"),
+            Some(SubmitVerdict::UpstreamBusy)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"duplicate\"}"),
+            Some(SubmitVerdict::DuplicateSubmission)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"invalid\"}"),
+            Some(SubmitVerdict::SubmissionRejected)
+        );
+
+        // ---- the pool's own object form, which keeps the extra fields ----
+        assert_eq!(
+            verdict("{\"ret\":0,\"kind\":\"block\",\"solved_height\":9}"),
+            Some(SubmitVerdict::Accepted)
+        );
+        assert_eq!(
+            verdict("{\"ret\":0,\"kind\":\"share\",\"accepted\":1234}"),
+            Some(SubmitVerdict::ShareCredited)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"stale\",\"height\":9}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"busy\",\"err\":\"too many shares this height\"}"),
+            Some(SubmitVerdict::UpstreamBusy)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"invalid\",\"err\":\"above share target\"}"),
+            Some(SubmitVerdict::SubmissionRejected)
+        );
+
+        // ---- fullnode dialect, unchanged ----
+        assert_eq!(
+            verdict("{\"ret\":0,\"height\":3,\"mining\":\"success\"}"),
+            Some(SubmitVerdict::Accepted)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"pending block height 3 not found\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"pending block not ready\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"difficulty check failed\"}"),
+            Some(SubmitVerdict::TemplateGone)
+        );
+        assert_eq!(
+            verdict("{\"ret\":1,\"err\":\"coinbase nonce format invalid\"}"),
+            Some(SubmitVerdict::SubmissionRejected)
+        );
+        // An unmarked success keeps the meaning it always had here.
+        assert_eq!(verdict("{\"ret\":0}"), Some(SubmitVerdict::Accepted));
+        // A kind nobody here knows falls back to the same rules, so a future pool
+        // word can never be read as a settle it did not mean.
+        assert_eq!(
+            verdict("{\"ret\":1,\"kind\":\"something-new\"}"),
+            Some(SubmitVerdict::SubmissionRejected)
+        );
+        // No `ret` at all stays a transport-level non-verdict.
+        assert!(verdict("<html>502 Bad Gateway</html>").is_none());
+        assert!(verdict("{\"kind\":\"stale\"}").is_none());
+
+        // The reason text still names what happened, for the submit log line.
+        let (_, reason) = classify_submit_response("{\"ret\":1,\"kind\":\"stale\"}").unwrap();
+        assert!(reason.contains("stale"), "the log line must name the kind");
+
+        // ---- what each verdict does to the template ----
+        assert!(SubmitVerdict::Accepted.ends_template());
+        assert!(SubmitVerdict::TemplateGone.ends_template());
+        assert!(!SubmitVerdict::ShareCredited.ends_template());
+        assert!(!SubmitVerdict::UpstreamBusy.ends_template());
+        assert!(!SubmitVerdict::DuplicateSubmission.ends_template());
+        assert!(!SubmitVerdict::SubmissionRejected.ends_template());
+        assert!(!SubmitVerdict::NoNodeVerdict.ends_template());
+        assert!(SubmitVerdict::ShareCredited.credits_share());
+        assert!(!SubmitVerdict::Accepted.credits_share());
+        assert_eq!(
+            SubmitVerdict::UpstreamBusy.retry_cooldown(),
+            Some(POOL_BUSY_COOLDOWN)
+        );
+        assert_eq!(SubmitVerdict::ShareCredited.retry_cooldown(), None);
+        assert_eq!(SubmitVerdict::SubmissionRejected.retry_cooldown(), None);
+
+        // A template the pool called stale must not be reported as a rejected
+        // submission: the operator line is the only thing they see.
+        let stale_line = SubmitVerdict::TemplateGone.outcome_text();
+        assert!(stale_line.contains("stale"));
+        assert!(!stale_line.contains("rejection"));
+    }
+
+    #[test]
+    fn every_pool_share_for_one_template_is_submitted_and_paid() {
+        // THE money guarantee. On mainnet the pool's share target is 2^24 easier
+        // than the network target, so "share" is the ordinary answer and "block"
+        // is rare. Each share is credited work, so treating the first one as a
+        // settle would drop every later share for that template on the floor:
+        // systematic underpayment of the miner, invisible in the logs.
+        let mut gate = SubmitGate::default();
+        let key = (950u64, vec![0x11u8; HASH_WIDTH]);
+        let (share, _) = classify_submit_response("{\"ret\":0,\"kind\":\"share\"}").unwrap();
+        assert_eq!(share, SubmitVerdict::ShareCredited);
+
+        // The pool answers every single submission with a credited share.
+        let mut submitted = 0u32;
+        for head_nonce in 0..200u32 {
+            let win = winner_for_template(950, 0x11, head_nonce);
+            if gate.admit(&win) {
+                submitted += 1;
+                gate.record_verdict(&win, share, 1);
+            }
+        }
+        assert_eq!(
+            submitted, 200,
+            "every share a pool credits is money: not one may be dropped locally"
+        );
+        assert_eq!(
+            gate.templates[&key].suppressed, 0,
+            "a credited share is never a redundant winner"
+        );
+        assert_ne!(
+            gate.templates[&key].state,
+            TemplateSubmitState::Settled,
+            "a share credit must never settle the template"
+        );
+
+        // The real drain admits a whole batch before any verdict comes back. Once
+        // the upstream has proved it pays per share, none of that batch may be
+        // dropped either.
+        let mut batch = 0u32;
+        for head_nonce in 200..260u32 {
+            if gate.admit(&winner_for_template(950, 0x11, head_nonce)) {
+                batch += 1;
+            }
+        }
+        assert_eq!(
+            batch, 60,
+            "a burst of shares must not be gated by the first"
+        );
+        assert_eq!(gate.templates[&key].suppressed, 0);
+
+        // The NEXT template inherits it. Otherwise every job change would start
+        // out "solo" again and eat the burst of shares found before its first
+        // verdict came back, which is earned income, once per template.
+        let mut fresh = 0u32;
+        for head_nonce in 0..40u32 {
+            if gate.admit(&winner_for_template(951, 0x22, head_nonce)) {
+                fresh += 1;
+            }
+        }
+        assert_eq!(
+            fresh, 40,
+            "a pool that pays per share keeps paying at the next height"
+        );
+        assert_eq!(
+            gate.templates[&(951u64, vec![0x22u8; HASH_WIDTH])].suppressed,
+            0
+        );
+    }
+
+    #[test]
+    fn a_share_paying_template_submits_every_winner_of_a_drain() {
+        let _guard = mining_state_guard();
+        // Same guarantee, through the real drain path: with a fullnode only the
+        // first winner of a template leaves, with a share-paying pool all of them do.
+        set_pending_block_stuff(710, pending_template_json(710, 0x11, 0xd1)).unwrap();
+        let cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        let (res_tx, mut res_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(16);
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(16);
+
+        // One earlier share told us this upstream credits them.
+        let gate = test_gate();
+        let primer = winner_for_template(710, 0x11, 99);
+        assert!(lock_gate(&gate).admit(&primer));
+        lock_gate(&gate).record_verdict(&primer, SubmitVerdict::ShareCredited, 1);
+
+        for head_nonce in 0..9u32 {
+            res_tx
+                .send(winner_for_template(710, 0x11, head_nonce))
+                .unwrap();
+        }
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            8,
+            &mut tracker,
+            1,
+            &submit_tx,
+            &gate,
+        );
+
+        let mut queued = Vec::new();
+        while let Ok(win) = submit_rx.try_recv() {
+            queued.push(win.head_nonce);
+        }
+        assert_eq!(
+            queued,
+            (0..9u32).collect::<Vec<u32>>(),
+            "every winner of a share-paying template is separately payable work"
+        );
+        assert_eq!(
+            lock_gate(&gate).templates[&(710u64, vec![0x11u8; HASH_WIDTH])].suppressed,
+            0
+        );
+    }
+
+    #[test]
+    fn a_pool_stale_reply_settles_the_template() {
+        // The 519 wasted round trips: "stale" carries no error text, so it used to
+        // read as a rejection of one submission and re-opened the template.
+        let mut gate = SubmitGate::default();
+        let key = (960u64, vec![0x11u8; HASH_WIDTH]);
+        let win = winner_for_template(960, 0x11, 1);
+        let (stale, _) = classify_submit_response("{\"ret\":1,\"kind\":\"stale\"}").unwrap();
+        assert!(gate.admit(&win));
+        gate.record_verdict(&win, stale, 1);
+        assert!(
+            !gate.admit(&winner_for_template(960, 0x11, 2)),
+            "a template the pool called stale can never take another winner"
+        );
+        assert_eq!(gate.templates[&key].state, TemplateSubmitState::Settled);
+        assert_eq!(
+            gate.templates[&key].outcome,
+            SubmitVerdict::TemplateGone.outcome_text()
+        );
+
+        // A duplicate is about ONE submission (the same height, coinbase nonce and
+        // block nonce), so a DIFFERENT nonce is still wanted: it must not settle.
+        let mut gate = SubmitGate::default();
+        let win = winner_for_template(961, 0x11, 1);
+        let (dup, _) = classify_submit_response("{\"ret\":1,\"kind\":\"duplicate\"}").unwrap();
+        assert!(gate.admit(&win));
+        gate.record_verdict(&win, dup, 1);
+        assert!(gate.admit(&winner_for_template(961, 0x11, 2)));
+        assert_ne!(
+            gate.templates[&(961u64, vec![0x11u8; HASH_WIDTH])].state,
+            TemplateSubmitState::Settled
+        );
+    }
+
+    #[test]
+    fn a_busy_pool_is_backed_off_without_killing_its_template() {
+        let mut gate = SubmitGate::default();
+        let key = (970u64, vec![0x11u8; HASH_WIDTH]);
+        let win = winner_for_template(970, 0x11, 1);
+        let (busy, _) = classify_submit_response("{\"ret\":1,\"kind\":\"busy\"}").unwrap();
+        let t0 = Instant::now();
+        assert!(gate.admit_at(&win, t0));
+        gate.record_verdict_at(&win, busy, 1, t0);
+        assert_ne!(
+            gate.templates[&key].state,
+            TemplateSubmitState::Settled,
+            "an overloaded pool has not consumed the template"
+        );
+        assert!(
+            !gate.admit_at(
+                &winner_for_template(970, 0x11, 2),
+                t0 + Duration::from_millis(123)
+            ),
+            "a pool that just said it is overloaded must not be hammered"
+        );
+        assert!(
+            gate.admit_at(&winner_for_template(970, 0x11, 3), t0 + POOL_BUSY_COOLDOWN),
+            "the pause is a back-off, not a settle: the template is still alive"
+        );
+
+        // Any other answer clears the pause at once, so a recovered pool is used
+        // again immediately.
+        gate.record_verdict_at(
+            &win,
+            SubmitVerdict::ShareCredited,
+            1,
+            t0 + POOL_BUSY_COOLDOWN,
+        );
+        assert!(gate.admit_at(&winner_for_template(970, 0x11, 4), t0 + POOL_BUSY_COOLDOWN));
+    }
+
+    #[test]
+    fn the_fullnode_gate_behaviour_is_unchanged() {
+        // Solo mining must behave exactly as it did: a height holds one block, so
+        // an accepted one settles the template, and a transport non-verdict never
+        // silences a height.
+        let (accepted, _) =
+            classify_submit_response("{\"ret\":0,\"height\":3,\"mining\":\"success\"}").unwrap();
+        assert_eq!(accepted, SubmitVerdict::Accepted);
+        let mut gate = SubmitGate::default();
+        let win = winner_for_template(980, 0x11, 1);
+        assert!(gate.admit(&win));
+        gate.record_verdict(&win, accepted, 1);
+        assert!(
+            !gate.admit(&winner_for_template(980, 0x11, 2)),
+            "an accepted block still settles the height"
+        );
+        assert_eq!(
+            gate.templates[&(980u64, vec![0x11u8; HASH_WIDTH])].suppressed,
+            1
+        );
+
+        assert!(classify_submit_response("<html>502 Bad Gateway</html>").is_none());
+        let mut gate = SubmitGate::default();
+        let win = winner_for_template(981, 0x11, 1);
+        assert!(gate.admit(&win));
+        gate.record_verdict(&win, SubmitVerdict::NoNodeVerdict, 1);
+        assert!(
+            gate.admit(&winner_for_template(981, 0x11, 2)),
+            "a network hiccup must never permanently silence a height"
+        );
     }
 }
