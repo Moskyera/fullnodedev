@@ -974,14 +974,22 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = genesis_block_hash();
         // Release: publish the STUFF write above before the number, so a reader that
-    // sees this number (with an Acquire load) also sees the matching prev_hash.
-    MINING_DIAMOND_NUM.store(next_num, Release);
+        // sees this number (with an Acquire load) also sees the matching prev_hash.
+        MINING_DIAMOND_NUM.store(next_num, Release);
         return; // first mining
     }
-    if next_num <= mining_num {
-        return; // no change
+    // Advance, or roll back after a chain reorg that lowered the diamond tip.
+    // Same number: still re-fetch prev_hash in case born.hash was replaced.
+    if next_num == mining_num {
+        // Refresh prev_hash for the same number when the node reorged the tip.
+        // Cheap GET; skip heavy work only when hash is unchanged.
+    } else if next_num < mining_num {
+        println!(
+            "[HACD] diamond tip reorg: number {} -> {}, refreshing job",
+            mining_num, next_num
+        );
     }
-    // query next!
+    // query prev diamond (or re-query when number did not advance)
     let urlapi_diamond = format!(
         "http://{}/query/diamond?number={}",
         &cnf.rpcaddr,
@@ -1016,9 +1024,17 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     let Ok(hash_bytes) = hx.try_into() else {
         delay_return!(30);
     };
-    *MINING_DIAMOND_STUFF
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = Hash::from(hash_bytes);
+    let new_hash = Hash::from(hash_bytes);
+    {
+        let mut stuff = MINING_DIAMOND_STUFF
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        // Same number and same prev_hash: nothing to do.
+        if next_num == mining_num && *stuff == new_hash {
+            return;
+        }
+        *stuff = new_hash;
+    }
     // Release: publish the STUFF write above before the number, so a reader that
     // sees this number (with an Acquire load) also sees the matching prev_hash.
     MINING_DIAMOND_NUM.store(next_num, Release);
@@ -1031,15 +1047,11 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
 fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
     let urlapi_success = format!("http://{}/submit/diamondminer/success", &cnf.rpcaddr);
     let actionbody = success.serialize();
-    // println!("\n\ncurl {}?hexbody=true -X POST -d '{}'", &urlapi_success, &actionbody.to_hex());
-    // Submitting the mined diamond is the whole payoff, and the result was already
-    // drained from the mining channel, so a single transient network error must not
-    // silently lose it. Retry transport failures with backoff; stop as soon as the
-    // node returns a response (accept or deterministic rejection), mirroring the
-    // block submit path.
+    // Submitting the mined diamond is the whole payoff. Match the block submit
+    // path: retry transport failures AND unrecognized HTTP-200 bodies (proxy
+    // HTML / truncated JSON); stop only on a clear node accept or reject.
     const MAX_SUBMIT_ATTEMPTS: u32 = 5;
-    let mut body = String::new();
-    let mut got_response = false;
+    let mut last = String::new();
     for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
         match crate::rpc_http::post_text(
             &HTTP_CLIENT,
@@ -1047,12 +1059,49 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
             &cnf.api_token,
             actionbody.clone(),
         ) {
-            Ok(t) => {
-                body = t;
-                got_response = true;
-                break;
+            Ok(body) => {
+                last = body.clone();
+                let Ok(res) = serde_json::from_str::<JV>(&body) else {
+                    let snippet: String = body.chars().take(120).collect();
+                    println!(
+                        "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} unrecognized response, retrying: {snippet}"
+                    );
+                    if attempt < MAX_SUBMIT_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500u64 * attempt as u64,
+                        ));
+                    }
+                    continue;
+                };
+                let jstr = |k: &str| res[k].as_str().unwrap_or("");
+                let tx_err = jstr("err");
+                if !tx_err.is_empty() {
+                    println!(
+                        "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet\n     ERROR: {}\n",
+                        tx_err
+                    );
+                    return;
+                }
+                let tx_hash = jstr("tx_hash");
+                if tx_hash.len() == 64 {
+                    println!(
+                        "Success submit tx diamond mint {} ({}) to mainnet, \n        get tx hash: {}\n",
+                        success.d.diamond.to_readable(),
+                        *success.d.number,
+                        tx_hash
+                    );
+                    return;
+                }
+                // JSON but no usable tx_hash — treat as transient front-end noise.
+                println!(
+                    "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} missing tx_hash, retrying"
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500u64 * attempt as u64));
+                }
             }
             Err(e) => {
+                last = format!("transport error: {e}");
                 println!(
                     "Error: attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} cannot submit diamond success to {urlapi_success}: {e}"
                 );
@@ -1062,34 +1111,8 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
             }
         }
     }
-    if !got_response {
-        println!(
-            "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet after {MAX_SUBMIT_ATTEMPTS} attempts (network unreachable). Check the node/connection."
-        );
-        return;
-    }
-    let Ok(res) = serde_json::from_str::<JV>(&body) else {
-        println!("Error: invalid JSON from {urlapi_success}");
-        return;
-    };
-    let jstr = |k: &str| res[k].as_str().unwrap_or("");
-    let tx_err = jstr("err");
-    if tx_err.len() > 0 {
-        println!(
-            "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet\n     ERROR: {}\n",
-            tx_err
-        );
-        return;
-    }
-    let tx_hash = jstr("tx_hash");
-    if tx_hash.len() != 64 {
-        return; // err
-    }
     println!(
-        "Success submit tx diamond mint {} ({}) to mainnet, \n        get tx hash: {}\n",
-        success.d.diamond.to_readable(),
-        *success.d.number,
-        tx_hash
+        "ㄨㄨㄨㄨ Failed submit tx diamond mint after {MAX_SUBMIT_ATTEMPTS} attempts ({last}). Check the node/connection."
     );
 }
 

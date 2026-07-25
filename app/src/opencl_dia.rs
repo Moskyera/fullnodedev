@@ -5,6 +5,7 @@ use mint::action::DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE;
 use mint::action::DiamondMint;
 use x16rs::calculate_hash;
 use x16rs::diamond_hash;
+use x16rs::x16rs_hash;
 
 use crate::hash_util::diamond_more_power;
 use crate::opencl_gpu::{
@@ -52,6 +53,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
         custom_nonce.as_ref().to_vec(),
     ]
     .concat();
+    let stuff_len = stuff.len() as u32;
 
     let write_event = match write_stuff_to_gpu(opencl, &stuff, None) {
         Ok(ev) => ev,
@@ -69,6 +71,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
         unit_size,
         num_work_groups,
         local_work_size,
+        stuff_len,
         Some(&write_event),
     ) {
         Ok(ev) => ev,
@@ -86,15 +89,21 @@ pub(crate) fn do_diamond_group_mining_opencl(
         return most;
     }
 
+    let mut found_success = false;
     for i in 0..num_work_groups as usize {
-        let hash_bytes = &hashes[i * 32..(i * 32) + 32].try_into().unwrap();
-        let dia_str = diamond_hash(hash_bytes);
-        let nonce_bytes = nonces[i].to_be_bytes();
+        let hash_bytes: [u8; 32] = match hashes[i * 32..(i * 32) + 32].try_into() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let nonce = nonces[i];
+        // Reject nonces outside the batch window (corrupt GPU read).
+        if nonce.wrapping_sub(nonce_start) >= nonce_space {
+            continue;
+        }
+        let nonce_bytes = nonce.to_be_bytes();
         // Re-hash with the SAME custom-message bytes the GPU kernel was fed:
         // `custom_nonce` is gated by number (empty at or below the custom-message
-        // threshold, matching node consensus). Using the raw `custom_message` here
-        // would make the verification hash disagree with the GPU result and reject
-        // otherwise-valid low-number diamonds.
+        // threshold, matching node consensus).
         let stuff = [
             prevblockhash.as_slice(),
             nonce_bytes.as_slice(),
@@ -103,34 +112,46 @@ pub(crate) fn do_diamond_group_mining_opencl(
         ]
         .concat();
         let ssshash: [u8; 32] = calculate_hash(stuff);
+        // Full medium-hash recompute (parity with block verify_gpu_best_result).
+        let expected_medium = x16rs_hash(repeat as i32, &ssshash);
+        if expected_medium != hash_bytes {
+            continue;
+        }
+        let dia_str = diamond_hash(&hash_bytes);
 
-        if let Some(dia_name) = check_diamer_success(number, ssshash, *hash_bytes, dia_str) {
+        if let Some(dia_name) = check_diamer_success(number, ssshash, hash_bytes, dia_str) {
             let name = DiamondName::from(dia_name);
             let number = DiamondNumber::from(number);
             let mut diamint = DiamondMint::with(name, number);
             diamint.d.prev_hash = prevblockhash.clone();
-            diamint.d.nonce = Fixed8::from(nonces[i].to_be_bytes());
+            diamint.d.nonce = Fixed8::from(nonce_bytes);
             diamint.d.address = rwdaddr.clone();
             diamint.d.custom_message = custom_message.clone();
             most.dia_str = dia_str;
-            most.u64_nonce = nonces[i];
+            most.u64_nonce = nonce;
             most.is_success = Some(diamint);
             most.gpu_batch_ok = true;
-            return most;
+            found_success = true;
+            break;
         } else if diamond_more_power(&dia_str, &most.dia_str) {
             most.dia_str = dia_str;
-            most.u64_nonce = nonces[i];
+            most.u64_nonce = nonce;
         }
     }
 
+    // Always finish the queue when required — including the early success path —
+    // so AMD RDNA/duplicate ICD does not leave work outstanding.
     if opencl.needs_queue_finish {
         if let Err(e) = opencl.queue.finish() {
             eprintln!("[OpenCL] diamond queue finish: {}", e);
             most.gpu_batch_ok = false;
+            most.is_success = None;
             return most;
         }
     }
 
-    most.gpu_batch_ok = true;
+    if !found_success {
+        most.gpu_batch_ok = true;
+    }
     most
 }

@@ -426,9 +426,7 @@ async fn process_line(
                 let job_id = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
                 let block_nonce = arr.get(2).and_then(|v| v.as_str()).unwrap_or("");
                 let coinbase_nonce = arr.get(3).and_then(|v| v.as_str()).unwrap_or("00");
-                let height = job_id
-                    .strip_prefix('h')
-                    .and_then(|s| s.parse::<u64>().ok())
+                let height = crate::job::job_height(job_id)
                     .or_else(|| hub.current().map(|j| j.height))
                     .unwrap_or(0);
                 match upstream
@@ -546,7 +544,7 @@ mod tests {
         // Wait for the connect-time push, which leaves the push task sleeping out
         // its 500ms cycle with last=h100.
         let first = drain_notifies(&mut lines, Duration::from_millis(400)).await;
-        assert_eq!(first, vec!["h100".to_string()]);
+        assert_eq!(first, vec!["h100_aa".to_string()]);
 
         // New block arrives, then the miner authorizes before the push task wakes.
         hub.update(
@@ -560,7 +558,7 @@ mod tests {
         // Long enough for the push task's copy to arrive as well, so a duplicate
         // would also be caught.
         let after = drain_notifies(&mut lines, Duration::from_secs(2)).await;
-        assert_eq!(after, vec!["h101".to_string()]);
+        assert_eq!(after, vec!["h101_aa".to_string()]);
     }
 
     /// A miner that pipelines subscribe+authorize in one segment must still get
@@ -579,7 +577,7 @@ mod tests {
 
         let mut lines = BufReader::new(r).lines();
         let seen = drain_notifies(&mut lines, Duration::from_secs(2)).await;
-        assert_eq!(seen, vec!["h100".to_string()]);
+        assert_eq!(seen, vec!["h100_aa".to_string()]);
     }
 
     /// A job upstream has stopped refreshing must not be handed out as work.

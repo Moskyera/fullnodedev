@@ -89,6 +89,9 @@ struct BlockMiningStuff {
 pub(crate) struct BlockMiningResult {
     worker_id: usize,
     pub height: u64,
+    /// Template generation when this result was mined. Dropped on submit if the
+    /// live epoch has moved on (reorg / new pending).
+    epoch: u64,
     pub nonce_start: u32,
     nonce_space: u32,
     gpu_nonce_space: u32,
@@ -331,6 +334,9 @@ pub(crate) fn start_block_mining_workers(
         let mut rstx = res_rx;
         loop {
             if super::should_stop(&stop_flag_res) {
+                // Final drain: do not abandon target-meeting winners still in the
+                // channel just because shutdown was requested.
+                drain_winners_for_shutdown(&cnf1, &mut rstx, &submit_tx);
                 return;
             }
             let now_ms = rate_clock.elapsed().as_millis() as u64;
@@ -406,6 +412,15 @@ pub(crate) fn set_pending_block_stuff(height: u64, res: JV) -> Result<(), String
     let intro_bytes = decode("block_intro")?;
     let block_intro =
         BlockIntro::build(&intro_bytes).map_err(|e| format!("invalid block_intro: {e}"))?;
+    // JSON height drives x16rs repeat count; consensus uses the height embedded in
+    // the intro. Reject mismatches so we never mine with the wrong repeat or
+    // submit under a height the header does not claim.
+    let intro_height = block_intro.height().uint();
+    if height != intro_height {
+        return Err(format!(
+            "pending height {height} does not match block_intro height {intro_height}"
+        ));
+    }
     let coinbase_bytes = decode("coinbase_body")?;
     let coinbase_tx = TransactionCoinbase::build(&coinbase_bytes)
         .map_err(|e| format!("invalid coinbase_body: {e}"))?;
@@ -743,10 +758,18 @@ fn run_block_mining_item(
         let gpu_ns = batch.gpu_nonce_space;
         let cpu_ns = batch.cpu_nonce_space;
 
+        // Drop batches whose template already moved before they enter the channel.
+        let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
+        let check_epoch = current_mining_epoch();
+        if check_hei != mining_hei || check_epoch != mining_epoch {
+            return;
+        }
+
         let use_secs = ctn.elapsed().as_secs_f64();
         let mlres = BlockMiningResult {
             worker_id: thrid,
             height,
+            epoch: mining_epoch,
             nonce_start,
             nonce_space: current_nonce_space,
             gpu_nonce_space: gpu_ns,
@@ -781,11 +804,26 @@ fn run_block_mining_item(
         };
         nonce_start = nst;
 
+        // Any height change (including reorg to a lower tip) or epoch bump means
+        // this job is done; the next outer loop iteration picks up the new template.
         let check_hei = MINING_BLOCK_HEIGHT.load(Relaxed);
-        // Roll over on a height advance OR a same-height reorg (epoch bump): both
-        // mean the template we are grinding is no longer the one to mine.
-        if check_hei > mining_hei || current_mining_epoch() != mining_epoch {
+        if check_hei != mining_hei || current_mining_epoch() != mining_epoch {
             return;
+        }
+    }
+}
+
+/// On shutdown, still submit any target-meeting results already in the channel.
+fn drain_winners_for_shutdown(
+    cnf: &PoWorkConf,
+    result_ch_rx: &mut mpsc::Receiver<Arc<BlockMiningResult>>,
+    submit_tx: &mpsc::SyncSender<Arc<BlockMiningResult>>,
+) {
+    let live_epoch = current_mining_epoch();
+    let live_hei = current_mining_height();
+    while let Ok(res) = result_ch_rx.try_recv() {
+        if res.epoch == live_epoch && res.height == live_hei && result_meets_target(&res) {
+            queue_block_mining_success(cnf, submit_tx, &res);
         }
     }
 }
@@ -831,22 +869,32 @@ fn deal_block_mining_results(
     // single strongest hash for stats, so collect ALL of them separately, otherwise
     // every winner but one in this drain window would be silently lost.
     let mut winners: Vec<Arc<BlockMiningResult>> = Vec::new();
+    let live_epoch = current_mining_epoch();
+    let live_hei = current_mining_height();
     while let Ok(res) = result_ch_rx.try_recv() {
         deal_hei = res.height;
-        total_nonce_space += res.nonce_space as u64;
+        // Prefer actual mined counts when recovery mined only a prefix of the plan.
         if res.gpu_nonce_space > 0 || res.cpu_nonce_space > 0 {
+            total_nonce_space += res.gpu_nonce_space as u64 + res.cpu_nonce_space as u64;
             gpu_nonce_space += res.gpu_nonce_space as u64;
             cpu_nonce_space += res.cpu_nonce_space as u64;
         } else if res.is_gpu {
+            total_nonce_space += res.nonce_space as u64;
             gpu_nonce_space += res.nonce_space as u64;
         } else {
+            total_nonce_space += res.nonce_space as u64;
             cpu_nonce_space += res.nonce_space as u64;
         }
         rate_tracker.record_result(&res, now_ms);
         if hash_more_power(&res.result_hash, &most.result_hash) {
             most = res.clone();
         }
-        if result_meets_target(&res) {
+        // Only accept winners that still match the live template epoch/height so a
+        // stale same-height reorg result cannot be submitted (or crowd out a live one).
+        if res.epoch == live_epoch
+            && res.height == live_hei
+            && result_meets_target(&res)
+        {
             record_winner(&mut winners, &res);
         }
         recv_count += 1;

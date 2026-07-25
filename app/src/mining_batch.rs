@@ -268,6 +268,15 @@ impl BlockMinerBackend for OpenclBlockBackend {
         ctx: &BatchCtx,
         cpu_mine: &dyn Fn(u64, Vec<u8>, u32, u32) -> (u32, [u8; 32]),
     ) -> BatchResult {
+        if self.gpu.gpu_is_disabled() {
+            return cpu_gpu_error_recovery(
+                ctx.height,
+                ctx.block_intro.clone(),
+                ctx.nonce_start,
+                ctx.nonce_space,
+                cpu_mine,
+            );
+        }
         let wg_cap = self.gpu.workgroups(ctx.configured_wg, ctx.thermal_wg_cap);
         let Some(plan) = plan_gpu_batch(ctx.nonce_space, wg_cap, ctx.localsize, ctx.unitsize)
         else {

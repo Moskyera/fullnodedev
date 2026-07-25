@@ -4,6 +4,9 @@ use crate::opencl_gpu::{
     OpenCLResources, enqueue_mining_kernel, read_block_gpu_results, write_stuff_to_gpu,
 };
 
+/// Block intro serialization is a fixed 89-byte layout (matches CUDA STUFF_BYTES).
+const BLOCK_INTRO_BYTES: usize = 89;
+
 pub fn do_group_block_mining_opencl(
     opencl: &OpenCLResources,
     height: u64,
@@ -13,6 +16,12 @@ pub fn do_group_block_mining_opencl(
     local_work_size: u32,
     unit_size: u32,
 ) -> std::result::Result<(u32, [u8; 32]), GpuBatchError> {
+    if block_intro.len() != BLOCK_INTRO_BYTES {
+        return Err(GpuBatchError::from_message(&format!(
+            "block intro must be {BLOCK_INTRO_BYTES} bytes, got {}",
+            block_intro.len()
+        )));
+    }
     let mut most_nonce = 0u32;
     let mut most_hash = [255u8; 32];
     let repeat = x16rs::block_hash_repeat(height) as u32;

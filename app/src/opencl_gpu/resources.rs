@@ -157,6 +157,7 @@ fn build_diamond_kernel(
         .arg(&res.buffer_global_order)
         .arg(&res.buffer_best_hashes)
         .arg(&res.buffer_best_nonces_diamond)
+        .arg(0u32) // stuff_len: 61 or 93
         .build()
         .map_err(|e| format!("kernel build: {}", e))
 }
@@ -303,6 +304,7 @@ pub fn enqueue_mining_kernel(
 }
 
 /// Diamond mining kernel (u64 nonce).
+/// `stuff_len` is the prehash byte length (61 without custom message, 93 with).
 pub fn enqueue_diamond_kernel(
     res: &OpenCLResources,
     nonce_start: u64,
@@ -310,6 +312,7 @@ pub fn enqueue_diamond_kernel(
     unit_size: u32,
     num_work_groups: u32,
     local_work_size: u32,
+    stuff_len: u32,
     wait: Option<&Event>,
 ) -> std::result::Result<Event, GpuBatchError> {
     run_cached_kernel(
@@ -328,6 +331,9 @@ pub fn enqueue_diamond_kernel(
             kernel
                 .set_arg(3, unit_size)
                 .map_err(|e| format!("set_arg unit_size: {}", e))?;
+            kernel
+                .set_arg(8, stuff_len)
+                .map_err(|e| format!("set_arg stuff_len: {}", e))?;
             Ok(())
         },
     )

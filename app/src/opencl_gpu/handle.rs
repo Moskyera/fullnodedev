@@ -46,6 +46,9 @@ pub struct OpenclGpuHandle {
     snapshot: OpenclGpuSnapshot,
     oom: Mutex<GpuOomState>,
     consecutive_errors: AtomicU32,
+    /// Session latch: after many consecutive failures at the OOM floor, stop
+    /// issuing work on this device for the rest of the process (parity with CUDA).
+    gpu_disabled: std::sync::atomic::AtomicBool,
     cached_scan: Mutex<Option<OpenClScan>>,
 }
 
@@ -61,8 +64,15 @@ impl OpenclGpuHandle {
             snapshot,
             oom: Mutex::new(GpuOomState::new(base_wg)),
             consecutive_errors: AtomicU32::new(0),
+            gpu_disabled: std::sync::atomic::AtomicBool::new(false),
             cached_scan: Mutex::new(Some(scan)),
         })
+    }
+
+    /// True once this card has been given up on for the rest of the process.
+    pub fn gpu_is_disabled(&self) -> bool {
+        self.gpu_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn configure_oom_floor(
@@ -115,6 +125,9 @@ impl OpenclGpuHandle {
     ) {
         runtime.record_gpu_error_event();
         use std::sync::atomic::Ordering::Relaxed;
+        if self.gpu_is_disabled() {
+            return;
+        }
         let mut res = self.lock_resources();
         let res_wg = res.workgroups;
         let arch_limits = ArchLimits::for_slug(&res.arch_slug);
@@ -123,6 +136,17 @@ impl OpenclGpuHandle {
         let cur_eff = oom.effective_wg();
         let at_floor = cur_eff <= oom.floor_wg();
         let n = self.consecutive_errors.fetch_add(1, Relaxed) + 1;
+        // Match CUDA: after many consecutive failures already at the floor, stop
+        // spending power on a dead device for this process.
+        if at_floor && n >= 20 {
+            drop(oom);
+            if !self.gpu_disabled.swap(true, Relaxed) {
+                eprintln!(
+                    "[OpenCL] GPU session disabled after {n} consecutive failures at work_groups floor; refusing further OpenCL batches on this device."
+                );
+            }
+            return;
+        }
         let retry_only =
             experimental && err.is_out_of_resources() && oom_fallback && !at_floor && n < 3;
         let next_wg = if retry_only {

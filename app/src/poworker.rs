@@ -303,31 +303,35 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         println!("Error: get block stuff error: {}", jstr("err"));
         delay_return!(15);
     };
-    // Real work is being served again.
-    leave_upstream_stale();
     let pending_height = jnum("height");
     let new_intro = res["block_intro"].as_str().unwrap_or("").to_string();
 
-    // Install on a height advance, OR a same-height reorg: if the node returns a
-    // different block_intro at the SAME height, the tip was replaced and the old
-    // template is now orphaned, so refresh instead of grinding dead work.
+    // Detect template change WITHOUT writing LAST_PENDING_INTRO yet: only commit
+    // the remembered intro after a successful install, otherwise a failed parse
+    // would permanently skip retries at the same height.
     let intro_changed = {
-        let mut g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
-        if *g != new_intro {
-            *g = new_intro.clone();
-            true
-        } else {
-            false
-        }
+        let g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
+        *g != new_intro
     };
-    if pending_height > curr_hei || (pending_height == curr_hei && intro_changed) {
+    // Install on any height change (including reorg to a lower tip) OR a
+    // same-height intro change (tip replaced at the same height).
+    if pending_height != curr_hei || intro_changed {
         if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
             println!("Error: invalid block data from {urlapi_pending}: {e}");
             delay_return!(10);
         }
+        {
+            let mut g = LAST_PENDING_INTRO.lock().unwrap_or_else(|e| e.into_inner());
+            *g = new_intro;
+        }
+        // Only clear the stale-work pause after a successful install of real work.
+        leave_upstream_stale();
         if curr_hei == 0 {
             block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
         }
+    } else {
+        // Same installed template is still live — resume if we had paused for stale.
+        leave_upstream_stale();
     }
 
     // with notice
@@ -387,15 +391,14 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         }
         let jnum = |k| res2[k].as_u64().unwrap_or(0);
         let res_hei = jnum("height");
-        // println!("\n++++++++ {} {} {}\n", &jsdata, res_hei, current_height);
-        if res_hei >= pending_height {
-            // next block discover
-            break;
-        }
-        // No new block yet. A compliant server long-polls (so this rarely loops),
-        // but a fast-returning/incompatible server or notice_wait=0 would otherwise
-        // spin this at 100% CPU, so cap the spin with a small delay before re-polling.
-        std::thread::sleep(Duration::from_millis(200));
+        // Fullnode notice reports chain tip height, while we long-poll with the
+        // pending (tip+1) height. When tip advances to pending_height, break for
+        // the next job. On timeout (or any other reply) also leave the wait so the
+        // outer loop re-fetches /query/miner/pending: that is how same-height tip
+        // reorgs (intro change without tip height advance) are detected. A second
+        // tight spin on the same tip would never re-read block_intro.
+        let _ = res_hei;
+        break;
     }
 }
 

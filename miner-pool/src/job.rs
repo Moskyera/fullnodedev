@@ -22,6 +22,27 @@ pub fn job_ttl(poll_ms: u64) -> Duration {
     Duration::from_millis(poll_ms.saturating_mul(4)).max(Duration::from_secs(15))
 }
 
+/// How much of block_intro is folded into the job id to distinguish two templates
+/// at the same height. Long enough that a same-height reorg always changes it.
+const INTRO_TAG_CHARS: usize = 16;
+
+/// Read the height back out of a job id produced by `JobHub::update`.
+///
+/// A stratum submit carries only the job id, so this is how a solution is billed to
+/// the height it was actually mined for. That matters: the node keeps several recent
+/// templates, so a solution found a moment before the tip moved is still accepted at
+/// its own height, but only if it is submitted with that height rather than the
+/// current one. Accepts the current `h{height}_{tag}` form and the older bare
+/// `h{height}` form, and returns None for anything else so the caller can fall back.
+pub fn job_height(job_id: &str) -> Option<u64> {
+    let rest = job_id.strip_prefix('h')?;
+    let digits = match rest.split_once('_') {
+        Some((h, _tag)) => h,
+        None => rest,
+    };
+    digits.parse::<u64>().ok()
+}
+
 pub struct JobHub {
     inner: RwLock<Option<MiningJob>>,
 }
@@ -34,7 +55,23 @@ impl JobHub {
     }
 
     pub fn update(&self, height: u64, raw: JV) {
-        let job_id = format!("h{height}");
+        // Include a short fingerprint of block_intro so same-height reorgs
+        // (template replaced without height change) get a new job_id and
+        // stratum clients receive mining.notify. Height-only ids left miners
+        // grinding an orphaned template after a tip rewrite.
+        let intro = raw
+            .get("block_intro")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Char-safe: block_intro comes from the upstream node's JSON, so it is not
+        // guaranteed ASCII. Byte slicing it could land mid-codepoint and panic the
+        // poll task on data we do not control.
+        let skip = intro.chars().count().saturating_sub(INTRO_TAG_CHARS);
+        let intro_tag: String = intro.chars().skip(skip).collect();
+        // The height must stay parseable out of the id: stratum submits carry only the
+        // job_id, and job_height() reads the height back from it so a solution found
+        // just before the tip moved is still submitted at the height it was mined for.
+        let job_id = format!("h{height}_{intro_tag}");
         // Poison-tolerant: a poisoned lock must never permanently wedge job
         // refresh on a 24/7 pool. The guarded value is a whole-job replacement,
         // so a recovered inner value is always self-consistent.
@@ -83,7 +120,46 @@ mod tests {
         hub.update(100, json!({"height": 100, "block_intro": "aa"}));
         let j = hub.current().unwrap();
         assert_eq!(j.height, 100);
-        assert_eq!(j.job_id, "h100");
+        assert_eq!(j.job_id, "h100_aa");
+        // Same height, different intro → new job_id (same-height reorg).
+        hub.update(100, json!({"height": 100, "block_intro": "bb"}));
+        assert_eq!(hub.current().unwrap().job_id, "h100_bb");
+    }
+
+    #[test]
+    fn height_survives_a_round_trip_through_the_job_id() {
+        // A stratum submit carries only the job id. If the height cannot be read back
+        // out, a winner found just before the tip moved gets billed to the CURRENT
+        // height and is rejected, losing a real block. Every id this hub emits must
+        // round-trip, including the reorg tag and a long real block_intro.
+        let hub = JobHub::new();
+        for (h, intro) in [
+            (100u64, "aa"),
+            (1u64, ""),
+            (4_294_967_296u64, "00112233445566778899aabbccddeeff0011"),
+            (u64::MAX, "ff"),
+        ] {
+            hub.update(h, json!({"height": h, "block_intro": intro}));
+            let id = hub.current().unwrap().job_id;
+            assert_eq!(job_height(&id), Some(h), "job_id {id} lost its height");
+        }
+        // The older bare form still parses, so a client holding a pre-upgrade job id
+        // is billed correctly instead of silently falling back to the current height.
+        assert_eq!(job_height("h100"), Some(100));
+        // Anything unrecognised must say so rather than guess a wrong height.
+        assert_eq!(job_height("garbage"), None);
+        assert_eq!(job_height("h"), None);
+        assert_eq!(job_height("hxx_aa"), None);
+    }
+
+    #[test]
+    fn a_non_ascii_block_intro_does_not_panic() {
+        // block_intro is upstream JSON, not something we control. Byte slicing it to
+        // build the tag could land mid-codepoint and take down the poll task.
+        let hub = JobHub::new();
+        hub.update(7, json!({"height": 7, "block_intro": "ααααααααααααααααββ"}));
+        let id = hub.current().unwrap().job_id;
+        assert_eq!(job_height(&id), Some(7));
     }
 
     #[test]

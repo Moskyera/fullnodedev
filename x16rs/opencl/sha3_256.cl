@@ -179,27 +179,40 @@ __inline__ void sha3_256_hash(const ulong *input, ulong *output)
 	output[3] = hash[3];
 }
 
-__inline__ void sha3_256_hash_diamond(const ulong *input, ulong *output)
-{	
-	ulong ALIGN hash[25] = {
-		le2me_64(input[ 0]),
-		le2me_64(input[ 1]),
-		le2me_64(input[ 2]),
-		le2me_64(input[ 3]),
-		le2me_64(input[ 4]),
-		le2me_64(input[ 5]),
-		le2me_64(input[ 6]),
-		le2me_64(input[ 7]),
-		le2me_64(input[ 8]),
-		le2me_64(input[ 9]),
-		le2me_64(input[10]),
-		(le2me_64(input[11]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL,
-		0,
-		0,
-		0,
-		0,
-		le2me_64(0x8000000000000000),
-	};
+// Diamond prehash is either 61 bytes (no custom message) or 93 bytes (32-byte custom).
+// Pad at the true message end so GPU matches CPU/consensus SHA3.
+__inline__ void sha3_256_hash_diamond(const ulong *input, ulong *output, const unsigned int msg_len)
+{
+	ulong ALIGN hash[25];
+	#pragma unroll 25
+	for (unsigned i = 0; i < 25; i++) hash[i] = 0;
+	if (msg_len == 61u) {
+		// 61 bytes = prev(32)+nonce(8)+addr(21); pad 0x06 starts at byte 61.
+		hash[0] = le2me_64(input[0]);
+		hash[1] = le2me_64(input[1]);
+		hash[2] = le2me_64(input[2]);
+		hash[3] = le2me_64(input[3]);
+		hash[4] = le2me_64(input[4]);
+		hash[5] = le2me_64(input[5]);
+		hash[6] = le2me_64(input[6]);
+		hash[7] = (le2me_64(input[7]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL;
+		hash[16] = le2me_64(0x8000000000000000);
+	} else {
+		// 93-byte path (with custom message)
+		hash[0] = le2me_64(input[0]);
+		hash[1] = le2me_64(input[1]);
+		hash[2] = le2me_64(input[2]);
+		hash[3] = le2me_64(input[3]);
+		hash[4] = le2me_64(input[4]);
+		hash[5] = le2me_64(input[5]);
+		hash[6] = le2me_64(input[6]);
+		hash[7] = le2me_64(input[7]);
+		hash[8] = le2me_64(input[8]);
+		hash[9] = le2me_64(input[9]);
+		hash[10] = le2me_64(input[10]);
+		hash[11] = (le2me_64(input[11]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL;
+		hash[16] = le2me_64(0x8000000000000000);
+	}
 	rhash_sha3_permutation(hash);
 	output[0] = hash[0];
 	output[1] = hash[1];

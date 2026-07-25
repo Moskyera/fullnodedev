@@ -45,7 +45,13 @@ pub struct MinerPendingStuff {
 
 impl MinerPendingStuff {
     pub fn easy_for_test(height: u64) -> Self {
-        let intro = BlockIntro::default();
+        let mut intro = BlockIntro::default();
+        // A real node always packs the height into the header it hands out, and the
+        // miner now rejects a template whose JSON height disagrees with its intro
+        // (the JSON height picks the x16rs repeat count while consensus reads the
+        // header, so a mismatch mines at the wrong repeat). Keep the fixture
+        // self-consistent instead of leaving the defaulted height 0.
+        intro.head.height = BlockHeight::from(height);
 
         let coinbase_tx = TransactionCoinbase::default();
 
