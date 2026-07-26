@@ -180,6 +180,45 @@ pub struct Strings {
     pub no_gpu: &'static str,
     pub label_language: &'static str,
     pub label_currency: &'static str,
+    // Pool payouts. Every one of these describes money, or the absence of a
+    // fact about money, so they must stay precise in every language: "unknown",
+    // "nothing owed" and "not a payout pool" are three different statements and
+    // none of them is "0 HAC".
+    pub pool_pay_title: &'static str,
+    pub pool_pay_total_paid: &'static str,
+    pub pool_pay_owed: &'static str,
+    pub pool_pay_in_flight: &'static str,
+    pub pool_pay_last: &'static str,
+    pub pool_pay_last_line: &'static str,
+    pub pool_pay_last_tx: &'static str,
+    pub pool_pay_never: &'static str,
+    pub pool_pay_shares: &'static str,
+    pub pool_pay_nothing_paid: &'static str,
+    pub pool_pay_nothing_owed: &'static str,
+    pub pool_pay_not_reported: &'static str,
+    pub pool_pay_unknown: &'static str,
+    pub pool_pay_waiting: &'static str,
+    pub pool_pay_unreachable: &'static str,
+    pub pool_pay_estimate_note: &'static str,
+    pub pool_pay_amount_note: &'static str,
+    pub pool_pay_solo: &'static str,
+    pub pool_pay_node: &'static str,
+    pub pool_pay_relay: &'static str,
+    pub pool_pay_no_earnings: &'static str,
+    pub pool_pay_unidentified: &'static str,
+    pub pool_pay_no_address: &'static str,
+    pub pool_pay_bad_address: &'static str,
+    pub pool_pay_checked: &'static str,
+    pub pool_terms_title: &'static str,
+    pub pool_terms_scheme: &'static str,
+    pub pool_terms_window: &'static str,
+    pub pool_terms_share_factor: &'static str,
+    pub pool_terms_fee: &'static str,
+    pub pool_terms_minimum: &'static str,
+    pub pool_terms_maturity: &'static str,
+    pub pool_terms_interval: &'static str,
+    pub pool_terms_unavailable: &'static str,
+    pub pool_terms_source: &'static str,
 }
 
 fn apply_format_template(template: &str, args: &[String]) -> String {
@@ -224,6 +263,16 @@ impl Strings {
                 &[effective.to_string(), configured.to_string()],
             )
         }
+    }
+
+    /// "<amount>, paid <age> ago". The whole sentence is per language so each
+    /// locale can put the time where its grammar wants it.
+    pub fn pool_pay_last_display(&self, amount: &str, age: &str) -> String {
+        apply_format_template(self.pool_pay_last_line, &[amount.to_string(), age.to_string()])
+    }
+
+    pub fn pool_pay_checked_display(&self, age: &str) -> String {
+        apply_format_template(self.pool_pay_checked, &[age.to_string()])
     }
 }
 
@@ -341,6 +390,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "No GPU",
             label_language: "Language:",
             label_currency: "Currency:",
+            pool_pay_title: "YOUR POOL PAYOUTS",
+            pool_pay_total_paid: "Total paid to you",
+            pool_pay_owed: "Owed to you (estimate)",
+            pool_pay_in_flight: "Payment on its way",
+            pool_pay_last: "Last payout",
+            pool_pay_last_line: "{}, paid {} ago",
+            pool_pay_last_tx: "Payout transaction",
+            pool_pay_never: "No payout yet",
+            pool_pay_shares: "Your shares in the pool's window",
+            pool_pay_nothing_paid: "Nothing paid yet",
+            pool_pay_nothing_owed: "Nothing owed right now",
+            pool_pay_not_reported: "This pool does not report it",
+            pool_pay_unknown: "Unknown",
+            pool_pay_waiting: "Asking the pool...",
+            pool_pay_unreachable: "The pool cannot be reached, so your earnings are unknown. Unknown is not zero: nothing has been lost, the panel simply has no answer yet.",
+            pool_pay_estimate_note: "What you are owed is an estimate. It moves with every share and every block, and it is only final once the pool has paid it.",
+            pool_pay_amount_note: "Amounts use Hacash notation: 1:248 is 1 HAC and 12:247 is 1.2 HAC.",
+            pool_pay_solo: "You are mining solo on your own full node. There is no pool ledger: every block you find pays your reward wallet in full.",
+            pool_pay_node: "This address is a plain full node, not a payout pool. It keeps no record per miner, so the block rewards go to that node's own reward wallet, not to you.",
+            pool_pay_relay: "This address is a relay (hac-pool). It passes work through and keeps no wallet and no share record, so it never pays miners. The rewards go to the full node behind it.",
+            pool_pay_no_earnings: "This pool answers, but it does not publish what each miner has earned. The panel will not guess an amount.",
+            pool_pay_unidentified: "This address answers, but it publishes no terms and no earnings, so the panel cannot tell you what it pays. Ask the operator before you point real hashrate at it.",
+            pool_pay_no_address: "No payout address is being sent to this pool, so it has nothing to credit. Set your reward wallet in Settings and use the pool connection.",
+            pool_pay_bad_address: "The reward wallet is not a Hacash address the pool can pay. Correct it in Settings.",
+            pool_pay_checked: "Checked {} ago",
+            pool_terms_title: "POOL TERMS",
+            pool_terms_scheme: "How it splits the reward",
+            pool_terms_window: "Shares counted",
+            pool_terms_share_factor: "Share difficulty",
+            pool_terms_fee: "Pool fee",
+            pool_terms_minimum: "Smallest payout",
+            pool_terms_maturity: "Blocks before a reward can be paid",
+            pool_terms_interval: "Payouts run every",
+            pool_terms_unavailable: "This pool does not publish its terms. Ask the operator what it pays and what it keeps.",
+            pool_terms_source: "Read from the pool itself, not from this panel.",
         },
         Lang::El => Strings {
             window_title: "HAC Miner Panel",
@@ -454,6 +538,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "Χωρίς GPU",
             label_language: "Γλώσσα:",
             label_currency: "Νόμισμα:",
+            pool_pay_title: "ΟΙ ΠΛΗΡΩΜΕΣ ΣΟΥ ΑΠΟ ΤΟ POOL",
+            pool_pay_total_paid: "Σύνολο που σου πληρώθηκε",
+            pool_pay_owed: "Σου οφείλονται (εκτίμηση)",
+            pool_pay_in_flight: "Πληρωμή σε εξέλιξη",
+            pool_pay_last: "Τελευταία πληρωμή",
+            pool_pay_last_line: "{}, πληρώθηκε πριν από {}",
+            pool_pay_last_tx: "Συναλλαγή πληρωμής",
+            pool_pay_never: "Καμία πληρωμή ακόμα",
+            pool_pay_shares: "Τα shares σου στο παράθυρο του pool",
+            pool_pay_nothing_paid: "Δεν έχει πληρωθεί τίποτα ακόμα",
+            pool_pay_nothing_owed: "Δεν οφείλεται τίποτα αυτή τη στιγμή",
+            pool_pay_not_reported: "Το pool δεν το δημοσιεύει",
+            pool_pay_unknown: "Άγνωστο",
+            pool_pay_waiting: "Ερώτηση στο pool...",
+            pool_pay_unreachable: "Το pool δεν είναι προσβάσιμο, οπότε τα κέρδη σου είναι άγνωστα. Άγνωστο δεν σημαίνει μηδέν: δεν χάθηκε τίποτα, απλώς το panel δεν έχει ακόμα απάντηση.",
+            pool_pay_estimate_note: "Αυτό που σου οφείλεται είναι εκτίμηση. Αλλάζει με κάθε share και κάθε block, και οριστικοποιείται μόνο όταν το pool το πληρώσει.",
+            pool_pay_amount_note: "Τα ποσά είναι σε σημειογραφία Hacash: 1:248 είναι 1 HAC και 12:247 είναι 1.2 HAC.",
+            pool_pay_solo: "Κάνεις solo mining στο δικό σου full node. Δεν υπάρχει λογιστική pool: κάθε block που βρίσκεις πληρώνει ολόκληρο το πορτοφόλι ανταμοιβής σου.",
+            pool_pay_node: "Αυτή η διεύθυνση είναι απλό full node, όχι pool πληρωμών. Δεν κρατά αρχείο ανά miner, οπότε οι ανταμοιβές πάνε στο πορτοφόλι εκείνου του node, όχι σε σένα.",
+            pool_pay_relay: "Αυτή η διεύθυνση είναι relay (hac-pool). Προωθεί μόνο τη δουλειά και δεν κρατά πορτοφόλι ούτε shares, οπότε δεν πληρώνει ποτέ miners. Οι ανταμοιβές πάνε στο full node από πίσω.",
+            pool_pay_no_earnings: "Αυτό το pool απαντά, αλλά δεν δημοσιεύει τι έχει κερδίσει ο κάθε miner. Το panel δεν θα μαντέψει ποσό.",
+            pool_pay_unidentified: "Αυτή η διεύθυνση απαντά, αλλά δεν δημοσιεύει ούτε όρους ούτε κέρδη, οπότε το panel δεν μπορεί να σου πει τι πληρώνει. Ρώτα τον διαχειριστή πριν στείλεις πραγματικό hashrate.",
+            pool_pay_no_address: "Δεν στέλνεται διεύθυνση πληρωμής σε αυτό το pool, οπότε δεν έχει πού να σε πιστώσει. Βάλε το πορτοφόλι ανταμοιβής στις Ρυθμίσεις και χρησιμοποίησε σύνδεση pool.",
+            pool_pay_bad_address: "Το πορτοφόλι ανταμοιβής δεν είναι διεύθυνση Hacash που μπορεί να πληρώσει το pool. Διόρθωσέ το στις Ρυθμίσεις.",
+            pool_pay_checked: "Ελέγχθηκε πριν από {}",
+            pool_terms_title: "ΟΡΟΙ ΤΟΥ POOL",
+            pool_terms_scheme: "Πώς μοιράζει την ανταμοιβή",
+            pool_terms_window: "Shares που μετρούν",
+            pool_terms_share_factor: "Δυσκολία share",
+            pool_terms_fee: "Προμήθεια pool",
+            pool_terms_minimum: "Μικρότερη πληρωμή",
+            pool_terms_maturity: "Blocks πριν πληρωθεί μια ανταμοιβή",
+            pool_terms_interval: "Οι πληρωμές τρέχουν κάθε",
+            pool_terms_unavailable: "Αυτό το pool δεν δημοσιεύει τους όρους του. Ρώτα τον διαχειριστή τι πληρώνει και τι κρατά.",
+            pool_terms_source: "Διαβάστηκε από το ίδιο το pool, όχι από αυτό το panel.",
         },
         Lang::Tr => Strings {
             window_title: "HAC Miner Panel",
@@ -567,6 +686,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "GPU yok",
             label_language: "Dil:",
             label_currency: "Para birimi:",
+            pool_pay_title: "HAVUZ ÖDEMELERİN",
+            pool_pay_total_paid: "Sana ödenen toplam",
+            pool_pay_owed: "Sana borçlu (tahmini)",
+            pool_pay_in_flight: "Yolda olan ödeme",
+            pool_pay_last: "Son ödeme",
+            pool_pay_last_line: "{}, {} önce ödendi",
+            pool_pay_last_tx: "Ödeme işlemi",
+            pool_pay_never: "Henüz ödeme yok",
+            pool_pay_shares: "Havuzun penceresindeki payların",
+            pool_pay_nothing_paid: "Henüz hiçbir şey ödenmedi",
+            pool_pay_nothing_owed: "Şu anda borç yok",
+            pool_pay_not_reported: "Bu havuz bunu bildirmiyor",
+            pool_pay_unknown: "Bilinmiyor",
+            pool_pay_waiting: "Havuza soruluyor...",
+            pool_pay_unreachable: "Havuza ulaşılamıyor, bu yüzden kazancın bilinmiyor. Bilinmiyor sıfır demek değildir: hiçbir şey kaybolmadı, panelin henüz bir yanıtı yok.",
+            pool_pay_estimate_note: "Sana borçlu olunan tutar bir tahmindir. Her pay ve her blokla değişir ve ancak havuz ödediğinde kesinleşir.",
+            pool_pay_amount_note: "Tutarlar Hacash gösterimindedir: 1:248 = 1 HAC ve 12:247 = 1.2 HAC.",
+            pool_pay_solo: "Kendi tam düğümünde solo kazıyorsun. Havuz defteri yok: bulduğun her blok ödül cüzdanına tamamen ödenir.",
+            pool_pay_node: "Bu adres ödeme havuzu değil, düz bir tam düğüm. Madenci başına kayıt tutmaz, bu yüzden blok ödülleri sana değil o düğümün kendi ödül cüzdanına gider.",
+            pool_pay_relay: "Bu adres bir aktarıcı (hac-pool). İşi iletir, cüzdan ve pay kaydı tutmaz, bu yüzden madencilere asla ödeme yapmaz. Ödüller arkasındaki tam düğüme gider.",
+            pool_pay_no_earnings: "Bu havuz yanıt veriyor ama her madencinin ne kazandığını yayınlamıyor. Panel tutar tahmin etmez.",
+            pool_pay_unidentified: "Bu adres yanıt veriyor ama ne koşullarını ne de kazançları yayınlıyor, bu yüzden panel ne ödediğini söyleyemez. Gerçek hashrate yöneltmeden önce işletmeciye sor.",
+            pool_pay_no_address: "Bu havuza ödeme adresi gönderilmiyor, bu yüzden alacak yazacağı bir yer yok. Ödül cüzdanını Ayarlar bölümünde gir ve havuz bağlantısını kullan.",
+            pool_pay_bad_address: "Ödül cüzdanı, havuzun ödeyebileceği bir Hacash adresi değil. Ayarlar bölümünde düzelt.",
+            pool_pay_checked: "{} önce kontrol edildi",
+            pool_terms_title: "HAVUZ KOŞULLARI",
+            pool_terms_scheme: "Ödülü nasıl paylaştırır",
+            pool_terms_window: "Sayılan paylar",
+            pool_terms_share_factor: "Pay zorluğu",
+            pool_terms_fee: "Havuz komisyonu",
+            pool_terms_minimum: "En küçük ödeme",
+            pool_terms_maturity: "Ödül ödenmeden önceki blok sayısı",
+            pool_terms_interval: "Ödemeler her",
+            pool_terms_unavailable: "Bu havuz koşullarını yayınlamıyor. İşletmeciye ne ödediğini ve ne kestiğini sor.",
+            pool_terms_source: "Bu panelden değil, havuzun kendisinden okundu.",
         },
         Lang::Zh => Strings {
             window_title: "HAC 挖矿面板",
@@ -680,6 +834,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "无 GPU",
             label_language: "语言:",
             label_currency: "货币:",
+            pool_pay_title: "你的矿池收款",
+            pool_pay_total_paid: "已支付给你的总额",
+            pool_pay_owed: "应付给你（估算）",
+            pool_pay_in_flight: "正在支付中",
+            pool_pay_last: "上次支付",
+            pool_pay_last_line: "{}，{}前支付",
+            pool_pay_last_tx: "支付交易",
+            pool_pay_never: "还没有支付过",
+            pool_pay_shares: "你在矿池窗口内的份额",
+            pool_pay_nothing_paid: "还没有支付任何金额",
+            pool_pay_nothing_owed: "目前没有欠款",
+            pool_pay_not_reported: "该矿池不公布此项",
+            pool_pay_unknown: "未知",
+            pool_pay_waiting: "正在询问矿池...",
+            pool_pay_unreachable: "无法连接矿池，因此你的收益未知。未知不等于零：没有任何损失，只是面板暂时没有得到答复。",
+            pool_pay_estimate_note: "应付给你的金额是估算值。它随每个份额和每个区块变化，只有矿池实际支付后才是最终数字。",
+            pool_pay_amount_note: "金额使用 Hacash 记法：1:248 表示 1 HAC，12:247 表示 1.2 HAC。",
+            pool_pay_solo: "你正在自己的全节点上单独挖矿。没有矿池账本：你找到的每个区块都全额支付到你的奖励钱包。",
+            pool_pay_node: "这个地址是普通全节点，不是支付矿池。它不为每个矿工记账，所以区块奖励归该节点自己的奖励钱包，而不是你。",
+            pool_pay_relay: "这个地址是中继（hac-pool）。它只转发工作，不保存钱包也不记录份额，因此永远不会支付矿工。奖励归它背后的全节点。",
+            pool_pay_no_earnings: "这个矿池有响应，但不公布每个矿工的收益。面板不会猜测金额。",
+            pool_pay_unidentified: "这个地址有响应，但既不公布条款也不公布收益，所以面板无法告诉你它支付什么。在投入真实算力前请先询问运营者。",
+            pool_pay_no_address: "没有向这个矿池发送支付地址，所以它无处记账。请在设置中填写奖励钱包并使用矿池连接。",
+            pool_pay_bad_address: "奖励钱包不是矿池可以支付的 Hacash 地址。请在设置中更正。",
+            pool_pay_checked: "{}前检查",
+            pool_terms_title: "矿池条款",
+            pool_terms_scheme: "奖励如何分配",
+            pool_terms_window: "计入的份额",
+            pool_terms_share_factor: "份额难度",
+            pool_terms_fee: "矿池手续费",
+            pool_terms_minimum: "最小支付额",
+            pool_terms_maturity: "奖励可支付前需要的区块数",
+            pool_terms_interval: "支付运行间隔",
+            pool_terms_unavailable: "这个矿池不公布条款。请询问运营者它支付什么、留下什么。",
+            pool_terms_source: "读取自矿池本身，而不是本面板。",
         },
         Lang::Ja => Strings {
             window_title: "HAC マイナーパネル",
@@ -793,6 +982,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "GPU なし",
             label_language: "言語:",
             label_currency: "通貨:",
+            pool_pay_title: "プールからの支払い",
+            pool_pay_total_paid: "あなたへの支払い合計",
+            pool_pay_owed: "未払い額（見積もり）",
+            pool_pay_in_flight: "送金処理中",
+            pool_pay_last: "前回の支払い",
+            pool_pay_last_line: "{}、{}前に支払い",
+            pool_pay_last_tx: "支払いトランザクション",
+            pool_pay_never: "まだ支払いはありません",
+            pool_pay_shares: "プールの集計範囲内のあなたのシェア",
+            pool_pay_nothing_paid: "まだ何も支払われていません",
+            pool_pay_nothing_owed: "現在の未払いはありません",
+            pool_pay_not_reported: "このプールは公開していません",
+            pool_pay_unknown: "不明",
+            pool_pay_waiting: "プールに問い合わせ中...",
+            pool_pay_unreachable: "プールに接続できないため、収益は不明です。不明はゼロではありません。失われたものはなく、パネルがまだ回答を得ていないだけです。",
+            pool_pay_estimate_note: "未払い額は見積もりです。シェアやブロックごとに変動し、プールが実際に支払った時点で確定します。",
+            pool_pay_amount_note: "金額は Hacash 表記です。1:248 は 1 HAC、12:247 は 1.2 HAC です。",
+            pool_pay_solo: "自分のフルノードでソロマイニング中です。プールの台帳はありません。見つけたブロックは全額あなたの報酬ウォレットに支払われます。",
+            pool_pay_node: "このアドレスは支払いプールではなく、通常のフルノードです。マイナーごとの記録を持たないため、ブロック報酬はあなたではなくそのノードの報酬ウォレットに入ります。",
+            pool_pay_relay: "このアドレスは中継（hac-pool）です。作業を中継するだけでウォレットもシェア記録も持たず、マイナーに支払うことはありません。報酬は背後のフルノードに入ります。",
+            pool_pay_no_earnings: "このプールは応答しますが、マイナーごとの収益を公開していません。パネルは金額を推測しません。",
+            pool_pay_unidentified: "このアドレスは応答しますが、条件も収益も公開していないため、何を支払うのかパネルには分かりません。実際のハッシュレートを向ける前に運営者に確認してください。",
+            pool_pay_no_address: "このプールに支払いアドレスが送られていないため、記帳する先がありません。設定で報酬ウォレットを入力し、プール接続を使ってください。",
+            pool_pay_bad_address: "報酬ウォレットはプールが支払える Hacash アドレスではありません。設定で修正してください。",
+            pool_pay_checked: "{}前に確認",
+            pool_terms_title: "プールの条件",
+            pool_terms_scheme: "報酬の分配方法",
+            pool_terms_window: "集計されるシェア",
+            pool_terms_share_factor: "シェアの難易度",
+            pool_terms_fee: "プール手数料",
+            pool_terms_minimum: "最小支払い額",
+            pool_terms_maturity: "報酬が支払えるまでのブロック数",
+            pool_terms_interval: "支払いの実行間隔",
+            pool_terms_unavailable: "このプールは条件を公開していません。何を支払い何を差し引くのか運営者に確認してください。",
+            pool_terms_source: "このパネルではなく、プール自身から読み取っています。",
         },
         Lang::Es => Strings {
             window_title: "Panel HAC Miner",
@@ -906,6 +1130,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "Sin GPU",
             label_language: "Idioma:",
             label_currency: "Moneda:",
+            pool_pay_title: "TUS PAGOS DEL POOL",
+            pool_pay_total_paid: "Total pagado a ti",
+            pool_pay_owed: "Se te debe (estimación)",
+            pool_pay_in_flight: "Pago en camino",
+            pool_pay_last: "Último pago",
+            pool_pay_last_line: "{}, pagado hace {}",
+            pool_pay_last_tx: "Transacción del pago",
+            pool_pay_never: "Todavía no hay ningún pago",
+            pool_pay_shares: "Tus shares en la ventana del pool",
+            pool_pay_nothing_paid: "Todavía no se ha pagado nada",
+            pool_pay_nothing_owed: "Ahora mismo no se debe nada",
+            pool_pay_not_reported: "Este pool no lo publica",
+            pool_pay_unknown: "Desconocido",
+            pool_pay_waiting: "Preguntando al pool...",
+            pool_pay_unreachable: "No se puede contactar con el pool, así que tus ganancias son desconocidas. Desconocido no es cero: no se ha perdido nada, el panel simplemente todavía no tiene respuesta.",
+            pool_pay_estimate_note: "Lo que se te debe es una estimación. Cambia con cada share y cada bloque, y solo es definitivo cuando el pool lo paga.",
+            pool_pay_amount_note: "Los importes usan la notación Hacash: 1:248 es 1 HAC y 12:247 es 1.2 HAC.",
+            pool_pay_solo: "Estás minando en solitario en tu propio nodo completo. No hay libro de cuentas de pool: cada bloque que encuentres paga íntegro a tu cartera de recompensas.",
+            pool_pay_node: "Esta dirección es un nodo completo normal, no un pool de pagos. No lleva registro por minero, así que las recompensas van a la cartera de ese nodo, no a la tuya.",
+            pool_pay_relay: "Esta dirección es un relé (hac-pool). Solo reenvía trabajo y no guarda cartera ni registro de shares, así que nunca paga a los mineros. Las recompensas van al nodo completo que tiene detrás.",
+            pool_pay_no_earnings: "Este pool responde, pero no publica lo que ha ganado cada minero. El panel no va a adivinar un importe.",
+            pool_pay_unidentified: "Esta dirección responde, pero no publica ni condiciones ni ganancias, así que el panel no puede decirte qué paga. Pregunta al operador antes de dirigir hashrate real.",
+            pool_pay_no_address: "No se envía ninguna dirección de pago a este pool, así que no tiene dónde abonarte. Pon tu cartera de recompensas en Ajustes y usa la conexión de pool.",
+            pool_pay_bad_address: "La cartera de recompensas no es una dirección Hacash que el pool pueda pagar. Corrígela en Ajustes.",
+            pool_pay_checked: "Comprobado hace {}",
+            pool_terms_title: "CONDICIONES DEL POOL",
+            pool_terms_scheme: "Cómo reparte la recompensa",
+            pool_terms_window: "Shares que cuentan",
+            pool_terms_share_factor: "Dificultad del share",
+            pool_terms_fee: "Comisión del pool",
+            pool_terms_minimum: "Pago más pequeño",
+            pool_terms_maturity: "Bloques antes de poder pagar una recompensa",
+            pool_terms_interval: "Los pagos se ejecutan cada",
+            pool_terms_unavailable: "Este pool no publica sus condiciones. Pregunta al operador qué paga y qué se queda.",
+            pool_terms_source: "Leído del propio pool, no de este panel.",
         },
         Lang::Fr => Strings {
             window_title: "Panneau HAC Miner",
@@ -1019,6 +1278,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "Sans GPU",
             label_language: "Langue :",
             label_currency: "Devise :",
+            pool_pay_title: "VOS PAIEMENTS DU POOL",
+            pool_pay_total_paid: "Total qui vous a été payé",
+            pool_pay_owed: "Ce qui vous est dû (estimation)",
+            pool_pay_in_flight: "Paiement en cours d'envoi",
+            pool_pay_last: "Dernier paiement",
+            pool_pay_last_line: "{}, payé il y a {}",
+            pool_pay_last_tx: "Transaction du paiement",
+            pool_pay_never: "Aucun paiement pour l'instant",
+            pool_pay_shares: "Vos shares dans la fenêtre du pool",
+            pool_pay_nothing_paid: "Rien n'a encore été payé",
+            pool_pay_nothing_owed: "Rien n'est dû pour le moment",
+            pool_pay_not_reported: "Ce pool ne le publie pas",
+            pool_pay_unknown: "Inconnu",
+            pool_pay_waiting: "Interrogation du pool...",
+            pool_pay_unreachable: "Le pool est injoignable, vos gains sont donc inconnus. Inconnu ne veut pas dire zéro : rien n'est perdu, le panneau n'a simplement pas encore de réponse.",
+            pool_pay_estimate_note: "Ce qui vous est dû est une estimation. Cela bouge à chaque share et à chaque bloc, et ce n'est définitif qu'une fois payé par le pool.",
+            pool_pay_amount_note: "Les montants sont en notation Hacash : 1:248 vaut 1 HAC et 12:247 vaut 1.2 HAC.",
+            pool_pay_solo: "Vous minez en solo sur votre propre nœud complet. Il n'y a pas de registre de pool : chaque bloc trouvé paie intégralement votre portefeuille de récompense.",
+            pool_pay_node: "Cette adresse est un simple nœud complet, pas un pool de paiement. Il ne tient aucun registre par mineur, donc les récompenses vont au portefeuille de ce nœud, pas au vôtre.",
+            pool_pay_relay: "Cette adresse est un relais (hac-pool). Il ne fait que transmettre le travail, sans portefeuille ni registre de shares, donc il ne paie jamais les mineurs. Les récompenses vont au nœud complet situé derrière.",
+            pool_pay_no_earnings: "Ce pool répond, mais il ne publie pas ce que chaque mineur a gagné. Le panneau ne devinera aucun montant.",
+            pool_pay_unidentified: "Cette adresse répond, mais ne publie ni conditions ni gains : le panneau ne peut pas vous dire ce qu'elle paie. Demandez à l'opérateur avant d'y diriger de la puissance réelle.",
+            pool_pay_no_address: "Aucune adresse de paiement n'est envoyée à ce pool, il n'a donc rien à créditer. Renseignez votre portefeuille de récompense dans les Réglages et utilisez la connexion pool.",
+            pool_pay_bad_address: "Le portefeuille de récompense n'est pas une adresse Hacash que le pool peut payer. Corrigez-le dans les Réglages.",
+            pool_pay_checked: "Vérifié il y a {}",
+            pool_terms_title: "CONDITIONS DU POOL",
+            pool_terms_scheme: "Comment la récompense est partagée",
+            pool_terms_window: "Shares comptés",
+            pool_terms_share_factor: "Difficulté du share",
+            pool_terms_fee: "Commission du pool",
+            pool_terms_minimum: "Plus petit paiement",
+            pool_terms_maturity: "Blocs avant qu'une récompense soit payable",
+            pool_terms_interval: "Les paiements se lancent toutes les",
+            pool_terms_unavailable: "Ce pool ne publie pas ses conditions. Demandez à l'opérateur ce qu'il paie et ce qu'il garde.",
+            pool_terms_source: "Lu directement depuis le pool, pas depuis ce panneau.",
         },
         Lang::Th => Strings {
             window_title: "HAC Miner Panel",
@@ -1132,6 +1426,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "ไม่มี GPU",
             label_language: "ภาษา:",
             label_currency: "สกุลเงิน:",
+            pool_pay_title: "การจ่ายเงินจากพูลของคุณ",
+            pool_pay_total_paid: "ยอดที่จ่ายให้คุณทั้งหมด",
+            pool_pay_owed: "ค้างจ่ายให้คุณ (ประมาณการ)",
+            pool_pay_in_flight: "กำลังจ่ายอยู่",
+            pool_pay_last: "การจ่ายครั้งล่าสุด",
+            pool_pay_last_line: "{} จ่ายเมื่อ {} ที่แล้ว",
+            pool_pay_last_tx: "ธุรกรรมการจ่ายเงิน",
+            pool_pay_never: "ยังไม่มีการจ่ายเงิน",
+            pool_pay_shares: "แชร์ของคุณในช่วงที่พูลนับ",
+            pool_pay_nothing_paid: "ยังไม่ได้จ่ายอะไรเลย",
+            pool_pay_nothing_owed: "ตอนนี้ไม่มียอดค้างจ่าย",
+            pool_pay_not_reported: "พูลนี้ไม่เปิดเผยข้อมูลนี้",
+            pool_pay_unknown: "ไม่ทราบ",
+            pool_pay_waiting: "กำลังถามพูล...",
+            pool_pay_unreachable: "ติดต่อพูลไม่ได้ จึงไม่ทราบรายได้ของคุณ ไม่ทราบไม่ได้แปลว่าศูนย์ ไม่มีอะไรหายไป เพียงแต่แผงควบคุมยังไม่ได้รับคำตอบ",
+            pool_pay_estimate_note: "ยอดที่ค้างจ่ายให้คุณเป็นเพียงการประมาณการ มันเปลี่ยนไปทุกแชร์และทุกบล็อก และจะแน่นอนก็ต่อเมื่อพูลจ่ายแล้วเท่านั้น",
+            pool_pay_amount_note: "จำนวนเงินใช้รูปแบบ Hacash: 1:248 คือ 1 HAC และ 12:247 คือ 1.2 HAC",
+            pool_pay_solo: "คุณกำลังขุดเดี่ยวบนฟูลโหนดของคุณเอง ไม่มีบัญชีของพูล ทุกบล็อกที่คุณหาได้จะจ่ายเข้ากระเป๋ารางวัลของคุณเต็มจำนวน",
+            pool_pay_node: "ที่อยู่นี้เป็นฟูลโหนดธรรมดา ไม่ใช่พูลที่จ่ายเงิน มันไม่เก็บบันทึกรายนักขุด รางวัลบล็อกจึงเข้ากระเป๋ารางวัลของโหนดนั้น ไม่ใช่ของคุณ",
+            pool_pay_relay: "ที่อยู่นี้เป็นตัวส่งต่อ (hac-pool) มันเพียงส่งงานผ่าน ไม่มีกระเป๋าเงินและไม่บันทึกแชร์ จึงไม่เคยจ่ายให้นักขุด รางวัลจะเข้าฟูลโหนดที่อยู่เบื้องหลัง",
+            pool_pay_no_earnings: "พูลนี้ตอบกลับ แต่ไม่เปิดเผยรายได้ของนักขุดแต่ละคน แผงควบคุมจะไม่เดาจำนวนเงิน",
+            pool_pay_unidentified: "ที่อยู่นี้ตอบกลับ แต่ไม่เปิดเผยทั้งเงื่อนไขและรายได้ แผงควบคุมจึงบอกไม่ได้ว่าจ่ายอะไร ควรถามผู้ดูแลก่อนส่งกำลังขุดจริงมาที่นี่",
+            pool_pay_no_address: "ไม่มีการส่งที่อยู่รับเงินไปยังพูลนี้ พูลจึงไม่มีที่จะบันทึกให้คุณ ตั้งค่ากระเป๋ารางวัลในหน้าตั้งค่าและใช้การเชื่อมต่อแบบพูล",
+            pool_pay_bad_address: "กระเป๋ารางวัลไม่ใช่ที่อยู่ Hacash ที่พูลจ่ายได้ กรุณาแก้ไขในหน้าตั้งค่า",
+            pool_pay_checked: "ตรวจสอบเมื่อ {} ที่แล้ว",
+            pool_terms_title: "เงื่อนไขของพูล",
+            pool_terms_scheme: "แบ่งรางวัลอย่างไร",
+            pool_terms_window: "แชร์ที่นับ",
+            pool_terms_share_factor: "ความยากของแชร์",
+            pool_terms_fee: "ค่าธรรมเนียมพูล",
+            pool_terms_minimum: "ยอดจ่ายขั้นต่ำ",
+            pool_terms_maturity: "จำนวนบล็อกก่อนจ่ายรางวัลได้",
+            pool_terms_interval: "รอบการจ่ายทุก",
+            pool_terms_unavailable: "พูลนี้ไม่เปิดเผยเงื่อนไข ควรถามผู้ดูแลว่าจ่ายอะไรและหักอะไร",
+            pool_terms_source: "อ่านจากพูลโดยตรง ไม่ใช่จากแผงควบคุมนี้",
         },
         Lang::Ru => Strings {
             window_title: "Панель HAC Miner",
@@ -1245,6 +1574,41 @@ pub fn strings(lang: Lang) -> Strings {
             no_gpu: "Без GPU",
             label_language: "Язык:",
             label_currency: "Валюта:",
+            pool_pay_title: "ВАШИ ВЫПЛАТЫ ИЗ ПУЛА",
+            pool_pay_total_paid: "Всего выплачено вам",
+            pool_pay_owed: "Вам причитается (оценка)",
+            pool_pay_in_flight: "Выплата в пути",
+            pool_pay_last: "Последняя выплата",
+            pool_pay_last_line: "{}, выплачено {} назад",
+            pool_pay_last_tx: "Транзакция выплаты",
+            pool_pay_never: "Выплат пока не было",
+            pool_pay_shares: "Ваши шары в окне пула",
+            pool_pay_nothing_paid: "Пока ничего не выплачено",
+            pool_pay_nothing_owed: "Сейчас ничего не причитается",
+            pool_pay_not_reported: "Этот пул это не публикует",
+            pool_pay_unknown: "Неизвестно",
+            pool_pay_waiting: "Запрос к пулу...",
+            pool_pay_unreachable: "Пул недоступен, поэтому ваш заработок неизвестен. Неизвестно это не ноль: ничего не потеряно, у панели просто пока нет ответа.",
+            pool_pay_estimate_note: "Причитающаяся вам сумма это оценка. Она меняется с каждым шаром и каждым блоком и становится окончательной только после выплаты пулом.",
+            pool_pay_amount_note: "Суммы записаны в нотации Hacash: 1:248 это 1 HAC, а 12:247 это 1.2 HAC.",
+            pool_pay_solo: "Вы майните соло на своём полном узле. Учёта пула нет: каждый найденный блок полностью оплачивает ваш кошелёк наград.",
+            pool_pay_node: "Этот адрес это обычный полный узел, а не пул выплат. Он не ведёт учёт по майнерам, поэтому награды идут в кошелёк этого узла, а не вам.",
+            pool_pay_relay: "Этот адрес это ретранслятор (hac-pool). Он только передаёт работу, не хранит кошелёк и не считает шары, поэтому никогда не платит майнерам. Награды идут полному узлу за ним.",
+            pool_pay_no_earnings: "Этот пул отвечает, но не публикует заработок каждого майнера. Панель не станет угадывать сумму.",
+            pool_pay_unidentified: "Этот адрес отвечает, но не публикует ни условий, ни заработка, поэтому панель не может сказать, что он платит. Спросите оператора, прежде чем направлять сюда реальный хешрейт.",
+            pool_pay_no_address: "На этот пул не отправляется адрес для выплат, поэтому ему некуда вам начислять. Укажите кошелёк наград в настройках и используйте подключение к пулу.",
+            pool_pay_bad_address: "Кошелёк наград это не адрес Hacash, на который пул может заплатить. Исправьте его в настройках.",
+            pool_pay_checked: "Проверено {} назад",
+            pool_terms_title: "УСЛОВИЯ ПУЛА",
+            pool_terms_scheme: "Как делится награда",
+            pool_terms_window: "Учитываемые шары",
+            pool_terms_share_factor: "Сложность шара",
+            pool_terms_fee: "Комиссия пула",
+            pool_terms_minimum: "Минимальная выплата",
+            pool_terms_maturity: "Блоков до того, как награду можно выплатить",
+            pool_terms_interval: "Выплаты запускаются каждые",
+            pool_terms_unavailable: "Этот пул не публикует свои условия. Спросите оператора, что он платит и что удерживает.",
+            pool_terms_source: "Прочитано из самого пула, а не из этой панели.",
         },
     }
 }
@@ -1286,6 +1650,131 @@ mod tests {
             assert_ne!(
                 msg, s.bid_password_required,
                 "{} must not reuse the blank password message",
+                lang.code()
+            );
+        }
+    }
+
+    /// Every string the payout screen can show, in the order the screen uses
+    /// them. Kept as one list so a new language cannot ship with a blank where
+    /// a money label belongs.
+    fn pool_money_strings(s: &Strings) -> [&'static str; 35] {
+        [
+            s.pool_pay_title,
+            s.pool_pay_total_paid,
+            s.pool_pay_owed,
+            s.pool_pay_in_flight,
+            s.pool_pay_last,
+            s.pool_pay_last_line,
+            s.pool_pay_last_tx,
+            s.pool_pay_never,
+            s.pool_pay_shares,
+            s.pool_pay_nothing_paid,
+            s.pool_pay_nothing_owed,
+            s.pool_pay_not_reported,
+            s.pool_pay_unknown,
+            s.pool_pay_waiting,
+            s.pool_pay_unreachable,
+            s.pool_pay_estimate_note,
+            s.pool_pay_amount_note,
+            s.pool_pay_solo,
+            s.pool_pay_node,
+            s.pool_pay_relay,
+            s.pool_pay_no_earnings,
+            s.pool_pay_unidentified,
+            s.pool_pay_no_address,
+            s.pool_pay_bad_address,
+            s.pool_pay_checked,
+            s.pool_terms_title,
+            s.pool_terms_scheme,
+            s.pool_terms_window,
+            s.pool_terms_share_factor,
+            s.pool_terms_fee,
+            s.pool_terms_minimum,
+            s.pool_terms_maturity,
+            s.pool_terms_interval,
+            s.pool_terms_unavailable,
+            s.pool_terms_source,
+        ]
+    }
+
+    #[test]
+    fn every_language_can_talk_about_money() {
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            for text in pool_money_strings(&s) {
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} left a payout string blank",
+                    lang.code()
+                );
+                assert!(
+                    !text.contains('\u{2014}'),
+                    "{} uses an em dash in a payout string: {text}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_language_keeps_the_three_money_states_apart() {
+        // "nothing owed", "not reported" and "unknown" are three different
+        // facts. A language that collapses any two of them tells a miner that
+        // an unreachable pool owes it nothing.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            let distinct = [
+                s.pool_pay_nothing_owed,
+                s.pool_pay_nothing_paid,
+                s.pool_pay_not_reported,
+                s.pool_pay_unknown,
+                s.pool_pay_never,
+            ];
+            for i in 0..distinct.len() {
+                for j in (i + 1)..distinct.len() {
+                    assert_ne!(
+                        distinct[i],
+                        distinct[j],
+                        "{} reuses one wording for two different payout states",
+                        lang.code()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn payout_sentences_keep_their_placeholders_in_every_language() {
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            assert_eq!(
+                s.pool_pay_last_line.matches("{}").count(),
+                2,
+                "{} must place both the amount and the age",
+                lang.code()
+            );
+            assert_eq!(
+                s.pool_pay_checked.matches("{}").count(),
+                1,
+                "{} must place the age",
+                lang.code()
+            );
+            let line = s.pool_pay_last_display("1:248", "5m");
+            assert!(line.contains("1:248") && line.contains("5m"));
+            assert!(s.pool_pay_checked_display("5m").contains("5m"));
+        }
+    }
+
+    #[test]
+    fn every_language_states_the_amount_notation_it_shows() {
+        // The panel prints chain amounts ("1:248"), so each language has to say
+        // what that means or the biggest number on the screen is unreadable.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            assert!(
+                s.pool_pay_amount_note.contains("1:248") && s.pool_pay_amount_note.contains("HAC"),
+                "{} must explain the amount notation",
                 lang.code()
             );
         }

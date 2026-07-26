@@ -22,8 +22,18 @@
 //!   * per-IP connection caps + a separate long-poll budget stop one host from
 //!     exhausting every connection slot
 //!
-//! Endpoints: /work, /share, /stats (own protocol) and /query/miner/pending,
-//! /query/miner/notice, /submit/miner/success (standard API).
+//! Endpoints: /work, /share, /stats, /terms, /earnings (own protocol) and
+//! /query/miner/pending, /query/miner/notice, /submit/miner/success (standard
+//! API).
+//!
+//! /terms and /earnings exist so a miner can judge the pool and see its money:
+//!   * /terms states the scheme, window, fee, minimum payout and maturity depths
+//!     by READING the constants and live values the pool acts on, so what is
+//!     advertised cannot drift from what is done
+//!   * /earnings?worker=<address> reports one worker's shares, its PAID total
+//!     (confirmed on chain), what is IN FLIGHT (submitted, unconfirmed) and an
+//!     explicitly-labelled PENDING estimate. The three are disjoint, and any of
+//!     them the pool cannot stand behind is reported as unknown, never as zero.
 //!
 //! Usage: pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
 //!   `chain` is REQUIRED: a wrong difficulty rule makes every share/block the
@@ -48,11 +58,14 @@ use sys::curtimes;
 use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::{self, Pplns, split_payout};
 use pool_spike::{
-    Admission, PAYOUT_MATURITY_DEPTH, PPLNS_WINDOW, PayoutTxState, Template, acquire_settle_lock,
-    assemble_block, atomic_write, balance, balance_units, block_reward_units, classify_payout_tx,
-    coinbase_body_hex, coinbase_with_extranonce, distributable_units, fetch_pool_template, find_str,
-    find_u64, get_json, http_client, intro_bytes, is_payout_address, load_or_create_wallet,
-    pool_state_path, post_hex, submit_block_bytes, verify_admitted, verify_chain_params,
+    Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PAYOUT_MATURITY_DEPTH, PAYOUT_UNIT, POOL_FEE_UNITS,
+    PPLNS_WINDOW, PaidLedger, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS, Template,
+    acquire_settle_lock, assemble_block, atomic_write, balance, balance_units, block_reward_units,
+    chunk_tx_fee, classify_payout_tx, coinbase_body_hex, coinbase_with_extranonce, confirm_payout,
+    distributable_units, drop_payout, fetch_pool_template, find_str, find_u64, get_json,
+    http_client, intro_bytes, is_payout_address, load_or_create_wallet, parse_paid_ledger,
+    parse_payout_records, payout_amount, pool_state_path, post_hex, submit_block_bytes,
+    verify_admitted, verify_chain_params,
 };
 
 use serde_json::json;
@@ -69,9 +82,6 @@ const MAX_NOTICE_WAITERS: usize = 384;
 /// implausible flood, so reject further shares this height rather than grow memory
 /// without limit. Reset every time the height advances.
 const SEEN_CAP: usize = 2_000_000;
-/// Recipients per settlement transaction. The node enforces TX_ACTIONS_MAX = 200
-/// actions; stay safely under it so a large payout is chunked, never rejected.
-const PAYOUT_CHUNK: usize = 190;
 /// After this many consecutive settlement cycles skipped by a payout that is
 /// still sitting in the mempool, escalate from a note to a loud warning: nothing
 /// is being paid, and the operator has to know why.
@@ -111,6 +121,13 @@ const BAD_STREAK_WORKERS: usize = 4096;
 /// after being printed with the same reason. The template loop runs every couple
 /// of seconds, so without this the warning would be the whole log.
 const TX_WARN_REPEAT: Duration = Duration::from_secs(300);
+/// Template cycles between refreshes of the pool's own wallet valuation. That
+/// number is what `/earnings` divides into a worker's PENDING estimate, and the
+/// settlement timer is far too slow to keep it current on its own. The cycle
+/// runs every two seconds, so this is roughly half a minute: one extra
+/// `/query/balance` per 30s against the node, and never on a miner's request
+/// path.
+const MONEY_REFRESH_CYCLES: u64 = 15;
 /// Template cycles a submitted block may go unnoticed by the chain before the
 /// pool shouts. `/submit/block` validates ASYNCHRONOUSLY and answers before the
 /// verdict, so the only evidence a block was refused is that the tip never
@@ -208,6 +225,18 @@ fn flush_state(shot: Option<StateShot>) -> bool {
     true
 }
 
+/// A valuation of the pool's own wallet, taken off the pool lock.
+///
+/// `units` is what has MATURED and is not yet settled: the node's confirmed
+/// balance, minus block income a reorg could still revoke, minus the fee reserve.
+/// It is deliberately a snapshot with a timestamp: `/earnings` must never make a
+/// node call, and a miner reading a figure has to be able to see how old it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Matured {
+    units: u64,
+    at: u64,
+}
+
 /// `durable` fsyncs before the rename; the frequent debounced share-save skips it
 /// (a crash loses at most the last handful of shares, which is already the
 /// accepted tolerance).
@@ -225,6 +254,13 @@ struct Pool {
     /// fraction of a real block — which is what makes credit proportional to
     /// hashrate instead of to batch cadence.
     share_factor: u32,
+    /// The factor the pool is REALLY serving. `share_target_hash` saturates at
+    /// the all-0xff ceiling, so on a low-difficulty chain the target handed out
+    /// can be far easier than `share_factor` asks for - and at the ceiling every
+    /// hash is a share, which is exactly when credit stops tracking hashrate.
+    /// Derived from the two targets, never assumed, and re-derived on every
+    /// difficulty change.
+    share_factor_achieved: u32,
     network_target: [u8; 32],
     /// Cached /query/miner/pending response for the current template, rebuilt
     /// only when the template changes so a poll never rebuilds it under the lock.
@@ -256,6 +292,30 @@ struct Pool {
     /// a restart mid-settlement does not re-pay. Robust to a lost submit ACK and
     /// to the wallet also earning coinbase income.
     settle_pending_txs: Vec<String>,
+    /// The exact per-recipient rows of every payout in `settle_pending_txs` this
+    /// pool submitted itself. A hash alone can only say that SOME payout is in
+    /// flight; these are what let a miner be told what is in flight FOR IT, and
+    /// what let a confirmed payout be credited to the right people.
+    payout_records: Vec<PayoutRecord>,
+    /// Total in-flight units across `payout_records`. Derived, kept beside them
+    /// so the PENDING estimate can subtract it in O(1): the node's CONFIRMED
+    /// balance still contains money that is already in a submitted payout, so
+    /// without this subtraction the same units would be reported as pending AND
+    /// as in flight.
+    inflight_units: u64,
+    /// What the pool has actually PAID each worker, folded in only when the node
+    /// reports a payout buried. Persisted, and only ever grows.
+    paid: PaidLedger,
+    /// The pool's last successful valuation of its own wallet: what has matured
+    /// and is not yet settled. `None` means the pool has never been able to value
+    /// its balance, and PENDING must then be reported as unknown - never as zero.
+    matured: Option<Matured>,
+    /// Did the most recent valuation attempt succeed? A stale figure is still
+    /// worth reporting, but a miner has to be told it is stale.
+    matured_current: bool,
+    /// How often the settlement timer runs, so `/terms` states the interval this
+    /// process is actually using rather than a documented default.
+    settle_secs: u64,
     /// Consecutive settlement cycles skipped because a payout was still waiting
     /// in the mempool. A payout that never confirms silently freezes every later
     /// payout, so this drives an escalating warning instead of silence. Purely a
@@ -288,9 +348,82 @@ impl Pool {
     }
 
     /// Derive the share target from the CURRENT network difficulty, so it tracks
-    /// difficulty changes instead of being a fixed absolute threshold.
+    /// difficulty changes instead of being a fixed absolute threshold, and
+    /// re-derive the factor it ACTUALLY achieves: the derivation saturates, and a
+    /// difficulty fall can quietly turn a 2^24 share into "every hash counts".
     fn recompute_share_target(&mut self) {
         self.share_target = pool_core::share_target_hash(self.tpl.difficulty, self.share_factor);
+        self.share_factor_achieved =
+            pool_core::achieved_share_factor(&self.network_target, &self.share_target);
+    }
+
+    /// Rebuild the derived in-flight total from the payout rows.
+    fn rebuild_inflight(&mut self) {
+        self.inflight_units = self
+            .payout_records
+            .iter()
+            .map(|r| r.units())
+            .fold(0u64, |a, b| a.saturating_add(b));
+    }
+
+    /// Everything `/earnings` needs about one worker, gathered in one short hold
+    /// of the pool lock. No node call, no full share table, no allocation beyond
+    /// the handful of in-flight rows that actually name this worker.
+    fn earnings_of(&self, worker: &str) -> Earnings {
+        let shares = self.pplns.count_of(worker);
+        let paid = self.paid.get(worker).cloned().unwrap_or_default();
+        let mut inflight = Vec::new();
+        let mut inflight_units = 0u64;
+        for r in &self.payout_records {
+            let u = r.units_for(worker);
+            if u == 0 {
+                continue;
+            }
+            inflight_units = inflight_units.saturating_add(u);
+            inflight.push(InflightRow {
+                hash: r.hash.clone(),
+                units: u,
+                at: r.at,
+                node_holds: r.node_holds,
+            });
+        }
+        Earnings {
+            // The pool knows a worker if it holds shares for it now, has paid it,
+            // owes it something in flight, or has handed it work. Anything else
+            // is an address this pool has never heard of, which is NOT the same
+            // fact as a worker that is owed nothing.
+            known: shares > 0
+                || paid.units > 0
+                || inflight_units > 0
+                || self.workers.contains_key(worker),
+            shares,
+            window_shares: self.pplns.total(),
+            window_size: self.pplns.window() as u64,
+            paid,
+            paid_since: self.paid.since,
+            inflight_units,
+            inflight,
+            // The confirmed balance still holds money that is already inside a
+            // submitted payout, so the pool-wide pending pot is what has matured
+            // MINUS what is in flight. Without this the same units would be
+            // reported to the same miner twice.
+            pool_pending_units: self
+                .matured
+                .map(|m| m.units.saturating_sub(self.inflight_units)),
+            matured_at: self.matured.map(|m| m.at).unwrap_or(0),
+            matured_current: self.matured_current,
+            // Payouts the pool is tracking but has no rows for: written by an
+            // older build, or by a tool that recorded only the hash. Their units
+            // are still inside the confirmed balance, so the subtraction above
+            // cannot be complete and PENDING would be overstated. Counted here so
+            // it can be reported as unknown rather than as a number that is too
+            // high, which is the one direction that would promise money.
+            unattributed_payouts: self
+                .settle_pending_txs
+                .iter()
+                .filter(|h| !self.payout_records.iter().any(|r| &&r.hash == h))
+                .count(),
+        }
     }
 
     /// Rebuild the cached standard-API pending response for the current template.
@@ -346,6 +479,14 @@ impl Pool {
             "blocks": self.blocks,
             "orphaned": self.orphaned,
             "settle_pending_txs": self.settle_pending_txs,
+            // The per-recipient rows behind those hashes, and the confirmed
+            // totals they turn into. Both must move in the SAME snapshot: a
+            // payout leaves the in-flight rows at the instant it enters the paid
+            // totals, and a crash between the two would either lose a payment or
+            // report it twice.
+            "payouts_inflight": self.payout_records.iter().map(|r| r.to_json())
+                .collect::<Vec<_>>(),
+            "paid": self.paid.to_json(),
             // Blocks still awaiting confirmation. Without these a restart in the
             // window between finding a block and burying it drops it from the
             // confirm/orphan reconciliation for good, so a later reorg of one of
@@ -440,16 +581,26 @@ impl Pool {
                     .collect()
             })
             .unwrap_or_default();
+        // The per-worker settlement ledger. Losing this would not lose anyone's
+        // money - the chain holds that - but it WOULD reset every miner's "total
+        // paid" to zero and make the pool report a number that quietly means
+        // something else, so it is restored with everything else and its start
+        // time travels with it.
+        self.payout_records = parse_payout_records(&j);
+        self.paid = parse_paid_ledger(&j);
+        self.rebuild_inflight();
         println!(
             "restored accounting: {} shares in window, {} blocks, {} orphaned, \
              {} block(s) awaiting confirmation, {} payout(s) pending, \
-             {} block(s) of income not yet matured",
+             {} block(s) of income not yet matured, \
+             {} worker(s) with a paid history",
             self.pplns.total(),
             self.blocks,
             self.orphaned,
             self.submitted.len(),
             self.settle_pending_txs.len(),
-            self.immature.len()
+            self.immature.len(),
+            self.paid.workers()
         );
     }
 }
@@ -520,6 +671,304 @@ fn check_share_factor(factor: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a share target the live network difficulty cannot support.
+///
+/// `check_share_factor` only ever looked at the number the operator typed. The
+/// target actually served is `network_target * 2^factor`, computed by
+/// `share_target_hash`, which SATURATES at the all-0xff ceiling and says nothing
+/// when it does. On a low-difficulty chain - a fresh testnet sits at
+/// `LOWEST_DIFFICULTY`, whose target has no leading zero bits at all - every hash
+/// then beats the share target. A worker is no longer credited for work: it is
+/// credited for how often it can complete an HTTP round trip, and one worker in a
+/// tight loop takes the whole payout window from everyone else. That is not a
+/// tuning wrinkle, it is the pool paying the wrong people, so it is refused.
+///
+/// The bound is the SAME `MIN_SHARE_FACTOR` the operator's `share_bits` must
+/// clear, applied to the factor the pool really achieves.
+fn check_share_target(factor: u32, achieved: u32, difficulty: u32) -> Result<(), String> {
+    if achieved >= MIN_SHARE_FACTOR {
+        return Ok(());
+    }
+    Err(format!(
+        "the network difficulty in force ({difficulty}) is too low to serve a fair share.\n\
+         share_bits={factor} asks for a share 2^{factor} easier than a block, but the derived \
+         share target saturates and what workers actually get is 2^{achieved} \
+         (minimum {MIN_SHARE_FACTOR}).\n\
+         At that point a share costs almost no work, so PPLNS credit tracks how fast a worker \
+         can submit rather than how much it hashes, and one worker can take the whole \
+         {PPLNS_WINDOW}-share payout window from everyone else. This pool will not distribute \
+         real money on that basis.\n\
+         Point it at a chain whose difficulty has risen, or wait for this one to adjust."
+    ))
+}
+
+/// Plan a settlement on the pool's ADVERTISED terms.
+///
+/// The only place the split is parameterised, and `/terms` reports the very same
+/// constants, so the fee and the minimum payout a miner is told about are the
+/// fee and the minimum payout the pool applies.
+fn plan_settlement(distributable: u64, payable: &[(String, u64)]) -> Vec<(String, u64)> {
+    split_payout(distributable, POOL_FEE_UNITS, PAYOUT_DUST_UNITS, payable)
+}
+
+/// A money figure, in the chain's own terms.
+///
+/// `units` is a whole number of 0.1 HAC (the granularity every payout this pool
+/// makes is planned in) and `amount` is that same number as the chain's `Amount`
+/// in its canonical `mantissa:unit` form - the identical string the node speaks
+/// and the transaction carries. No float, no hand-rolled decimal.
+fn money(units: u64) -> serde_json::Value {
+    json!({
+        "units": units,
+        "amount": payout_amount(units).to_fin_string(),
+        "unit": PAYOUT_UNIT,
+    })
+}
+
+/// What `/earnings` can say about a worker id before it looks anything up.
+///
+/// Three different facts, and a miner must never be shown one when another is
+/// true: a string that is not an address at all, an address this pool could never
+/// pay (so it never credits shares to it), and an address that is fine - after
+/// which "the pool has never heard of it" and "it is owed nothing" are two more
+/// answers again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerId {
+    Payable,
+    Unpayable,
+    NotAnAddress,
+}
+
+fn classify_worker_id(s: &str) -> WorkerId {
+    if Address::from_readable(s).is_err() {
+        return WorkerId::NotAnAddress;
+    }
+    if is_payout_address(s) {
+        WorkerId::Payable
+    } else {
+        WorkerId::Unpayable
+    }
+}
+
+/// One payout that is submitted but not yet confirmed, as it concerns one worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InflightRow {
+    hash: String,
+    units: u64,
+    at: u64,
+    node_holds: bool,
+}
+
+/// Everything `/earnings` says about one worker, gathered under the pool lock and
+/// rendered with it released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Earnings {
+    /// Has this pool ever heard of this address? A worker it has never seen is a
+    /// different fact from a worker that is owed nothing, and reporting the first
+    /// as the second tells a miner its pool is tracking work that it is not.
+    known: bool,
+    shares: u64,
+    window_shares: u64,
+    window_size: u64,
+    paid: pool_spike::PaidRow,
+    paid_since: u64,
+    inflight_units: u64,
+    inflight: Vec<InflightRow>,
+    /// Pool-wide matured-and-unsettled pot, already net of everything in flight.
+    /// `None` means the pool cannot value its own wallet right now.
+    pool_pending_units: Option<u64>,
+    matured_at: u64,
+    matured_current: bool,
+    /// Tracked payouts whose per-recipient rows this pool does not have. While
+    /// there is even one, the pending pot cannot be computed honestly.
+    unattributed_payouts: usize,
+}
+
+/// One worker's share of the pool-wide pending pot.
+///
+/// The same floor split `split_payout` applies, for one worker: a settlement
+/// hands out `pot * mine / total` rounded down, and anything under the minimum
+/// payout is not paid at all. Deliberately does NOT add the largest-remainder
+/// unit `split_payout` may award, so this figure is never higher than what a
+/// settlement at this instant would actually pay.
+///
+/// Every share in the window belongs to a payable address - `handle_submission`
+/// refuses any other - so the window total IS the payable total the split runs
+/// over.
+fn worker_pending_units(pot: u64, mine: u64, window_total: u64) -> u64 {
+    if pot == 0 || mine == 0 || window_total == 0 {
+        return 0;
+    }
+    let share = (pot as u128 * mine as u128 / window_total as u128) as u64;
+    // Below the advertised minimum a settlement pays nothing at all, so promising
+    // a fraction of it would be promising money that never moves.
+    if share < PAYOUT_DUST_UNITS { 0 } else { share }
+}
+
+/// The `/earnings` body for one worker.
+fn earnings_json(worker: &str, e: &Earnings, now: u64) -> serde_json::Value {
+    if !e.known {
+        // No numbers at all. A zero here would read as "your pool owes you
+        // nothing", when the truth is that it has never seen this address.
+        return json!({
+            "ok": true,
+            "kind": "unknown_worker",
+            "worker": worker,
+            "known": false,
+            "err": "this pool has no record of that address: it holds no shares for it, has \
+                    never paid it, and has no payout in flight for it",
+        });
+    }
+    let pending = match e.pool_pending_units.filter(|_| e.unattributed_payouts == 0) {
+        Some(pot) => {
+            let units = worker_pending_units(pot, e.shares, e.window_shares);
+            json!({
+                "known": true,
+                "estimate": true,
+                "units": units,
+                "amount": payout_amount(units).to_fin_string(),
+                "unit": PAYOUT_UNIT,
+                "as_of_unix": e.matured_at,
+                "as_of_age_secs": now.saturating_sub(e.matured_at),
+                "current": e.matured_current,
+                "note": "an ESTIMATE, not a promise: it is this worker's share of what the pool \
+                         has matured and not yet settled, and it moves every time any worker's \
+                         share enters or leaves the payout window. Shares that leave the window \
+                         before a settlement earn nothing.",
+            })
+        }
+        // Rule of the house: never show a number the pool cannot stand behind.
+        None if e.unattributed_payouts > 0 => json!({
+            "known": false,
+            "reason": format!(
+                "{} payout(s) this pool is tracking have no recipient detail behind them, so it \
+                 cannot separate what is still owed from what is already in flight and would \
+                 overstate this figure. It resolves itself as those payouts confirm. This is not \
+                 a zero.",
+                e.unattributed_payouts
+            ),
+        }),
+        None => json!({
+            "known": false,
+            "reason": "the pool has not been able to value its own wallet balance, so it cannot \
+                       say what is owed. This is not a zero.",
+        }),
+    };
+    json!({
+        "ok": true,
+        "kind": "worker",
+        "worker": worker,
+        "known": true,
+        "scheme": "PPLNS",
+        "shares_in_window": e.shares,
+        "window_shares": e.window_shares,
+        "window_size": e.window_size,
+        // Confirmed on chain. Only ever grows, and only when the node reports the
+        // paying transaction buried.
+        "paid": money(e.paid.units),
+        "paid_since_unix": e.paid_since,
+        "last_payout": if e.paid.last_units > 0 {
+            json!({
+                "units": e.paid.last_units,
+                "amount": payout_amount(e.paid.last_units).to_fin_string(),
+                "unit": PAYOUT_UNIT,
+                "tx": e.paid.last_hash,
+                "at_unix": e.paid.last_at,
+            })
+        } else {
+            // Never paid by this ledger. An explicit null, not a zero amount.
+            serde_json::Value::Null
+        },
+        // Submitted, not confirmed: neither paid nor pending.
+        "in_flight": {
+            "units": e.inflight_units,
+            "amount": payout_amount(e.inflight_units).to_fin_string(),
+            "unit": PAYOUT_UNIT,
+            "txs": e.inflight.iter().map(|r| json!({
+                "tx": r.hash,
+                "units": r.units,
+                "amount": payout_amount(r.units).to_fin_string(),
+                "submitted_unix": r.at,
+                // false = submitted, but the node's verdict could not be read.
+                // The pool keeps tracking it and claims nothing about it.
+                "node_holds": r.node_holds,
+            })).collect::<Vec<_>>(),
+            "note": "submitted to the node and NOT yet confirmed on chain. Nothing here is paid \
+                     yet, and none of it is counted in pending.",
+        },
+        "pending": pending,
+        "buckets": "paid, in_flight and pending are disjoint: a unit is in exactly one of them.",
+    })
+}
+
+/// The pool's terms, read out of the code that enforces them.
+///
+/// Every number here is the constant or the live value some other part of this
+/// pool acts on, so what is advertised cannot drift from what is done. Nothing in
+/// it is typed twice.
+#[allow(clippy::too_many_arguments)]
+fn terms_json(
+    window_size: u64,
+    share_factor: u32,
+    share_factor_achieved: u32,
+    difficulty: u32,
+    settle_secs: u64,
+    coinbase_maturity: u64,
+    payout_confirm_depth: u64,
+) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "scheme": "PPLNS",
+        "scheme_full": "Pay Per Last N Shares",
+        "scheme_note": "Every settlement is split over the last N accepted shares the pool holds \
+                        at that moment, whoever found them and whenever they were found. There \
+                        are no rounds: this is NOT PROP, which would pay each block's shares in \
+                        proportion to that block's round.",
+        "window_shares": window_size,
+        "share_factor": share_factor,
+        "share_factor_achieved": share_factor_achieved,
+        "share_factor_note": "a share is 2^share_factor_achieved times easier to find than a \
+                              network block at the current difficulty. The pool refuses to serve \
+                              work when the achieved factor falls below its minimum, because a \
+                              share that costs almost nothing makes credit track submission rate \
+                              instead of hashrate.",
+        "network_difficulty": difficulty,
+        "fee": money(POOL_FEE_UNITS),
+        "fee_note": "this pool takes no fee: the whole matured balance is split over the share \
+                     window.",
+        "minimum_payout": money(PAYOUT_DUST_UNITS),
+        "minimum_payout_note": "a worker whose share of a settlement rounds below this is paid \
+                                nothing that cycle. That money is not taken from anyone: it stays \
+                                in the pool wallet and is part of the next cycle's balance.",
+        "fee_reserve": money(SETTLE_RESERVE_UNITS),
+        "fee_reserve_note": "kept in the pool wallet so it can always fund the network fee on a \
+                             settlement transaction. Not a fee, and not skimmed: a later cycle \
+                             distributes whatever of it is no longer needed.",
+        "network_fee_per_settlement_tx": chunk_tx_fee().to_fin_string(),
+        "recipients_per_settlement_tx": PAYOUT_CHUNK,
+        "settle_interval_secs": settle_secs,
+        "coinbase_maturity_blocks": coinbase_maturity,
+        "coinbase_maturity_note": "income from a block this pool finds is held back until the \
+                                   chain has buried it this deep. Paying it out earlier and then \
+                                   losing the block to a reorg would spend money the chain no \
+                                   longer holds.",
+        "payout_confirm_blocks": payout_confirm_depth,
+        "payout_confirm_note": "a payout counts as PAID only once the node reports the paying \
+                                transaction this many blocks deep. Until then it is in flight.",
+        "share_eviction_note": "a share is credited only while it is among the last \
+                                window_shares the pool accepted. Once newer shares push it out it \
+                                earns nothing, and nothing is carried forward for it.",
+        "payout_address_required": true,
+        "payout_address_note": "the worker id IS the payout address. The pool refuses a share \
+                                from any id it could not pay, so nobody mines for an id that \
+                                would be dropped at settlement.",
+        "amount_unit": PAYOUT_UNIT,
+        "amount_note": "`units` are whole 0.1 HAC and `amount` is the same figure as the chain's \
+                        own mantissa:unit amount. The pool never reports money as a decimal it \
+                        rounded itself.",
+    })
 }
 
 fn main() {
@@ -601,10 +1050,28 @@ fn main() {
     let (tpl, txs_note) = fetch_pool_template(&client, &node, &payout, &params, None)
         .expect("could not fetch an initial template — is the node running and synced?");
     let network_target = tpl.target;
+    // The factor the operator asked for is not necessarily the factor workers
+    // get: the derivation saturates. Refuse to serve, and to distribute real
+    // money, on a share nobody had to work for.
+    let share_target = pool_core::share_target_hash(tpl.difficulty, share_factor);
+    let share_factor_achieved = pool_core::achieved_share_factor(&network_target, &share_target);
+    if let Err(e) = check_share_target(share_factor, share_factor_achieved, tpl.difficulty) {
+        eprintln!("REFUSING to start: {e}");
+        std::process::exit(2);
+    }
 
     println!("listen  = {listen}");
     println!("chain   = {chain} (ASERT at height {})", params.asert_height);
-    println!("share   = 2^{share_factor} easier than a network block");
+    println!("share   = 2^{share_factor_achieved} easier than a network block");
+    if share_factor_achieved < share_factor {
+        // Above the refusal bound, so shares are still worth something, but not
+        // what was asked for: say the real number rather than let the operator
+        // believe a figure the chain will not support.
+        println!(
+            "          (share_bits={share_factor} was asked for; the difficulty in force caps it \
+             at 2^{share_factor_achieved})"
+        );
+    }
     println!("settle  = every {settle_secs}s");
     println!(
         "height  = {} (template, difficulty {}, {} packed tx(s) from the node)",
@@ -623,9 +1090,10 @@ fn main() {
         state_file: pool_state_path(&wallet_file),
         client,
         params,
-        share_target: pool_core::share_target_hash(tpl.difficulty, share_factor),
+        share_target,
         tpl,
         share_factor,
+        share_factor_achieved,
         network_target,
         pending_cache: String::new(),
         workers: HashMap::new(),
@@ -640,10 +1108,23 @@ fn main() {
         unsaved: 0,
         state_seq: 0,
         settle_pending_txs: Vec::new(),
+        payout_records: Vec::new(),
+        inflight_units: 0,
+        // A ledger with no start time would report "paid since the beginning of
+        // time". `load_state` replaces this with the stored one if there is one.
+        paid: PaidLedger::started(curtimes()),
+        matured: None,
+        matured_current: false,
+        settle_secs,
         settle_stalls: 0,
         bad_streak: HashMap::new(),
     };
     pool.load_state();
+    if pool.paid.since == 0 {
+        // A state file written before the ledger existed: start counting now
+        // rather than claim a total that reaches back further than it does.
+        pool.paid.since = curtimes();
+    }
     pool.rebuild_pending_cache();
     let pool = Arc::new(Mutex::new(pool));
 
@@ -664,9 +1145,15 @@ fn main() {
             )
         };
         std::thread::spawn(move || {
+            let mut tick: u64 = 0;
             loop {
+                // The wallet valuation behind every miner's PENDING figure is
+                // refreshed here, on a slow multiple of the template cycle: it is
+                // one extra node call, and it must never happen on a request.
+                let money = tick % MONEY_REFRESH_CYCLES == 0;
+                tick = tick.wrapping_add(1);
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    template_cycle(&pool, &client, &node, &payout, &params);
+                    template_cycle(&pool, &client, &node, &payout, &params, money);
                 }));
                 if let Err(e) = r {
                     eprintln!("[template] cycle panicked, continuing: {e:?}");
@@ -750,6 +1237,7 @@ fn template_cycle(
     node: &str,
     payout: &str,
     params: &ChainParams,
+    refresh_money: bool,
 ) {
     // Cloning the live template is cheap (its transaction set is behind an Arc)
     // and lets an unchanged tip skip re-downloading a whole block of bodies.
@@ -838,9 +1326,42 @@ fn template_cycle(
             None => {}
         }
     }
+    // Value the pool wallet OFF the lock, so `/earnings` can answer a PENDING
+    // question without any node call at all. Balance FIRST and the hold-back
+    // after, exactly as settlement does: a block found in between then shows up
+    // in the hold-back but not yet in the balance, which errs towards reporting
+    // LESS as owed.
+    let money = if refresh_money {
+        let bal = balance(client, node, payout);
+        match balance_units(&bal) {
+            Some(units) => {
+                let immature_units: u64 =
+                    plock(pool).immature.iter().map(|(_, _, u)| *u).sum();
+                // `None` here is a KNOWN nothing (the balance is at or below the
+                // reserve), which is not the same as a balance we cannot value.
+                Some(distributable_units(units, immature_units, SETTLE_RESERVE_UNITS).unwrap_or(0))
+            }
+            // Unreadable, or implausible. NOT a zero: the last good figure is
+            // kept and flagged stale rather than replaced with a made-up one.
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let mut shot = None;
+    let mut degraded: Option<(u32, u32, u32)> = None;
     {
         let mut p = plock(pool);
+        if refresh_money {
+            p.matured_current = money.is_some();
+            if let Some(units) = money {
+                p.matured = Some(Matured {
+                    units,
+                    at: curtimes(),
+                });
+            }
+        }
         if let Some(t) = fresh {
             // Replace the template when the tip changes: either a new height, or
             // a same-height reorg (different prev-hash). At the same height and
@@ -857,11 +1378,21 @@ fn template_cycle(
             // transaction that arrives mid-height is packed into the next block.
             let changed = t.height != p.tpl.height || t.prevhash != p.tpl.prevhash;
             if changed {
+                let was = p.share_factor_achieved;
                 p.tpl = t;
                 p.network_target = p.tpl.target;
                 // Re-derive the share target from the new difficulty so shares stay
                 // a fixed fraction of a block as difficulty moves.
                 p.recompute_share_target();
+                // A difficulty FALL can push the derived share target into
+                // saturation while the pool is running, and from that moment
+                // credit tracks submission rate, not hashrate. Startup refuses
+                // it; here the pool is already serving miners, so say so loudly
+                // and only when it changes.
+                let now = p.share_factor_achieved;
+                if now < MIN_SHARE_FACTOR && was >= MIN_SHARE_FACTOR {
+                    degraded = Some((p.share_factor, now, p.tpl.difficulty));
+                }
                 let height = p.tpl.height;
                 prune_seen(&mut p.seen, height);
                 p.rebuild_pending_cache();
@@ -879,6 +1410,15 @@ fn template_cycle(
         if !confirmed.is_empty() || !orphaned.is_empty() || !released.is_empty() {
             shot = p.state_shot(true);
         }
+    }
+    if let Some((asked, achieved, difficulty)) = degraded {
+        eprintln!(
+            "[share] the network difficulty fell to {difficulty} and the share target saturated: \
+             share_bits={asked} now serves only 2^{achieved} (minimum {MIN_SHARE_FACTOR}). \
+             Shares now cost almost no work, so PPLNS credit follows how fast a worker submits \
+             rather than how much it hashes and the payout split is NOT trustworthy. Stop the \
+             pool, or stop settling, until the difficulty recovers."
+        );
     }
     flush_state(shot);
 }
@@ -1078,6 +1618,10 @@ fn forget_unadmitted_payout(pool: &Arc<Mutex<Pool>>, txhash: &str) {
     let shot = {
         let mut p = plock(pool);
         p.settle_pending_txs.retain(|h| h != txhash);
+        // Nothing was paid, so nothing is credited: drop the rows too, and the
+        // units they carried go straight back into every recipient's PENDING.
+        drop_payout(&mut p.payout_records, txhash);
+        p.rebuild_inflight();
         p.state_shot(true)
     };
     flush_state(shot);
@@ -1097,14 +1641,16 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
             p.settle_pending_txs.clone(),
         )
     };
-    if counts.is_empty() {
-        return;
-    }
     let client = http_client();
 
     // Resolve any outstanding payouts FIRST, using the node's own view of each tx
     // rather than the wallet balance. Correct even if a submit ACK was lost and
     // even though the same wallet keeps earning coinbase income.
+    //
+    // This runs BEFORE the "nothing to settle" exit on purpose. A pool with an
+    // empty share window still has to finish resolving the payouts it already
+    // made: they are what turns a miner's IN FLIGHT into PAID, and skipping the
+    // poll left a miner's last payout showing as in flight forever.
     //
     // This guard must fail SAFE. Only a definitive node verdict resolves a hash:
     // an unreachable node, a timeout or an answer we cannot parse keeps the hash
@@ -1113,17 +1659,24 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     // to the mempool. Anything else re-opens the double-payout window.
     if !pending_txs.is_empty() {
         let mut still = Vec::new();
+        let mut buried: Vec<String> = Vec::new();
+        let mut gone: Vec<String> = Vec::new();
         for hx in &pending_txs {
             let j = get_json(&client, &format!("{node}/query/transaction?hash={hx}"));
             // Never slice mid-character: these come off disk, and a corrupt
             // ledger entry must not panic the settlement thread.
             let short = hx.get(..16).unwrap_or(hx);
             match classify_payout_tx(&j) {
-                PayoutTxState::Buried(_) => {}
-                PayoutTxState::Gone => eprintln!(
-                    "[settle] payout tx {short} is unknown to the node (rejected or dropped); \
-                     this cycle will re-issue it"
-                ),
+                // The node has buried it: this, and ONLY this, is what turns
+                // money that was in flight into money that was paid.
+                PayoutTxState::Buried(_) => buried.push(hx.clone()),
+                PayoutTxState::Gone => {
+                    eprintln!(
+                        "[settle] payout tx {short} is unknown to the node (rejected or dropped); \
+                         this cycle will re-issue it"
+                    );
+                    gone.push(hx.clone());
+                }
                 PayoutTxState::Pending => {
                     println!(
                         "[settle] payout tx {short} is still waiting in the node's mempool; \
@@ -1145,6 +1698,37 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
                     );
                     still.push(hx.clone());
                 }
+            }
+        }
+        // Credit the buried ones and forget the dead ones in ONE locked step, so
+        // a unit is never simultaneously in flight and paid, and never neither.
+        if !buried.is_empty() || !gone.is_empty() {
+            let (shot, credited) = {
+                let mut guard = plock(pool);
+                // Reborrow so the two ledgers can be handed over together: they
+                // MUST move in one step, or a unit is briefly in both or neither.
+                let p = &mut *guard;
+                let now = curtimes();
+                let mut credited: Vec<(String, u64, usize)> = Vec::new();
+                for hx in &buried {
+                    if let Some(rec) = confirm_payout(&mut p.payout_records, &mut p.paid, hx, now) {
+                        credited.push((hx.clone(), rec.units(), rec.rows.len()));
+                    }
+                }
+                for hx in &gone {
+                    drop_payout(&mut p.payout_records, hx);
+                }
+                p.rebuild_inflight();
+                p.settle_pending_txs.retain(|h| still.contains(h));
+                (p.state_shot(true), credited)
+            };
+            flush_state(shot);
+            for (hx, units, n) in credited {
+                let short = hx.get(..16).unwrap_or(&hx);
+                println!(
+                    "[settle] payout tx {short} is buried: {units} unit(s) to {n} miner(s) are \
+                     now PAID"
+                );
             }
         }
         if !still.is_empty() {
@@ -1182,6 +1766,12 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         flush_state(shot);
     }
 
+    // Nothing credited in the window: nobody is owed anything, so there is
+    // nothing to split. The payout resolution above still ran.
+    if counts.is_empty() {
+        return;
+    }
+
     let acc = load_or_create_wallet(wallet_file);
     let bal = balance(&client, &node, acc.readable());
     // An answer we cannot value is NOT a zero balance: paying out on a garbled or
@@ -1192,6 +1782,9 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
             "[settle] the node reported a balance this pool cannot value ({bal:?}); \
              skipping this settlement cycle"
         );
+        // Say so to miners too: `/earnings` must report PENDING as stale rather
+        // than keep quoting a figure the pool can no longer confirm.
+        plock(pool).matured_current = false;
         return;
     };
     // Read the hold-back AFTER the balance, never before. A block found in
@@ -1202,11 +1795,25 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
 
     // Keep a reserve so the wallet always covers the (per-chunk) tx fee. No pool
     // fee is skimmed: this is a community pool, and the reserve covers the fees.
-    let reserve = 5u64; // 0.5 HAC — covers up to ~50 chunk fees of 0.01 HAC each
+    // `/terms` reports this same constant, so what a miner is told is what runs.
+    let reserve = SETTLE_RESERVE_UNITS;
     // Hold back the coinbase of blocks that are not yet buried: distributing
     // income a reorg can still revoke costs the operator a whole subsidy that
     // nothing can claw back, because the payout stays valid on the new chain.
-    let Some(distributable) = distributable_units(units, immature_units, reserve) else {
+    let distributable = distributable_units(units, immature_units, reserve);
+    // Publish the valuation this cycle just made, so a miner polling /earnings
+    // right after a settlement sees the same figure the settlement acted on
+    // instead of one up to MONEY_REFRESH_CYCLES old. `None` here is a KNOWN
+    // nothing (at or below the reserve), not an unreadable balance.
+    {
+        let mut p = plock(pool);
+        p.matured = Some(Matured {
+            units: distributable.unwrap_or(0),
+            at: curtimes(),
+        });
+        p.matured_current = true;
+    }
+    let Some(distributable) = distributable else {
         if immature_units > 0 {
             println!(
                 "[settle] holding back {immature_units} unit(s) of block income that is not yet \
@@ -1225,7 +1832,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     if payable_counts.is_empty() {
         return;
     }
-    let split = split_payout(distributable, 0, 1, &payable_counts);
+    let split = plan_settlement(distributable, &payable_counts);
     if split.is_empty() {
         return;
     }
@@ -1233,33 +1840,28 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
     let main = Address::from(*acc.address());
     let mut tally = SettleTally::default();
     for chunk in split.chunks(PAYOUT_CHUNK) {
-        let fee = match Amount::from("1:246") {
-            Ok(f) => f, // 0.01 HAC tx fee (from reserve)
-            Err(_) => {
-                eprintln!("[settle] internal: bad fee literal");
-                return;
-            }
-        };
-        let mut tx = TransactionType2::new_by(main.clone(), fee, curtimes());
-        let mut pushed = 0usize;
-        let mut chunk_units = 0u64;
+        // 0.01 HAC network fee, funded by the reserve. Built from the same helper
+        // `/terms` quotes, so the fee a miner is told about is the fee the
+        // transaction carries.
+        let mut tx = TransactionType2::new_by(main.clone(), chunk_tx_fee(), curtimes());
+        // Exactly what this transaction pays, in the order it pays it. Only rows
+        // that made it into the transaction are here: a recipient the pool had to
+        // skip must never appear in anyone's accounting as money in flight.
+        let mut rows: Vec<(String, u64)> = Vec::with_capacity(chunk.len());
         for (addr, u) in chunk {
             let Ok(to) = Address::from_readable(addr) else {
                 continue;
             };
-            let Ok(amt) = Amount::from(&format!("{u}:247")) else {
-                eprintln!("[settle] skip {addr}: amount {u}:247 not representable");
-                continue;
-            };
             let mut act = HacToTrs::new();
             act.to = AddrOrPtr::from_addr(to);
-            act.hacash = amt;
+            act.hacash = payout_amount(*u);
             if tx.push_action(Box::new(act)).is_err() {
                 break; // should not happen within a <=190 chunk, but stay safe
             }
-            pushed += 1;
-            chunk_units += *u;
+            rows.push((addr.clone(), *u));
         }
+        let pushed = rows.len();
+        let chunk_units: u64 = rows.iter().map(|(_, u)| *u).sum();
         if pushed == 0 {
             continue;
         }
@@ -1270,10 +1872,23 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
         // Record the payout tx hash BEFORE submitting AND persist it, so a lost
         // ACK or a crash mid-settlement still blocks a second payout: next cycle
         // we poll this hash and only retry if it is gone.
+        //
+        // The per-recipient rows are written in the SAME snapshot, not after the
+        // node answers. A crash in between would otherwise leave a tracked hash
+        // with no rows behind it, and when that payout later confirmed the pool
+        // could not tell a single miner it had been paid.
         let txhash = hex::encode(tx.hash().serialize());
         let shot = {
             let mut p = plock(pool);
             p.settle_pending_txs.push(txhash.clone());
+            p.payout_records.push(PayoutRecord {
+                hash: txhash.clone(),
+                at: curtimes(),
+                // Not yet: the node has not been asked whether it holds this.
+                node_holds: false,
+                rows,
+            });
+            p.rebuild_inflight();
             p.state_shot(true)
         };
         // The fsync happens here, with the pool lock released: no miner request
@@ -1320,6 +1935,17 @@ fn settle_once(pool: &Arc<Mutex<Pool>>, wallet_file: &str) {
                     "[settle] submitted payout tx {short} paying {pushed} miner(s) \
                      {chunk_units} units; the node holds it"
                 );
+                // Upgrade the record: the node confirms it holds this, so every
+                // recipient can be told its money is really in flight rather than
+                // merely submitted. Still NOT paid - that needs burial.
+                let shot = {
+                    let mut p = plock(pool);
+                    if let Some(r) = p.payout_records.iter_mut().find(|r| r.hash == txhash) {
+                        r.node_holds = true;
+                    }
+                    p.state_shot(true)
+                };
+                flush_state(shot);
                 tally.record(ChunkOutcome::Delivered, pushed, chunk_units);
             }
             Admission::Missing => {
@@ -1778,6 +2404,67 @@ fn route(
             })
             .to_string()
         }
+
+        // The pool's terms, READ OUT OF the code that enforces them. Nothing here
+        // is a number somebody typed into a description: change what the pool
+        // does and this changes with it, which is the whole point.
+        "/terms" => {
+            let (window_size, share_factor, achieved, difficulty, settle_secs) = {
+                let p = plock(pool);
+                (
+                    p.pplns.window() as u64,
+                    p.share_factor,
+                    p.share_factor_achieved,
+                    p.tpl.difficulty,
+                    p.settle_secs,
+                )
+            };
+            terms_json(
+                window_size,
+                share_factor,
+                achieved,
+                difficulty,
+                settle_secs,
+                COINBASE_MATURITY_DEPTH,
+                PAYOUT_MATURITY_DEPTH,
+            )
+            .to_string()
+        }
+
+        // What ONE worker is owed, what is in flight for it, and what it has been
+        // paid. Polled by miners, so it does no node call and holds the pool lock
+        // only long enough to copy this worker's own numbers out.
+        "/earnings" => {
+            let Some(worker) = params.get("worker") else {
+                return json!({
+                    "ok": false,
+                    "kind": "missing_worker",
+                    "err": "ask for one worker: /earnings?worker=<your HAC address>",
+                })
+                .to_string();
+            };
+            match classify_worker_id(worker) {
+                WorkerId::NotAnAddress => json!({
+                    "ok": false,
+                    "kind": "invalid_address",
+                    "worker": worker,
+                    "err": "that is not a Hacash address",
+                })
+                .to_string(),
+                WorkerId::Unpayable => json!({
+                    "ok": false,
+                    "kind": "unpayable_address",
+                    "worker": worker,
+                    "err": "that is a Hacash address this pool cannot pay, so it never credits \
+                            shares to it. Use a normal single-key address.",
+                })
+                .to_string(),
+                WorkerId::Payable => {
+                    let e = plock(pool).earnings_of(worker);
+                    earnings_json(worker, &e, curtimes()).to_string()
+                }
+            }
+        }
         _ => json!({"ok":false,"err":"no such endpoint"}).to_string(),
     }
 }
@@ -1785,8 +2472,552 @@ fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pool_spike::{PackedTxs, admission_of};
+    use basis::difficulty::LOWEST_DIFFICULTY;
+    use pool_spike::{PackedTxs, PaidRow, admission_of};
     use std::sync::Arc;
+
+    /* ---- the money a miner is shown: paid, in flight, pending ---- */
+
+    /// Two real, payable mainnet-format addresses. The pool refuses a share from
+    /// anything else, so the accounting keys are always addresses like these.
+    const W_A: &str = "1MzNY1oA3kfgYi75zquj3SRUPYztzXHzK9";
+    const W_B: &str = "12vi7DEZjh6KrK5PVmmqSgvuJPCsZMmpfi";
+
+    fn a_payout(hash: &str, at: u64, node_holds: bool, rows: &[(&str, u64)]) -> PayoutRecord {
+        PayoutRecord {
+            hash: hash.to_string(),
+            at,
+            node_holds,
+            rows: rows.iter().map(|(w, u)| (w.to_string(), *u)).collect(),
+        }
+    }
+
+    fn inflight_total(records: &[PayoutRecord]) -> u64 {
+        records.iter().map(|r| r.units()).sum()
+    }
+
+    #[test]
+    fn the_three_money_buckets_never_double_count() {
+        // Follow ONE worker's 40 units through the whole lifecycle. At every step
+        // the three buckets must add up to the same 40, and no unit may ever be
+        // in two of them: that is the entire promise /earnings makes.
+        let mut records: Vec<PayoutRecord> = Vec::new();
+        let mut paid = PaidLedger::started(1_000);
+        // What the pool's wallet says has matured and is unsettled. A payout
+        // sitting in the mempool does NOT reduce the node's confirmed balance, so
+        // this number keeps containing money that is already in flight - which is
+        // exactly why pending has to subtract it.
+        let mut matured = 40u64;
+
+        let buckets = |matured: u64, records: &[PayoutRecord], paid: &PaidLedger| {
+            let inflight = inflight_total(records);
+            let pending = matured.saturating_sub(inflight);
+            let done = paid.get(W_A).map(|r| r.units).unwrap_or(0);
+            (pending, inflight, done)
+        };
+
+        // 1) Nothing submitted yet: it is all pending.
+        assert_eq!(buckets(matured, &records, &paid), (40, 0, 0));
+
+        // 2) Submitted. The same 40 units are in flight, and pending must drop to
+        // zero even though the confirmed balance still holds them.
+        records.push(a_payout("tx1", 1_100, true, &[(W_A, 40)]));
+        assert_eq!(buckets(matured, &records, &paid), (0, 40, 0));
+
+        // 3) Buried. It leaves in flight at the same instant it enters paid, and
+        // the chain has really spent it so the balance falls with it.
+        let rec = confirm_payout(&mut records, &mut paid, "tx1", 1_200).expect("credited");
+        assert_eq!(rec.units(), 40);
+        matured -= 40;
+        assert_eq!(buckets(matured, &records, &paid), (0, 0, 40));
+
+        // Every step totalled 40. Nothing was created and nothing was lost.
+        for (p, i, d) in [(40, 0, 0), (0, 40, 0), (0, 0, 40)] {
+            assert_eq!(p + i + d, 40);
+        }
+    }
+
+    #[test]
+    fn a_payout_the_node_never_took_goes_back_to_pending_and_never_to_paid() {
+        let mut records = vec![a_payout("dead", 1_000, false, &[(W_A, 25)])];
+        let mut paid = PaidLedger::started(1_000);
+        let matured = 25u64;
+        assert_eq!(matured.saturating_sub(inflight_total(&records)), 0);
+
+        // The node definitively does not hold it: nothing was paid and nothing
+        // was relayed, so those units are owed again.
+        assert!(drop_payout(&mut records, "dead").is_some());
+        assert_eq!(inflight_total(&records), 0);
+        assert_eq!(matured.saturating_sub(inflight_total(&records)), 25);
+        assert!(paid.get(W_A).is_none(), "a dropped payout pays nobody");
+        // And it cannot be confirmed after the fact: there is nothing to confirm.
+        assert!(confirm_payout(&mut records, &mut paid, "dead", 2_000).is_none());
+        assert!(paid.get(W_A).is_none());
+    }
+
+    #[test]
+    fn paid_moves_only_when_the_node_buries_a_payout_and_only_upward() {
+        let mut records: Vec<PayoutRecord> = Vec::new();
+        let mut paid = PaidLedger::started(1_000);
+
+        // Submitted is not paid, however sure the node sounds.
+        records.push(a_payout("tx1", 1_100, true, &[(W_A, 10), (W_B, 5)]));
+        assert_eq!(paid.total_units(), 0);
+        assert_eq!(paid.workers(), 0);
+
+        // Buried: credited, once, to the right people in the right amounts.
+        confirm_payout(&mut records, &mut paid, "tx1", 1_200).expect("credited");
+        assert_eq!(paid.get(W_A).unwrap().units, 10);
+        assert_eq!(paid.get(W_B).unwrap().units, 5);
+        assert_eq!(paid.total_units(), 15);
+        assert_eq!(paid.get(W_A).unwrap().last_hash, "tx1");
+        assert_eq!(paid.get(W_A).unwrap().last_at, 1_200);
+
+        // A second payout adds; it never replaces.
+        records.push(a_payout("tx2", 2_100, true, &[(W_A, 7)]));
+        confirm_payout(&mut records, &mut paid, "tx2", 2_200).expect("credited");
+        assert_eq!(paid.get(W_A).unwrap().units, 17, "totals only ever grow");
+        assert_eq!(paid.get(W_B).unwrap().units, 5, "untouched by someone else's payout");
+        // "last payout" is the most recent one, with its own amount and hash.
+        assert_eq!(paid.get(W_A).unwrap().last_units, 7);
+        assert_eq!(paid.get(W_A).unwrap().last_hash, "tx2");
+        assert_eq!(paid.get(W_A).unwrap().last_at, 2_200);
+
+        // A restart must not lose or double any of it.
+        let restored = PaidLedger::from_json(&paid.to_json());
+        assert_eq!(restored, paid);
+        assert_eq!(restored.get(W_A).unwrap().units, 17);
+        assert_eq!(restored.since, 1_000);
+    }
+
+    #[test]
+    fn a_payout_row_survives_the_state_file_round_trip() {
+        // The rows are what let a confirmed payout be credited to the right
+        // miners. Losing them across a restart means a payout that confirms and
+        // reaches nobody's total.
+        let rec = a_payout("abc123", 4_242, true, &[(W_A, 12), (W_B, 3)]);
+        let back = PayoutRecord::from_json(&rec.to_json()).expect("parsed");
+        assert_eq!(back, rec);
+        assert_eq!(back.units(), 15);
+        assert_eq!(back.units_for(W_A), 12);
+        assert_eq!(back.units_for("someone-else"), 0);
+        // A row the file cannot describe is dropped, never guessed at.
+        let broken = serde_json::json!({"hash":"h","at":1,"rows":[["a"],["b",4]]});
+        let back = PayoutRecord::from_json(&broken).expect("parsed");
+        assert_eq!(back.rows, vec![("b".to_string(), 4u64)]);
+        assert!(!back.node_holds, "an absent verdict is not a confirmed one");
+        assert!(PayoutRecord::from_json(&serde_json::json!({"at":1})).is_none());
+    }
+
+    /* ---- what /earnings says, and what it refuses to say ---- */
+
+    fn an_earnings() -> Earnings {
+        Earnings {
+            known: true,
+            shares: 0,
+            window_shares: 0,
+            window_size: PPLNS_WINDOW as u64,
+            paid: PaidRow::default(),
+            paid_since: 1_000,
+            inflight_units: 0,
+            inflight: Vec::new(),
+            pool_pending_units: Some(0),
+            matured_at: 1_500,
+            matured_current: true,
+            unattributed_payouts: 0,
+        }
+    }
+
+    #[test]
+    fn an_unknown_worker_is_not_a_worker_that_is_owed_nothing() {
+        // Showing "0 HAC owed" for an address the pool has never seen tells a
+        // miner its work is being tracked when it is not.
+        let unknown = Earnings {
+            known: false,
+            ..an_earnings()
+        };
+        let j = earnings_json(W_A, &unknown, 2_000);
+        assert_eq!(j["kind"].as_str(), Some("unknown_worker"));
+        assert_eq!(j["known"].as_bool(), Some(false));
+        for absent in ["paid", "pending", "in_flight", "last_payout"] {
+            assert!(j.get(absent).is_none(), "no money figures at all: {absent}");
+        }
+
+        // A worker the pool DOES know, owed nothing, says exactly that.
+        let zero = an_earnings();
+        let j = earnings_json(W_A, &zero, 2_000);
+        assert_eq!(j["kind"].as_str(), Some("worker"));
+        assert_eq!(j["known"].as_bool(), Some(true));
+        assert_eq!(j["paid"]["units"].as_u64(), Some(0));
+        assert_eq!(j["pending"]["known"].as_bool(), Some(true));
+        assert_eq!(j["pending"]["units"].as_u64(), Some(0));
+        assert_eq!(j["in_flight"]["units"].as_u64(), Some(0));
+        assert!(j["last_payout"].is_null(), "never paid is null, not 0");
+    }
+
+    #[test]
+    fn a_bad_address_is_a_third_answer_again() {
+        assert_eq!(classify_worker_id(W_A), WorkerId::Payable);
+        assert_eq!(classify_worker_id("not-an-address"), WorkerId::NotAnAddress);
+        assert_eq!(classify_worker_id(""), WorkerId::NotAnAddress);
+        // A well-formed address this pool could never pay is its own case: the
+        // pool refuses to credit shares to it at all, so reporting it as an
+        // unknown worker would hide WHY it will never earn anything.
+        let mut raw = [0u8; 21];
+        raw[0] = 1; // CONTRACT version
+        raw[1..].copy_from_slice(&[9u8; 20]);
+        let contract = Address::from(raw).to_readable();
+        assert_eq!(classify_worker_id(&contract), WorkerId::Unpayable);
+    }
+
+    #[test]
+    fn pending_is_unknown_not_zero_when_the_pool_cannot_value_its_wallet() {
+        // "0 HAC owed" and "the pool cannot say" are different facts, and the
+        // second must never be rendered as the first.
+        let blind = Earnings {
+            pool_pending_units: None,
+            shares: 10,
+            window_shares: 10,
+            ..an_earnings()
+        };
+        let j = earnings_json(W_A, &blind, 2_000);
+        assert_eq!(j["pending"]["known"].as_bool(), Some(false));
+        assert!(j["pending"].get("units").is_none(), "no number to misread");
+        assert!(j["pending"].get("amount").is_none());
+        assert!(
+            j["pending"]["reason"].as_str().unwrap().contains("not a zero"),
+            "{}",
+            j["pending"]
+        );
+        // The rest of the answer still stands: paid and in flight are the pool's
+        // own ledger and do not depend on reading the wallet.
+        assert_eq!(j["paid"]["units"].as_u64(), Some(0));
+
+        // A known zero says so, and says how old the figure is.
+        let known_zero = Earnings {
+            pool_pending_units: Some(0),
+            shares: 10,
+            window_shares: 10,
+            ..an_earnings()
+        };
+        let j = earnings_json(W_A, &known_zero, 2_000);
+        assert_eq!(j["pending"]["known"].as_bool(), Some(true));
+        assert_eq!(j["pending"]["units"].as_u64(), Some(0));
+        assert_eq!(j["pending"]["estimate"].as_bool(), Some(true));
+        assert_eq!(j["pending"]["as_of_age_secs"].as_u64(), Some(500));
+        assert_eq!(j["pending"]["current"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn pending_is_unknown_while_a_tracked_payout_has_no_recipient_detail() {
+        // A payout hash left by an older build, or by a tool that recorded only
+        // the hash. Its units are still inside the node's confirmed balance, so
+        // the in-flight subtraction is incomplete and pending would be too HIGH -
+        // the one direction that promises a miner money.
+        let e = Earnings {
+            shares: 1,
+            window_shares: 1,
+            pool_pending_units: Some(100),
+            unattributed_payouts: 1,
+            ..an_earnings()
+        };
+        let j = earnings_json(W_A, &e, 2_000);
+        assert_eq!(j["pending"]["known"].as_bool(), Some(false));
+        assert!(j["pending"].get("units").is_none());
+        let why = j["pending"]["reason"].as_str().expect("a reason");
+        assert!(why.contains("not a zero"), "{why}");
+        assert!(why.contains("overstate"), "{why}");
+        // Paid and in flight are the pool's own ledger and still stand.
+        assert_eq!(j["paid"]["units"].as_u64(), Some(0));
+        // Once the rows are known, the same worker gets its figure.
+        let ok = Earnings {
+            unattributed_payouts: 0,
+            ..e
+        };
+        let j = earnings_json(W_A, &ok, 2_000);
+        assert_eq!(j["pending"]["units"].as_u64(), Some(100));
+    }
+
+    #[test]
+    fn money_is_reported_as_the_chains_own_amount() {
+        // Never a float, never a decimal this pool rounded itself: the same
+        // mantissa:unit string the node speaks and the transaction carries.
+        let e = Earnings {
+            paid: PaidRow {
+                units: 35,
+                last_units: 35,
+                last_hash: "tx1".to_string(),
+                last_at: 1_900,
+            },
+            inflight_units: 4,
+            inflight: vec![InflightRow {
+                hash: "tx2".to_string(),
+                units: 4,
+                at: 1_950,
+                node_holds: true,
+            }],
+            shares: 2,
+            window_shares: 4,
+            pool_pending_units: Some(10),
+            ..an_earnings()
+        };
+        let j = earnings_json(W_A, &e, 2_000);
+        assert_eq!(j["paid"]["amount"].as_str(), Some("35:247"));
+        assert_eq!(j["paid"]["units"].as_u64(), Some(35));
+        assert_eq!(j["last_payout"]["amount"].as_str(), Some("35:247"));
+        assert_eq!(j["last_payout"]["tx"].as_str(), Some("tx1"));
+        assert_eq!(j["last_payout"]["at_unix"].as_u64(), Some(1_900));
+        assert_eq!(j["in_flight"]["amount"].as_str(), Some("4:247"));
+        assert_eq!(j["in_flight"]["txs"][0]["node_holds"].as_bool(), Some(true));
+        // 10 units over a window of 4, holding 2 of them: 5.
+        assert_eq!(j["pending"]["units"].as_u64(), Some(5));
+        assert_eq!(j["pending"]["amount"].as_str(), Some("5:247"));
+        // The chain normalizes 100 units of 0.1 HAC to 10 HAC, and so does this.
+        assert_eq!(payout_amount(100).to_fin_string(), "1:249");
+        assert_eq!(payout_amount(0).to_fin_string(), "0:0");
+    }
+
+    #[test]
+    fn a_pending_estimate_never_promises_more_than_a_settlement_would_pay() {
+        // The estimate is the floor share. `split_payout` may hand one extra unit
+        // to the largest remainders, so the estimate is at or below what a
+        // settlement at this instant pays - never above it.
+        let counts = vec![(W_A.to_string(), 3u64), (W_B.to_string(), 1u64)];
+        let split: HashMap<String, u64> = plan_settlement(100, &counts).into_iter().collect();
+        assert_eq!(worker_pending_units(100, 3, 4), split[W_A]);
+        assert_eq!(worker_pending_units(100, 1, 4), split[W_B]);
+
+        let thirds = vec![
+            (W_A.to_string(), 1u64),
+            (W_B.to_string(), 1u64),
+            ("c".to_string(), 1u64),
+        ];
+        for (_, paid) in plan_settlement(100, &thirds) {
+            assert!(
+                worker_pending_units(100, 1, 3) <= paid,
+                "the estimate must never be the rounded-UP share"
+            );
+        }
+
+        // Nothing to split, nothing held, or an empty window: zero, honestly.
+        assert_eq!(worker_pending_units(0, 5, 10), 0);
+        assert_eq!(worker_pending_units(100, 0, 10), 0);
+        assert_eq!(worker_pending_units(100, 5, 0), 0);
+        // A share below the advertised minimum is paid nothing at all, so the
+        // estimate must not promise a fraction of it.
+        assert_eq!(worker_pending_units(1, 1, 1_000), 0);
+        // And it does not overflow at the top of the range.
+        assert_eq!(worker_pending_units(u64::MAX, 1, 1), u64::MAX);
+    }
+
+    /// A pool with no node, no disk and no listener: enough to exercise the
+    /// accounting the endpoints read.
+    fn a_pool() -> Pool {
+        let tpl = a_template(PackedTxs::default());
+        Pool {
+            node: String::new(),
+            payout: W_A.to_string(),
+            state_file: String::new(), // no disk: state_shot returns None
+            client: http_client(),
+            params: ChainParams::mainnet(),
+            share_target: [0xff; 32],
+            network_target: tpl.target,
+            tpl,
+            share_factor: 24,
+            share_factor_achieved: 24,
+            pending_cache: String::new(),
+            workers: HashMap::new(),
+            next_en: 0,
+            pplns: Pplns::new(PPLNS_WINDOW),
+            accepted: 0,
+            blocks: 0,
+            orphaned: 0,
+            seen: HashSet::new(),
+            submitted: Vec::new(),
+            immature: Vec::new(),
+            unsaved: 0,
+            state_seq: 0,
+            settle_pending_txs: Vec::new(),
+            payout_records: Vec::new(),
+            inflight_units: 0,
+            paid: PaidLedger::started(1_000),
+            matured: None,
+            matured_current: false,
+            settle_secs: 300,
+            settle_stalls: 0,
+            bad_streak: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_workers_pending_never_repeats_money_that_is_already_in_flight() {
+        // The node's CONFIRMED balance still contains a payout that is sitting in
+        // the mempool. Reporting the matured balance as pending while the same
+        // units are reported as in flight would show a miner its money twice.
+        let mut p = a_pool();
+        for _ in 0..3 {
+            p.pplns.record(W_A);
+        }
+        p.pplns.record(W_B);
+        // 100 units matured, of which 40 are already inside a submitted payout.
+        p.matured = Some(Matured {
+            units: 100,
+            at: 1_500,
+        });
+        p.matured_current = true;
+        p.payout_records
+            .push(a_payout("tx1", 1_400, true, &[(W_A, 30), (W_B, 10)]));
+        p.rebuild_inflight();
+        assert_eq!(p.inflight_units, 40);
+
+        let a = p.earnings_of(W_A);
+        let b = p.earnings_of(W_B);
+        // Pool-wide pending is 100 - 40 = 60, split 3:1 by shares.
+        assert_eq!(a.pool_pending_units, Some(60));
+        assert_eq!(worker_pending_units(60, a.shares, a.window_shares), 45);
+        assert_eq!(worker_pending_units(60, b.shares, b.window_shares), 15);
+        assert_eq!((a.shares, a.inflight_units), (3, 30));
+        assert_eq!((b.shares, b.inflight_units), (1, 10));
+        // Everything the pool holds is accounted for exactly once: 45 + 15
+        // pending, 30 + 10 in flight, 0 paid, and that is the whole 100.
+        assert_eq!(45 + 15 + 30 + 10, 100);
+
+        // Confirming the payout moves 40 from in flight to paid and takes it out
+        // of the balance; pending is unchanged, because it never contained it.
+        let mut guard = p;
+        let pp = &mut guard;
+        confirm_payout(&mut pp.payout_records, &mut pp.paid, "tx1", 1_600).expect("credited");
+        pp.rebuild_inflight();
+        pp.matured = Some(Matured {
+            units: 60,
+            at: 1_650,
+        });
+        let a = pp.earnings_of(W_A);
+        assert_eq!(a.inflight_units, 0);
+        assert_eq!(a.paid.units, 30);
+        assert_eq!(a.pool_pending_units, Some(60));
+        assert_eq!(worker_pending_units(60, a.shares, a.window_shares), 45);
+    }
+
+    #[test]
+    fn the_pool_can_tell_a_worker_it_has_never_seen_from_one_it_owes_nothing() {
+        let mut p = a_pool();
+        // Never heard of: no shares, no payments, no work handed out.
+        assert!(!p.earnings_of(W_A).known);
+        // A worker that fetched work but has not found a share yet IS known: the
+        // pool is tracking it, it simply has nothing yet.
+        p.extranonce_for(W_A);
+        let e = p.earnings_of(W_A);
+        assert!(e.known);
+        assert_eq!((e.shares, e.paid.units, e.inflight_units), (0, 0, 0));
+        // A worker whose shares have all been evicted from the window is still
+        // known while it has a paid history: its money did not stop existing.
+        let mut q = a_pool();
+        q.payout_records
+            .push(a_payout("tx1", 1_100, true, &[(W_B, 12)]));
+        q.rebuild_inflight();
+        confirm_payout(&mut q.payout_records, &mut q.paid, "tx1", 1_200);
+        let e = q.earnings_of(W_B);
+        assert!(e.known);
+        assert_eq!(e.shares, 0);
+        assert_eq!(e.paid.units, 12);
+        assert_eq!(e.paid.last_hash, "tx1");
+    }
+
+    /* ---- the terms the pool advertises are the terms it applies ---- */
+
+    #[test]
+    fn the_advertised_terms_are_the_terms_the_settlement_applies() {
+        let t = terms_json(
+            PPLNS_WINDOW as u64,
+            24,
+            24,
+            0x2000_0000,
+            300,
+            COINBASE_MATURITY_DEPTH,
+            PAYOUT_MATURITY_DEPTH,
+        );
+        // It is PPLNS, and it says so without leaving room to read PROP into it.
+        assert_eq!(t["scheme"].as_str(), Some("PPLNS"));
+        assert!(t["scheme_note"].as_str().unwrap().contains("NOT PROP"), "{t}");
+        assert_eq!(t["window_shares"].as_u64(), Some(PPLNS_WINDOW as u64));
+
+        // The advertised fee is the fee the split applies.
+        let fee = t["fee"]["units"].as_u64().expect("fee");
+        let counts = vec![(W_A.to_string(), 3u64), (W_B.to_string(), 1u64)];
+        let split = plan_settlement(100, &counts);
+        assert_eq!(
+            split.iter().map(|(_, u)| *u).sum::<u64>(),
+            100 - fee,
+            "everything but the advertised fee reaches the miners"
+        );
+
+        // The advertised minimum is the minimum the split enforces.
+        let min = t["minimum_payout"]["units"].as_u64().expect("minimum");
+        let lopsided = vec![(W_A.to_string(), 10_000u64), (W_B.to_string(), 1u64)];
+        for (_, u) in plan_settlement(1_000, &lopsided) {
+            assert!(u >= min, "nothing below the advertised minimum is ever paid");
+        }
+
+        // Every money figure is the chain's own amount, matching its own units.
+        for key in ["fee", "minimum_payout", "fee_reserve"] {
+            let units = t[key]["units"].as_u64().expect(key);
+            assert_eq!(
+                t[key]["amount"].as_str(),
+                Some(payout_amount(units).to_fin_string().as_str()),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            t["network_fee_per_settlement_tx"].as_str(),
+            Some(chunk_tx_fee().to_fin_string().as_str())
+        );
+        // The maturity depths are the ones the code waits for, not a description.
+        assert_eq!(
+            t["coinbase_maturity_blocks"].as_u64(),
+            Some(COINBASE_MATURITY_DEPTH)
+        );
+        assert_eq!(
+            t["payout_confirm_blocks"].as_u64(),
+            Some(PAYOUT_MATURITY_DEPTH)
+        );
+        assert_eq!(t["settle_interval_secs"].as_u64(), Some(300));
+        assert_eq!(t["recipients_per_settlement_tx"].as_u64(), Some(PAYOUT_CHUNK as u64));
+    }
+
+    /* ---- the share target has to be worth something ---- */
+
+    #[test]
+    fn a_share_target_the_live_difficulty_cannot_support_is_refused() {
+        // Observed on a live run: one worker took the ENTIRE 4096-share window.
+        // `check_share_factor` passed, because the factor the operator typed was
+        // fine - but at the difficulty in force the derived share target had
+        // saturated, every hash was a valid share, and the number of shares a
+        // worker was credited with measured how fast it could submit.
+        assert!(check_share_factor(24).is_ok());
+
+        let net = pool_core::network_target_hash(LOWEST_DIFFICULTY);
+        let served = pool_core::share_target_hash(LOWEST_DIFFICULTY, 24);
+        let achieved = pool_core::achieved_share_factor(&net, &served);
+        assert_eq!(achieved, 0, "24 asked for, 0 actually served");
+        let e = check_share_target(24, achieved, LOWEST_DIFFICULTY).expect_err("refused");
+        assert!(e.contains("too low"), "{e}");
+        assert!(e.contains("submit"), "{e}");
+
+        // A difficulty with room to shift keeps the factor the operator chose.
+        // (The top byte encodes 255 - leading_zero_bits, so this target has 223
+        // leading zeros and 24 significant bits: 24 powers of two to spare.)
+        let d = 0x20FF_FFFFu32;
+        let net = pool_core::network_target_hash(d);
+        let served = pool_core::share_target_hash(d, 24);
+        assert_eq!(pool_core::achieved_share_factor(&net, &served), 24);
+        assert!(check_share_target(24, 24, d).is_ok());
+
+        // The bound is the SAME one share_bits must clear, applied to what is
+        // really served.
+        assert!(check_share_target(24, MIN_SHARE_FACTOR, 1).is_ok());
+        assert!(check_share_target(24, MIN_SHARE_FACTOR - 1, 1).is_err());
+    }
 
     #[test]
     fn a_same_height_reorg_keeps_already_credited_solutions() {

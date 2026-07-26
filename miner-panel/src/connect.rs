@@ -95,11 +95,18 @@ pub fn is_local_connect(connect: &str) -> bool {
 ///
 /// Pools / services that expose the same miner HTTP RPC as a fullnode
 /// (/query/miner/pending, /query/miner/notice, /submit/miner/success). The base
-/// Hacash worker protocol is just `connect = host:port` — there is no separate
-/// pool auth/stratum layer — so any node or pool that speaks this API is
-/// reachable by pointing `connect` at it. New pools can therefore be added
-/// without rebuilding the panel: drop a `pools.json` next to the exe (see
+/// Hacash worker protocol is just `connect = host:port`, with no separate pool
+/// auth/stratum layer, so any node or pool that speaks this API is reachable by
+/// pointing `connect` at it. New pools can therefore be added without
+/// rebuilding the panel: drop a `pools.json` next to the exe (see
 /// [`load_pool_directory`]) and they appear in the dropdown.
+///
+/// `note` is advertising copy, and this panel cannot verify a third party's
+/// payout scheme, fee or minimum: it has never connected to most of these
+/// entries. So a note here states only what the panel itself can stand behind.
+/// The pool's real terms are read from the pool at run time (`/terms`) and
+/// shown on the dashboard; that, and not this list, is where a miner learns
+/// what a pool pays.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolInfo {
     /// Display name in the dropdown.
@@ -137,6 +144,14 @@ impl PoolInfo {
 /// Community payout pools hand out their `host:port` through a web config
 /// generator, so we cannot hard-code a verified address; the user pastes it
 /// (or we publish it later via `pools.json`, with no rebuild).
+///
+/// No entry may promise a payout scheme, a fee or a minimum. The panel has
+/// never connected to any of these third-party services, so it cannot know
+/// those, and the pool this project ships (`pool-spike`'s pool-server) pays
+/// PPLNS, not PROP: an earlier note here advertised "PROP payouts, low fee,
+/// small minimum", which described neither the third-party pool it named nor
+/// any pool in this repository. See [`PoolInfo`] for where those numbers now
+/// come from instead.
 pub fn builtin_pools() -> Vec<PoolInfo> {
     vec![
         PoolInfo::simple(
@@ -148,29 +163,44 @@ pub fn builtin_pools() -> Vec<PoolInfo> {
         PoolInfo::simple(
             "LAN full node / cluster",
             "192.168.1.10:8080",
-            "Point every PC on your network at one full node; their hashrate adds up.",
+            "Point every PC on your network at one full node; their hashrate adds up. Rewards go to that node's wallet, not to each PC.",
             "",
         ),
         PoolInfo::simple(
             "Hacash.Diamonds pool",
             "",
-            "Community pool. Get your host:port from the pool page, then paste it above.",
+            "Third-party pool, not verified by this panel. Get your host:port from the pool page, then paste it above.",
             "https://www.hacash.diamonds/pool",
         ),
         PoolInfo::simple(
             "Hacash Community (HACPool)",
             "",
-            "Community pool: PROP payouts, low fee, small minimum. Get host:port from the pool site.",
+            "Third-party pool, not verified by this panel. Get your host:port from the pool site, then paste it above.",
             "https://pool.hacash.community",
         ),
         PoolInfo::simple(
             "HacashPool.com",
             "",
-            "Community pool. Get your host:port from the pool site, then paste it above.",
+            "Third-party pool, not verified by this panel. Get your host:port from the pool site, then paste it above.",
             "https://hacashpool.com",
         ),
     ]
 }
+
+/// Words a directory note may not use about a service this panel has never
+/// connected to. A scheme, a fee level or a minimum is a claim about somebody
+/// else's software, and the panel has no way to check any of them; the
+/// dashboard reads the real terms from the pool instead.
+const UNBACKED_NOTE_CLAIMS: [&str; 8] = [
+    "prop",
+    "pplns",
+    "pps",
+    "solo payouts",
+    "low fee",
+    "no fee",
+    "zero fee",
+    "small minimum",
+];
 
 #[derive(serde::Deserialize)]
 struct PoolJson {
@@ -189,12 +219,33 @@ struct PoolJson {
     notice_wait: Option<u64>,
 }
 
+/// Neutral replacement for a note that promised something the panel cannot
+/// check.
+pub const UNVERIFIED_TERMS_NOTE: &str =
+    "Payout terms are not verified by this panel. The dashboard shows the pool's own terms once you connect.";
+
+/// Refuse to repeat a payout claim about a service the panel has never checked.
+/// `pools.json` is an unsigned data file that anyone can drop next to the exe,
+/// so a note promising "PROP payouts, low fee, small minimum" would put words
+/// in the software's mouth. The address, name and link are kept; only the
+/// unbacked sentence is replaced.
+fn backed_note(note: &str) -> String {
+    let lowered = note.to_ascii_lowercase();
+    if UNBACKED_NOTE_CLAIMS
+        .iter()
+        .any(|claim| lowered.contains(claim))
+    {
+        return UNVERIFIED_TERMS_NOTE.to_string();
+    }
+    note.to_string()
+}
+
 /// Build the pool directory: the built-in list, then merge an optional
 /// `pools.json` sitting next to the panel. Entries whose `name` matches a
 /// built-in override it (so a verified address can be published for a known
 /// pool); new names are appended. A fresh pool therefore appears in the panel
-/// by shipping/downloading a `pools.json` — no rebuild required. A missing or
-/// malformed file simply falls back to the built-ins.
+/// by shipping/downloading a `pools.json`, with no rebuild required. A missing
+/// or malformed file simply falls back to the built-ins.
 pub fn load_pool_directory(dir: &Path) -> Vec<PoolInfo> {
     let mut pools = builtin_pools();
     let Ok(raw) = std::fs::read_to_string(dir.join("pools.json")) else {
@@ -210,7 +261,7 @@ pub fn load_pool_directory(dir: &Path) -> Vec<PoolInfo> {
         let info = PoolInfo {
             name: e.name,
             connect: e.connect,
-            note: e.note,
+            note: backed_note(&e.note),
             url: e.url,
             verified: e.verified,
             nonce_max: e.nonce_max,
@@ -230,7 +281,7 @@ pub fn load_pool_directory(dir: &Path) -> Vec<PoolInfo> {
 /// Best-effort reachability check: resolve `connect` (host:port) and open a TCP
 /// connection with a short timeout. Confirms the endpoint is listening and
 /// reachable FROM HERE. It cannot prove external/NAT reachability of a pool you
-/// host — only that this machine can open the socket. Returns the elapsed
+/// host: only that this machine can open the socket. Returns the elapsed
 /// milliseconds on success, or a human-readable error.
 pub fn probe_reachable(connect: &str, timeout_ms: u64) -> Result<u128, String> {
     let addr = normalize_connect(connect)?;
@@ -343,5 +394,87 @@ mod tests {
     fn probe_reachable_rejects_invalid_address() {
         assert!(probe_reachable("", 100).is_err());
         assert!(probe_reachable("not-a-host-port", 100).is_err());
+    }
+
+    #[test]
+    fn no_builtin_entry_promises_a_payout_scheme_a_fee_or_a_minimum() {
+        // One entry used to read "Community pool: PROP payouts, low fee, small
+        // minimum". The panel has never connected to that pool, and the pool
+        // this project ships pays PPLNS, so the sentence was unbacked either
+        // way. Nothing in this list may make that kind of claim again.
+        for pool in builtin_pools() {
+            let note = pool.note.to_ascii_lowercase();
+            for claim in UNBACKED_NOTE_CLAIMS {
+                assert!(
+                    !note.contains(claim),
+                    "{} claims '{claim}' the panel cannot check: {}",
+                    pool.name,
+                    pool.note
+                );
+            }
+            assert!(
+                !pool.note.contains('\u{2014}'),
+                "{} uses an em dash",
+                pool.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_third_party_entry_says_it_is_unverified() {
+        // An entry with no address of its own is a name the user has to trust.
+        // Say plainly that the panel has not checked it.
+        for pool in builtin_pools() {
+            if pool.connect.is_empty() && !pool.url.is_empty() {
+                assert!(
+                    pool.note.to_ascii_lowercase().contains("not verified"),
+                    "{} must say it is unverified: {}",
+                    pool.name,
+                    pool.note
+                );
+                assert!(!pool.verified, "{} was never connected to", pool.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_downloaded_pools_json_cannot_reintroduce_a_payout_promise() {
+        let dir = std::env::temp_dir().join(format!(
+            "hacash-poolnote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pools.json"),
+            r#"[
+              {"name":"Promising Pool","connect":"1.2.3.4:8080",
+               "note":"PROP payouts, low fee, small minimum","verified":true}
+            ]"#,
+        )
+        .unwrap();
+
+        let pools = load_pool_directory(&dir);
+        let entry = pools.iter().find(|p| p.name == "Promising Pool").unwrap();
+        assert_eq!(entry.note, UNVERIFIED_TERMS_NOTE);
+        // The address and the rest of the entry are untouched: only the claim
+        // the panel cannot stand behind is replaced.
+        assert_eq!(entry.connect, "1.2.3.4:8080");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_note_that_claims_nothing_is_left_exactly_as_written() {
+        let plain = "Get your host:port from the pool site, then paste it above.";
+        assert_eq!(backed_note(plain), plain);
+        assert_eq!(backed_note(""), "");
+        // The check is case insensitive, so shouting the claim does not slip
+        // through.
+        assert_eq!(backed_note("PPLNS pool"), UNVERIFIED_TERMS_NOTE);
+        assert_eq!(backed_note("Pool with No Fee"), UNVERIFIED_TERMS_NOTE);
     }
 }

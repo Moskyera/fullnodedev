@@ -37,14 +37,13 @@ use sys::*;
 use pool_spike::difficulty::ChainParams;
 use pool_spike::pool_core::split_payout;
 use pool_spike::{
-    Admission, PayoutTxState, acquire_settle_lock, balance, balance_units, classify_payout_tx,
-    distributable_units, find_u64, get_json, http_client, is_payout_address, load_immature_units,
-    load_or_create_wallet, load_pending_payout_txs, load_pplns_counts, mine_and_submit_block,
-    pool_state_path, post_hex, save_pending_payout_txs, verify_admitted,
+    Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS,
+    acquire_settle_lock, balance, balance_units, chunk_tx_fee, classify_payout_tx, confirm_payout,
+    distributable_units, drop_payout, find_u64, get_json, http_client, is_payout_address,
+    load_immature_units, load_or_create_wallet, load_paid_ledger, load_payout_records,
+    load_pending_payout_txs, load_pplns_counts, mine_and_submit_block, payout_amount,
+    pool_state_path, post_hex, save_settlement_ledger, verify_admitted,
 };
-
-/// Recipients per settlement transaction — safely under TX_ACTIONS_MAX (200).
-const PAYOUT_CHUNK: usize = 190;
 
 /// The leading 16 characters of a tx hash, for readable log lines. Never slices
 /// mid-character, so a corrupt ledger entry cannot panic a settlement run.
@@ -109,8 +108,16 @@ fn main() {
         .get(3)
         .cloned()
         .unwrap_or_else(|| "pool-wallet.key".to_string());
-    let reserve_units: u64 = pos.get(4).and_then(|s| s.parse().ok()).unwrap_or(5); // 0.5 HAC
-    let dust_units: u64 = pos.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Default to the pool server's OWN advertised terms, so a manual run pays on
+    // the same reserve and the same minimum payout `/terms` states.
+    let reserve_units: u64 = pos
+        .get(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SETTLE_RESERVE_UNITS);
+    let dust_units: u64 = pos
+        .get(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PAYOUT_DUST_UNITS);
 
     let client = http_client();
     println!("== pool-payout ({}) ==", if commit { "COMMIT" } else { "DRY-RUN" });
@@ -148,6 +155,16 @@ fn main() {
     // that is only shallowly confirmed, or whose state we could not determine,
     // counts as still in flight.
     let state_file = pool_state_path(&wallet_file);
+    // The per-worker settlement ledger the pool server keeps. This tool writes to
+    // the SAME file, so it has to carry it forward: a payout it makes that is
+    // never recorded here is one no miner can ever see it was paid, and a payout
+    // that buries while the server is stopped would otherwise vanish out of
+    // "in flight" without ever becoming "paid".
+    let mut records = load_payout_records(&state_file);
+    let mut paid = load_paid_ledger(&state_file);
+    if paid.since == 0 {
+        paid.since = curtimes();
+    }
     let mut prior = load_pending_payout_txs(&state_file);
     // Older builds of this tool kept their OWN ledger, which the server never
     // read. Fold anything left there into the shared one before deciding, so an
@@ -163,11 +180,29 @@ fn main() {
         for h in &prior {
             let j = get_json(&client, &format!("{node}/query/transaction?hash={h}"));
             match classify_payout_tx(&j) {
-                PayoutTxState::Buried(_) => {}
-                PayoutTxState::Gone => println!(
-                    "  prior payout tx {} is unknown to the node (rejected or dropped)",
-                    short(h)
-                ),
+                // Buried is the ONLY thing that turns money in flight into money
+                // paid, and it must be recorded here too: otherwise a payout that
+                // confirmed while the pool server was stopped would leave the
+                // in-flight list without ever reaching anyone's paid total.
+                PayoutTxState::Buried(_) => {
+                    if let Some(rec) = confirm_payout(&mut records, &mut paid, h, curtimes()) {
+                        println!(
+                            "  prior payout tx {} is buried: {} unit(s) to {} miner(s) are now PAID",
+                            short(h),
+                            rec.units(),
+                            rec.rows.len()
+                        );
+                    }
+                }
+                PayoutTxState::Gone => {
+                    println!(
+                        "  prior payout tx {} is unknown to the node (rejected or dropped)",
+                        short(h)
+                    );
+                    // Nothing was paid, so nothing is credited: those units are
+                    // still owed and go back into the split below.
+                    drop_payout(&mut records, h);
+                }
                 PayoutTxState::Confirming(d) => {
                     println!("  prior payout tx {} is only {d} block(s) deep", short(h));
                     still.push(h.clone());
@@ -180,7 +215,7 @@ fn main() {
             }
         }
         if !still.is_empty() {
-            if let Err(e) = save_pending_payout_txs(&state_file, &still) {
+            if let Err(e) = save_settlement_ledger(&state_file, &still, &records, &paid) {
                 eprintln!("could not update the pending ledger {state_file}: {e}");
             }
             eprintln!(
@@ -192,7 +227,7 @@ fn main() {
             std::process::exit(1);
         }
         println!("prior payout(s) all final; clearing the ledger.");
-        if let Err(e) = save_pending_payout_txs(&state_file, &[]) {
+        if let Err(e) = save_settlement_ledger(&state_file, &[], &records, &paid) {
             eprintln!("REFUSING to pay: cannot clear the pending ledger {state_file}: {e}");
             std::process::exit(1);
         }
@@ -264,7 +299,8 @@ fn main() {
         split.len()
     );
     for (w, u) in &split {
-        println!("  -> {w} = {u}:247");
+        // The chain's own amount, exactly as the transaction will carry it.
+        println!("  -> {w} = {}", payout_amount(*u).to_fin_string());
     }
 
     if !commit {
@@ -281,25 +317,26 @@ fn main() {
     let mut submitted: Vec<String> = Vec::new();
     let mut all_ok = true;
     for chunk in split.chunks(PAYOUT_CHUNK) {
-        let fee = Amount::from("1:246").expect("tx fee"); // 0.01 HAC (from reserve)
-        let mut tx = TransactionType2::new_by(main.clone(), fee, curtimes());
-        let mut pushed = 0usize;
+        // 0.01 HAC network fee, from the reserve, built by the same helper the
+        // pool server and `/terms` use.
+        let mut tx = TransactionType2::new_by(main.clone(), chunk_tx_fee(), curtimes());
+        // Exactly what this transaction pays, so a miner can later be told what
+        // it was paid and by which transaction. Only rows that really made it
+        // into the transaction are recorded.
+        let mut rows: Vec<(String, u64)> = Vec::with_capacity(chunk.len());
         for (worker, units) in chunk {
             let Ok(to) = Address::from_readable(worker) else {
                 continue;
             };
-            let Ok(amt) = Amount::from(&format!("{units}:247")) else {
-                eprintln!("  skip {worker}: amount {units}:247 not representable");
-                continue;
-            };
             let mut act = HacToTrs::new();
             act.to = AddrOrPtr::from_addr(to);
-            act.hacash = amt;
+            act.hacash = payout_amount(*units);
             if tx.push_action(Box::new(act)).is_err() {
                 break;
             }
-            pushed += 1;
+            rows.push((worker.clone(), *units));
         }
+        let pushed = rows.len();
         if pushed == 0 {
             continue;
         }
@@ -311,10 +348,18 @@ fn main() {
         // Record the hash in the shared pending ledger BEFORE submitting, so a
         // crash after submit still blocks a duplicate payout on the next run. If
         // that write fails, stop: an untracked payout is one a later run (or the
-        // pool server) could pay all over again.
+        // pool server) could pay all over again. The per-recipient rows go in the
+        // same write: a tracked hash with no rows behind it is a payout no miner
+        // could ever be shown.
         let txhash = hex::encode(tx.hash().serialize());
         submitted.push(txhash.clone());
-        if let Err(e) = save_pending_payout_txs(&state_file, &submitted) {
+        records.push(PayoutRecord {
+            hash: txhash.clone(),
+            at: curtimes(),
+            node_holds: false,
+            rows,
+        });
+        if let Err(e) = save_settlement_ledger(&state_file, &submitted, &records, &paid) {
             eprintln!(
                 "  cannot record the payout tx in {state_file} ({e}); ABORTING before submit so \
                  nothing is paid untracked."
@@ -337,8 +382,10 @@ fn main() {
             println!("  tx {} paying {pushed} miner(s): REJECTED -> {resp}", short(&txhash));
             // Never submitted, so never relayed: drop it so a retry re-issues
             // this chunk instead of waiting forever on a hash nothing holds.
+            // Nothing was paid, so the rows come out with it.
             submitted.retain(|h| h != &txhash);
-            let _ = save_pending_payout_txs(&state_file, &submitted);
+            drop_payout(&mut records, &txhash);
+            let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
             continue;
         }
         // ret=0 only means the API took the bytes. The node validates the
@@ -348,6 +395,10 @@ fn main() {
         let held = match verify_admitted(&client, &node, &txhash) {
             Admission::Held => {
                 println!("  tx {} paying {pushed} miner(s): the node holds it", short(&txhash));
+                if let Some(r) = records.iter_mut().find(|r| r.hash == txhash) {
+                    r.node_holds = true;
+                }
+                let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
                 true
             }
             Admission::Missing => {
@@ -358,7 +409,8 @@ fn main() {
                     short(&txhash)
                 );
                 submitted.retain(|h| h != &txhash);
-                let _ = save_pending_payout_txs(&state_file, &submitted);
+                drop_payout(&mut records, &txhash);
+                let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
                 false
             }
             Admission::Unresolved => {

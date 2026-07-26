@@ -8,7 +8,7 @@ pub mod pool_core;
 
 use difficulty::ChainParams;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use basis::difficulty::*;
@@ -368,6 +368,315 @@ pub fn load_immature_units(state_file: &str) -> u64 {
 pub fn save_pending_payout_txs(state_file: &str, hashes: &[String]) -> std::io::Result<()> {
     let mut j = read_state_json(state_file).unwrap_or_else(|| serde_json::json!({}));
     j["settle_pending_txs"] = serde_json::json!(hashes);
+    atomic_write(state_file, j.to_string().as_bytes(), true)
+}
+
+/* ---------------------------------------------------------------------------
+ * The pool's money terms, in ONE place.
+ *
+ * `/terms` reads these same constants and `settle_once` / `pool-payout` apply
+ * them, so what the pool advertises cannot drift from what it does. Change a
+ * number here and every place that states it changes with it.
+ * ------------------------------------------------------------------------- */
+
+/// The amount unit the pool accounts in: 0.1 HAC (Hacash amount unit 247). Every
+/// payout it plans, submits and reports is a whole number of these.
+pub const PAYOUT_UNIT: u8 = 247;
+
+/// `units` of 0.1 HAC as the chain's OWN money type. The pool never renders money
+/// as a float or a hand-rolled decimal: what a miner is shown is exactly what the
+/// transaction carries.
+pub fn payout_amount(units: u64) -> Amount {
+    Amount::coin(units, PAYOUT_UNIT)
+}
+
+/// The network fee ONE settlement transaction carries: 0.01 HAC. It comes out of
+/// the reserve below, never out of a miner's share.
+pub fn chunk_tx_fee() -> Amount {
+    Amount::coin(1, 246)
+}
+
+/// The pool's own fee, in units of 0.1 HAC, taken off the top of a settlement
+/// before it is split. It is ZERO: this pool skims nothing.
+pub const POOL_FEE_UNITS: u64 = 0;
+
+/// Held back from every settlement so the wallet can always fund the per-chunk
+/// network fee above. This is NOT a fee: it stays in the pool wallet and a later
+/// cycle distributes whatever of it is no longer needed.
+pub const SETTLE_RESERVE_UNITS: u64 = 5;
+
+/// The smallest payout a settlement will include, in units of 0.1 HAC. A worker
+/// whose share of a cycle rounds below this is paid nothing THAT CYCLE; the money
+/// is never taken from anyone - it stays in the pool wallet and is part of the
+/// next cycle's distributable balance.
+pub const PAYOUT_DUST_UNITS: u64 = 1;
+
+/// Recipients per settlement transaction. The node enforces TX_ACTIONS_MAX = 200
+/// actions, so stay safely under it: a large payout is chunked, never rejected.
+pub const PAYOUT_CHUNK: usize = 190;
+
+/* ---------------------------------------------------------------------------
+ * Per-worker settlement ledger.
+ *
+ * `settle_pending_txs` alone can only say that SOME payout is in flight. A miner
+ * needs to know what is in flight FOR IT, what it has actually been paid, and
+ * when - so the pool keeps the exact per-recipient rows of every payout it
+ * submits, and folds them into a paid ledger when, and only when, the node
+ * reports that transaction buried.
+ * ------------------------------------------------------------------------- */
+
+/// One settlement transaction this pool submitted, with the exact amounts it
+/// carries for each recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayoutRecord {
+    pub hash: String,
+    /// Unix seconds when the pool submitted it.
+    pub at: u64,
+    /// Did the NODE confirm it holds this transaction? `false` means it was
+    /// submitted but the node's verdict could not be read: it may well be in
+    /// flight, so it stays tracked, but nothing about it is claimed.
+    pub node_holds: bool,
+    /// (worker address, units of 0.1 HAC) exactly as the transaction pays them.
+    pub rows: Vec<(String, u64)>,
+}
+
+impl PayoutRecord {
+    /// Total this transaction pays, in units of 0.1 HAC.
+    pub fn units(&self) -> u64 {
+        self.rows.iter().map(|(_, u)| *u).fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// What this transaction pays ONE worker.
+    pub fn units_for(&self, worker: &str) -> u64 {
+        self.rows
+            .iter()
+            .filter(|(w, _)| w == worker)
+            .map(|(_, u)| *u)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "hash": self.hash,
+            "at": self.at,
+            "node_holds": self.node_holds,
+            "rows": self.rows.iter()
+                .map(|(w, u)| serde_json::json!([w, u]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Rebuild one record. A row the file cannot describe is DROPPED rather than
+    /// guessed at: an unreadable amount must never become a number a miner is
+    /// shown.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let hash = v.get("hash")?.as_str()?.to_string();
+        if hash.is_empty() {
+            return None;
+        }
+        let rows = v
+            .get("rows")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| {
+                let a = r.as_array()?;
+                Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_u64()?))
+            })
+            .collect();
+        Some(Self {
+            hash,
+            at: v.get("at").and_then(|x| x.as_u64()).unwrap_or(0),
+            node_holds: v
+                .get("node_holds")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            rows,
+        })
+    }
+}
+
+/// What this pool's ledger has actually paid ONE worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaidRow {
+    /// Total confirmed paid, in units of 0.1 HAC. Only ever grows.
+    pub units: u64,
+    /// The most recent confirmed payout: amount, transaction, and when the pool
+    /// saw the node bury it.
+    pub last_units: u64,
+    pub last_hash: String,
+    pub last_at: u64,
+}
+
+/// Confirmed payouts per worker.
+///
+/// `since` is reported next to every total on purpose: this is what the pool has
+/// paid SINCE THIS LEDGER EXISTED, not what a worker has ever earned. A pool
+/// whose state file was lost starts a new ledger, and a miner must be able to see
+/// that rather than read a total that silently means something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaidLedger {
+    pub since: u64,
+    rows: HashMap<String, PaidRow>,
+}
+
+impl PaidLedger {
+    /// A fresh ledger that starts counting now.
+    pub fn started(at: u64) -> Self {
+        Self {
+            since: at,
+            rows: HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, worker: &str) -> Option<&PaidRow> {
+        self.rows.get(worker)
+    }
+
+    pub fn workers(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn total_units(&self) -> u64 {
+        self.rows
+            .values()
+            .map(|r| r.units)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Fold a payout the node has BURIED into the ledger.
+    ///
+    /// Only ever ADDS: a worker's paid total can never go down, and it moves only
+    /// on a node confirmation - never when a payout is merely submitted, and
+    /// never when one is only shallowly mined and a reorg could still undo it.
+    pub fn credit(&mut self, rec: &PayoutRecord, confirmed_at: u64) {
+        for (worker, units) in &rec.rows {
+            if *units == 0 {
+                continue;
+            }
+            let row = self.rows.entry(worker.clone()).or_default();
+            row.units = row.units.saturating_add(*units);
+            row.last_units = *units;
+            row.last_hash = rec.hash.clone();
+            row.last_at = confirmed_at;
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut rows: Vec<(&String, &PaidRow)> = self.rows.iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0)); // stable file, stable diffs
+        serde_json::json!({
+            "since": self.since,
+            "rows": rows.iter().map(|(w, r)| serde_json::json!({
+                "worker": w,
+                "units": r.units,
+                "last_units": r.last_units,
+                "last_hash": r.last_hash,
+                "last_at": r.last_at,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Self {
+        let since = v.get("since").and_then(|x| x.as_u64()).unwrap_or(0);
+        let mut rows: HashMap<String, PaidRow> = HashMap::new();
+        if let Some(a) = v.get("rows").and_then(|x| x.as_array()) {
+            for r in a {
+                let Some(w) = r.get("worker").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some(units) = r.get("units").and_then(|x| x.as_u64()) else {
+                    continue; // an unreadable total is not a zero total
+                };
+                rows.insert(
+                    w.to_string(),
+                    PaidRow {
+                        units,
+                        last_units: r.get("last_units").and_then(|x| x.as_u64()).unwrap_or(0),
+                        last_hash: r
+                            .get("last_hash")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        last_at: r.get("last_at").and_then(|x| x.as_u64()).unwrap_or(0),
+                    },
+                );
+            }
+        }
+        Self { since, rows }
+    }
+}
+
+/// Move a payout the node reports BURIED out of the in-flight list and into the
+/// paid ledger, in one step so a unit can never be counted in both.
+///
+/// Returns the record it credited, or `None` if this pool has no rows for that
+/// hash (a payout submitted by an older build, or by a tool that did not record
+/// its rows). `None` is why the caller must still drop the hash from the pending
+/// ledger: the money moved, this pool just cannot attribute it.
+pub fn confirm_payout(
+    records: &mut Vec<PayoutRecord>,
+    paid: &mut PaidLedger,
+    hash: &str,
+    confirmed_at: u64,
+) -> Option<PayoutRecord> {
+    let i = records.iter().position(|r| r.hash == hash)?;
+    let rec = records.remove(i);
+    paid.credit(&rec, confirmed_at);
+    Some(rec)
+}
+
+/// Drop a payout the node definitively does NOT hold. Nothing was paid, so
+/// nothing is credited: that money is still owed and goes back to `pending`.
+pub fn drop_payout(records: &mut Vec<PayoutRecord>, hash: &str) -> Option<PayoutRecord> {
+    let i = records.iter().position(|r| r.hash == hash)?;
+    Some(records.remove(i))
+}
+
+/// The per-transaction rows of every payout this pool has in flight.
+pub fn load_payout_records(state_file: &str) -> Vec<PayoutRecord> {
+    let Some(j) = read_state_json(state_file) else {
+        return Vec::new();
+    };
+    parse_payout_records(&j)
+}
+
+/// Read the in-flight payout rows out of an already-parsed state document.
+pub fn parse_payout_records(j: &Value) -> Vec<PayoutRecord> {
+    j.get("payouts_inflight")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(PayoutRecord::from_json).collect())
+        .unwrap_or_default()
+}
+
+/// The confirmed-payout ledger.
+pub fn load_paid_ledger(state_file: &str) -> PaidLedger {
+    let Some(j) = read_state_json(state_file) else {
+        return PaidLedger::default();
+    };
+    parse_paid_ledger(&j)
+}
+
+/// Read the confirmed-payout ledger out of an already-parsed state document.
+pub fn parse_paid_ledger(j: &Value) -> PaidLedger {
+    j.get("paid").map(PaidLedger::from_json).unwrap_or_default()
+}
+
+/// Replace the WHOLE settlement ledger (pending hashes, per-transaction rows and
+/// confirmed totals) in the pool state file, preserving every other field.
+///
+/// One write, because the three move together: a payout leaves the in-flight
+/// rows at the same instant it enters the paid totals, and a crash between the
+/// two would either lose a payment or count it twice.
+pub fn save_settlement_ledger(
+    state_file: &str,
+    hashes: &[String],
+    records: &[PayoutRecord],
+    paid: &PaidLedger,
+) -> std::io::Result<()> {
+    let mut j = read_state_json(state_file).unwrap_or_else(|| serde_json::json!({}));
+    j["settle_pending_txs"] = serde_json::json!(hashes);
+    j["payouts_inflight"] = Value::Array(records.iter().map(|r| r.to_json()).collect());
+    j["paid"] = paid.to_json();
     atomic_write(state_file, j.to_string().as_bytes(), true)
 }
 
@@ -1543,6 +1852,78 @@ mod tests {
             vec![("a".to_string(), 1u64), ("b".to_string(), 1u64)]
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_per_worker_settlement_ledger_survives_the_state_file() {
+        // A miner's "total paid" is only as good as this file. The pool server
+        // and pool-payout both write it, so it has to round-trip through both
+        // without losing anyone's money or the rest of the accounting.
+        let path = tmp_path("earnings.state.json");
+        let _ = std::fs::remove_file(&path);
+        atomic_write(
+            &path,
+            serde_json::json!({"order": ["a"], "accepted": 3})
+                .to_string()
+                .as_bytes(),
+            true,
+        )
+        .expect("write state");
+        // A file written before this ledger existed reads as an empty one, not as
+        // a corrupt one: nobody has been paid yet, which is the truth.
+        assert!(load_payout_records(&path).is_empty());
+        assert_eq!(load_paid_ledger(&path), PaidLedger::default());
+
+        let mut records = vec![PayoutRecord {
+            hash: "aa11".to_string(),
+            at: 1_100,
+            node_holds: true,
+            rows: vec![("w1".to_string(), 12), ("w2".to_string(), 3)],
+        }];
+        let mut paid = PaidLedger::started(1_000);
+        save_settlement_ledger(&path, &["aa11".to_string()], &records, &paid).expect("save");
+
+        // Everything else in the file is untouched.
+        let j: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(j["accepted"].as_u64(), Some(3));
+        assert_eq!(load_pending_payout_txs(&path), vec!["aa11".to_string()]);
+        assert_eq!(load_payout_records(&path), records);
+
+        // Confirm it, save again, and reload: the money is in the paid ledger and
+        // out of the in-flight rows, in both memory and on disk.
+        confirm_payout(&mut records, &mut paid, "aa11", 1_200).expect("credited");
+        save_settlement_ledger(&path, &[], &records, &paid).expect("save");
+        assert!(load_payout_records(&path).is_empty());
+        let back = load_paid_ledger(&path);
+        assert_eq!(back, paid);
+        assert_eq!(back.get("w1").expect("w1").units, 12);
+        assert_eq!(back.get("w2").expect("w2").units, 3);
+        assert_eq!(back.get("w1").expect("w1").last_hash, "aa11");
+        assert_eq!(back.get("w1").expect("w1").last_at, 1_200);
+        assert_eq!(back.total_units(), 15);
+        assert_eq!(back.since, 1_000);
+        assert!(back.get("never-paid").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_money_terms_are_stated_in_the_chains_own_amount() {
+        // Never a float and never a decimal this pool rounded itself.
+        assert_eq!(payout_amount(0).to_fin_string(), "0:0");
+        assert_eq!(payout_amount(1).to_fin_string(), "1:247"); // 0.1 HAC
+        assert_eq!(payout_amount(10).to_fin_string(), "1:248"); // 1 HAC
+        assert_eq!(payout_amount(35).to_fin_string(), "35:247");
+        assert_eq!(chunk_tx_fee().to_fin_string(), "1:246"); // 0.01 HAC
+        // The reserve and the minimum payout are the ones the settlement uses.
+        assert_eq!(SETTLE_RESERVE_UNITS, 5); // 0.5 HAC
+        assert_eq!(PAYOUT_DUST_UNITS, 1); // 0.1 HAC
+        assert_eq!(POOL_FEE_UNITS, 0); // no pool fee
+        // And the same value the chain would build from its own text form.
+        assert_eq!(
+            payout_amount(35),
+            Amount::from("35:247").expect("chain amount")
+        );
     }
 
     #[test]
