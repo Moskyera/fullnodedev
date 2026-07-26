@@ -5,7 +5,7 @@
 //! (chunked to the node's 200-action limit).
 //!
 //! Safety properties (real money):
-//!   * DRY-RUN by default — prints the planned split and pays NOTHING unless you
+//!   * DRY-RUN by default - prints the planned split and pays NOTHING unless you
 //!     pass `--commit`.
 //!   * Exclusive - takes the wallet's settlement lock for the whole run, so it
 //!     can never pay out of a wallet a running hbit-pool-server is already settling.
@@ -17,17 +17,21 @@
 //!     overlap cannot double-pay.
 //!   * Balance-derived - never pays more than (matured balance - reserve); no
 //!     fixed "total" that could overspend.
-//!   * Payable-first — the proportional split is computed over payable addresses
+//!   * Payable-first - the proportional split is computed over payable addresses
 //!     only, so unpayable IP-fallback keys never dilute honest miners.
-//!   * Chunked — at most 190 recipients per tx, so a large payout is never
+//!   * Chunked - at most 190 recipients per tx, so a large payout is never
 //!     rejected by the node's TX_ACTIONS_MAX=200 limit.
-//!   * Honest — reports the node's accept/reject for every tx and the real
+//!   * Honest - reports the node's accept/reject for every tx and the real
 //!     before/after balances; no "looks funded" guesswork.
 //!
 //! Usage: hbit-pool-payout <pool_base> <node> <chain> [wallet_file]
 //!        [reserve_units] [dust_units] [--commit]
-//!   chain = mainnet | testnet | testnet:<adjust_blocks>:<target_time>
-//!   (required - a wrong difficulty rule means rejected blocks)
+//!   `--help` prints the whole of it: every argument, what it means, and a
+//!   working example. See `usage()`, which is the only place that text lives.
+//!   `chain` is required - a wrong difficulty rule means rejected blocks.
+//!
+//! Nothing here ever prompts, so it is safe to run from a script: every input is
+//! an argument, and anything missing or wrong is a refusal that says what to do.
 
 use basis::interface::*;
 use field::*;
@@ -39,17 +43,82 @@ use hbit_pool::difficulty::ChainParams;
 use hbit_pool::pool_core::split_payout;
 use hbit_pool::{
     Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS,
-    acquire_settle_lock, balance, balance_units, chunk_tx_fee, classify_payout_tx, confirm_payout,
-    distributable_units, drop_payout, find_u64, get_json, http_client, is_payout_address,
-    load_immature_units, load_or_create_wallet, load_paid_ledger, load_payout_records,
-    load_pending_payout_txs, load_pplns_counts, mine_and_submit_block, payout_amount,
-    pool_state_path, post_hex, save_settlement_ledger, verify_admitted,
+    WALLET_PASSWORD_ENV, acquire_settle_lock, balance, balance_units, chunk_tx_fee,
+    classify_payout_tx, confirm_payout, distributable_units, drop_payout, find_u64, get_json,
+    http_client, is_payout_address, load_immature_units, load_or_create_wallet, load_paid_ledger,
+    load_payout_records, load_pending_payout_txs, load_pplns_counts, mine_and_submit_block,
+    payout_amount, pool_state_path, post_hex, save_settlement_ledger, settle_lock_path,
+    verify_admitted,
 };
+
+/// The default wallet path, used when the operator does not name one. Quoted by
+/// `usage()` so the help cannot describe a file the tool does not open.
+const DEFAULT_WALLET_FILE: &str = "pool-wallet.key";
 
 /// The leading 16 characters of a tx hash, for readable log lines. Never slices
 /// mid-character, so a corrupt ledger entry cannot panic a settlement run.
 fn short(hash: &str) -> &str {
     hash.get(..16).unwrap_or(hash)
+}
+
+/// Everything needed to run a manual settlement correctly, without reading this
+/// source. Printed on `--help` and on any refusal that comes from the command
+/// line itself.
+fn usage() -> String {
+    format!(
+        r"hbit-pool-payout v{ver}: pays the pool's miners by hand, out of the pool wallet.
+Run it ONLY while hbit-pool-server is stopped, and read the dry run before you commit.
+
+usage:
+  hbit-pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
+
+  <pool_base>      Base URL of the pool server, e.g. http://127.0.0.1:9777 - the
+                   same address you started it on. It is asked for the share
+                   window; while the server is stopped, as it must be, that is
+                   read from the accounting file next to the wallet instead.
+
+  <node>           Base URL of YOUR OWN Hacash fullnode, already running and
+                   synced. Normally http://127.0.0.1:8080 in this package.
+
+  <chain>          Which chain your node is on. REQUIRED and never guessed:
+                     mainnet
+                     testnet
+                     testnet:<difficulty_adjust_blocks>:<each_block_target_time>
+
+  [wallet_file]    The pool's wallet key file. Default {wallet}. This tool never
+                   creates one: the pool server does that on its first run.
+
+  [reserve_units]  Units of 0.1 HAC left in the wallet to fund network fees.
+                   Default {reserve}, which is what the pool server itself uses
+                   and what its /terms endpoint advertises.
+
+  [dust_units]     Units of 0.1 HAC below which a miner is paid nothing this run;
+                   the money stays in the wallet for the next one. Default {dust}.
+
+  --commit         Actually pay. WITHOUT IT NOTHING IS PAID: the run prints the
+                   split it would make and stops.
+
+the safe order, exactly:
+  1. stop hbit-pool-server and wait for the process to really exit
+  2. hbit-pool-payout http://127.0.0.1:9777 http://127.0.0.1:8080 mainnet {wallet}
+  3. read the planned split; if it is right, run the SAME line again with --commit
+  4. start hbit-pool-server again
+
+If the wallet file is encrypted, set {pw} first, in the same window.
+
+The full runbook is POOL-OPERATOR.md.",
+        ver = env!("CARGO_PKG_VERSION"),
+        wallet = DEFAULT_WALLET_FILE,
+        reserve = SETTLE_RESERVE_UNITS,
+        dust = PAYOUT_DUST_UNITS,
+        pw = WALLET_PASSWORD_ENV,
+    )
+}
+
+/// Print `text` and stop with the conventional configuration-error status.
+fn refuse(text: &str) -> ! {
+    eprintln!("{text}");
+    std::process::exit(2)
 }
 
 /// Read (and retire) the ledger older builds kept privately, next to the wallet.
@@ -68,6 +137,10 @@ fn take_legacy_ledger(wallet_file: &str) -> Vec<String> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if a.iter().skip(1).any(|x| x == "-h" || x == "--help" || x == "/?") {
+        println!("{}", usage());
+        return;
+    }
     let commit = a.iter().any(|x| x == "--commit");
     let pos: Vec<String> = a
         .iter()
@@ -76,50 +149,69 @@ fn main() {
         .cloned()
         .collect();
 
-    let pool_base = pos
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:9777".to_string());
-    let node = pos
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
-    let pool_base = pool_base.trim_end_matches('/').to_string();
-    let node = node.trim_end_matches('/').to_string();
-    let Some(chain) = pos.get(2).cloned() else {
-        eprintln!(
-            "usage: hbit-pool-payout <pool_base> <node> <chain> [wallet_file] \
-             [reserve_units] [dust_units] [--commit]\n\
-             chain is required: `mainnet`, `testnet`, or \
-             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`."
-        );
-        std::process::exit(2);
-    };
+    // Three arguments are required. Nothing about WHERE the money goes is ever
+    // guessed here.
+    if pos.len() < 3 {
+        eprintln!("{}\n", usage());
+        refuse(&format!(
+            "REFUSING to run: {} argument(s) given, 3 are required \
+             (<pool_base> <node> <chain>).",
+            pos.len()
+        ));
+    }
+    let pool_base = pos[0].trim().trim_end_matches('/').to_string();
+    let node = pos[1].trim().trim_end_matches('/').to_string();
+    let chain = pos[2].trim().to_string();
     // A testnet node reads its difficulty window and block time from its OWN
     // config, so accept them spelled out instead of assuming a pair that would
     // make the confirming block below unmineable.
     let Some(params) = ChainParams::parse(&chain) else {
-        eprintln!(
-            "chain must be `mainnet`, `testnet`, or \
-             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` (got `{chain}`)"
-        );
-        std::process::exit(2);
+        eprintln!("{}\n", usage());
+        refuse(&format!(
+            "REFUSING to run: <chain> must be `mainnet`, `testnet`, or \
+             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` (got `{chain}`).\n\
+             What to do: name the chain YOUR node is on, the same one the pool server runs with."
+        ));
     };
     let is_testnet = chain != "mainnet";
     let wallet_file = pos
         .get(3)
-        .cloned()
-        .unwrap_or_else(|| "pool-wallet.key".to_string());
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| DEFAULT_WALLET_FILE.to_string());
+    // This tool pays OUT of an existing pool wallet; it must never bring one into
+    // being. Creating one here would hand back a fresh empty address, report a
+    // zero balance and nothing to pay, and leave a real-money-looking key file in
+    // whatever directory the operator happened to be standing in.
+    if !std::path::Path::new(&wallet_file).exists() {
+        refuse(&format!(
+            "REFUSING to run: there is no wallet file at {wallet_file}.\n\
+             hbit-pool-server creates the pool wallet on its first run; this tool only ever pays \
+             out of one that already exists.\n\
+             What to do: run this from the folder that holds the pool's wallet file, or pass the \
+             path to it as argument 4."
+        ));
+    }
     // Default to the pool server's OWN advertised terms, so a manual run pays on
-    // the same reserve and the same minimum payout `/terms` states.
-    let reserve_units: u64 = pos
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(SETTLE_RESERVE_UNITS);
-    let dust_units: u64 = pos
-        .get(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(PAYOUT_DUST_UNITS);
+    // the same reserve and the same minimum payout `/terms` states. A value that
+    // does not parse is REFUSED rather than quietly replaced by that default:
+    // both of these decide how much money stays in the wallet, and an operator
+    // who mistyped one would never be told the number they typed was ignored.
+    let unit_arg = |i: usize, name: &str, default: u64| -> u64 {
+        match pos.get(i) {
+            None => default,
+            Some(raw) => match raw.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => refuse(&format!(
+                    "REFUSING to run: [{name}] must be a whole number of 0.1 HAC units \
+                     (got `{raw}`).\n\
+                     What to do: leave it out to use the pool's own advertised {default}, or pass \
+                     a whole number - 5 means 0.5 HAC."
+                )),
+            },
+        }
+    };
+    let reserve_units = unit_arg(4, "reserve_units", SETTLE_RESERVE_UNITS);
+    let dust_units = unit_arg(5, "dust_units", PAYOUT_DUST_UNITS);
 
     let client = http_client();
     println!("== HBIT pool payout ({}) ==", if commit { "COMMIT" } else { "DRY-RUN" });
@@ -132,11 +224,31 @@ fn main() {
             eprintln!(
                 "REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds \
                  {wallet_file} ({e}).\n\
-                 Only one process may settle a wallet - stop the pool server first."
+                 Two settlers would each see the whole wallet balance, each believe it is the only \
+                 payer, and pay the same shares twice out of your own funds.\n\
+                 What to do: stop hbit-pool-server, wait for it to actually exit, then run this \
+                 again.\n\
+                 The lock belongs to the running process, not to the file: deleting {} frees \
+                 nothing and would only let two of them pay at once.",
+                settle_lock_path(&wallet_file)
             );
             std::process::exit(1);
         }
     };
+    // The node has to answer before anything is valued. An unreachable node
+    // returns no balance at all, which reads as an empty string and values as
+    // zero: the run would then report "balance = , nothing to pay" and an
+    // operator would believe the wallet was empty.
+    if find_u64(&get_json(&client, &format!("{node}/query/latest")), "height").is_none() {
+        eprintln!(
+            "REFUSING to pay: no Hacash fullnode answered at {node}, so this tool cannot read the \
+             wallet's balance or what is already in flight.\n\
+             Nothing was paid.\n\
+             What to do: start your fullnode, let it finish syncing, and check that {node} is its \
+             API address."
+        );
+        std::process::exit(1);
+    }
     let pool_acc = load_or_create_wallet(&wallet_file);
     let pool_addr = pool_acc.readable().to_string();
     let bal = balance(&client, &node, &pool_addr);
@@ -258,7 +370,7 @@ fn main() {
         }
     }
     if counts.is_empty() {
-        println!("no shares recorded yet — nothing to pay");
+        println!("no shares recorded yet - nothing to pay");
         return;
     }
 
@@ -273,7 +385,7 @@ fn main() {
         println!("({skipped} worker(s) without an announced payout address are excluded)");
     }
     if payable_counts.is_empty() {
-        println!("no payable workers (nobody announced a payout address) — nothing to pay");
+        println!("no payable workers (nobody announced a payout address) - nothing to pay");
         return;
     }
     // Apply the SAME maturity gate as the automatic settlement: the pool server
@@ -292,7 +404,7 @@ fn main() {
     };
     let split = split_payout(distributable, 0, dust_units, &payable_counts);
     if split.is_empty() {
-        println!("split produced no payable rows (all below dust {dust_units}) — nothing to pay");
+        println!("split produced no payable rows (all below dust {dust_units}) - nothing to pay");
         return;
     }
     let n_tx = split.len().div_ceil(PAYOUT_CHUNK);

@@ -83,10 +83,10 @@ jobs:
       - name: Build public free-IP pool (hac-pool)
         run: cargo build --locked --release -p miner-pool
 
-      # HBIT payout pool: hbit-pool-server, hbit-settle-spike and
-      # hbit-pool-payout hold the pool wallet and compute real payouts, so they
-      # must compile in the release pipeline even though they are not packaged
-      # (operators self-build).
+      # HBIT payout pool: hbit-pool-server and hbit-pool-payout hold the pool
+      # wallet and compute real payouts. They SHIP in the full package, so this
+      # build is what the packaging step below copies from and a failure here
+      # must stop the release rather than produce a package without its pool.
       - name: Build HBIT payout pool server (hbit-pool)
         run: cargo build --locked --release -p hbit-pool
 
@@ -141,15 +141,60 @@ jobs:
               "PRESETS-INDEX.txt", "START-MINER-PANEL.bat", "LIST-OPENCL.bat"
             )
             $isFull = $zip.Name -like "hacash-miner-full-windows-x64*"
-            if ($isFull) { $required += @("hacash.exe", "SETUP.bat", "README-RELEASE.txt") }
-            else { $required += @("SETUP-MINER.bat", "README-MINER-ONLY.txt") }
+            # The HBIT pool binaries never ship alone. Each one holds a wallet
+            # that receives real mining income, so the runbook, the argument
+            # worksheet and the plain-language README are part of the package,
+            # not optional extras: a build that forgets one must fail here
+            # rather than hand an operator a daemon with no instructions.
+            $poolFiles = @(
+              "hbit-pool-server.exe", "hbit-pool-payout.exe",
+              "POOL-OPERATOR.md", "hbit-pool.example.ini", "README-POOL.txt"
+            )
+            if ($isFull) {
+              $required += @("hacash.exe", "SETUP.bat", "README-RELEASE.txt") + $poolFiles
+            } else {
+              $required += @("SETUP-MINER.bat", "README-MINER-ONLY.txt")
+            }
             foreach ($file in $required) {
               if (-not (Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {
                 throw "$($zip.Name) missing $file"
               }
             }
-            if (-not $isFull -and (Test-Path -LiteralPath (Join-Path $stage "hacash.exe"))) {
-              throw "Miner-only ZIP unexpectedly contains hacash.exe"
+            if (-not $isFull) {
+              if (Test-Path -LiteralPath (Join-Path $stage "hacash.exe")) {
+                throw "Miner-only ZIP unexpectedly contains hacash.exe"
+              }
+              # The pool needs a fullnode this package does not carry, and the
+              # people who take the workers-only download are the ones who
+              # should never meet a wallet-holding daemon by accident.
+              foreach ($file in $poolFiles) {
+                if (Test-Path -LiteralPath (Join-Path $stage $file)) {
+                  throw "Miner-only ZIP unexpectedly contains $file"
+                }
+              }
+            }
+            if ($isFull) {
+              # The worksheet must arrive with every operator-specific answer
+              # blank, and neither operator file may carry anything shaped like
+              # a live address or key: a value shipped by somebody else is a
+              # value the operator did not choose, and one of them decides
+              # which wallet holds other people's money.
+              $worksheet = Get-Content -LiteralPath (Join-Path $stage "hbit-pool.example.ini")
+              $filled = @($worksheet | Where-Object {
+                $_ -match '^\s*(node|wallet_file|listen|chain|pool_base)\s*=\s*\S'
+              })
+              if ($filled.Count -gt 0) {
+                throw "$($zip.Name) ships a filled-in worksheet value: $($filled -join '; ')"
+              }
+              foreach ($doc in @("hbit-pool.example.ini", "README-POOL.txt")) {
+                $text = [IO.File]::ReadAllText((Join-Path $stage $doc))
+                if ($text -match '\b1[1-9A-HJ-NP-Za-km-z]{25,34}\b') {
+                  throw "$($zip.Name): $doc ships a live-looking HAC address: $($Matches[0])"
+                }
+                if ($text -match '\b[0-9a-fA-F]{64}\b') {
+                  throw "$($zip.Name): $doc ships a private-key-looking value: $($Matches[0])"
+                }
+              }
             }
             $kernels = @(Get-ChildItem -LiteralPath (Join-Path $stage "x16rs\opencl") -Filter "*.cl" -File)
             if ($kernels.Count -ne 25) { throw "$($zip.Name) has $($kernels.Count) kernels, expected 25" }
@@ -280,6 +325,61 @@ jobs:
           test "${#dia_presets[@]}" -eq 23
           grep -Fxq 'reward = YOUR_HACD_PRIVAKEY_3x' "$full/hacash.config.ini.example"
 
+          # The HBIT pool binaries never ship alone. Each one holds a wallet
+          # that receives real mining income, so the runbook, the argument
+          # worksheet and the plain-language README are part of the package,
+          # not optional extras: a build that forgets one must fail here rather
+          # than hand an operator a daemon with no instructions.
+          full_archive=(dist/hacash-miner-full-linux-x86_64*.tar.gz)
+          only_archive=(dist/hacash-miner-only-linux-x86_64*.tar.gz)
+          # Listed once into a variable: piping tar into grep -q lets grep close
+          # the pipe early, and under pipefail that SIGPIPE would fail the step
+          # on a listing that was actually fine.
+          full_list=$(tar -tzf "${full_archive[0]}")
+          only_list=$(tar -tzf "${only_archive[0]}")
+          for name in hbit-pool-server hbit-pool-payout POOL-OPERATOR.md \
+            hbit-pool.example.ini README-POOL.txt; do
+            if [[ ! -f "$full/$name" ]] ||
+              ! grep -Fxq "hacash-miner-full-linux-x86_64/$name" <<<"$full_list"; then
+              echo "Full archive is missing its pool file $name"
+              exit 1
+            fi
+            # The pool needs a fullnode this package does not carry, and the
+            # people who take the workers-only download are the ones who should
+            # never meet a wallet-holding daemon by accident.
+            if [[ -e "$only/$name" ]] || grep -Fq "/$name" <<<"$only_list"; then
+              echo "Miner-only archive unexpectedly contains $name"
+              exit 1
+            fi
+          done
+          for name in hbit-pool-server hbit-pool-payout; do
+            if [[ ! -x "$full/$name" ]]; then
+              echo "Packaged $name is not executable"
+              exit 1
+            fi
+          done
+
+          # The worksheet must arrive with every operator-specific answer blank,
+          # and neither operator file may carry anything shaped like a live
+          # address or key: a value shipped by somebody else is a value the
+          # operator did not choose, and one of them decides which wallet holds
+          # other people's money.
+          if grep -nE '^[[:space:]]*(node|wallet_file|listen|chain|pool_base)[[:space:]]*=[[:space:]]*[^[:space:]]' \
+            "$full/hbit-pool.example.ini"; then
+            echo "packaged hbit-pool.example.ini ships a filled-in operator value"
+            exit 1
+          fi
+          for doc in "$full/hbit-pool.example.ini" "$full/README-POOL.txt"; do
+            if grep -oE '\b1[1-9A-HJ-NP-Za-km-z]{25,34}\b' "$doc"; then
+              echo "$doc ships something shaped like a live HAC address"
+              exit 1
+            fi
+            if grep -oE '\b[0-9a-fA-F]{64}\b' "$doc"; then
+              echo "$doc ships something shaped like a private key"
+              exit 1
+            fi
+          done
+
           HACASH_SETUP_NO_LAUNCH=1 bash "$full/SETUP-LINUX.sh" --no-launch </dev/null
           HACASH_SETUP_NO_LAUNCH=1 bash "$only/SETUP-LINUX.sh" --no-launch </dev/null
           test "$(stat -c '%a' "$full/poworker.config.ini")" = 600
@@ -361,6 +461,18 @@ jobs:
 
             Windows: extract and run `SETUP.bat` or `SETUP-MINER.bat`.
             Linux: extract and run `./SETUP-LINUX.sh` (or `bash SETUP-LINUX.sh`).
+
+            ### Running a pool (optional, full packages only)
+
+            The two `full` packages also contain HBIT, the mining pool:
+            `hbit-pool-server`, `hbit-pool-payout`, the `POOL-OPERATOR.md`
+            runbook and a blank argument worksheet. You do NOT need any of it to
+            mine, and most people should not run it. It serves work to other
+            people's miners and holds their money until it pays them, in a
+            wallet file it creates on first start. If you lose that file, or the
+            passphrase that encrypts it, the coins in it are gone for good.
+
+            Read `README-POOL.txt` in the package before you start it.
 
             ### Check the download before you run it
 

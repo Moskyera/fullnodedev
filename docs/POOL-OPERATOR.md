@@ -3,11 +3,16 @@
 HBIT is the mining pool this project builds, and this is the operator runbook
 for it: the program that serves work to other people's miners, keeps PPLNS share
 accounting, submits found blocks and pays everybody out. It handles **real money
-that is not yours**, so read the four warnings below before you start it. Each
-one changes something an operator can see, and not knowing about it is how
-people lose coins or think the pool is broken.
+that is not yours**, so read the warnings below before you start it. Each one
+changes something an operator can see, and not knowing about it is how people
+lose coins or think the pool is broken.
 
-Both programs live in the `hbit-pool` crate and are built with
+If you have not read `README-POOL.txt` yet, read that first. It is the short
+version of why you would run a pool at all. This file is what you keep open
+while you do.
+
+In a release download both programs are already built and sit next to the miner.
+From a source checkout they live in the `hbit-pool` crate and are built with
 `cargo build --release -p hbit-pool`.
 
 Design background: **[COMMUNITY-POOL-DESIGN.md](COMMUNITY-POOL-DESIGN.md)**.
@@ -22,6 +27,84 @@ The separate free-IP work relay (`hac-pool`) is **[PUBLIC-POOL.md](PUBLIC-POOL.m
 hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
 hbit-pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
 ```
+
+**Both programs print all of that themselves.** `hbit-pool-server --help` and
+`hbit-pool-payout --help` describe every argument, with a working example and
+the two settings a miner needs; the `hbit-pool.example.ini` worksheet that ships
+beside them is the same list with room to write your own answers in. You never
+have to guess an argument from this file, and neither program ever asks you a
+question: everything is an argument or an environment variable, so both run
+unattended under a service manager.
+
+---
+
+## 0. The first ten minutes
+
+**Before the first start.** Have your own Hacash fullnode running and synced.
+The pool talks to its API, whose port is the `[server] listen` value in that
+node's `hacash.config.ini`; the config this package ships uses **8080**, so the
+node URL is normally `http://127.0.0.1:8080`. Set a wallet passphrase in the
+same window you are about to start the pool in (section 1), because the wallet
+is created on the first start and it is encrypted only if a passphrase is set
+then.
+
+**The first start.** Bind to loopback while you look around, so nobody can mine
+here yet:
+
+```powershell
+$env:HBIT_WALLET_PASSWORD = "a long passphrase you have written down"
+.\hbit-pool-server.exe http://127.0.0.1:8080 pool-wallet.key 127.0.0.1:9777 24 mainnet
+```
+
+```bash
+export HBIT_WALLET_PASSWORD='a long passphrase you have written down'
+./hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 127.0.0.1:9777 24 mainnet
+```
+
+It refuses to start, with an explanation and a `What to do:` line, if the node
+is not answering, if the chain argument does not match that node, if the listen
+address is wrong or its port is taken, if `share_bits` or `settle_secs` is not a
+number in range, or if another copy is already running on the same wallet.
+Nothing is mined and nothing is paid when it refuses.
+
+**What a good start looks like.** Just before `listening on` it prints a
+readback. Check every line of it:
+
+```
+----------------------------------------------------------------------
+ HBIT pool is up. Read this back before you let anyone mine here.
+   pays FROM   <your pool's address>
+               key file pool-wallet.key, ENCRYPTED at rest
+   follows     http://127.0.0.1:8080 (mainnet, at block <height>)
+   terms       PPLNS over the last 4096 shares, no pool fee, minimum payout 0.1 HAC
+               block income payable 16 blocks after this pool finds it, settles every 5m
+   share       2^24 easier to find than a network block
+   miners set  connect = <the address and port miners use>
+               pool_worker = <that miner's own HAC address>
+               loopback only: no other machine can mine here. Bind 0.0.0.0 when you are ready
+   check it    http://<the address and port miners use>/terms
+----------------------------------------------------------------------
+```
+
+- **pays FROM** is the wallet every payout comes out of. It is the address you
+  back up, and the one to check on a block explorer.
+- **key file** says what is really on the disk. `PLAINTEXT on disk` means no
+  passphrase was set: fix that before real money arrives (section 1).
+- **follows** must be your own node, and the height must be the real chain tip.
+- **terms** is read out of the same constants the payout code uses, so it is
+  what your miners will actually get. It is the same thing `/terms` serves them.
+- **miners set** is the line to paste to a miner. If the pool is bound to
+  `0.0.0.0` it cannot know your public address, so it says so instead of
+  inventing one.
+
+**On the very first start only**, a second block follows it: the pool created
+its wallet. Back that file up before you go any further; section 1 is the whole
+of why.
+
+**Then open it up.** Stop the pool, restart it with `0.0.0.0:9777` in place of
+`127.0.0.1:9777`, and give a miner the `connect` and `pool_worker` lines above.
+Check `http://<your pool>/terms` and `http://<your pool>/earnings?worker=<a
+miner's address>` from another machine to confirm it is reachable.
 
 ---
 
@@ -46,25 +129,37 @@ Windows PowerShell:
 
 ```powershell
 $env:HBIT_WALLET_PASSWORD = "a long passphrase you have written down"
-.\hbit-pool-server.exe http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
+.\hbit-pool-server.exe http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 24 mainnet
 ```
 
 Linux:
 
 ```bash
 export HBIT_WALLET_PASSWORD='a long passphrase you have written down'
-./hbit-pool-server http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
+./hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 24 mainnet
 ```
+
+A passphrase shorter than 8 characters, or a `HBIT_WALLET_PASSWORD_FILE` that
+cannot be read, stops the pool before it touches a key, with a message saying
+which one it was. It never falls back to writing the key in the clear because
+the passphrase was faulty.
 
 What happens next:
 
 - **No wallet file yet:** a new wallet is generated and written **encrypted**.
+  The pool then prints a block you cannot miss, as the last thing before it
+  starts serving: the file, the address, and what losing either half costs.
 - **An existing plaintext wallet file:** it is **migrated automatically** the
   next time the wallet is loaded. The encrypted form is decrypted and compared
   against the original key before it replaces the file, so a failed migration can
   never cost you the wallet. The pool prints `[wallet] <file> is now ENCRYPTED`.
 - **No passphrase set:** the file stays plaintext and the pool prints a loud
   warning every time it starts. This still works, it is just not protected.
+
+Either way the startup readback states which it is, every single start:
+`key file pool-wallet.key, ENCRYPTED at rest` or `key file pool-wallet.key,
+PLAINTEXT on disk, no passphrase set`. That line is read from the file itself,
+not from the environment, so it says what is really on the disk.
 
 ### Back up the passphrase ALONGSIDE the key file
 
@@ -122,18 +217,30 @@ each one believes it is the only settler, and the same PPLNS window gets paid
 **twice** out of the operator's own funds. The lock is what makes that impossible.
 
 The lock is held by the operating system, so a crash or a kill releases it
-immediately. There is no stale lock file to clean up by hand.
+immediately. There is nothing to clean up by hand, and **deleting the
+`<wallet_file>.settle.lock` file does not release anything**: the lock belongs to
+the running process, not to the file, so removing it would only let two payers
+run at once. Both refusals say so themselves.
 
 ### Correct procedure for a manual payout
 
 1. **Stop `hbit-pool-server`** and wait for the process to actually exit.
 2. Run the tool in its **dry-run** default first and read the planned split:
    ```bash
-   ./hbit-pool-payout http://127.0.0.1:9777 http://127.0.0.1:8088 mainnet pool-wallet.key
+   ./hbit-pool-payout http://127.0.0.1:9777 http://127.0.0.1:8080 mainnet pool-wallet.key
    ```
    It pays nothing without `--commit`.
 3. If the split looks right, run it again with `--commit`.
 4. **Restart `hbit-pool-server`.**
+
+Set `HBIT_WALLET_PASSWORD` in that window too if the wallet is encrypted, and
+run it **in the folder that holds the wallet file** (or pass the path as
+argument 4). The tool never creates a wallet: if there is no key file where it
+was told to look, it refuses and says so, rather than making a fresh empty one
+and reporting that you have nothing to pay.
+
+If the node is not answering it refuses as well, instead of reading an empty
+balance as a zero balance.
 
 While the server is stopped its `/stats` endpoint cannot answer, so
 `hbit-pool-payout` reads the share window out of the accounting file the server
@@ -184,17 +291,28 @@ Practical consequences to tell your miners about:
 
 ---
 
-## 4. `hbit-pool-server` now refuses to start on a bad configuration
+## 4. `hbit-pool-server` refuses to start on a bad configuration
 
 The server checks its own configuration before it serves a single piece of work.
-Each check below exits with status 2 and an explanation instead of running in a
-state that would quietly lose money.
+Each check below exits with status 2 and an explanation ending in a `What to do:`
+line, instead of running in a state that would quietly lose money. **When it
+refuses, nothing has been mined and nothing has been paid.** On the checks that
+run before the wallet is opened it does not even create a wallet file, so a
+mistyped first attempt leaves nothing behind to tidy up.
+
+### Every argument is required, and none is guessed
+
+All five positional arguments must be present. A number that is not a number is
+**refused, never replaced by the default**: an operator who mistyped `share_bits`
+would otherwise mine for weeks on a share size they did not choose and were never
+told about. Running the program with no arguments, or with `--help`, prints the
+whole usage text.
 
 ### `share_bits` must be between 18 and 40
 
-`share_bits` (argument 4, default 24) says how many powers of two easier a share
-is than a real network block. Outside `18..=40` the server prints
-`share_bits must be between 18 and 40 (got N)` and exits.
+`share_bits` (argument 4) says how many powers of two easier a share is than a
+real network block. Outside `18..=40` the server prints
+`<share_bits> must be between 18 and 40 (got N)` and exits.
 
 - **Below 18:** shares get so hard that the 4096-share PPLNS window covers a
   meaningful slice of a block interval. A difficulty change landing inside a live
@@ -205,6 +323,36 @@ is than a real network block. Outside `18..=40` the server prints
   degenerates.
 
 24 suits GPU batches and is the right answer unless you have measured otherwise.
+
+There is a second, separate check on the same setting once the pool has seen the
+live difficulty: if the chain is so easy that the share target saturates, every
+hash would be a valid share and PPLNS credit would track how fast a worker can
+submit rather than how much it hashes. The pool refuses to distribute real money
+on that basis. Lowering `share_bits` does not help, because the ceiling is the
+chain's, not yours.
+
+### `settle_secs` must be between 30 and 86400
+
+`settle_secs` (argument 6, default 300) is the automatic payout interval. Each
+settlement is a signed transaction that carries a network fee, so paying out
+every few seconds spends the reserve for nothing, and `0` would leave the
+settlement thread spinning against the node with no pause at all. Leave it out
+unless you have a reason.
+
+### The node has to be there, and it has to be yours
+
+Before anything else the pool asks the node for its current block. If nothing
+answers it refuses, naming the URL it tried and where the port comes from (the
+`[server] listen` value in the node's `hacash.config.ini`, 8080 in the config
+this package ships). A node that is still syncing, or that would not hand over a
+block template, is refused the same way.
+
+### The listen address has to be usable
+
+The pool binds its port **before** it opens the wallet, so the two commonest
+first-run mistakes here cost nothing: a `<listen>` with no port in it, and a port
+something else already holds. Both are refused with the correct form and the
+likely cause.
 
 ### The test routes require `worker=<HAC address>`
 
@@ -260,7 +408,20 @@ entry with **no address**, because no HBIT address is published in this
 repository and an invented one is an address somebody would paste in and point
 real hashrate at. You publish yours.
 
-Drop a `pools.json` next to `miner-panel.exe` on the miner's PC:
+A miner that is configuring `poworker` by hand needs exactly two settings, and
+the pool prints them for you in its startup readback:
+
+```
+connect = <your pool's address and port>
+pool_worker = <that miner's own HAC address>
+```
+
+`pool_worker` is where that miner gets paid, so it is theirs, not yours. If your
+pool is bound to `0.0.0.0` it cannot know what address the outside world reaches
+it on, so the readback says `<this machine's IP address or hostname>` instead of
+inventing one: that part is for you to fill in.
+
+For the panel, drop a `pools.json` next to `miner-panel.exe` on the miner's PC:
 
 ```json
 [
@@ -290,12 +451,23 @@ listed honestly next to pools the panel has never spoken to.
 
 ## Quick reference
 
+Every refusal below ends with its own `What to do:` line; this table is for
+finding the one you are looking at.
+
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds ...` | Both settlers running at once | Stop `hbit-pool-server`, run the tool, restart the server |
+| `REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds ...` | Both settlers running at once | Stop `hbit-pool-server`, run the tool, restart the server. Do not delete the `.settle.lock` file: it frees nothing |
+| `REFUSING to start: no Hacash fullnode answered at ...` | Node not running, still starting, or wrong URL/port | Start and sync the node; use the `[server] listen` port from its `hacash.config.ini` (8080 here) |
+| `REFUSING to start: the node ... would not give a block template` | Node is up but not ready to be mined on | Let it finish syncing, then start the pool again |
+| `REFUSING to start: cannot listen on ...` | `<listen>` is not `<ip>:<port>`, or the port is taken | Use `0.0.0.0:9777` or `127.0.0.1:9777`; if the form is right, something else holds that port |
 | `wallet file ... is encrypted but no passphrase is configured` | Passphrase missing from the environment | Set `HBIT_WALLET_PASSWORD` or `HBIT_WALLET_PASSWORD_FILE` |
 | `cannot decrypt wallet file ...` | Wrong passphrase, or a corrupted file | Use the backed-up passphrase; restore the file from backup |
-| `share_bits must be between 18 and 40` | Out-of-range argument 4 | Use 24 |
+| `the wallet passphrase in ... must be at least 8` | Passphrase too short to protect real money | Set a longer one, written down somewhere physical |
+| `<share_bits> must be between 18 and 40` | Out-of-range or mistyped argument 4 | Use 24 |
+| `the network difficulty in force ... is too low to serve a fair share` | Chain too easy for an honest share target | Point the pool at mainnet, or wait for that chain to adjust upward |
+| `[settle_secs] must be between 30 and 86400` | Out-of-range or mistyped argument 6 | Leave it out to get 300 |
 | `set worker=<your HAC address> so the pool can pay you` | Worker name is not a payable address | Pass the miner's real HAC address |
 | `REFUSING to start: difficulty rule mismatch ...` | Wrong `chain` argument for this node | Use `mainnet`, or spell out `testnet:<adjust_blocks>:<target_time>` |
+| `REFUSING to run: there is no wallet file at ...` | `hbit-pool-payout` run in the wrong folder | Run it where the wallet file is, or pass its path as argument 4 |
 | `[settle] holding back N unit(s) ...` | Recently found block not yet 16 deep | Nothing to do, wait about 80 minutes |
+| Miners cannot connect at all | Pool bound to `127.0.0.1`, so only this machine can reach it | Restart with `0.0.0.0:<port>`; the readback says which one it is |

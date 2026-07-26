@@ -1,5 +1,5 @@
 //! Hacash pool server: serves work, validates shares, keeps PPLNS accounting,
-//! submits full blocks, and settles payouts. Blocking HTTP on std::net — no
+//! submits full blocks, and settles payouts. Blocking HTTP on std::net - no
 //! async runtime, no node changes.
 //!
 //! Speaks the STANDARD miner API (so an unmodified poworker can mine here) with
@@ -11,7 +11,7 @@
 //!     miner's PPLNS credit at everyone else's expense)
 //!   * accounting is persisted atomically, so a restart never erases work
 //!   * a submitted block only counts once the chain still holds OUR hash at that
-//!     height — orphans are detected and not paid for
+//!     height - orphans are detected and not paid for
 //!   * a found block's coinbase is held back from settlement until the chain has
 //!     buried it, so a reorg can never revoke income that was already paid out
 //!   * only one process may settle a wallet (OS lock), and it shares ONE pending
@@ -36,11 +36,18 @@
 //!     them the pool cannot stand behind is reported as unknown, never as zero.
 //!
 //! Usage: hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
-//!   `chain` is REQUIRED: a wrong difficulty rule makes every share/block the
-//!   node rejects, so there is no silent default. It is `mainnet`, `testnet`, or
+//!   `--help` prints the whole of it: every argument, what it means, and a
+//!   working example. See `usage()`, which is the only place that text lives.
+//!   All five positional arguments are REQUIRED and none is guessed. `chain`
+//!   above all: a wrong difficulty rule makes every share and block one the node
+//!   rejects, so it is `mainnet`, `testnet`, or
 //!   `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` for a testnet
-//!   node configured with anything other than the documented 288/10 pair. The
-//!   choice is PROVED against the node's own tip before the pool serves work.
+//!   node configured with anything other than the documented 288/10 pair, and
+//!   the choice is PROVED against the node's own tip before work is served.
+//!
+//! Nothing here ever prompts. It has to come up unattended under a service
+//! manager, so every input is an argument or an environment variable, and
+//! anything missing or wrong is a refusal that says what to do about it.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
@@ -60,15 +67,16 @@ use hbit_pool::pool_core::{self, Pplns, split_payout};
 use hbit_pool::{
     Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PAYOUT_MATURITY_DEPTH, PAYOUT_UNIT, POOL_FEE_UNITS,
     PPLNS_WINDOW, PaidLedger, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS, Template,
-    acquire_settle_lock, assemble_block, atomic_write, balance, balance_units, block_reward_units,
-    chunk_tx_fee, classify_payout_tx, coinbase_body_hex, coinbase_with_extranonce, confirm_payout,
-    distributable_units, drop_payout, fetch_pool_template, find_str, find_u64, get_json,
-    http_client, intro_bytes, is_payout_address, load_or_create_wallet, parse_paid_ledger,
-    parse_payout_records, payout_amount, pool_state_path, post_hex, submit_block_bytes,
-    verify_admitted, verify_chain_params,
+    WALLET_PASSWORD_ENV, WALLET_PASSWORD_FILE_ENV, acquire_settle_lock, assemble_block,
+    atomic_write, balance, balance_units, block_reward_units, chunk_tx_fee, classify_payout_tx,
+    coinbase_body_hex, coinbase_with_extranonce, confirm_payout, distributable_units, drop_payout,
+    fetch_pool_template, find_str, find_u64, get_json, http_client, intro_bytes, is_payout_address,
+    load_or_create_wallet, parse_paid_ledger, parse_payout_records, payout_amount, pool_state_path,
+    post_hex, settle_lock_path, submit_block_bytes, verify_admitted, verify_chain_params,
 };
 
 use serde_json::json;
+use zeroize::Zeroizing;
 
 /// Global live-connection cap and the per-source-IP cap. The per-IP cap is what
 /// actually stops one host pinning every slot with long-polls; the global cap is
@@ -134,6 +142,23 @@ const MONEY_REFRESH_CYCLES: u64 = 15;
 /// reaches its height. At roughly one cycle every two seconds this is about two
 /// minutes, far longer than a node needs to insert a block it accepted.
 const BLOCK_STALL_CYCLES: u32 = 60;
+/// Bounds on the automatic settlement interval. Each settlement is a signed
+/// on-chain transaction carrying a network fee, so running one every few seconds
+/// spends the reserve for nothing; `0` is worse still, because the timer thread
+/// would then never sleep and would hammer the node in a tight loop. The upper
+/// bound is a day: past that the operator has effectively turned payouts off and
+/// should say so by stopping the pool, not by typing a large number.
+const MIN_SETTLE_SECS: u64 = 30;
+const MAX_SETTLE_SECS: u64 = 86_400;
+/// The documented defaults. `usage()` quotes these, so the help text cannot
+/// describe a default the code does not use.
+const DEFAULT_SETTLE_SECS: u64 = 300;
+const DEFAULT_SHARE_BITS: u32 = 24;
+/// Shortest passphrase the wallet layer accepts. Mirrored here only so a short
+/// one is a refusal that says what to do, instead of a panic out of the key
+/// loader with a backtrace note on it. The loader still has the final say: if
+/// these ever disagree, the worst case is the old panic, never a weaker key.
+const WALLET_PASSWORD_MIN: usize = 8;
 
 static CONNS: AtomicUsize = AtomicUsize::new(0);
 static NOTICE_WAITERS: AtomicUsize = AtomicUsize::new(0);
@@ -155,8 +180,8 @@ fn per_ip_lock() -> MutexGuard<'static, HashMap<IpAddr, u32>> {
     PER_IP.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Releases a connection's global + per-IP slot on scope exit — including on an
-/// unwind — so a panicking handler can never leak a slot and wedge the listener.
+/// Releases a connection's global + per-IP slot on scope exit - including on an
+/// unwind - so a panicking handler can never leak a slot and wedge the listener.
 struct ConnGuard {
     ip: Option<IpAddr>,
 }
@@ -251,7 +276,7 @@ struct Pool {
     /// How many powers of two EASIER than the network target a share is. The
     /// share target is derived from the live network difficulty (not an absolute
     /// value), so it scales as difficulty changes and a share represents a fixed
-    /// fraction of a real block — which is what makes credit proportional to
+    /// fraction of a real block - which is what makes credit proportional to
     /// hashrate instead of to batch cadence.
     share_factor: u32,
     /// The factor the pool is REALLY serving. `share_target_hash` saturates at
@@ -271,7 +296,7 @@ struct Pool {
     accepted: u64,
     blocks: u64,
     orphaned: u64,
-    /// Solutions already credited for the current template — rejects replays.
+    /// Solutions already credited for the current template - rejects replays.
     seen: HashSet<(u64, [u8; 32], u32)>,
     /// Blocks we submitted, awaiting confirmation that they stuck.
     submitted: Vec<(u64, [u8; 32])>,
@@ -664,10 +689,13 @@ fn pending_cache_json(tpl: &Template, share_target: &[u8; 32]) -> String {
 fn check_share_factor(factor: u32) -> Result<(), String> {
     if !(MIN_SHARE_FACTOR..=MAX_SHARE_FACTOR).contains(&factor) {
         return Err(format!(
-            "share_bits must be between {MIN_SHARE_FACTOR} and {MAX_SHARE_FACTOR} (got {factor}).\n\
+            "<share_bits> must be between {MIN_SHARE_FACTOR} and {MAX_SHARE_FACTOR} (got {factor}).\n\
              A share is 2^share_bits easier than a network block; below {MIN_SHARE_FACTOR} the \
              {PPLNS_WINDOW}-share payout window covers enough of a block interval that a \
-             difficulty change inside it would misallocate real payouts."
+             difficulty change inside it would misallocate real payouts, and above \
+             {MAX_SHARE_FACTOR} a share costs so little that credit stops tracking hashrate.\n\
+             What to do: pass {DEFAULT_SHARE_BITS} as argument 4 unless you have measured \
+             otherwise."
         ));
     }
     Ok(())
@@ -700,7 +728,9 @@ fn check_share_target(factor: u32, achieved: u32, difficulty: u32) -> Result<(),
          can submit rather than how much it hashes, and one worker can take the whole \
          {PPLNS_WINDOW}-share payout window from everyone else. This pool will not distribute \
          real money on that basis.\n\
-         Point it at a chain whose difficulty has risen, or wait for this one to adjust."
+         What to do: point the pool at a chain whose difficulty has risen (mainnet is far above \
+         this), or wait for this one to adjust upward and start it again. Lowering <share_bits> \
+         does not help: the ceiling is the chain's, not yours."
     ))
 }
 
@@ -971,58 +1001,421 @@ fn terms_json(
     })
 }
 
+/// A whole number of 0.1 HAC units written as HAC, for the operator-facing
+/// startup text only.
+///
+/// One unit IS one tenth of a HAC, so a single decimal place is EXACT: this
+/// rounds nothing and invents no precision. Money a miner is shown still goes
+/// through `money()` and the chain's own `Amount`; this is for the two constants
+/// the operator reads back on the console.
+fn hac(units: u64) -> String {
+    format!("{}.{} HAC", units / 10, units % 10)
+}
+
+/// A settlement interval the way an operator would say it out loud.
+fn every(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// How a miner reaches this pool, worked out from what the pool is bound to, as
+/// (the `connect =` value, the one thing about it the operator must know).
+///
+/// A wildcard bind carries no host anybody can dial and a loopback bind carries
+/// one no OTHER machine can reach, so an operator who pastes the listen address
+/// straight into a miner's config has sent that miner somewhere that will never
+/// answer - and all the miner sees is a connection error with nothing to blame.
+fn miner_connect(listen: &str) -> (String, &'static str) {
+    let (host, port) = match listen.rsplit_once(':') {
+        Some((h, p)) => (
+            h.trim().trim_start_matches('[').trim_end_matches(']'),
+            p.trim(),
+        ),
+        None => ("", listen.trim()),
+    };
+    match host {
+        "0.0.0.0" | "::" | "*" | "" => (
+            format!("<this machine's IP address or hostname>:{port}"),
+            "bound to every interface: any machine that can reach this one can mine here",
+        ),
+        "127.0.0.1" | "localhost" | "::1" => (
+            format!("{host}:{port}"),
+            "loopback only: no other machine can mine here. Bind 0.0.0.0 when you are ready",
+        ),
+        _ => (
+            format!("{host}:{port}"),
+            "reachable from wherever that address is reachable",
+        ),
+    }
+}
+
+/// The terms this pool is about to enforce, in two operator-readable lines.
+///
+/// Every number here is the SAME constant `/terms` publishes and settlement
+/// applies, so the console and the endpoint cannot tell a miner two different
+/// stories. Nothing in it is typed twice.
+fn terms_lines(window: u64, settle_secs: u64) -> [String; 2] {
+    let fee = if POOL_FEE_UNITS == 0 {
+        "no pool fee".to_string()
+    } else {
+        format!("pool fee {}", hac(POOL_FEE_UNITS))
+    };
+    [
+        format!(
+            "PPLNS over the last {window} shares, {fee}, minimum payout {}",
+            hac(PAYOUT_DUST_UNITS)
+        ),
+        format!(
+            "block income payable {COINBASE_MATURITY_DEPTH} blocks after this pool finds it, \
+             settles every {}",
+            every(settle_secs)
+        ),
+    ]
+}
+
+/// Everything needed to start this pool correctly, without reading a line of its
+/// source. Printed on `--help` and on every refusal that comes from the command
+/// line itself, because somebody who got one argument wrong is exactly the person
+/// who cannot see what the other five should have been.
+fn usage() -> String {
+    format!(
+        r"HBIT pool server v{ver}: serves work to miners, counts their shares, submits the
+blocks it finds, and pays everybody out of a wallet it creates and holds.
+
+usage:
+  hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
+
+  <node>         Base URL of YOUR OWN Hacash fullnode, already running and synced.
+                 The port is the `[server] listen` value in that node's
+                 hacash.config.ini; the config this package ships uses 8080, so
+                 the answer is normally http://127.0.0.1:8080
+
+  <wallet_file>  Path to the pool's wallet key file, e.g. pool-wallet.key. It is
+                 CREATED on the first run, and from that moment it holds the pool's
+                 income and the money owed to your miners. There is no other copy.
+
+  <listen>       <ip>:<port> to serve miners on. 0.0.0.0:9777 can be reached by any
+                 machine that can reach this one, which is what a real pool wants.
+                 127.0.0.1:9777 can be reached only from this machine, which is
+                 what you want while you are still trying it out.
+
+  <share_bits>   How many powers of two easier than a real block a share is,
+                 {min_bits} to {max_bits}. Use {def_bits} unless you have measured otherwise.
+
+  <chain>        Which chain your node is on. REQUIRED and never guessed, and
+                 proved against the node itself before any work is served:
+                   mainnet
+                   testnet
+                   testnet:<difficulty_adjust_blocks>:<each_block_target_time>
+
+  [settle_secs]  Seconds between automatic payouts, {min_settle} to {max_settle}.
+                 Default {def_settle} ({def_every}).
+
+example, real Hacash, open to your other machines, paying out every {def_every}:
+  hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 {def_bits} mainnet
+
+Set a passphrase FIRST and the wallet file is written encrypted. Without one it is
+a plaintext private key sitting on the disk:
+  Windows PowerShell:  $env:{pw} = '<a long passphrase you have written down>'
+  Linux / macOS:       export {pw}='<a long passphrase you have written down>'
+Or put it in a file of its own and name that file in {pwf}.
+
+A miner joins this pool with two settings in its poworker config:
+  connect = <the address and port above>
+  pool_worker = <that miner's own HAC address, which is where it gets paid>
+
+The full runbook, including how to pay out by hand and what every refusal means,
+is POOL-OPERATOR.md.",
+        ver = env!("CARGO_PKG_VERSION"),
+        min_bits = MIN_SHARE_FACTOR,
+        max_bits = MAX_SHARE_FACTOR,
+        def_bits = DEFAULT_SHARE_BITS,
+        min_settle = MIN_SETTLE_SECS,
+        max_settle = MAX_SETTLE_SECS,
+        def_settle = DEFAULT_SETTLE_SECS,
+        def_every = every(DEFAULT_SETTLE_SECS),
+        pw = WALLET_PASSWORD_ENV,
+        pwf = WALLET_PASSWORD_FILE_ENV,
+    )
+}
+
+/// The one screen an operator reads back before letting real hashrate in: which
+/// wallet the money will be paid FROM, which node the pool follows, the terms it
+/// is about to enforce on other people's money, and the single line a miner needs.
+#[allow(clippy::too_many_arguments)]
+fn startup_summary(
+    payout: &str,
+    wallet_file: &str,
+    encrypted: bool,
+    node: &str,
+    chain: &str,
+    tip: Option<u64>,
+    listen: &str,
+    window: u64,
+    settle_secs: u64,
+    share_factor: u32,
+    achieved: u32,
+) -> String {
+    let (connect, reach) = miner_connect(listen);
+    let [terms_a, terms_b] = terms_lines(window, settle_secs);
+    let tip = match tip {
+        Some(h) => format!("at block {h}"),
+        // Never claim a height that was not read: an unknown tip is unknown.
+        None => "height unknown".to_string(),
+    };
+    // Above the refusal bound, so shares are still worth something, but not what
+    // was asked for: say the real number rather than let the operator believe a
+    // figure the chain in force will not support.
+    let capped = if achieved < share_factor {
+        format!(
+            "\n               (share_bits={share_factor} was asked for; the difficulty in force \
+             caps it at 2^{achieved})"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r"----------------------------------------------------------------------
+ HBIT pool is up. Read this back before you let anyone mine here.
+   pays FROM   {payout}
+               key file {wallet_file}, {prot}
+   follows     {node} ({chain}, {tip})
+   terms       {terms_a}
+               {terms_b}
+   share       2^{achieved} easier to find than a network block{capped}
+   miners set  connect = {connect}
+               pool_worker = <that miner's own HAC address>
+               {reach}
+   check it    http://{connect}/terms
+----------------------------------------------------------------------",
+        prot = if encrypted {
+            "ENCRYPTED at rest"
+        } else {
+            "PLAINTEXT on disk, no passphrase set"
+        },
+    )
+}
+
+/// Said once, on the run that CREATES the wallet, as the last thing before the
+/// pool starts serving: what this file is, and what losing it costs.
+///
+/// It is deliberately the final block on the screen. An operator who starts the
+/// pool and walks away has to come back to this, not to a scrolled-off line.
+fn new_wallet_banner(wallet_file: &str, payout: &str, encrypted: bool) -> String {
+    let key_half = if encrypted {
+        format!(
+            "   The file is ENCRYPTED with the passphrase in {WALLET_PASSWORD_ENV}. THE TWO HALVES\n\
+             \x20  ARE BOTH NEEDED: the file without the passphrase is noise, and the passphrase\n\
+             \x20  without the file is a string of words. Back up BOTH, keep the passphrase\n\
+             \x20  somewhere physical, and never rely on remembering it. There is no reset."
+        )
+    } else {
+        format!(
+            "   NO PASSPHRASE IS SET, so this file holds the private key in PLAINTEXT. Anything\n\
+             \x20  that can read those bytes - a backup, a disk snapshot, an old drive, anyone\n\
+             \x20  with the machine - can spend every coin the pool holds.\n\
+             \x20  To fix it: stop the pool, set {WALLET_PASSWORD_ENV} to a passphrase of at least\n\
+             \x20  {WALLET_PASSWORD_MIN} characters, and start it again. The file is then re-written encrypted."
+        )
+    };
+    format!(
+        r"**********************************************************************
+ THIS RUN CREATED THE POOL'S WALLET. BACK IT UP NOW, BEFORE MINERS ARRIVE.
+   file      {wallet_file}
+   address   {payout}
+ That file is the ONLY copy of the private key to that address. Every coin
+ this pool mines lands there, including the money you will owe your miners.
+ Lose the file and that money is gone permanently. Nobody can recover it:
+ not the author of this software, not a support address, not the network.
+   Copy it now to somewhere that survives this machine dying, and copy
+   {state} with it: that is the record of who is owed what.
+{key_half}
+**********************************************************************",
+        state = pool_state_path(wallet_file),
+    )
+}
+
+/// Check the passphrase configuration BEFORE anything touches a key.
+///
+/// Mirrors `hbit_pool`'s own rule (the variable wins over the file; empty means
+/// no passphrase at all) so that a passphrase which is too short, or a passphrase
+/// file that cannot be read, is a refusal saying what to do instead of a panic
+/// with a backtrace note on it - halfway through creating the very wallet the
+/// passphrase was supposed to protect.
+fn check_wallet_passphrase() -> Result<(), String> {
+    let direct = Zeroizing::new(std::env::var(WALLET_PASSWORD_ENV).unwrap_or_default());
+    if !direct.is_empty() {
+        if direct.len() < WALLET_PASSWORD_MIN {
+            return Err(format!(
+                "the wallet passphrase in {WALLET_PASSWORD_ENV} is {} character(s); it must be at \
+                 least {WALLET_PASSWORD_MIN}.\n\
+                 What to do: set {WALLET_PASSWORD_ENV} to a longer passphrase, one you have written \
+                 down somewhere physical, and start the pool again.",
+                direct.len()
+            ));
+        }
+        return Ok(());
+    }
+    let Ok(file) = std::env::var(WALLET_PASSWORD_FILE_ENV) else {
+        return Ok(());
+    };
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => Zeroizing::new(t),
+        Err(e) => {
+            return Err(format!(
+                "{WALLET_PASSWORD_FILE_ENV} names {file}, which cannot be read: {e}.\n\
+                 What to do: point it at a readable file holding just the passphrase, or unset it \
+                 and use {WALLET_PASSWORD_ENV} instead."
+            ));
+        }
+    };
+    let pass = Zeroizing::new(text.trim().to_string());
+    if !pass.is_empty() && pass.len() < WALLET_PASSWORD_MIN {
+        return Err(format!(
+            "the wallet passphrase in {file} is {} character(s); it must be at least \
+             {WALLET_PASSWORD_MIN}.\n\
+             What to do: put a longer passphrase in that file and start the pool again.",
+            pass.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Is the key file on disk an encrypted envelope, or a bare private key?
+///
+/// Read from the FILE, never from the environment. A passphrase that is set but
+/// whose migration failed leaves a plaintext key behind, and an operator has to
+/// be told what is really on the disk rather than what was intended. This is the
+/// same test the wallet loader applies, and it reads only the first few bytes, so
+/// no part of a key is copied out of the file.
+fn key_file_encrypted(path: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Zeroizing::new([0u8; 8]);
+    let Ok(n) = f.read(&mut head[..]) else {
+        return false;
+    };
+    head[..n].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
+}
+
+/// The node's current tip height, or None if it did not answer at all.
+///
+/// Asked BEFORE the difficulty rule is proved, so "your node is not there" and
+/// "your node is on a different chain" are two different messages with two
+/// different fixes, instead of one sentence covering both.
+fn node_tip(client: &reqwest::blocking::Client, node: &str) -> Option<u64> {
+    find_u64(&get_json(client, &format!("{node}/query/latest")), "height")
+}
+
+/// Print `text` and stop with the conventional configuration-error status.
+fn refuse(text: &str) -> ! {
+    eprintln!("{text}");
+    std::process::exit(2)
+}
+
+/// Refuse an argument the operator typed, with the whole usage text under it.
+fn refuse_with_usage(text: &str) -> ! {
+    eprintln!("{}\n", usage());
+    refuse(text)
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let node = a
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
-    let node = node.trim_end_matches('/').to_string();
-    let wallet_file = a
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "pool-wallet.key".to_string());
-    let listen = a
-        .get(3)
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:9777".to_string());
+    // Asked for, so it goes to stdout and succeeds: `hbit-pool-server --help >
+    // help.txt` has to work like every other program's help.
+    if a.iter().skip(1).any(|x| x == "-h" || x == "--help" || x == "/?") {
+        println!("{}", usage());
+        return;
+    }
+    // Five arguments are required. Nothing is guessed: every one of them decides
+    // something an operator cannot see the consequences of afterwards, from which
+    // wallet holds other people's money to which chain the work is for.
+    if a.len() < 6 {
+        refuse_with_usage(&format!(
+            "REFUSING to start: {} argument(s) given, 5 are required \
+             (<node> <wallet_file> <listen> <share_bits> <chain>).",
+            a.len() - 1
+        ));
+    }
+    let node = a[1].trim().trim_end_matches('/').to_string();
+    let wallet_file = a[2].trim().to_string();
+    let listen = a[3].trim().to_string();
     // How many powers of two easier than a network block a share is. Tune to the
     // miner population and GPU batch size: too small and small miners rarely find
     // a share; too large and a whole GPU batch's best hash always beats it, so
     // credit tracks batch cadence rather than hashrate. ~24 suits GPU batches.
-    let share_factor: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(24);
+    //
+    // A value that does not parse is REFUSED, never quietly replaced by the
+    // default: an operator who typed `share_bits` wrong would otherwise be told
+    // nothing and would run for weeks on a share size they did not choose.
+    let Ok(share_factor) = a[4].trim().parse::<u32>() else {
+        refuse_with_usage(&format!(
+            "REFUSING to start: <share_bits> must be a whole number between {MIN_SHARE_FACTOR} and \
+             {MAX_SHARE_FACTOR} (got `{}`).\n\
+             What to do: pass {DEFAULT_SHARE_BITS} unless you have measured otherwise.",
+            a[4]
+        ));
+    };
     if let Err(e) = check_share_factor(share_factor) {
-        eprintln!("{e}");
-        std::process::exit(2);
+        refuse_with_usage(&format!("REFUSING to start: {e}"));
     }
     // chain is REQUIRED: a mainnet pool run with testnet difficulty (or vice
     // versa) computes the wrong target and every block/share is rejected. Refuse
     // to guess.
-    let Some(chain) = a.get(5).cloned() else {
-        eprintln!(
-            "usage: hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]\n\
-             `chain` is required: `mainnet`, `testnet`, or \
-             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`."
-        );
-        std::process::exit(2);
-    };
+    //
     // A testnet node takes its difficulty window and block time from its OWN
     // config file, so accept them spelled out rather than assuming a pair that
     // would make the node reject every block this pool mines.
+    let chain = a[5].trim().to_string();
     let Some(params) = ChainParams::parse(&chain) else {
-        eprintln!(
-            "chain must be `mainnet`, `testnet`, or \
-             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` (got `{chain}`)"
-        );
-        std::process::exit(2);
+        refuse_with_usage(&format!(
+            "REFUSING to start: <chain> must be `mainnet`, `testnet`, or \
+             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` (got `{chain}`).\n\
+             What to do: name the chain YOUR node is on. There is no default, because a pool \
+             mining on the wrong rule has every block it finds thrown away, forever, with \
+             nothing said about it."
+        ));
     };
-    let settle_secs: u64 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let settle_secs: u64 = match a.get(6) {
+        None => DEFAULT_SETTLE_SECS,
+        Some(raw) => {
+            let Ok(secs) = raw.trim().parse::<u64>() else {
+                refuse_with_usage(&format!(
+                    "REFUSING to start: [settle_secs] must be a whole number of seconds between \
+                     {MIN_SETTLE_SECS} and {MAX_SETTLE_SECS} (got `{raw}`).\n\
+                     What to do: leave it out for the default of {DEFAULT_SETTLE_SECS} ({}).",
+                    every(DEFAULT_SETTLE_SECS)
+                ));
+            };
+            secs
+        }
+    };
+    if !(MIN_SETTLE_SECS..=MAX_SETTLE_SECS).contains(&settle_secs) {
+        refuse_with_usage(&format!(
+            "REFUSING to start: [settle_secs] must be between {MIN_SETTLE_SECS} and \
+             {MAX_SETTLE_SECS} (got {settle_secs}).\n\
+             Every settlement is a signed transaction that costs a network fee, so paying out \
+             faster than that spends the reserve for nothing.\n\
+             What to do: leave it out for the default of {DEFAULT_SETTLE_SECS} ({}).",
+            every(DEFAULT_SETTLE_SECS)
+        ));
+    }
 
     // Name the PRODUCT, not the executable. An operator reading a terminal or
     // pasting a log into a support thread has to be able to say what is running,
     // and a file name does not tell them: this is the HBIT pool.
     println!("== HBIT pool server v{} ==", env!("CARGO_PKG_VERSION"));
     println!("node    = {node}");
+    // Settle what protects the key BEFORE a key exists, so a passphrase that is
+    // too short or unreadable stops the run instead of panicking halfway through
+    // creating the wallet it was supposed to protect.
+    if let Err(e) = check_wallet_passphrase() {
+        refuse(&format!("REFUSING to start: {e}"));
+    }
     // Exactly one process may settle a wallet, enforced by the OS for as long as
     // this one lives. `hbit-pool-payout` takes the SAME lock, so it can never
     // pay out of a wallet this server is already settling: both read the CONFIRMED
@@ -1030,28 +1423,74 @@ fn main() {
     // see the full balance and pay the same PPLNS window a second time.
     let _settle_lock = match acquire_settle_lock(&wallet_file) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "another hbit-pool-server or hbit-pool-payout already holds {wallet_file} ({e}).\n\
-                 Only one process may settle a wallet - stop the other one first."
-            );
-            std::process::exit(2);
-        }
+        Err(e) => refuse(&format!(
+            "REFUSING to start: another hbit-pool-server or hbit-pool-payout already holds \
+             {wallet_file} ({e}).\n\
+             Two of them would each see the whole wallet balance, each believe it is the only \
+             payer, and pay the same shares twice out of your own funds.\n\
+             What to do: stop the other one, wait for it to actually exit, then start this again.\n\
+             The lock belongs to the running process, not to the file: deleting {} frees nothing \
+             and would only let two of them pay at once.",
+            settle_lock_path(&wallet_file)
+        )),
     };
-    let wallet = load_or_create_wallet(&wallet_file);
-    let payout = wallet.readable().to_string();
 
     let client = http_client();
+    // Two different failures with two different fixes, so they get two different
+    // messages: a node that is not answering at all, and a node that is answering
+    // about a different chain than the one named on the command line.
+    let Some(tip) = node_tip(&client, &node) else {
+        refuse(&format!(
+            "REFUSING to start: no Hacash fullnode answered at {node}.\n\
+             Nothing was mined and nothing was paid; the pool cannot serve work without a node.\n\
+             What to do: start your fullnode and let it finish syncing, then check that {node} is \
+             its API address. The port is the `[server] listen` value in the node's \
+             hacash.config.ini, which is 8080 in the config this package ships (so \
+             http://127.0.0.1:8080)."
+        ));
+    };
     // Prove the difficulty rule in force here reproduces the node's OWN tip
     // before serving a single piece of work. Otherwise a chain label that does
     // not match the node's config makes every block the pool finds rejected, and
     // nothing says so: the pool just mines dead work indefinitely.
     if let Err(e) = verify_chain_params(&client, &node, &params) {
-        eprintln!("REFUSING to start: {e}");
-        std::process::exit(2);
+        refuse(&format!(
+            "REFUSING to start: {e}\n\
+             What to do: pass the chain that node is really on as <chain>. If it is a testnet, \
+             spell out its own two settings as \
+             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`, copied from that \
+             node's hacash.config.ini. Do not work around this: every block the pool found would \
+             be thrown away and every miner here would earn nothing."
+        ));
     }
-    let (tpl, txs_note) = fetch_pool_template(&client, &node, &payout, &params, None)
-        .expect("could not fetch an initial template — is the node running and synced?");
+    // Bind BEFORE creating a wallet. The commonest first-run mistakes here are a
+    // port something else already holds and a listen address with no port in it,
+    // and neither of them should leave a real-money key file behind.
+    let listener = match TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(e) => refuse(&format!(
+            "REFUSING to start: cannot listen on {listen} ({e}).\n\
+             What to do: <listen> must be <ip>:<port>, for example 0.0.0.0:9777 to let other \
+             machines mine here or 127.0.0.1:9777 to keep it on this one. If the address looks \
+             right, something else already holds that port - another hbit-pool-server, or your \
+             node - so pick a different port or stop the other program."
+        )),
+    };
+
+    let wallet_existed = std::path::Path::new(&wallet_file).exists();
+    let wallet = load_or_create_wallet(&wallet_file);
+    let payout = wallet.readable().to_string();
+    // What is REALLY on the disk now, after any migration the loader performed.
+    let encrypted = key_file_encrypted(&wallet_file);
+
+    let Some((tpl, txs_note)) = fetch_pool_template(&client, &node, &payout, &params, None) else {
+        refuse(&format!(
+            "REFUSING to start: the node at {node} answered, but would not give a block template \
+             to mine on.\n\
+             What to do: let the node finish syncing (its own log says so) and check it is not \
+             shutting down, then start the pool again. Nothing was mined and nothing was paid."
+        ));
+    };
     let network_target = tpl.target;
     // The factor the operator asked for is not necessarily the factor workers
     // get: the derivation saturates. Refuse to serve, and to distribute real
@@ -1059,23 +1498,10 @@ fn main() {
     let share_target = pool_core::share_target_hash(tpl.difficulty, share_factor);
     let share_factor_achieved = pool_core::achieved_share_factor(&network_target, &share_target);
     if let Err(e) = check_share_target(share_factor, share_factor_achieved, tpl.difficulty) {
-        eprintln!("REFUSING to start: {e}");
-        std::process::exit(2);
+        refuse(&format!("REFUSING to start: {e}"));
     }
 
-    println!("listen  = {listen}");
     println!("chain   = {chain} (ASERT at height {})", params.asert_height);
-    println!("share   = 2^{share_factor_achieved} easier than a network block");
-    if share_factor_achieved < share_factor {
-        // Above the refusal bound, so shares are still worth something, but not
-        // what was asked for: say the real number rather than let the operator
-        // believe a figure the chain will not support.
-        println!(
-            "          (share_bits={share_factor} was asked for; the difficulty in force caps it \
-             at 2^{share_factor_achieved})"
-        );
-    }
-    println!("settle  = every {settle_secs}s");
     println!(
         "height  = {} (template, difficulty {}, {} packed tx(s) from the node)",
         tpl.height,
@@ -1086,6 +1512,27 @@ fn main() {
     // node's transactions. Mining empty blocks is the failure that leaves the
     // pool's own payouts stuck in the mempool forever.
     report_packed_txs(txs_note.as_deref());
+    println!(
+        "{}",
+        startup_summary(
+            &payout,
+            &wallet_file,
+            encrypted,
+            &node,
+            &chain,
+            Some(tip),
+            &listen,
+            PPLNS_WINDOW as u64,
+            settle_secs,
+            share_factor,
+            share_factor_achieved,
+        )
+    );
+    // Last, so it is what an operator comes back to: this run made a wallet that
+    // is about to start holding other people's money.
+    if !wallet_existed {
+        println!("{}", new_wallet_banner(&wallet_file, &payout, encrypted));
+    }
 
     let mut pool = Pool {
         node: node.clone(),
@@ -1185,13 +1632,12 @@ fn main() {
         });
     }
 
-    let listener = TcpListener::bind(&listen).expect("bind");
-    println!("listening...\n");
+    println!("listening on {listen}\n");
     for stream in listener.incoming() {
         let s = match stream {
             Ok(s) => s,
             // A single accept() error (e.g. EMFILE under load) must not tear down
-            // the whole listener — log and keep serving.
+            // the whole listener - log and keep serving.
             Err(e) => {
                 eprintln!("accept error: {e}");
                 continue;
@@ -2009,7 +2455,7 @@ fn handle_submission(
         });
     }
     let key = (height, coinbase_nonce, block_nonce);
-    // Phase 1 — brief lock: reject stale/duplicate early and snapshot the inputs.
+    // Phase 1 - brief lock: reject stale/duplicate early and snapshot the inputs.
     let (tpl, share_target, network_target, client, node) = {
         let p = plock(pool);
         if height != p.tpl.height {
@@ -2027,7 +2473,7 @@ fn handle_submission(
         )
     };
 
-    // Phase 2 — no lock: rebuild exactly what the worker hashed and evaluate the
+    // Phase 2 - no lock: rebuild exactly what the worker hashed and evaluate the
     // (deliberately slow) x16rs PoW hash without blocking any other request.
     let cb = coinbase_with_extranonce(&tpl, &coinbase_nonce);
     let intro = intro_bytes(&tpl, &cb, block_nonce);
@@ -2051,7 +2497,7 @@ fn handle_submission(
     }
     let is_block = pool_core::beats(&hash, &network_target);
 
-    // Phase 3 — brief lock: atomically re-check freshness + replay, then credit.
+    // Phase 3 - brief lock: atomically re-check freshness + replay, then credit.
     // The accounting snapshot leaves the lock as bytes; writing it is phase 3b,
     // because every other request is serialized behind this same mutex and a
     // create/rename/fsync must never happen underneath it.
@@ -3335,5 +3781,218 @@ mod tests {
             distributable_units(held + reserve, held - matured_one, reserve),
             Some(matured_one)
         );
+    }
+
+    /* ---- the operator's first ten minutes ---- */
+
+    #[test]
+    fn the_usage_text_is_enough_to_start_the_pool_without_reading_the_source() {
+        let u = usage();
+        // Every argument is named and explained, in the order they are typed.
+        for arg in [
+            "<node>",
+            "<wallet_file>",
+            "<listen>",
+            "<share_bits>",
+            "<chain>",
+            "[settle_secs]",
+        ] {
+            assert!(u.contains(arg), "usage never explains {arg}:\n{u}");
+        }
+        // A command that really works, with the required arguments in place.
+        assert!(
+            u.contains("hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 24 mainnet"),
+            "usage has no working example:\n{u}"
+        );
+        // The bounds and defaults are read from the constants that enforce them,
+        // so the help can never describe a pool that does not exist.
+        for n in [
+            MIN_SHARE_FACTOR.to_string(),
+            MAX_SHARE_FACTOR.to_string(),
+            DEFAULT_SHARE_BITS.to_string(),
+            MIN_SETTLE_SECS.to_string(),
+            MAX_SETTLE_SECS.to_string(),
+            DEFAULT_SETTLE_SECS.to_string(),
+        ] {
+            assert!(u.contains(&n), "usage never mentions {n}:\n{u}");
+        }
+        // How to protect the key, and how a miner actually joins.
+        assert!(u.contains(WALLET_PASSWORD_ENV) && u.contains(WALLET_PASSWORD_FILE_ENV), "{u}");
+        assert!(u.contains("connect =") && u.contains("pool_worker ="), "{u}");
+        // And it ships nothing anybody could paste and pay: no address-shaped
+        // string, no key-shaped string, no passphrase. An earlier audit found a
+        // shipped file carrying a live third-party address; help text is exactly
+        // the kind of place that happens again.
+        for line in u.lines() {
+            for word in line.split_whitespace() {
+                let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                assert!(
+                    !is_payout_address(w),
+                    "usage carries something payable: {word}"
+                );
+                assert!(
+                    !(w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())),
+                    "usage carries something key-shaped: {word}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_startup_summary_states_the_same_terms_the_pool_enforces() {
+        // The console readback and /terms must never tell a miner two different
+        // stories, so both are built from the same constants.
+        let t = terms_json(
+            PPLNS_WINDOW as u64,
+            24,
+            24,
+            0x2000_0000,
+            DEFAULT_SETTLE_SECS,
+            COINBASE_MATURITY_DEPTH,
+            PAYOUT_MATURITY_DEPTH,
+        );
+        let s = startup_summary(
+            W_A,
+            "pool-wallet.key",
+            true,
+            "http://127.0.0.1:8080",
+            "mainnet",
+            Some(738_700),
+            "0.0.0.0:9777",
+            PPLNS_WINDOW as u64,
+            DEFAULT_SETTLE_SECS,
+            24,
+            24,
+        );
+        // The four things an operator has to be able to check.
+        assert!(s.contains(W_A), "the address it pays FROM is missing:\n{s}");
+        assert!(s.contains("pool-wallet.key"), "{s}");
+        assert!(s.contains("http://127.0.0.1:8080"), "{s}");
+        assert!(s.contains("mainnet") && s.contains("738700"), "{s}");
+        assert!(s.contains("9777") && s.contains("pool_worker"), "{s}");
+        // The terms, matching the endpoint exactly.
+        assert!(s.contains(&t["window_shares"].as_u64().unwrap().to_string()), "{s}");
+        assert!(s.contains(&hac(t["minimum_payout"]["units"].as_u64().unwrap())), "{s}");
+        assert!(
+            s.contains(&t["coinbase_maturity_blocks"].as_u64().unwrap().to_string()),
+            "{s}"
+        );
+        assert_eq!(
+            t["fee"]["units"].as_u64(),
+            Some(0),
+            "a pool with a fee must say so in the summary too"
+        );
+        assert!(s.contains("no pool fee"), "{s}");
+        // A capped share factor is stated as the number really served, and the
+        // number asked for is not passed off as the truth.
+        let capped = startup_summary(
+            W_A,
+            "pool-wallet.key",
+            false,
+            "http://127.0.0.1:8080",
+            "mainnet",
+            None,
+            "0.0.0.0:9777",
+            PPLNS_WINDOW as u64,
+            DEFAULT_SETTLE_SECS,
+            24,
+            21,
+        );
+        assert!(capped.contains("2^21"), "{capped}");
+        assert!(capped.contains("share_bits=24 was asked for"), "{capped}");
+        assert!(capped.contains("PLAINTEXT"), "an unprotected key must be said out loud:\n{capped}");
+        assert!(capped.contains("height unknown"), "a tip that was not read is not a number:\n{capped}");
+    }
+
+    #[test]
+    fn a_miner_is_never_told_to_connect_somewhere_that_cannot_answer() {
+        // A wildcard bind carries no host anybody can dial. Handing 0.0.0.0 to a
+        // miner sends it nowhere, and all the miner sees is "cannot connect".
+        for wildcard in ["0.0.0.0:9777", ":::9777", "[::]:9777"] {
+            let (connect, note) = miner_connect(wildcard);
+            assert!(!connect.starts_with("0.0.0.0"), "{connect}");
+            assert!(!connect.starts_with("::"), "{connect}");
+            assert!(connect.ends_with(":9777"), "{connect}");
+            assert!(note.contains("any machine"), "{note}");
+        }
+        // Loopback is a real address, and the note is the whole point: it is why
+        // nobody else can mine here.
+        for local in ["127.0.0.1:9777", "localhost:9777", "[::1]:9777"] {
+            let (connect, note) = miner_connect(local);
+            assert!(connect.ends_with(":9777"), "{connect}");
+            assert!(note.contains("loopback only"), "{note}");
+        }
+        // Anything else is handed over as typed.
+        let (connect, _) = miner_connect("10.0.0.4:9777");
+        assert_eq!(connect, "10.0.0.4:9777");
+    }
+
+    #[test]
+    fn the_new_wallet_banner_says_what_losing_the_file_costs() {
+        let plain = new_wallet_banner("pool-wallet.key", W_A, false);
+        assert!(plain.contains("pool-wallet.key"), "{plain}");
+        assert!(plain.contains(W_A), "{plain}");
+        assert!(plain.contains(&pool_state_path("pool-wallet.key")), "{plain}");
+        // The cost of losing it, in words, not a hint.
+        assert!(plain.contains("gone permanently"), "{plain}");
+        assert!(plain.contains("BACK IT UP"), "{plain}");
+        // With no passphrase the key is lying on the disk, and that is said
+        // plainly along with the way out of it.
+        assert!(plain.contains("PLAINTEXT"), "{plain}");
+        assert!(plain.contains(WALLET_PASSWORD_ENV), "{plain}");
+        assert!(plain.contains(&WALLET_PASSWORD_MIN.to_string()), "{plain}");
+
+        // With one, both halves are needed and both must be backed up.
+        let enc = new_wallet_banner("pool-wallet.key", W_A, true);
+        assert!(enc.contains("ENCRYPTED"), "{enc}");
+        assert!(enc.contains("BOTH"), "{enc}");
+        assert!(enc.contains("no reset"), "{enc}");
+        assert!(!enc.contains("PLAINTEXT"), "{enc}");
+    }
+
+    #[test]
+    fn a_mistyped_number_is_never_quietly_replaced_by_a_default() {
+        // `share_bits` and `settle_secs` used to fall back to their defaults on
+        // ANY unparseable value, so an operator who typed one wrong ran for weeks
+        // on a setting they had not chosen and were never told about. Both are
+        // now parsed strictly and bounded; these are the exact predicates main()
+        // applies.
+        assert!("twentyfour".trim().parse::<u32>().is_err());
+        assert!("24 ".trim().parse::<u32>().is_ok(), "surrounding space is not a typo");
+        assert!("-1".trim().parse::<u32>().is_err());
+        assert!("5m".trim().parse::<u64>().is_err());
+
+        // A settle interval of 0 would spin the settlement thread with no sleep
+        // at all, hammering the node forever.
+        assert!(!(MIN_SETTLE_SECS..=MAX_SETTLE_SECS).contains(&0));
+        assert!((MIN_SETTLE_SECS..=MAX_SETTLE_SECS).contains(&DEFAULT_SETTLE_SECS));
+        assert!(check_share_factor(DEFAULT_SHARE_BITS).is_ok());
+        // Both refusals name the value to use instead of just the rule.
+        let e = check_share_factor(MIN_SHARE_FACTOR - 1).expect_err("refused");
+        assert!(e.contains("What to do"), "{e}");
+        assert!(e.contains(&DEFAULT_SHARE_BITS.to_string()), "{e}");
+    }
+
+    #[test]
+    fn money_in_the_startup_text_is_exact() {
+        // The console prints tenths of a HAC, which is exactly what a unit is, so
+        // this converts rather than rounds. Anything else would put a number on
+        // the screen the pool would not pay.
+        assert_eq!(hac(0), "0.0 HAC");
+        assert_eq!(hac(PAYOUT_DUST_UNITS), "0.1 HAC");
+        assert_eq!(hac(SETTLE_RESERVE_UNITS), "0.5 HAC");
+        assert_eq!(hac(10), "1.0 HAC");
+        assert_eq!(hac(1234), "123.4 HAC");
+        // Round trip: every rendering names exactly the units it was given.
+        for u in [0u64, 1, 5, 9, 10, 99, 100, 1_000_007] {
+            let s = hac(u);
+            let digits: String = s.trim_end_matches(" HAC").chars().filter(|c| *c != '.').collect();
+            assert_eq!(digits.parse::<u64>().expect("digits"), u, "{s}");
+        }
+        // And the interval reads the way an operator would say it.
+        assert_eq!(every(DEFAULT_SETTLE_SECS), "5m");
+        assert_eq!(every(30), "30s");
+        assert_eq!(every(90), "90s");
+        assert_eq!(every(3600), "1h");
     }
 }

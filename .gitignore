@@ -104,6 +104,7 @@ hacash_*
 # anyone mine to a value they did not choose.
 !mainnet-configs/*.ini
 !miner-pool/hac-pool.example.ini
+!hbit-pool/hbit-pool.example.ini
 *.exe
 *_ubuntu
 *_windows
