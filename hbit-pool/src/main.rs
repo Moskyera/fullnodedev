@@ -3,12 +3,12 @@
 //! proving the node accepts an externally-chosen coinbase with no node change.
 //! Run against a fresh local testnet (chain_id != 0).
 //!
-//! Usage:  pool-spike [node_base_url] [payout_privakey_address]
+//! Usage:  hbit-pool-spike [node_base_url] [payout_privakey_address]
 
 use std::env;
 
-use pool_spike::difficulty::ChainParams;
-use pool_spike::{balance, http_client, mine_and_submit_block};
+use hbit_pool::difficulty::ChainParams;
+use hbit_pool::{balance, http_client, mine_and_submit_block};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -22,7 +22,7 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "1MzNY1oA3kfgYi75zquj3SRUPYztzXHzK9".to_string());
 
-    println!("== pool-spike ==");
+    println!("== HBIT pool spike ==");
     println!("node   = {base}");
     println!("payout = {payout}");
 

@@ -56,7 +56,7 @@ const SUBMIT_GATE_HEIGHT_WINDOW: u64 = 8;
 const SUBMIT_GATE_MAX_TEMPLATES: usize = 64;
 /// How long one template is left alone after a pool answered `kind:"busy"`.
 ///
-/// "Busy" means the pool is shedding load (pool-spike refuses a share once it is
+/// "Busy" means the pool is shedding load (HBIT refuses a share once it is
 /// already holding its cap for that height), so the very next winner would be
 /// refused too and hammering it makes the overload worse. Two seconds is an order
 /// of magnitude longer than the 123 ms result drain tick, so the drain cadence
@@ -411,7 +411,7 @@ fn node_error_ends_template(err: &str) -> bool {
 /// `ret` and `kind`). `None` means no `kind` we know, so the fullnode rules below
 /// decide instead.
 ///
-/// The kinds come straight from pool-spike's `handle_submission`:
+/// The kinds come straight from the HBIT pool's `handle_submission`:
 ///   `block`     the pool relayed a full network block: the template is DEAD.
 ///   `share`     a PPLNS share was credited: the template is ALIVE and paying.
 ///   `stale`     the pool has moved to another job: DEAD.

@@ -374,7 +374,7 @@ pub fn save_pending_payout_txs(state_file: &str, hashes: &[String]) -> std::io::
 /* ---------------------------------------------------------------------------
  * The pool's money terms, in ONE place.
  *
- * `/terms` reads these same constants and `settle_once` / `pool-payout` apply
+ * `/terms` reads these same constants and `settle_once` / `hbit-pool-payout` apply
  * them, so what the pool advertises cannot drift from what it does. Change a
  * number here and every place that states it changes with it.
  * ------------------------------------------------------------------------- */
@@ -694,7 +694,7 @@ pub struct SettleLock {
 
 /// Take the wallet's settlement lock, or fail if another process holds it.
 ///
-/// The pool server takes this for its whole run and `pool-payout` takes it for
+/// The pool server takes this for its whole run and `hbit-pool-payout` takes it for
 /// its whole run. Without it the two paths each see the full CONFIRMED balance
 /// (a payout sitting in the mempool does not reduce it) and each pays the same
 /// PPLNS window - a real double payout of the pool's distributable balance.
@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn the_per_worker_settlement_ledger_survives_the_state_file() {
         // A miner's "total paid" is only as good as this file. The pool server
-        // and pool-payout both write it, so it has to round-trip through both
+        // and hbit-pool-payout both write it, so it has to round-trip through both
         // without losing anyone's money or the rest of the accounting.
         let path = tmp_path("earnings.state.json");
         let _ = std::fs::remove_file(&path);

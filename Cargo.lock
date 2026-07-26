@@ -2164,6 +2164,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hbit-pool"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "basis",
+ "field",
+ "fs2",
+ "getrandom 0.3.4",
+ "hex",
+ "mint",
+ "num-bigint",
+ "protocol",
+ "reqwest",
+ "serde_json",
+ "sys",
+ "x16rs",
+ "zeroize",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3758,27 +3779,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug 0.3.1",
  "universal-hash",
-]
-
-[[package]]
-name = "pool-spike"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "basis",
- "field",
- "fs2",
- "getrandom 0.3.4",
- "hex",
- "mint",
- "num-bigint",
- "protocol",
- "reqwest",
- "serde_json",
- "sys",
- "x16rs",
- "zeroize",
 ]
 
 [[package]]

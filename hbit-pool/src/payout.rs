@@ -8,7 +8,7 @@
 //!   * DRY-RUN by default — prints the planned split and pays NOTHING unless you
 //!     pass `--commit`.
 //!   * Exclusive - takes the wallet's settlement lock for the whole run, so it
-//!     can never pay out of a wallet a running pool-server is already settling.
+//!     can never pay out of a wallet a running hbit-pool-server is already settling.
 //!     Both read the CONFIRMED balance, so without the lock each would see the
 //!     full balance and pay the same PPLNS window.
 //!   * Idempotent - records every submitted payout tx hash in the SAME pending
@@ -24,7 +24,8 @@
 //!   * Honest — reports the node's accept/reject for every tx and the real
 //!     before/after balances; no "looks funded" guesswork.
 //!
-//! Usage: pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
+//! Usage: hbit-pool-payout <pool_base> <node> <chain> [wallet_file]
+//!        [reserve_units] [dust_units] [--commit]
 //!   chain = mainnet | testnet | testnet:<adjust_blocks>:<target_time>
 //!   (required - a wrong difficulty rule means rejected blocks)
 
@@ -34,9 +35,9 @@ use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType2;
 use sys::*;
 
-use pool_spike::difficulty::ChainParams;
-use pool_spike::pool_core::split_payout;
-use pool_spike::{
+use hbit_pool::difficulty::ChainParams;
+use hbit_pool::pool_core::split_payout;
+use hbit_pool::{
     Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS,
     acquire_settle_lock, balance, balance_units, chunk_tx_fee, classify_payout_tx, confirm_payout,
     distributable_units, drop_payout, find_u64, get_json, http_client, is_payout_address,
@@ -87,7 +88,8 @@ fn main() {
     let node = node.trim_end_matches('/').to_string();
     let Some(chain) = pos.get(2).cloned() else {
         eprintln!(
-            "usage: pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]\n\
+            "usage: hbit-pool-payout <pool_base> <node> <chain> [wallet_file] \
+             [reserve_units] [dust_units] [--commit]\n\
              chain is required: `mainnet`, `testnet`, or \
              `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`."
         );
@@ -120,15 +122,15 @@ fn main() {
         .unwrap_or(PAYOUT_DUST_UNITS);
 
     let client = http_client();
-    println!("== pool-payout ({}) ==", if commit { "COMMIT" } else { "DRY-RUN" });
+    println!("== HBIT pool payout ({}) ==", if commit { "COMMIT" } else { "DRY-RUN" });
     // Exclusive claim on this wallet's settlement, held for the whole run. A
-    // running pool-server holds the same lock, so this can never become a second
+    // running hbit-pool-server holds the same lock, so this can never become a second
     // settler paying the same PPLNS window out of the same confirmed balance.
     let _settle_lock = match acquire_settle_lock(&wallet_file) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "REFUSING to run: another pool-server or pool-payout already holds \
+                "REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds \
                  {wallet_file} ({e}).\n\
                  Only one process may settle a wallet - stop the pool server first."
             );

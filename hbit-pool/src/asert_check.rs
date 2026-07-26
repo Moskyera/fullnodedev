@@ -13,12 +13,12 @@
 //! whose target hash is too tight, and such a pool silently discards solutions
 //! the node would have accepted - lost blocks, lost revenue.
 //!
-//! Usage: asert-check [node_base] [count] [chain]
+//! Usage: hbit-asert-check [node_base] [count] [chain]
 //!   chain = mainnet | testnet | testnet:<adjust_blocks>:<target_time>
 
 use basis::difficulty::hash_bigger_than;
-use pool_spike::difficulty::{ChainParams, next_difficulty};
-use pool_spike::{find_str, find_u64, get_json, http_client};
+use hbit_pool::difficulty::{ChainParams, next_difficulty};
+use hbit_pool::{find_str, find_u64, get_json, http_client};
 
 /// The block's own PoW hash from a `/query/block/intro` response.
 fn block_hash32(b: &serde_json::Value) -> Option<[u8; 32]> {
@@ -55,7 +55,7 @@ fn main() {
     )
     .expect("no chain tip");
 
-    println!("== asert-check ==");
+    println!("== HBIT ASERT check ==");
     println!("node   = {node}");
     println!("chain  = {chain} (ASERT anchor at height {})", params.asert_height);
     println!("tip    = {tip}");

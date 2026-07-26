@@ -10,12 +10,12 @@
 //! the root itself, which is the standard `/query/miner/pending` protocol, not
 //! this one. Change that and this file must honour the list too.
 //!
-//! Usage: test-miner [pool_base] [worker_address] [shares_to_find]
+//! Usage: hbit-test-miner [pool_base] [worker_address] [shares_to_find]
 //!   The worker id must be a payable HAC address: the pool credits shares under
 //!   that key and refuses one it could never pay, exactly as on the paid path.
 
-use pool_spike::pool_core;
-use pool_spike::{find_str, find_u64, get_json, http_client};
+use hbit_pool::pool_core;
+use hbit_pool::{find_str, find_u64, get_json, http_client};
 
 /// Consecutive rejected submissions before this miner stops and says why.
 /// Mining on regardless is how a worker burns hours producing nothing: the pool
@@ -82,7 +82,7 @@ fn main() {
     let want: u64 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     let client = http_client();
-    println!("== test-miner {worker} -> {pool} (want {want} shares) ==");
+    println!("== HBIT test miner: {worker} -> {pool} (want {want} shares) ==");
 
     let mut found = 0u64;
     let mut rejected = 0u64;

@@ -25,7 +25,7 @@ members = [
     "x16rs",
     "x16rs-cuda",
     "miner-pool",
-    "pool-spike",
+    "hbit-pool",
 ]
 exclude = [
     "chainv1",
@@ -82,14 +82,14 @@ panic = 'unwind'    # Unwind (not abort): a panic in one request/mining thread m
                     # that impossible and turn any panic into full downtime.
 strip = true        # Strip symbols from binary
 
-# Money crate only: pool-spike owns the share accounting, payout splitting and settlement.
+# Money crate only: hbit-pool owns the share accounting, payout splitting and settlement.
 # There a silent wrapping add or multiply would pay a miner the wrong amount and the pool
 # would never notice, so arithmetic overflow must panic. The settlement work is already
 # wrapped in catch_unwind, which turns such a panic into "skip this item and report it"
 # instead of a wrong transfer.
 # This is deliberately NOT workspace wide: overflow checks in the x16rs / CPU mining hot
 # path cost real hashrate, and that code is consensus defined and already range safe.
-[profile.release.package.pool-spike]
+[profile.release.package.hbit-pool]
 overflow-checks = true
 
 [profile.wasm-release]

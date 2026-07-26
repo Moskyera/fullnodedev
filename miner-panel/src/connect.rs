@@ -2,6 +2,8 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::i18n::{Lang, load_lang, strings};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnectMode {
     /// Local hacash.exe fullnode (solo mining, rewards to your wallet).
@@ -107,6 +109,14 @@ pub fn is_local_connect(connect: &str) -> bool {
 /// The pool's real terms are read from the pool at run time (`/terms`) and
 /// shown on the dashboard; that, and not this list, is where a miner learns
 /// what a pool pays.
+///
+/// HBIT is the one entry whose terms the panel can actually check, because
+/// HBIT is the pool this project builds and it answers `/terms` and
+/// `/earnings`: the dashboard shows its real scheme, fee and minimum, and this
+/// miner's own paid total, read live from the pool. For every other entry here
+/// the panel has no such source, so it says nothing about what they pay. Being
+/// ours is not a substitute for having connected, so the HBIT entry ships
+/// unverified with no address, exactly like the others.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PoolInfo {
     /// Display name in the dropdown.
@@ -140,20 +150,33 @@ impl PoolInfo {
     }
 }
 
-/// The pools that ship with the panel. Always present, even offline.
-/// Community payout pools hand out their `host:port` through a web config
-/// generator, so we cannot hard-code a verified address; the user pastes it
-/// (or we publish it later via `pools.json`, with no rebuild).
+/// The pools that ship with the panel, in the panel's own language. Always
+/// present, even offline. Community payout pools hand out their `host:port`
+/// through a web config generator, so we cannot hard-code a verified address;
+/// the user pastes it (or we publish it later via `pools.json`, with no
+/// rebuild).
 ///
-/// No entry may promise a payout scheme, a fee or a minimum. The panel has
-/// never connected to any of these third-party services, so it cannot know
-/// those, and the pool this project ships (`pool-spike`'s pool-server) pays
-/// PPLNS, not PROP: an earlier note here advertised "PROP payouts, low fee,
-/// small minimum", which described neither the third-party pool it named nor
-/// any pool in this repository. See [`PoolInfo`] for where those numbers now
-/// come from instead.
-pub fn builtin_pools() -> Vec<PoolInfo> {
+/// HBIT, the pool this project builds and supports, is first. It ships with an
+/// empty `connect` because no HBIT address is published anywhere in this
+/// repository, and an address invented here is one a miner would paste in and
+/// send real hashrate to. An operator publishes theirs through `pools.json`,
+/// or the miner asks them for it.
+///
+/// No entry may promise a payout scheme, a fee or a minimum, HBIT's included.
+/// The panel has never connected to any of these services, so it cannot know
+/// those numbers; see [`PoolInfo`] for where they now come from instead. An
+/// earlier note here advertised "PROP payouts, low fee, small minimum", which
+/// described neither the third-party pool it named nor any pool in this
+/// repository.
+///
+/// Names are NOT translated: `pools.json` overrides a built-in by matching its
+/// `name`, so a name that changed with the language would silently stop
+/// matching an operator's published file. Only the HBIT note is translated so
+/// far; the four notes below shipped in English and translating them is a
+/// separate pass, not part of adding HBIT.
+pub fn builtin_pools_in(lang: Lang) -> Vec<PoolInfo> {
     vec![
+        PoolInfo::simple("HBIT pool", "", strings(lang).pool_dir_hbit_note, ""),
         PoolInfo::simple(
             "Custom pool / node",
             "",
@@ -240,14 +263,21 @@ fn backed_note(note: &str) -> String {
     note.to_string()
 }
 
+/// Build the pool directory in the language the panel is running in, which is
+/// the one saved next to it (`miner-panel.lang`, the same file the rest of the
+/// UI reads). See [`load_pool_directory_in`] for what merging does.
+pub fn load_pool_directory(dir: &Path) -> Vec<PoolInfo> {
+    load_pool_directory_in(dir, load_lang(dir))
+}
+
 /// Build the pool directory: the built-in list, then merge an optional
 /// `pools.json` sitting next to the panel. Entries whose `name` matches a
 /// built-in override it (so a verified address can be published for a known
 /// pool); new names are appended. A fresh pool therefore appears in the panel
 /// by shipping/downloading a `pools.json`, with no rebuild required. A missing
 /// or malformed file simply falls back to the built-ins.
-pub fn load_pool_directory(dir: &Path) -> Vec<PoolInfo> {
-    let mut pools = builtin_pools();
+pub fn load_pool_directory_in(dir: &Path, lang: Lang) -> Vec<PoolInfo> {
+    let mut pools = builtin_pools_in(lang);
     let Ok(raw) = std::fs::read_to_string(dir.join("pools.json")) else {
         return pools;
     };
@@ -353,9 +383,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // No pools.json -> built-ins only, "Custom" first.
+        // No pools.json -> built-ins only, HBIT first.
         let base = load_pool_directory(&dir);
-        assert_eq!(base[0].name, "Custom pool / node");
+        assert_eq!(base[0].name, "HBIT pool");
         let base_len = base.len();
 
         std::fs::write(
@@ -385,7 +415,7 @@ mod tests {
         assert_eq!(fresh.notice_wait, Some(30));
 
         assert_eq!(merged.len(), base_len + 1);
-        assert_eq!(merged[0].name, "Custom pool / node");
+        assert_eq!(merged[0].name, "HBIT pool");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -402,7 +432,7 @@ mod tests {
         // minimum". The panel has never connected to that pool, and the pool
         // this project ships pays PPLNS, so the sentence was unbacked either
         // way. Nothing in this list may make that kind of claim again.
-        for pool in builtin_pools() {
+        for pool in builtin_pools_in(Lang::En) {
             let note = pool.note.to_ascii_lowercase();
             for claim in UNBACKED_NOTE_CLAIMS {
                 assert!(
@@ -424,7 +454,7 @@ mod tests {
     fn every_third_party_entry_says_it_is_unverified() {
         // An entry with no address of its own is a name the user has to trust.
         // Say plainly that the panel has not checked it.
-        for pool in builtin_pools() {
+        for pool in builtin_pools_in(Lang::En) {
             if pool.connect.is_empty() && !pool.url.is_empty() {
                 assert!(
                     pool.note.to_ascii_lowercase().contains("not verified"),
@@ -435,6 +465,108 @@ mod tests {
                 assert!(!pool.verified, "{} was never connected to", pool.name);
             }
         }
+    }
+
+    #[test]
+    fn hbit_is_first_and_ships_with_no_address_and_no_tick() {
+        let pools = builtin_pools_in(Lang::En);
+        let hbit = &pools[0];
+        assert_eq!(hbit.name, "HBIT pool");
+        // No HBIT host:port is published anywhere in this repository. An
+        // invented one is an address a miner would paste in and point real
+        // hashrate at, so it stays empty until an operator publishes theirs
+        // through pools.json.
+        assert!(
+            hbit.connect.is_empty(),
+            "HBIT must not ship an invented address"
+        );
+        assert!(hbit.url.is_empty(), "HBIT must not ship an invented link");
+        // Being ours is not the same as having been reached: the tick in the
+        // dropdown means the panel connected to that endpoint, and it has not.
+        assert!(
+            !hbit.verified,
+            "the panel has never connected to an HBIT address"
+        );
+        assert!(hbit.nonce_max.is_none() && hbit.notice_wait.is_none());
+    }
+
+    #[test]
+    fn the_hbit_note_states_only_what_the_panel_can_check_in_every_language() {
+        for lang in Lang::ALL {
+            let pools = builtin_pools_in(lang);
+            let note = &pools[0].note;
+            assert!(!note.trim().is_empty(), "{} has no HBIT note", lang.code());
+            assert!(
+                !note.contains('\u{2014}'),
+                "{} uses an em dash: {note}",
+                lang.code()
+            );
+            let lowered = note.to_ascii_lowercase();
+            for claim in UNBACKED_NOTE_CLAIMS {
+                assert!(
+                    !lowered.contains(claim),
+                    "{} claims '{claim}' about HBIT: {note}",
+                    lang.code()
+                );
+            }
+            // No digits: an address, a fee or a minimum typed into this list is
+            // a number the panel cannot check, and the dashboard reads all
+            // three from the pool itself.
+            assert!(
+                !note.chars().any(|c| c.is_ascii_digit()),
+                "{} puts a number in the HBIT note: {note}",
+                lang.code()
+            );
+            // It has to tell the miner where the address actually comes from.
+            assert!(
+                note.contains("host:port"),
+                "{} must say where to get the address: {note}",
+                lang.code()
+            );
+        }
+    }
+
+    #[test]
+    fn directory_names_are_identical_in_every_language() {
+        // pools.json overrides a built-in by matching its name, so a name that
+        // changed with the language would silently stop matching an operator's
+        // published file and append a duplicate entry instead.
+        let en: Vec<String> = builtin_pools_in(Lang::En)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        for lang in Lang::ALL {
+            let names: Vec<String> = builtin_pools_in(lang).into_iter().map(|p| p.name).collect();
+            assert_eq!(names, en, "{} renamed a directory entry", lang.code());
+        }
+    }
+
+    #[test]
+    fn an_operator_publishes_the_hbit_address_through_pools_json() {
+        // The panel ships no HBIT address, so this is the supported way one
+        // reaches a miner: drop the file next to the exe, no rebuild.
+        let dir = std::env::temp_dir().join(format!(
+            "hacash-hbitdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pools.json"),
+            r#"[{"name":"HBIT pool","connect":"1.2.3.4:9777","verified":true}]"#,
+        )
+        .unwrap();
+
+        let pools = load_pool_directory(&dir);
+        assert_eq!(pools[0].name, "HBIT pool");
+        assert_eq!(pools[0].connect, "1.2.3.4:9777");
+        assert!(pools[0].verified);
+        assert_eq!(pools.len(), builtin_pools_in(Lang::En).len());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

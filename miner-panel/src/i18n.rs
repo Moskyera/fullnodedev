@@ -219,6 +219,13 @@ pub struct Strings {
     pub pool_terms_interval: &'static str,
     pub pool_terms_unavailable: &'static str,
     pub pool_terms_source: &'static str,
+    /// Note under the pool picker for HBIT, the pool this project builds. It
+    /// says one checkable thing and no more: HBIT answers /terms and /earnings,
+    /// so the panel can show its real terms and this miner's paid total, and it
+    /// cannot do that for anybody else's pool. It promises no scheme, no fee,
+    /// no minimum and no address, because none of those is the panel's to
+    /// promise.
+    pub pool_dir_hbit_note: &'static str,
 }
 
 fn apply_format_template(template: &str, args: &[String]) -> String {
@@ -425,6 +432,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Payouts run every",
             pool_terms_unavailable: "This pool does not publish its terms. Ask the operator what it pays and what it keeps.",
             pool_terms_source: "Read from the pool itself, not from this panel.",
+            pool_dir_hbit_note: "The pool this project builds and supports. It publishes its terms and each miner's earnings, so the panel reads the real scheme, fee, smallest payout and your own paid total live from the pool; for the other pools here it cannot. No address ships with the panel and none is verified: ask the operator for the host:port, or run the pool yourself.",
         },
         Lang::El => Strings {
             window_title: "HAC Miner Panel",
@@ -573,6 +581,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Οι πληρωμές τρέχουν κάθε",
             pool_terms_unavailable: "Αυτό το pool δεν δημοσιεύει τους όρους του. Ρώτα τον διαχειριστή τι πληρώνει και τι κρατά.",
             pool_terms_source: "Διαβάστηκε από το ίδιο το pool, όχι από αυτό το panel.",
+            pool_dir_hbit_note: "Το pool που φτιάχνει και υποστηρίζει αυτό το πρόγραμμα. Δημοσιεύει τους όρους του και τα κέρδη κάθε miner, οπότε το panel διαβάζει ζωντανά από το pool τον πραγματικό τρόπο μοιρασιάς, την προμήθεια, τη μικρότερη πληρωμή και όσα σου έχουν πληρωθεί· για τα άλλα pools εδώ δεν μπορεί. Δεν έρχεται διεύθυνση μαζί με το panel και καμία δεν είναι επαληθευμένη: ζήτα το host:port από τον διαχειριστή ή τρέξε το pool μόνος σου.",
         },
         Lang::Tr => Strings {
             window_title: "HAC Miner Panel",
@@ -721,6 +730,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Ödemeler her",
             pool_terms_unavailable: "Bu havuz koşullarını yayınlamıyor. İşletmeciye ne ödediğini ve ne kestiğini sor.",
             pool_terms_source: "Bu panelden değil, havuzun kendisinden okundu.",
+            pool_dir_hbit_note: "Bu projenin geliştirdiği ve desteklediği havuz. Koşullarını ve her madencinin kazancını yayınlar, bu yüzden panel gerçek dağıtım yöntemini, komisyonu, en küçük ödemeyi ve sana ödenen toplamı doğrudan havuzdan okur; buradaki diğer havuzlar için bunu yapamaz. Panelle birlikte bir adres gelmez ve hiçbiri doğrulanmış değildir: host:port bilgisini işletmeciden iste ya da havuzu kendin çalıştır.",
         },
         Lang::Zh => Strings {
             window_title: "HAC 挖矿面板",
@@ -869,6 +879,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "支付运行间隔",
             pool_terms_unavailable: "这个矿池不公布条款。请询问运营者它支付什么、留下什么。",
             pool_terms_source: "读取自矿池本身，而不是本面板。",
+            pool_dir_hbit_note: "本项目自己开发并维护的矿池。它公开自己的条件和每位矿工的收益，因此面板可以直接从矿池实时读取真实的分配方式、手续费、最小支付额以及已付给你的总额；对这里的其他矿池则做不到。面板不附带任何地址，也没有任何地址经过验证: 请向运营者索取 host:port，或者自己运行这个矿池。",
         },
         Lang::Ja => Strings {
             window_title: "HAC マイナーパネル",
@@ -1017,6 +1028,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "支払いの実行間隔",
             pool_terms_unavailable: "このプールは条件を公開していません。何を支払い何を差し引くのか運営者に確認してください。",
             pool_terms_source: "このパネルではなく、プール自身から読み取っています。",
+            pool_dir_hbit_note: "このプロジェクトが開発し、運用を支えているプールです。条件とマイナーごとの収益を公開しているため、パネルは実際の分配方式、手数料、最小支払い額、そしてあなたへの支払い合計をプールから直接読み取れます。ここにある他のプールではそれができません。アドレスはパネルに同梱されておらず、検証済みのものもありません。運営者に host:port を聞くか、自分でプールを動かしてください。",
         },
         Lang::Es => Strings {
             window_title: "Panel HAC Miner",
@@ -1165,6 +1177,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Los pagos se ejecutan cada",
             pool_terms_unavailable: "Este pool no publica sus condiciones. Pregunta al operador qué paga y qué se queda.",
             pool_terms_source: "Leído del propio pool, no de este panel.",
+            pool_dir_hbit_note: "El pool que este proyecto construye y mantiene. Publica sus condiciones y las ganancias de cada minero, así que el panel lee en directo del pool el reparto real, la comisión, el pago más pequeño y el total que se te ha pagado; con los demás pools de esta lista no puede. El panel no trae ninguna dirección y ninguna está verificada: pide el host:port al operador o levanta tú el pool.",
         },
         Lang::Fr => Strings {
             window_title: "Panneau HAC Miner",
@@ -1313,6 +1326,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Les paiements se lancent toutes les",
             pool_terms_unavailable: "Ce pool ne publie pas ses conditions. Demandez à l'opérateur ce qu'il paie et ce qu'il garde.",
             pool_terms_source: "Lu directement depuis le pool, pas depuis ce panneau.",
+            pool_dir_hbit_note: "Le pool que ce projet développe et maintient. Il publie ses conditions et les gains de chaque mineur, donc le panneau lit en direct depuis le pool le partage réel, la commission, le plus petit paiement et le total qui vous a été payé ; pour les autres pools de cette liste, il ne le peut pas. Aucune adresse n'est fournie avec le panneau et aucune n'est vérifiée : demandez le host:port à l'opérateur, ou faites tourner le pool vous-même.",
         },
         Lang::Th => Strings {
             window_title: "HAC Miner Panel",
@@ -1461,6 +1475,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "รอบการจ่ายทุก",
             pool_terms_unavailable: "พูลนี้ไม่เปิดเผยเงื่อนไข ควรถามผู้ดูแลว่าจ่ายอะไรและหักอะไร",
             pool_terms_source: "อ่านจากพูลโดยตรง ไม่ใช่จากแผงควบคุมนี้",
+            pool_dir_hbit_note: "พูลที่โครงการนี้พัฒนาและดูแลเอง มันเปิดเผยเงื่อนไขและรายได้ของนักขุดแต่ละคน แผงควบคุมจึงอ่านวิธีแบ่งรางวัลจริง ค่าธรรมเนียม ยอดจ่ายขั้นต่ำ และยอดที่จ่ายให้คุณแล้ว จากพูลโดยตรง ส่วนพูลอื่นในรายการนี้ทำแบบนั้นไม่ได้ แผงควบคุมไม่ได้แถมที่อยู่มาให้ และยังไม่มีที่อยู่ใดผ่านการตรวจสอบ ขอ host:port จากผู้ดูแล หรือรันพูลนี้ด้วยตัวคุณเอง",
         },
         Lang::Ru => Strings {
             window_title: "Панель HAC Miner",
@@ -1609,6 +1624,7 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_interval: "Выплаты запускаются каждые",
             pool_terms_unavailable: "Этот пул не публикует свои условия. Спросите оператора, что он платит и что удерживает.",
             pool_terms_source: "Прочитано из самого пула, а не из этой панели.",
+            pool_dir_hbit_note: "Пул, который создаёт и поддерживает этот проект. Он публикует свои условия и заработок каждого майнера, поэтому панель читает прямо из пула реальную схему раздела, комиссию, минимальную выплату и выплаченную вам сумму; для остальных пулов в этом списке она так не может. Адрес с панелью не поставляется, и ни один адрес не проверен: спросите host:port у оператора или запустите пул сами.",
         },
     }
 }

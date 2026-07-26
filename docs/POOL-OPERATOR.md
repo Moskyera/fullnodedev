@@ -1,23 +1,26 @@
-# Running the pool (`pool-server` + `pool-payout`)
+# Running HBIT (`hbit-pool-server` + `hbit-pool-payout`)
 
-This is the operator runbook for the payout pool: the program that serves work to
-other people's miners, keeps PPLNS share accounting, submits found blocks and
-pays everybody out. It handles **real money that is not yours**, so read the four
-warnings below before you start it. Each one changes something an operator can
-see, and not knowing about it is how people lose coins or think the pool is
-broken.
+HBIT is the mining pool this project builds, and this is the operator runbook
+for it: the program that serves work to other people's miners, keeps PPLNS share
+accounting, submits found blocks and pays everybody out. It handles **real money
+that is not yours**, so read the four warnings below before you start it. Each
+one changes something an operator can see, and not knowing about it is how
+people lose coins or think the pool is broken.
+
+Both programs live in the `hbit-pool` crate and are built with
+`cargo build --release -p hbit-pool`.
 
 Design background: **[COMMUNITY-POOL-DESIGN.md](COMMUNITY-POOL-DESIGN.md)**.
 The separate free-IP work relay (`hac-pool`) is **[PUBLIC-POOL.md](PUBLIC-POOL.md)**.
 
 | Program | What it does |
 |---------|--------------|
-| `pool-server` | Serves work, validates shares, submits blocks, settles on a timer |
-| `pool-payout` | Manual settlement, run by hand when the server is stopped |
+| `hbit-pool-server` | Serves work, validates shares, submits blocks, settles on a timer |
+| `hbit-pool-payout` | Manual settlement, run by hand when the server is stopped |
 
 ```
-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
-pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
+hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
+hbit-pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
 ```
 
 ---
@@ -29,7 +32,7 @@ controls **every coin the pool has taken in but not yet paid out**. It can now b
 stored encrypted with Argon2id + AES-256-GCM.
 
 Set a passphrase in one of these two environment variables before starting
-`pool-server` or `pool-payout`:
+`hbit-pool-server` or `hbit-pool-payout`:
 
 | Variable | Meaning |
 |----------|---------|
@@ -43,14 +46,14 @@ Windows PowerShell:
 
 ```powershell
 $env:HBIT_WALLET_PASSWORD = "a long passphrase you have written down"
-.\pool-server.exe http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
+.\hbit-pool-server.exe http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
 ```
 
 Linux:
 
 ```bash
 export HBIT_WALLET_PASSWORD='a long passphrase you have written down'
-./pool-server http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
+./hbit-pool-server http://127.0.0.1:8088 pool-wallet.key 0.0.0.0:9777 24 mainnet
 ```
 
 What happens next:
@@ -75,9 +78,9 @@ This is the part that loses money if you skip it.
   or keep both in two separate safe places. Do not put one on the mining rig and
   the other nowhere.
 - Test the pair before you trust it: with the pool stopped, restore the backed-up
-  file to a scratch directory, set the passphrase and start `pool-payout` in its
-  default dry-run mode. It prints the wallet address. If that address matches your
-  live pool address, the backup works.
+  file to a scratch directory, set the passphrase and start `hbit-pool-payout` in
+  its default dry-run mode. It prints the wallet address. If that address matches
+  your live pool address, the backup works.
 
 ### Your OLD plaintext copies are still out there
 
@@ -95,22 +98,22 @@ ones you do not need, and keep the ones you do need under the same protection yo
 would give cash.
 
 If you believe a plaintext copy leaked, the only real fix is a new wallet: stop
-the pool, run `pool-payout --commit` to pay everyone out of the old wallet, move
-the remainder to your own address, then start the pool with a fresh wallet file
-and a fresh passphrase.
+the pool, run `hbit-pool-payout --commit` to pay everyone out of the old wallet,
+move the remainder to your own address, then start the pool with a fresh wallet
+file and a fresh passphrase.
 
 ---
 
-## 2. `pool-payout` will not run while `pool-server` is running
+## 2. `hbit-pool-payout` will not run while `hbit-pool-server` is running
 
-`pool-server` now takes an **exclusive OS lock on the wallet** for its whole run,
-and `pool-payout` takes the same lock. So:
+`hbit-pool-server` now takes an **exclusive OS lock on the wallet** for its whole
+run, and `hbit-pool-payout` takes the same lock. So:
 
-- `pool-payout` started while the server is up **refuses to run and exits
-  non-zero**, printing `REFUSING to run: another pool-server or pool-payout
-  already holds <wallet file>`.
-- `pool-server` started while `pool-payout` is mid-run refuses to start the same
-  way.
+- `hbit-pool-payout` started while the server is up **refuses to run and exits
+  non-zero**, printing `REFUSING to run: another hbit-pool-server or
+  hbit-pool-payout already holds <wallet file>`.
+- `hbit-pool-server` started while `hbit-pool-payout` is mid-run refuses to start
+  the same way.
 
 **This is deliberate and it is protecting your money.** Both programs decide what
 to pay from the wallet's *confirmed* balance, and a payout sitting in the mempool
@@ -123,20 +126,20 @@ immediately. There is no stale lock file to clean up by hand.
 
 ### Correct procedure for a manual payout
 
-1. **Stop `pool-server`** and wait for the process to actually exit.
+1. **Stop `hbit-pool-server`** and wait for the process to actually exit.
 2. Run the tool in its **dry-run** default first and read the planned split:
    ```bash
-   ./pool-payout http://127.0.0.1:9777 http://127.0.0.1:8088 mainnet pool-wallet.key
+   ./hbit-pool-payout http://127.0.0.1:9777 http://127.0.0.1:8088 mainnet pool-wallet.key
    ```
    It pays nothing without `--commit`.
 3. If the split looks right, run it again with `--commit`.
-4. **Restart `pool-server`.**
+4. **Restart `hbit-pool-server`.**
 
-While the server is stopped its `/stats` endpoint cannot answer, so `pool-payout`
-reads the share window out of the accounting file the server left next to the
-wallet (`<wallet_file>.state.json`). Keep that file with the wallet file; it also
-carries the shared pending-payout ledger that stops a re-run, a crash or an
-overlapping cron job paying the same window twice.
+While the server is stopped its `/stats` endpoint cannot answer, so
+`hbit-pool-payout` reads the share window out of the accounting file the server
+left next to the wallet (`<wallet_file>.state.json`). Keep that file with the
+wallet file; it also carries the shared pending-payout ledger that stops a
+re-run, a crash or an overlapping cron job paying the same window twice.
 
 ---
 
@@ -181,7 +184,7 @@ Practical consequences to tell your miners about:
 
 ---
 
-## 4. `pool-server` now refuses to start on a bad configuration
+## 4. `hbit-pool-server` now refuses to start on a bad configuration
 
 The server checks its own configuration before it serves a single piece of work.
 Each check below exits with status 2 and an explanation instead of running in a
@@ -245,7 +248,43 @@ An exact match is the only proof that the rule in force here is the one the node
 validates with. If you see this error, fix the chain argument; do not work around
 it, because every block the pool finds would otherwise be thrown away.
 
-`pool-payout` takes the same required `chain` argument in the same three forms.
+`hbit-pool-payout` takes the same required `chain` argument in the same three
+forms.
+
+---
+
+## 5. Telling miners how to reach your pool
+
+The miner panel lists **HBIT pool** first in its pool picker, and it ships that
+entry with **no address**, because no HBIT address is published in this
+repository and an invented one is an address somebody would paste in and point
+real hashrate at. You publish yours.
+
+Drop a `pools.json` next to `miner-panel.exe` on the miner's PC:
+
+```json
+[
+  {"name": "HBIT pool", "connect": "pool.example:9777"}
+]
+```
+
+The name is matched case insensitively against the built-in entry, so this
+replaces the HBIT entry in place rather than adding a second one; it keeps its
+first position, and the panel reads the file when the miner presses Refresh next
+to the picker, with no rebuild. Two things to know:
+
+- Overriding an entry replaces the whole entry, so the built-in note disappears
+  and the panel falls back to its generic pool hint. Set `"note"` yourself if
+  you want one. A note that promises a payout scheme, a fee level or a minimum
+  is refused and replaced by the panel: those are claims it cannot check.
+- `"verified": true` is the panel's own statement that it reached the endpoint.
+  Leave it out.
+
+What the panel shows about your terms does not come from that file. It comes
+from your running pool: the dashboard reads `/terms` and `/earnings` from
+`hbit-pool-server` and shows the miner your real scheme, fee and minimum payout,
+and what you have already paid that miner. That is the whole reason HBIT can be
+listed honestly next to pools the panel has never spoken to.
 
 ---
 
@@ -253,7 +292,7 @@ it, because every block the pool finds would otherwise be thrown away.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `REFUSING to run: another pool-server or pool-payout already holds ...` | Both settlers running at once | Stop `pool-server`, run the tool, restart the server |
+| `REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds ...` | Both settlers running at once | Stop `hbit-pool-server`, run the tool, restart the server |
 | `wallet file ... is encrypted but no passphrase is configured` | Passphrase missing from the environment | Set `HBIT_WALLET_PASSWORD` or `HBIT_WALLET_PASSWORD_FILE` |
 | `cannot decrypt wallet file ...` | Wrong passphrase, or a corrupted file | Use the backed-up passphrase; restore the file from backup |
 | `share_bits must be between 18 and 40` | Out-of-range argument 4 | Use 24 |

@@ -4,7 +4,7 @@
 //! the on-chain "payout" half of the pool. Sender + recipients are deterministic
 //! accounts we control, so balances are verifiable.
 //!
-//! Usage:  settle-spike [node_base_url]
+//! Usage:  hbit-settle-spike [node_base_url]
 
 use std::env;
 
@@ -14,7 +14,7 @@ use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType2;
 use sys::*;
 
-use pool_spike::{balance, http_client, mine_and_submit_block, post_hex};
+use hbit_pool::{balance, http_client, mine_and_submit_block, post_hex};
 
 fn main() {
     let base = env::args()
@@ -29,8 +29,8 @@ fn main() {
     // accident.
     if env::args().nth(2).as_deref() != Some("testnet") {
         eprintln!(
-            "settle-spike is a TESTNET-ONLY demo that uses well-known public keys ([1..4;32]).\n\
-             It must never touch mainnet. Re-run as:  settle-spike <node_base_url> testnet"
+            "hbit-settle-spike is a TESTNET-ONLY demo that uses well-known public keys ([1..4;32]).\n\
+             It must never touch mainnet. Re-run as:  hbit-settle-spike <node_base_url> testnet"
         );
         std::process::exit(2);
     }
@@ -45,7 +45,7 @@ fn main() {
         (Account::create_by_secret_key_value([4u8; 32]).unwrap(), "1:247"), // 0.1 HAC
     ];
 
-    println!("== settle-spike ==");
+    println!("== HBIT settlement spike ==");
     println!("node   = {base}");
     println!("sender = {}", sender.readable());
     let sender_bal = balance(&client, &base, sender.readable());
@@ -54,7 +54,7 @@ fn main() {
     if sender_bal.is_empty() || sender_bal.starts_with("0:") {
         println!(
             "\nSender is unfunded. Fund it by mining one block to it, then re-run:\n  \
-             pool-spike {base} {}\n",
+             hbit-pool-spike {base} {}\n",
             sender.readable()
         );
         return;
@@ -98,7 +98,7 @@ fn main() {
         &base,
         sender.readable(),
         vec![Box::new(tx) as Box<dyn Transaction>],
-        &pool_spike::difficulty::ChainParams::from_name("testnet"),
+        &hbit_pool::difficulty::ChainParams::from_name("testnet"),
     );
     println!("mined confirming block {h} (coinbase+transfer) -> {blkresp}");
 

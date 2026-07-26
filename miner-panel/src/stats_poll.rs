@@ -262,7 +262,7 @@ impl MinerApp {
 // ---------------------------------------------------------------------------
 
 /// The unit the pool ledger counts in: 0.1 HAC, the Hacash amount `1:247`.
-/// `pool-spike` documents and uses exactly this ("units of 0.1 HAC" in
+/// The HBIT pool documents and uses exactly this ("units of 0.1 HAC" in
 /// `balance_units` / `block_reward_units`), so a `*_units` field coming back
 /// from `/earnings` is converted with this unit and nothing else.
 const POOL_LEDGER_UNIT: u8 = 247;
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn pool_units_are_tenths_of_a_hac_in_the_chains_own_amount() {
-        // pool-spike counts in units of 0.1 HAC: "1:247" is one unit and
+        // the HBIT pool counts in units of 0.1 HAC: "1:247" is one unit and
         // "1:248" is 1 HAC. Getting this wrong is a factor of ten on real money.
         assert_eq!(units_to_amount(1).to_fin_string(), "1:247");
         assert_eq!(units_to_amount(12).to_fin_string(), "12:247");

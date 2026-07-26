@@ -20,7 +20,7 @@ on NVIDIA exactly as it does on AMD.
 !test -f "$HOME/.cargo/env" || (curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal)
 !cd /content/fullnodedev && . "$HOME/.cargo/env" && export CUDA_PATH=/usr/local/cuda && export PATH=$PATH:/usr/local/cuda/bin && \
   cargo build --release --features cuda --bin fullnode --bin poworker 2>&1 | tail -5 && \
-  cargo build --release -p pool-spike --bin pool-server 2>&1 | tail -3
+  cargo build --release -p hbit-pool --bin hbit-pool-server 2>&1 | tail -3
 ```
 
 Expect `Finished release profile`. The first build takes roughly 7 to 8 minutes.
@@ -116,7 +116,7 @@ attempt failed because the node had already exited before the miner started.
 import subprocess, os, time, json, urllib.request
 D = "/content/fullnodedev/target/release"
 env = dict(os.environ, LD_LIBRARY_PATH="/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH",""))
-subprocess.run("pkill -9 fullnode; pkill -9 poworker; pkill -9 pool-server; sleep 3; rm -rf %s/hacash_*_data %s/pool-wallet.key*" % (D,D), shell=True)
+subprocess.run("pkill -9 fullnode; pkill -9 poworker; pkill -9 hbit-pool-server; sleep 3; rm -rf %s/hacash_*_data %s/pool-wallet.key*" % (D,D), shell=True)
 
 def get(url, t=3):
     return json.loads(urllib.request.urlopen(url, timeout=t).read().decode())
@@ -128,7 +128,7 @@ for _ in range(60):
         print("NODE UP height =", get("http://127.0.0.1:18080/query/latest")["height"]); break
     except Exception: time.sleep(1)
 
-pool = subprocess.Popen(["./pool-server","http://127.0.0.1:18080","pool-wallet.key",
+pool = subprocess.Popen(["./hbit-pool-server","http://127.0.0.1:18080","pool-wallet.key",
                          "127.0.0.1:18082","24","testnet:8:10","120"], cwd=D,
                         stdout=open("/content/pool.log","w"), stderr=subprocess.STDOUT,
                         env=env, start_new_session=True)

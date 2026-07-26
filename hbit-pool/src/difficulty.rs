@@ -66,7 +66,7 @@ impl ChainParams {
     /// `testnet` keeps the documented 288/10 pair; spell the real pair out as
     /// `testnet:<adjust_blocks>:<target_time>` for any node configured
     /// otherwise. Either way the caller must PROVE the choice against the node
-    /// (`pool_spike::verify_chain_params`) instead of trusting the label.
+    /// (`hbit_pool::verify_chain_params`) instead of trusting the label.
     pub fn parse(name: &str) -> Option<Self> {
         if name == "mainnet" {
             return Some(Self::mainnet());

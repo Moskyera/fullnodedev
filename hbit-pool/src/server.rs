@@ -15,7 +15,7 @@
 //!   * a found block's coinbase is held back from settlement until the chain has
 //!     buried it, so a reorg can never revoke income that was already paid out
 //!   * only one process may settle a wallet (OS lock), and it shares ONE pending
-//!     payout ledger with the manual pool-payout tool
+//!     payout ledger with the manual hbit-pool-payout tool
 //!   * settlement runs automatically on a timer, is idempotent across restarts,
 //!     and chunks into <=200-action transactions the node will accept
 //!   * one panicking request or poisoned lock cannot freeze or crash the pool
@@ -35,7 +35,7 @@
 //!     explicitly-labelled PENDING estimate. The three are disjoint, and any of
 //!     them the pool cannot stand behind is reported as unknown, never as zero.
 //!
-//! Usage: pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
+//! Usage: hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
 //!   `chain` is REQUIRED: a wrong difficulty rule makes every share/block the
 //!   node rejects, so there is no silent default. It is `mainnet`, `testnet`, or
 //!   `testnet:<difficulty_adjust_blocks>:<each_block_target_time>` for a testnet
@@ -55,9 +55,9 @@ use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType2;
 use sys::curtimes;
 
-use pool_spike::difficulty::ChainParams;
-use pool_spike::pool_core::{self, Pplns, split_payout};
-use pool_spike::{
+use hbit_pool::difficulty::ChainParams;
+use hbit_pool::pool_core::{self, Pplns, split_payout};
+use hbit_pool::{
     Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PAYOUT_MATURITY_DEPTH, PAYOUT_UNIT, POOL_FEE_UNITS,
     PPLNS_WINDOW, PaidLedger, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS, Template,
     acquire_settle_lock, assemble_block, atomic_write, balance, balance_units, block_reward_units,
@@ -201,7 +201,7 @@ struct StateShot {
 static PERSIST: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
 
 /// Write a snapshot to disk, OFF the pool lock. The file is written atomically
-/// (temp + optional fsync + rename) by `pool_spike::atomic_write`, so a crash or
+/// (temp + optional fsync + rename) by `hbit_pool::atomic_write`, so a crash or
 /// a full disk mid-write can never leave a truncated or corrupt file.
 ///
 /// Returns false only if this snapshot (or a newer one) did NOT reach disk, so a
@@ -772,7 +772,7 @@ struct Earnings {
     shares: u64,
     window_shares: u64,
     window_size: u64,
-    paid: pool_spike::PaidRow,
+    paid: hbit_pool::PaidRow,
     paid_since: u64,
     inflight_units: u64,
     inflight: Vec<InflightRow>,
@@ -1000,7 +1000,7 @@ fn main() {
     // to guess.
     let Some(chain) = a.get(5).cloned() else {
         eprintln!(
-            "usage: pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]\n\
+            "usage: hbit-pool-server <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]\n\
              `chain` is required: `mainnet`, `testnet`, or \
              `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`."
         );
@@ -1018,18 +1018,21 @@ fn main() {
     };
     let settle_secs: u64 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(300);
 
-    println!("== pool-server ==");
+    // Name the PRODUCT, not the executable. An operator reading a terminal or
+    // pasting a log into a support thread has to be able to say what is running,
+    // and a file name does not tell them: this is the HBIT pool.
+    println!("== HBIT pool server v{} ==", env!("CARGO_PKG_VERSION"));
     println!("node    = {node}");
     // Exactly one process may settle a wallet, enforced by the OS for as long as
-    // this one lives. `pool-payout` takes the SAME lock, so it can never pay out
-    // of a wallet this server is already settling: both read the CONFIRMED
+    // this one lives. `hbit-pool-payout` takes the SAME lock, so it can never
+    // pay out of a wallet this server is already settling: both read the CONFIRMED
     // balance (a payout waiting in the mempool does not reduce it), so each would
     // see the full balance and pay the same PPLNS window a second time.
     let _settle_lock = match acquire_settle_lock(&wallet_file) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "another pool-server or pool-payout already holds {wallet_file} ({e}).\n\
+                "another hbit-pool-server or hbit-pool-payout already holds {wallet_file} ({e}).\n\
                  Only one process may settle a wallet - stop the other one first."
             );
             std::process::exit(2);
@@ -2323,7 +2326,7 @@ fn route(
             }
         }
 
-        // ---- our own simple protocol (test-miner) ----
+        // ---- our own simple protocol (hbit-test-miner) ----
         // Both routes demand a payable worker exactly like the paid path: a share
         // credited to a key the pool cannot pay is work done for nothing that
         // also evicts a payable miner's share from the shared 4096-share window.
@@ -2473,7 +2476,7 @@ fn route(
 mod tests {
     use super::*;
     use basis::difficulty::LOWEST_DIFFICULTY;
-    use pool_spike::{PackedTxs, PaidRow, admission_of};
+    use hbit_pool::{PackedTxs, PaidRow, admission_of};
     use std::sync::Arc;
 
     /* ---- the money a miner is shown: paid, in flight, pending ---- */

@@ -83,11 +83,12 @@ jobs:
       - name: Build public free-IP pool (hac-pool)
         run: cargo build --locked --release -p miner-pool
 
-      # Payout pool: pool-server, settle-spike and pool-payout hold the pool
-      # wallet and compute real payouts, so they must compile in the release
-      # pipeline even though they are not packaged (operators self-build).
-      - name: Build payout pool server (pool-spike)
-        run: cargo build --locked --release -p pool-spike
+      # HBIT payout pool: hbit-pool-server, hbit-settle-spike and
+      # hbit-pool-payout hold the pool wallet and compute real payouts, so they
+      # must compile in the release pipeline even though they are not packaged
+      # (operators self-build).
+      - name: Build HBIT payout pool server (hbit-pool)
+        run: cargo build --locked --release -p hbit-pool
 
       - name: Run Windows release tests
         run: |
@@ -97,7 +98,7 @@ jobs:
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
-          cargo test --locked -p pool-spike
+          cargo test --locked -p hbit-pool
 
       - name: Package release ZIPs
         shell: pwsh
@@ -206,9 +207,9 @@ jobs:
         run: |
           cargo build --locked --release -p miner-panel
           cargo build --locked --release -p miner-pool
-          # pool-spike holds the payout pool wallet and the money math
+          # hbit-pool holds the payout pool wallet and the money math
           # (split_payout, balance_units, off-node ASERT difficulty).
-          cargo build --locked --release -p pool-spike
+          cargo build --locked --release -p hbit-pool
           cargo test --locked -p miner-pool
           cargo test --locked -p x16rs
           cargo test --locked --release -p x16rs
@@ -216,7 +217,7 @@ jobs:
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
-          cargo test --locked -p pool-spike
+          cargo test --locked -p hbit-pool
 
       - name: Verify HACD CPU-only and release preset completeness
         run: bash scripts/verify-mining-presets.sh
