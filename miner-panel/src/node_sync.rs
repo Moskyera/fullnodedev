@@ -69,6 +69,33 @@ pub fn status_from(height: u64, tip_unix: i64, genesis_unix: i64, now_unix: i64)
     }
 }
 
+/// Ask the node where it is. Blocking; call it from the poller thread.
+///
+/// Two requests because no single endpoint answers the question: `/query/latest`
+/// gives the height it has reached, and `/query/block/intro` gives that block's
+/// timestamp, which is the part that says whether the height means anything.
+///
+/// `None` means "could not tell", never "at genesis". Every caller treats it as
+/// keep waiting, because a node that is mid-batch and briefly unresponsive must
+/// not be mistaken for one that has finished.
+pub fn probe(connect: &str) -> Option<SyncStatus> {
+    let (_, latest) = crate::stats_poll::http_get(connect, "/query/latest").ok()?;
+    let height = parse_height(&latest)?;
+    let (_, intro) =
+        crate::stats_poll::http_get(connect, &format!("/query/block/intro?height={height}")).ok()?;
+    let tip_unix = parse_timestamp(&intro)?;
+    // Genesis is fetched once per probe rather than cached: it is one small
+    // request against a local node, and caching it would mean carrying state
+    // that goes stale if the operator points the panel at a different chain.
+    let (_, genesis) = crate::stats_poll::http_get(connect, "/query/block/intro?height=1").ok()?;
+    let genesis_unix = parse_timestamp(&genesis)?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(status_from(height, tip_unix, genesis_unix, now_unix))
+}
+
 /// Pull `"height"` out of a `/query/latest` body.
 pub fn parse_height(body: &str) -> Option<u64> {
     json_number(body, "height").map(|v| v as u64)

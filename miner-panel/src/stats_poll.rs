@@ -758,7 +758,7 @@ fn payout_address(raw: &str) -> Option<String> {
 
 /// One small blocking HTTP GET with an absolute deadline and a bounded answer.
 /// Runs on the poller thread only.
-fn http_get(connect: &str, path: &str) -> Result<(u16, String), String> {
+pub(crate) fn http_get(connect: &str, path: &str) -> Result<(u16, String), String> {
     let address = normalize_connect(connect)?;
     let deadline = Instant::now() + HTTP_WALL_TIMEOUT;
     let resolved = address

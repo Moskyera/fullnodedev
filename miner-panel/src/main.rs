@@ -154,6 +154,9 @@ struct MinerApp {
     benchmark_last_log: String,
     stats_next_read: Instant,
     pending_start: Option<mining_control::PendingStart>,
+    /// Set only while a solo start is waiting for the node to catch up.
+    /// Drives the progress bar; None means nothing is syncing.
+    sync_status: Option<node_sync::SyncStatus>,
     mining: bool,
     child: Option<Child>,
     worker_stop_rx: Option<Receiver<Result<(), String>>>,
@@ -368,6 +371,7 @@ impl MinerApp {
             benchmark_last_log: String::new(),
             stats_next_read: Instant::now(),
             pending_start: None,
+            sync_status: None,
             mining: false,
             child: None,
             worker_stop_rx: None,
@@ -1279,6 +1283,37 @@ impl eframe::App for MinerApp {
                             .color(theme::colors::TEXT_MUTED)
                             .size(13.0),
                     );
+                    // In the footer on purpose: it is visible from every tab, so
+                    // a user who wandered off to Settings still sees that the
+                    // node is working rather than concluding it is broken. That
+                    // is the whole failure this replaces, a stalled sync and a
+                    // ready-looking panel being indistinguishable.
+                    if let Some(sync) = self.sync_status.clone() {
+                        let t = self.t();
+                        ui.add_space(12.0);
+                        ui.add(
+                            egui::ProgressBar::new(sync.progress)
+                                .desired_width(170.0)
+                                .text(format!("{:.1}%", sync.progress * 100.0)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}: {} ({} {})",
+                                t.sync_title,
+                                sync.height,
+                                sync.blocks_behind(),
+                                t.sync_behind
+                            ))
+                            .color(theme::colors::TEXT_MUTED)
+                            .size(13.0),
+                        )
+                        .on_hover_text(t.sync_note);
+                        // egui redraws on input; without this the bar would sit
+                        // frozen while the node works, which looks like the very
+                        // hang this is meant to disprove.
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
                 });
             });
 

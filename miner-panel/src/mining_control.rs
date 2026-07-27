@@ -48,7 +48,22 @@ pub(super) struct PendingStart {
     next_probe: Instant,
     probe_delay: Duration,
     cancel_flag: Arc<AtomicBool>,
+    /// Set once the RPC answers. From then on this is no longer a start that can
+    /// time out: the node is up and downloading the chain, which legitimately
+    /// takes an hour or more, so the 45 second deadline must stop applying or it
+    /// would abandon a node that is working perfectly well.
+    syncing: bool,
+    /// In flight sync probe. One at a time: `probe` does three blocking HTTP
+    /// requests and the UI thread must never wait on them.
+    sync_rx: Option<Receiver<Option<crate::node_sync::SyncStatus>>>,
+    next_sync_probe: Instant,
 }
+
+/// How often to ask the node how far it has got. The node syncs in batches of
+/// 10,000 blocks, so a faster poll only produces a bar that sits still between
+/// jumps; this is often enough to feel live and rare enough to stay out of the
+/// way of the node's own work.
+const SYNC_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 impl MinerApp {
     pub(super) fn start_mining(&mut self) {
@@ -188,6 +203,9 @@ impl MinerApp {
                     next_probe: Instant::now(),
                     probe_delay: RPC_PROBE_INITIAL_DELAY,
                     cancel_flag,
+                    syncing: false,
+                    sync_rx: None,
+                    next_sync_probe: Instant::now(),
                 });
             }
             Err(error) => {
@@ -222,17 +240,32 @@ impl MinerApp {
         };
         let t = self.t();
         let now = Instant::now();
-        if now >= pending.deadline {
+        // The deadline governs GETTING the node up, not getting it caught up.
+        // Once it answers, waiting is the correct behaviour and may last hours.
+        if !pending.syncing && now >= pending.deadline {
             pending.cancel_flag.store(true, Ordering::Release);
             self.fullnode_log_rx = None;
             self.status_msg = format!("{} {}", t.fullnode_not_ready, self.connect);
             return;
         }
 
+        if pending.syncing {
+            self.poll_node_sync(pending);
+            return;
+        }
+
         if let Some(setup_rx) = pending.setup_rx.take() {
             match setup_rx.try_recv() {
                 Ok(FullnodeSetupResult::Ready) => {
-                    self.launch_worker(pending.worker_path);
+                    // NOT ready to mine, only ready to talk. Mining on a node
+                    // part way through the chain hashes against blocks the
+                    // network settled long ago: every solution is rejected, and
+                    // because block_hash_repeat is smaller down there the
+                    // reported hashrate is HIGHER than normal, so it reads as
+                    // success. Wait for the chain before starting the worker.
+                    pending.syncing = true;
+                    pending.next_sync_probe = Instant::now();
+                    self.pending_start = Some(pending);
                     return;
                 }
                 Ok(FullnodeSetupResult::Waiting {
@@ -457,6 +490,58 @@ fn spawn_log_drainer<R: Read + Send + 'static>(stream: R, tx: Sender<String>) {
             }
         }
     });
+}
+
+impl MinerApp {
+    /// Wait for the node to catch up, showing how far it has got, and start the
+    /// worker only when it has.
+    ///
+    /// Never blocks the UI: the probe does three HTTP requests, so it runs on its
+    /// own thread and this reads the answer when it arrives.
+    pub(super) fn poll_node_sync(&mut self, mut pending: PendingStart) {
+        let now = Instant::now();
+
+        if let Some(rx) = pending.sync_rx.take() {
+            match rx.try_recv() {
+                Ok(Some(status)) => {
+                    let synced = status.is_synced();
+                    self.sync_status = Some(status);
+                    pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
+                    if synced {
+                        self.sync_status = None;
+                        self.launch_worker(pending.worker_path);
+                        return;
+                    }
+                }
+                // Could not tell. Not an error and not a reason to start mining:
+                // a node mid-batch can be briefly unresponsive, and treating
+                // silence as "caught up" is the whole bug being fixed here.
+                Ok(None) => pending.next_sync_probe = now + SYNC_PROBE_INTERVAL,
+                Err(std::sync::mpsc::TryRecvError::Empty) => pending.sync_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending.next_sync_probe = now + SYNC_PROBE_INTERVAL
+                }
+            }
+        }
+
+        if pending.sync_rx.is_none() && now >= pending.next_sync_probe {
+            let connect = self.connect.clone();
+            let (tx, rx) = mpsc::channel();
+            if std::thread::Builder::new()
+                .name("hacash-sync-probe".to_string())
+                .spawn(move || {
+                    let _ = tx.send(crate::node_sync::probe(&connect));
+                })
+                .is_ok()
+            {
+                pending.sync_rx = Some(rx);
+            } else {
+                pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
+            }
+        }
+
+        self.pending_start = Some(pending);
+    }
 }
 
 pub(super) fn rpc_reachable(connect: &str) -> bool {
