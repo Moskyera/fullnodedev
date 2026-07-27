@@ -142,7 +142,8 @@ reward = %s
 message = hbit-colab
 """ % GPU_WORKER)
 
-# connect is rewritten by Cell 5 once the pool's port is known; 18082 is it.
+# 18082 is the pool. Nothing rewrites this file later: there is no warm-up phase
+# to point it at the node, because the difficulty comes from the real chain.
 (D/"poworker.config.ini").write_text("""connect = 127.0.0.1:18082
 pool_worker = %s
 supervene = 0
