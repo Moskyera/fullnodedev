@@ -60,9 +60,9 @@ pub struct BatchCtx {
     ///
     /// A pool serves its SHARE target as the template `target_hash`, so this is
     /// that same value and there is no second threshold to carry. `None` is what
-    /// keeps solo mining byte identical: the OpenCL kernel is launched with
-    /// share_capacity=0, skips the appending block entirely, and the host neither
-    /// writes nor reads a share buffer.
+    /// keeps solo mining byte identical on BOTH GPU backends: the kernel is
+    /// launched with share_capacity=0, skips the appending block entirely, and the
+    /// host neither writes nor reads a share buffer.
     pub share_target: Option<[u8; 32]>,
 }
 
@@ -82,8 +82,8 @@ pub struct GpuBatchOutcome {
     /// read only this, and it is produced exactly as it always was.
     pub best: (u32, [u8; 32]),
     pub gpu_nonce_space: u32,
-    /// Verified extra shares. Always empty for solo mining, and for CUDA, which
-    /// still reports one result per batch.
+    /// Verified extra shares. Always empty for solo mining; both GPU backends
+    /// fill it when the miner is pooled.
     pub shares: Vec<MinedShare>,
     /// Hits the kernel counted but could not store. Non-zero means the fixed
     /// capacity was exceeded and the miner is being paid for less than it mined.
@@ -557,12 +557,13 @@ impl BlockMinerBackend for CudaBlockBackend {
             );
         };
 
-        match crate::poworker::do_group_block_mining_cuda(
+        match crate::poworker::do_group_block_mining_cuda_shares(
             &self.cuda,
             ctx.height,
             ctx.block_intro.clone(),
             ctx.nonce_start,
             plan.workgroups_eff,
+            ctx.share_target.as_ref(),
         ) {
             Err(e) => {
                 eprintln!("[CUDA] batch failed: {e}");
@@ -587,44 +588,74 @@ impl BlockMinerBackend for CudaBlockBackend {
                     cpu_mine,
                 )
             }
-            Ok(best) => {
+            Ok(output) => {
                 // Re-verify the GPU's best hash on the CPU, like OpenCL, so a
-                // faulty card cannot make us submit a wrong solution.
-                if let Err(message) = verify_gpu_nonce_result(
+                // faulty card cannot make us submit a wrong solution. Every entry
+                // of the share list goes through the SAME check (verify_gpu_shares
+                // calls verify_gpu_nonce_result per entry and additionally proves
+                // the hash really beats the target the kernel filtered on), so a
+                // card returning garbage is caught here and not forwarded to the
+                // pool as a hundred bad shares that get the miner throttled.
+                let verified = verify_gpu_nonce_result(
                     ctx.height,
                     &ctx.block_intro,
                     ctx.nonce_start,
                     plan.gpu_nonce_space,
-                    &best,
-                ) {
-                    eprintln!("[CUDA] GPU integrity error: {message}");
-                    self.runtime.record_gpu_error_event();
-                    // A card returning hashes the CPU cannot reproduce is as dead
-                    // as one that fails to launch, so it shares the same budget.
-                    let report = self.cuda.note_batch_failure();
-                    self.cuda.record_error();
-                    self.cuda.announce_quarantine(
-                        &report,
-                        "The card is returning hashes the CPU cannot reproduce; check for an overclock, bad memory or a failing driver.",
-                    );
-                    return cpu_gpu_error_recovery(
+                    &output.best,
+                )
+                .and_then(|()| match ctx.share_target.as_ref() {
+                    Some(target) => verify_gpu_shares(
                         ctx.height,
-                        ctx.block_intro.clone(),
+                        &ctx.block_intro,
                         ctx.nonce_start,
-                        ctx.nonce_space,
-                        cpu_mine,
-                    );
-                }
+                        plan.gpu_nonce_space,
+                        target,
+                        &output.shares,
+                    ),
+                    None => Ok(Vec::new()),
+                });
+                let shares = match verified {
+                    Ok(shares) => shares,
+                    Err(message) => {
+                        eprintln!("[CUDA] GPU integrity error: {message}");
+                        self.runtime.record_gpu_error_event();
+                        // A card returning hashes the CPU cannot reproduce is as
+                        // dead as one that fails to launch, so it shares the same
+                        // budget.
+                        let report = self.cuda.note_batch_failure();
+                        self.cuda.record_error();
+                        self.cuda.announce_quarantine(
+                            &report,
+                            "The card is returning hashes the CPU cannot reproduce; check for an overclock, bad memory or a failing driver.",
+                        );
+                        return cpu_gpu_error_recovery(
+                            ctx.height,
+                            ctx.block_intro.clone(),
+                            ctx.nonce_start,
+                            ctx.nonce_space,
+                            cpu_mine,
+                        );
+                    }
+                };
                 // Clean batch: ramp effective work-groups back toward the max.
                 self.cuda.record_success();
-                // Best only for now: the CUDA kernel has no share list yet, so
-                // this backend keeps exactly the behaviour it has today.
+                // The kernel's counter is the TOTAL number of hits, so anything it
+                // could not store is lost income and has to be reported, not
+                // silently truncated. Same split as the OpenCL arm, against the
+                // kernel's own capacity.
+                let (_, share_overflow) =
+                    split_share_readback(output.share_hits, x16rs_cuda::SHARE_LIST_CAPACITY);
                 finish_gpu_batch(
                     ctx.height,
                     ctx.block_intro.clone(),
                     ctx.nonce_start,
                     ctx.nonce_space,
-                    GpuBatchOutcome::best_only(best, plan.gpu_nonce_space),
+                    GpuBatchOutcome {
+                        best: output.best,
+                        gpu_nonce_space: plan.gpu_nonce_space,
+                        shares,
+                        share_overflow,
+                    },
                     cpu_mine,
                 )
             }
@@ -935,6 +966,62 @@ mod tests {
         assert_eq!(batch.submission_nonces(), vec![best.0]);
         assert_eq!(batch.gpu_nonce_space, 256);
         assert_eq!(batch.cpu_nonce_space, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn the_cuda_arm_splits_the_readback_against_the_cuda_kernels_own_capacity() {
+        // The CUDA arm must not carry the OpenCL capacity or a hardcoded one: the
+        // number that decides how much of the list is live is the one the CUDA
+        // kernel was launched with, and the rest is reported as lost income.
+        let cap = x16rs_cuda::SHARE_LIST_CAPACITY;
+        assert_eq!(split_share_readback(0, cap), (0, 0));
+        assert_eq!(split_share_readback(cap as u64, cap), (cap, 0));
+        assert_eq!(split_share_readback(cap as u64 + 5, cap), (cap, 5));
+        // And the kernel's own clamp agrees with the host's split, so the host can
+        // never ask for more entries than the device actually wrote.
+        assert_eq!(x16rs_cuda::stored_share_count(cap as u64 + 5), cap);
+        assert_eq!(
+            split_share_readback(cap as u64 + 5, cap).0,
+            x16rs_cuda::stored_share_count(cap as u64 + 5)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_solo_cuda_batch_asks_the_kernel_for_no_share_list_at_all() {
+        // (f) of the brief for the CUDA path: a solo template carries no share
+        // target, share_capacity_for turns that into 0, and 0 is what makes the
+        // kernel skip the appending block and the host skip the target upload, the
+        // counter clear and the readback.
+        let solo = BatchCtx {
+            height: 7,
+            block_intro: vec![0u8; BLOCK_INTRO_BYTES],
+            nonce_start: 0,
+            nonce_space: 256,
+            configured_wg: 1,
+            localsize: x16rs_cuda::DEFAULT_LOCAL_SIZE,
+            unitsize: 1,
+            thermal_wg_cap: None,
+            share_target: None,
+        };
+        assert_eq!(x16rs_cuda::share_capacity_for(solo.share_target.as_ref()), 0);
+
+        let pooled_target = [0x0fu8; 32];
+        assert_eq!(
+            x16rs_cuda::share_capacity_for(Some(&pooled_target)),
+            x16rs_cuda::SHARE_LIST_CAPACITY as u32
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn the_cuda_reduction_still_needs_its_full_256_thread_block() {
+        // The kernel's shared local_nonces[256] and its power-of-two tree reduction
+        // make this structural: a smaller block silently corrupts the reduction and
+        // reports a wrong best nonce. The share list is an output path beside that
+        // reduction and must never be a reason to launch a different block size.
+        assert_eq!(x16rs_cuda::DEFAULT_LOCAL_SIZE, 256);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use x16rs_cuda::{CudaMiner, CudaResult};
+use x16rs_cuda::{CudaBatchOutput, CudaMiner, CudaResult};
 
 pub struct CudaMiningResources {
     pub miner: CudaMiner,
@@ -173,6 +173,10 @@ pub fn initialize_cuda(
     }
 }
 
+/// One CUDA block batch, best result only.
+///
+/// Kept exactly as it was for the callers that want one hash per batch and nothing
+/// else. Pool mining goes through [`do_group_block_mining_cuda_shares`].
 pub fn do_group_block_mining_cuda(
     cuda: &CudaMiningResources,
     height: u64,
@@ -180,6 +184,29 @@ pub fn do_group_block_mining_cuda(
     nonce_start: u32,
     workgroups: u32,
 ) -> CudaResult<(u32, [u8; 32])> {
-    cuda.miner
-        .mine_block_batch(height, &block_intro, nonce_start, workgroups)
+    do_group_block_mining_cuda_shares(cuda, height, block_intro, nonce_start, workgroups, None)
+        .map(|out| out.best)
+}
+
+/// One CUDA block batch, plus every nonce that beat `share_target`.
+///
+/// `share_target` is `None` for solo mining, and that is the whole guarantee that
+/// solo behaviour is unchanged: the kernel is launched with share_capacity=0, skips
+/// the appending block, and the host neither uploads a target nor reads a share
+/// buffer back.
+pub fn do_group_block_mining_cuda_shares(
+    cuda: &CudaMiningResources,
+    height: u64,
+    block_intro: Vec<u8>,
+    nonce_start: u32,
+    workgroups: u32,
+    share_target: Option<&[u8; 32]>,
+) -> CudaResult<CudaBatchOutput> {
+    cuda.miner.mine_block_batch_shares(
+        height,
+        &block_intro,
+        nonce_start,
+        workgroups,
+        share_target,
+    )
 }

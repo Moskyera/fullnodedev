@@ -32,7 +32,21 @@ extern "C" __global__ void x16rs_cuda_main(
     hash_32 *global_hashes,
     unsigned int *global_order,
     hash_32 *best_hashes,
-    unsigned int *best_nonces)
+    unsigned int *best_nonces,
+    // Pool share list. Purely an extra OUTPUT path: nothing below reads these back
+    // into the hashing or the reduction, so the block a solo miner needs is byte for
+    // byte the one it always was. `share_capacity` is 0 unless the host is pool
+    // mining, and 0 skips the whole list.
+    //
+    // Same five arguments, same order, same meaning as x16rs/opencl/x16rs_main.cl.
+    // Keep them in step with the FFI declaration and the launch argument array in
+    // x16rs-cuda/src/lib.rs: cudaLaunchKernel takes an untyped void** so a mismatch
+    // here is not a link error, it is silent garbage on the device.
+    const hash_32 *share_target,
+    unsigned int *share_found,
+    unsigned int *share_nonces,
+    hash_32 *share_hashes,
+    const unsigned int share_capacity)
 {
     const unsigned int local_id = threadIdx.x;
     const unsigned int local_size = blockDim.x;
@@ -67,6 +81,31 @@ extern "C" __global__ void x16rs_cuda_main(
         AES0, AES1, AES2, AES3,
         LT0, LT1, LT2, LT3, LT4, LT5, LT6, LT7,
         mixtab0, mixtab1, mixtab2, mixtab3);
+
+    // Append every payable nonce BEFORE the reduction below overwrites
+    // local_hashes[index] with this thread's best. Each thread reads and writes only
+    // its own unit_size slots here, so no barrier is needed and none of the existing
+    // ones move.
+    //
+    // A pool credits a PPLNS share for EVERY hash under the share target, so
+    // reporting one per batch tied income to batch cadence instead of hashrate. The
+    // counter is incremented for every hit, including hits that do not fit, which is
+    // what lets the host say it is undersampling instead of quietly losing money.
+    //
+    // atomicAdd(p, 1u) is the CUDA spelling of the OpenCL atomic_inc used in the
+    // model kernel: both return the value held BEFORE the increment, which is the
+    // write slot.
+    if (share_capacity != 0) {
+        for (unsigned int i = 0; i < unit_size; i++) {
+            if (diff_big_hash_dev(&local_hashes[index + i], &share_target[0]) == 0) {
+                const unsigned int slot = atomicAdd(&share_found[0], 1u);
+                if (slot < share_capacity) {
+                    share_nonces[slot] = global_offset + i;
+                    share_hashes[slot] = local_hashes[index + i];
+                }
+            }
+        }
+    }
 
     // Must start at this thread's own first slot (index), NOT 0. Starting at 0 made every
     // thread t>0 compare against thread 0's slot and skip its own slot index+0, so the
