@@ -17,6 +17,21 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
+# Cap the compiler parallelism, because the default is one job per core and each
+# rustc on this tree can hold well over a gigabyte.
+#
+# On the machines this image is FOR, a VPS or a mini PC with 2 to 8 GB, an
+# unbounded build is not slow, it is fatal: the kernel kills rustc and the build
+# fails with a message about a signal that says nothing about memory. It bites on
+# large machines too. Building this on a 32 core host killed the Docker engine
+# outright, mid-compile, leaving only an RPC EOF behind.
+#
+# 4 keeps the peak near 6 to 8 GB. Raise it when the builder has the memory for
+# it, roughly 2 GB per job:
+#   docker build --build-arg CARGO_JOBS=16 -f deploy/Dockerfile -t hbit:local .
+ARG CARGO_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
+
 # --locked so the image is built from the committed dependency set and a
 # release cannot silently pick up a different one.
 RUN cargo build --locked --release --bin fullnode \
