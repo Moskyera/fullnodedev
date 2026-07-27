@@ -60,12 +60,34 @@ services:
     # <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
     # Listening on 0.0.0.0 INSIDE the container is correct and not an exposure:
     # only the published port below reaches the outside world.
+    #
+    # share_bits is how many powers of two EASIER a share is than a block, so
+    # what a share costs is (block work - share_bits). Measured on the live chain
+    # on 2026-07-27, a block costs 2^42, which makes 20 the right value here for
+    # two reasons.
+    #
+    # Margin. The pool refuses to start when a share would cost less than 2^16,
+    # because below that PPLNS credit tracks how fast a worker completes an HTTP
+    # round trip rather than how much it hashes. 24 leaves a share at 2^18: only
+    # two bits of headroom, so a network difficulty drop of 4x would take this
+    # pool offline at its next restart. 20 leaves 2^22, which is six bits.
+    #
+    # Payout memory. PPLNS pays on the last 4096 shares, so easier shares make
+    # that window cover LESS time. At 2^18 a single card of ordinary speed
+    # produces about 26 shares a second, and with ten miners attached the whole
+    # window turns over in roughly fifteen seconds: a miner that drops off for
+    # half a minute loses everything it was owed. At 2^22 the same pool keeps
+    # about four minutes of history, which is the difference between a payout
+    # scheme and a lottery on connection stability.
+    #
+    # Raise it only if miners report too few shares to be paid smoothly, and
+    # never past (block work - 16), which the pool enforces and explains.
     command:
       - "hbit-pool-server"
       - "http://node:8080"
       - "pool-wallet.key"
       - "0.0.0.0:9777"
-      - "24"
+      - "20"
       - "mainnet"
       - "300"
     environment:

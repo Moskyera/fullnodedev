@@ -322,14 +322,41 @@ real network block. Outside `18..=40` the server prints
   credit tracks batch cadence rather than hashrate, and the share target
   degenerates.
 
-24 suits GPU batches and is the right answer unless you have measured otherwise.
+**20 is the recommended value**, and the shipped `deploy/docker-compose.yml`
+uses it. Measured on the live chain on 2026-07-27, a block costs 2^42, so 20
+leaves each share costing 2^22 hashes. That choice is about payout memory as much
+as about size: PPLNS pays on the last 4096 shares, so EASIER shares make that
+window cover LESS TIME. At `share_bits` 24 an ordinary card produces roughly 26
+shares a second, and a pool with ten miners turns its whole window over in about
+fifteen seconds, so a miner that drops off for half a minute loses everything it
+was owed. At 20 the same pool keeps about four minutes of history.
 
-There is a second, separate check on the same setting once the pool has seen the
-live difficulty: if the chain is so easy that the share target saturates, every
-hash would be a valid share and PPLNS credit would track how fast a worker can
-submit rather than how much it hashes. The pool refuses to distribute real money
-on that basis. Lowering `share_bits` does not help, because the ceiling is the
-chain's, not yours.
+### The live difficulty is checked too, and it is checked twice
+
+The range above is only about the number you typed. Once the pool has fetched a
+template it checks the target it would really serve, and there are TWO ways that
+can fail, because a ratio and a cost are different questions.
+
+- **The ratio.** `share_target = network_target * 2^share_bits` saturates at the
+  all-0xff ceiling, so on a very easy chain what workers get is not what was
+  asked for. If the achieved factor falls below 18 the pool refuses.
+- **The cost.** A share must be worth at least 2^16 hashes. This is the bound
+  that matters and it is NOT implied by the first one: a chain whose target has
+  22 leading zero bits, served with `share_bits` 24, reports an achieved factor
+  of 22, clears the ratio bound comfortably, and still hands out a share target
+  that every hash on earth beats.
+
+In both cases the reason is the same. When a share costs nothing, PPLNS credit
+measures how fast a worker completes an HTTP round trip instead of how much it
+hashed, so the fastest submitter takes the window from miners doing more work.
+The pool will not distribute real money on that basis.
+
+The remedies are opposite, so read which one you got. Since
+`leading_zero_bits(network) = achieved + cost`, lowering `share_bits` moves work
+out of the ratio and into the cost, and the message names the highest value that
+would work. Only when the chain cannot support any legal setting, which is where
+a fresh testnet always sits, does the pool tell you that nothing here helps and
+that the ceiling is the chain's rather than yours.
 
 ### `settle_secs` must be between 30 and 86400
 
@@ -463,8 +490,9 @@ finding the one you are looking at.
 | `wallet file ... is encrypted but no passphrase is configured` | Passphrase missing from the environment | Set `HBIT_WALLET_PASSWORD` or `HBIT_WALLET_PASSWORD_FILE` |
 | `cannot decrypt wallet file ...` | Wrong passphrase, or a corrupted file | Use the backed-up passphrase; restore the file from backup |
 | `the wallet passphrase in ... must be at least 8` | Passphrase too short to protect real money | Set a longer one, written down somewhere physical |
-| `<share_bits> must be between 18 and 40` | Out-of-range or mistyped argument 4 | Use 24 |
-| `the network difficulty in force ... is too low to serve a fair share` | Chain too easy for an honest share target | Point the pool at mainnet, or wait for that chain to adjust upward |
+| `<share_bits> must be between 18 and 40` | Out-of-range or mistyped argument 4 | Use 20 |
+| `the network difficulty in force ... is too low to serve a fair share` | The chain is so easy the share target saturates, so the achieved ratio is under 18 | Point the pool at mainnet. Lowering `share_bits` cannot help here |
+| `the network difficulty in force ... is too low to serve a share worth counting` | The ratio is fine but a share would cost under 2^16 hashes | Lower `share_bits` to the value the message names; if it says nothing helps, the chain itself is too easy |
 | `[settle_secs] must be between 30 and 86400` | Out-of-range or mistyped argument 6 | Leave it out to get 300 |
 | `set worker=<your HAC address> so the pool can pay you` | Worker name is not a payable address | Pass the miner's real HAC address |
 | `REFUSING to start: difficulty rule mismatch ...` | Wrong `chain` argument for this node | Use `mainnet`, or spell out `testnet:<adjust_blocks>:<target_time>` |
