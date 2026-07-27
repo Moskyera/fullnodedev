@@ -129,7 +129,7 @@ CPU_WORKER = "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v"
 listen = 13337
 boots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337
 not_find_nodes = false
-fast_sync = true
+fast_sync = false
 
 [server]
 enable = true

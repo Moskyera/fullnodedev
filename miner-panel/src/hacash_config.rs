@@ -259,7 +259,14 @@ fn ensure_mainnet_node_section(content: &str) -> String {
     if has_node {
         return content.to_string();
     }
-    let node = "[node]\nname = rust_node\nlisten = 3337\nboots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337\nnot_find_nodes = false\nfast_sync = true\n\n";
+    // fast_sync is deliberately FALSE. Measured 2026-07-27: a chain synced with
+    // it on stops dead at a block whose state it never wrote, with
+    //   [Block Sync Warning] insert N failed: diamond status HTAKES not found
+    // and nothing retries, so the node sits at that height forever while looking
+    // perfectly healthy. Turning the flag off afterwards does not repair it,
+    // because the state was never written. A clean sync with it OFF reached the
+    // tip in seven minutes with no errors at all.
+    let node = "[node]\nname = rust_node\nlisten = 3337\nboots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337\nnot_find_nodes = false\nfast_sync = false\n\n";
     format!("{node}{content}")
 }
 
