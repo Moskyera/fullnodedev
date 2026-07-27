@@ -1,10 +1,18 @@
 //! Start/stop mining and worker process spawn.
 
+// Only the piped-log path uses these, and it is not compiled on Windows.
+#[cfg(not(windows))]
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender as Sender};
+use std::process::{Child, Command};
+// Only the piped path needs Stdio, and that path is not compiled on Windows,
+// where every child gets its own console instead.
+#[cfg(not(windows))]
+use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver};
+#[cfg(not(windows))]
+use std::sync::mpsc::SyncSender as Sender;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -407,21 +415,43 @@ impl MinerApp {
     pub(super) fn spawn_worker_with_logs(
         cmd: &mut Command,
     ) -> Result<(Child, Receiver<String>), String> {
-        platform::configure_background_command(cmd);
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        // Bounded so a hung UI cannot grow worker log memory without limit.
-        let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
-        if let Some(out) = child.stdout.take() {
-            spawn_log_drainer(out, tx.clone());
+        // On Windows the node and the workers get their OWN console window, so
+        // the operator can watch them. That is not decoration: a node
+        // downloading the chain prints every batch it inserts, and hiding that
+        // is how a stalled sync came to look identical to a healthy one from
+        // this panel.
+        //
+        // A child with its own console is not piping anything back, so the
+        // channel returned here stays empty and the panel quotes no log. Status
+        // is unaffected: it comes from polling the RPC and from the exit code.
+        // The detail is in the window the user can now see.
+        #[cfg(windows)]
+        {
+            platform::configure_visible_command(cmd);
+            let child = cmd.spawn().map_err(|e| e.to_string())?;
+            let (_tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
+            return Ok((child, rx));
         }
-        if let Some(err) = child.stderr.take() {
-            spawn_log_drainer(err, tx);
+        // Elsewhere a GUI-launched child has no terminal to attach to, so keep
+        // piping and let the panel show the log itself.
+        #[cfg(not(windows))]
+        {
+            platform::configure_background_command(cmd);
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            // Bounded so a hung UI cannot grow worker log memory without limit.
+            let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
+            if let Some(out) = child.stdout.take() {
+                spawn_log_drainer(out, tx.clone());
+            }
+            if let Some(err) = child.stderr.take() {
+                spawn_log_drainer(err, tx);
+            }
+            Ok((child, rx))
         }
-        Ok((child, rx))
     }
 }
 
@@ -477,6 +507,9 @@ pub(super) fn queue_child_termination(mut child: Child) -> Receiver<Result<(), S
 /// Max queued log lines from worker stdout/stderr (oldest dropped when full).
 const LOG_CHANNEL_CAP: usize = 512;
 
+/// Drains a child's piped output into the panel. Not built on Windows: children
+/// there own a console and pipe nothing back.
+#[cfg(not(windows))]
 fn spawn_log_drainer<R: Read + Send + 'static>(stream: R, tx: Sender<String>) {
     thread::spawn(move || {
         let reader = BufReader::new(stream);
