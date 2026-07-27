@@ -131,9 +131,23 @@ stats_file = miner-stats.json
 """ % GPU_WORKER)
 
 # The rival: one CPU thread, no GPU, its own pool address and its own stats
-# file. poworker takes its config path as argv[1], so both workers can run out
-# of the same directory.
-(D/"cpurival.config.ini").write_text("""connect = 127.0.0.1:18082
+# file.
+#
+# It gets its OWN DIRECTORY, and that is not tidiness. poworker resolves
+# "./poworker.config.ini" relative to its working directory and never reads a
+# path from the command line (app/src/poworker.rs: `let default_config =
+# "./poworker.config.ini"`). Passing a filename as an argument is silently
+# ignored, so running the rival from this directory would load the GPU config
+# instead: two CUDA miners on one card, both paid to the same address, no rival
+# at all, and Cell 6 reporting PASS on a test that measured nothing.
+RIVAL = D / "cpurival"
+RIVAL.mkdir(exist_ok=True)
+for name in ("poworker", "opencl"):
+    src = D / name
+    dst = RIVAL / name
+    if src.exists() and not dst.exists():
+        dst.symlink_to(src)
+(RIVAL/"poworker.config.ini").write_text("""connect = 127.0.0.1:18082
 pool_worker = %s
 supervene = 1
 nonce_max = 4294967295
@@ -195,9 +209,16 @@ print(open("/content/pool.log").read()[-600:])
 
 miner = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/miner.log","w"),
                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
-rival = subprocess.Popen(["./poworker","cpurival.config.ini"], cwd=D,
+# cwd is the rival's OWN directory, because that is the only thing that selects
+# its config: poworker always reads ./poworker.config.ini and ignores arguments.
+rival = subprocess.Popen(["./poworker"], cwd=D + "/cpurival",
                          stdout=open("/content/cpu.log","w"), stderr=subprocess.STDOUT,
                          env=env, start_new_session=True)
+time.sleep(4)
+_rival_cfg = open("/content/cpu.log").read()
+if GPU_WORKER in _rival_cfg or "CUDA" in _rival_cfg:
+    raise SystemExit("the rival loaded the GPU config: it must be a CPU worker on its own address, "
+                     "or the whole measurement is meaningless")
 print("CUDA miner + single-thread CPU rival started, sampling for 10 minutes...")
 stats = {}
 for i in range(10):
