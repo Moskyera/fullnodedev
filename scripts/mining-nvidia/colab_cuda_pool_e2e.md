@@ -183,130 +183,173 @@ processes are torn down, because Cell 6 needs the PPLNS window split and the
 pool is gone by then.
 
 ```python
-import subprocess, os, time, json, urllib.request, re
+import subprocess, os, time, json, urllib.request, re, socket
 D = "/content/fullnodedev/target/release"
 GPU_WORKER = "1AVRuFXNFi3rdMrPH4hdqSgFrEBnWisWaS"
 CPU_WORKER = "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v"
 env = dict(os.environ, LD_LIBRARY_PATH="/usr/local/cuda/lib64:" + os.environ.get("LD_LIBRARY_PATH",""))
-subprocess.run("pkill -9 fullnode; pkill -9 poworker; pkill -9 hbit-pool-server; sleep 3; rm -rf %s/hacash_*_data %s/pool-wallet.key*" % (D,D), shell=True)
+
+# Kill by EXACT process name, and include the 15-character truncation.
+#
+# The kernel stores comm in TASK_COMM_LEN bytes, 16 including the NUL, so a
+# 16-character binary name is only ever visible as 15. "hbit-pool-server" is
+# exactly 16, so `pkill hbit-pool-server` matches nothing and a pool from an
+# earlier attempt survives, holding 18082, and the next run dies on EADDRINUSE.
+# "fullnode" and "poworker" are 8 characters, which is why only the pool leaked.
+#
+# -x (exact match on comm) rather than -f (full command line) is deliberate: -f
+# would match this very shell, whose own command line contains all three names,
+# so the first pkill would kill the shell and the rest would never run.
+subprocess.run("pkill -9 -x fullnode; pkill -9 -x poworker; "
+               "pkill -9 -x hbit-pool-server; pkill -9 -x hbit-pool-serve; "
+               "sleep 3; rm -rf %s/hacash_*_data %s/pool-wallet.key*" % (D, D), shell=True)
 
 def get(url, t=3):
     return json.loads(urllib.request.urlopen(url, timeout=t).read().decode())
 
-node = subprocess.Popen(["./fullnode"], cwd=D, stdout=open("/content/node.log","w"),
-                        stderr=subprocess.STDOUT, env=env, start_new_session=True)
-for _ in range(60):
+def port_free(port):
+    s = socket.socket()
     try:
-        print("NODE UP height =", get("http://127.0.0.1:18080/query/latest")["height"]); break
-    except Exception: time.sleep(1)
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
-# PHASE 1: raise the difficulty before the pool exists.
-#
-# At height 0 the chain sits at LOWEST_DIFFICULTY, where the share target
-# saturates and every hash is a share. The pool REFUSES to start on that, by
-# design, because credit would track submission rate instead of hashrate. So the
-# GPU mines SOLO against the node first, until ASERT has pulled the difficulty
-# off its floor. Cell 3 set difficulty_adjust_blocks = 8, so this takes a couple
-# of minutes rather than the 289 blocks the default would need.
-# Normalise to the pool address FIRST and keep that as the copy to restore.
-# Snapshotting the file as found would be a trap: if this cell dies during the
-# warm-up it leaves the config pointing at the node, and the next run would
-# "restore" that, so phase 2 would mine solo while the pool sat at zero shares
-# and nothing would report a problem.
-CFG = D + "/poworker.config.ini"
-pool_cfg = open(CFG).read().replace("connect = 127.0.0.1:18080", "connect = 127.0.0.1:18082")
-open(CFG, "w").write(pool_cfg.replace("connect = 127.0.0.1:18082", "connect = 127.0.0.1:18080"))
-warmup = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/warmup.log","w"),
-                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
-# Wait for the exact condition the pool checks, rather than a proxy for it.
-#
-# /query/miner/pending sends target_hash, not a difficulty number. With
-# share_bits = 24 the served share target is the network target made 24 bits
-# easier, but it cannot be made easier than the all-ones ceiling, so the factor a
-# worker really gets is min(24, N) where N is the leading zero bits of the network
-# target. The pool demands 18. So count N and wait for it, with a little margin
-# because ASERT keeps moving.
-#
-# Counting is also safer than prefix-matching the bootstrap target. That target
-# is not simply u32_to_hash(LOWEST_DIFFICULTY): the endpoint passes it through
-# right_00_to_ff, which decrements the last non-zero byte and fills the tail with
-# ff, so FF FF FE 00.. is published as fffffdffff... A prefix test has to get that
-# transform right to mean anything, and a wrong digit fails open, exiting the
-# warm-up while the chain is still on its floor.
-def lzbits(hexstr):
-    n = 0
-    for ch in hexstr:
-        v = int(ch, 16)
-        if v:
-            return n + 4 - v.bit_length()
-        n += 4
-    return n
+for port, who in ((18080, "the node"), (18082, "the pool")):
+    if not port_free(port):
+        raise SystemExit("port %d is still held after the cleanup, so %s cannot start. "
+                         "Something from an earlier attempt survived. Run this to see it: "
+                         "!ps -eo pid,comm,args | grep -E 'fullnode|poworker|hbit'" % (port, who))
 
-NEED = 20
-print("warming the chain up off LOWEST_DIFFICULTY (solo, no pool yet)...")
-ready = False
-for _ in range(40):
-    time.sleep(15)
-    h = get("http://127.0.0.1:18080/query/latest")["height"]
-    t = get("http://127.0.0.1:18080/query/miner/pending")["target_hash"]
-    n = lzbits(t)
-    print("  height %-4d target %s  zero bits %-3d share factor %d" % (h, t[:16], n, min(24, n)))
-    if n >= NEED:
-        ready = True
-        break
-if not ready:
-    print("WARNING: the target never reached %d zero bits, so a share would still cost" % NEED)
-    print("almost nothing and the pool will refuse to start. It is right to. Give it longer.")
-warmup.terminate(); time.sleep(3)
-open(CFG, "w").write(pool_cfg)   # back to the pool address
-assert "18082" in open(CFG).read(), "the worker config must point at the pool for phase 2"
-
-# PHASE 2: now the pool can serve work that costs something.
-pool = subprocess.Popen(["./hbit-pool-server","http://127.0.0.1:18080","pool-wallet.key",
-                         "127.0.0.1:18082","24","testnet:8:10","120"], cwd=D,
-                        stdout=open("/content/pool.log","w"), stderr=subprocess.STDOUT,
-                        env=env, start_new_session=True)
-time.sleep(10)
-print(open("/content/pool.log").read()[-800:])
-if pool.poll() is not None:
-    raise SystemExit("the pool refused to start; read the message above. If it is the share "
-                     "target saturating, the warm-up did not raise the difficulty enough.")
-
-miner = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/miner.log","w"),
+procs = []
+def spawn(argv, cwd, log):
+    p = subprocess.Popen(argv, cwd=cwd, stdout=open(log, "w"),
                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
-# The rival takes its config as an ABSOLUTE argument. Its own directory is only
-# for the stats file; it cannot select the config, because poworker resolves the
-# default against the executable's directory and current_exe() follows symlinks.
-RIVAL_CFG = D + "/cpurival/poworker.config.ini"
-rival = subprocess.Popen([D + "/poworker", RIVAL_CFG], cwd=D + "/cpurival",
-                         stdout=open("/content/cpu.log","w"), stderr=subprocess.STDOUT,
-                         env=env, start_new_session=True)
-time.sleep(6)
-_riv = open("/content/cpu.log").read()
-# poworker prints the canonical path of the file it loaded. That is the direct
-# evidence, so check it rather than inferring from behaviour. It matters because
-# an unreadable config is not fatal: load_config_path prints "[Config Error]" and
-# hands back an EMPTY map, so the rival would run on defaults and look plausible.
-if RIVAL_CFG not in _riv:
-    print(_riv[:800])
-    raise SystemExit("the rival did not load " + RIVAL_CFG + "; its log is above")
-if re.search(r"Create CUDA block miner worker|\[CUDA\] Device #", _riv):
-    raise SystemExit("the rival came up as a CUDA worker: it must be the CPU worker on its own "
-                     "address, or the whole measurement is meaningless")
-print("CUDA miner + single-thread CPU rival started, sampling for 10 minutes...")
-stats = {}
-for i in range(10):
-    time.sleep(60)
-    stats = get("http://127.0.0.1:18082/stats")
-    h = get("http://127.0.0.1:18080/query/latest")["height"]
-    counts = dict((a, n) for a, n in stats["workers"])
-    g, c = counts.get(GPU_WORKER, 0), counts.get(CPU_WORKER, 0)
-    pct = (100.0 * g / (g + c)) if (g + c) else 0.0
-    print("t+%2dmin node_h=%-4d diff=%-12d shares=%-6d pend=%d orph=%d conf=%d | window gpu=%-6d cpu=%-5d gpu=%.1f%%"
-          % (i+1, h, stats["difficulty"], stats["accepted_shares"], stats["blocks_pending"],
-             stats["blocks_orphaned"], stats["blocks_confirmed"], g, c, pct))
-json.dump(stats, open("/content/final_stats.json","w"))
-for p in (rival, miner, pool, node): p.terminate()
+    procs.append(p)
+    return p
+
+# Everything is torn down in the finally block, including on an early exit.
+# Without it, a guard that fires mid-run leaves the node, the pool and two miners
+# alive, and the next attempt inherits them. That is what happened here: the
+# rival guard fired, the pool was never stopped, and the following run could not
+# bind its port.
+try:
+    node = spawn(["./fullnode"], D, "/content/node.log")
+    up = False
+    for _ in range(60):
+        try:
+            print("NODE UP height =", get("http://127.0.0.1:18080/query/latest")["height"])
+            up = True
+            break
+        except Exception:
+            time.sleep(1)
+    if not up:
+        print(open("/content/node.log").read()[-800:])
+        raise SystemExit("the node never answered on 18080; its log is above")
+
+    # PHASE 1: raise the difficulty before the pool exists.
+    #
+    # At height 0 the chain sits at LOWEST_DIFFICULTY, where the share target
+    # saturates and every hash is a share. The pool REFUSES to start on that, by
+    # design, because credit would then track submission rate rather than
+    # hashrate and one worker could take the whole payout window.
+    #
+    # Normalise to the pool address FIRST and keep that as the copy to restore.
+    # If this cell dies during the warm-up it leaves the config pointing at the
+    # node, and snapshotting the file as found would faithfully "restore" that:
+    # phase 2 would mine solo while the pool sat at zero shares.
+    CFG = D + "/poworker.config.ini"
+    pool_cfg = open(CFG).read().replace("connect = 127.0.0.1:18080", "connect = 127.0.0.1:18082")
+    open(CFG, "w").write(pool_cfg.replace("connect = 127.0.0.1:18082", "connect = 127.0.0.1:18080"))
+    warmup = spawn(["./poworker"], D, "/content/warmup.log")
+
+    # Wait for the exact condition the pool checks. With share_bits = 24 the
+    # factor a worker really gets is min(24, N), N being the leading zero bits of
+    # the network target, because the share target cannot be eased past the
+    # all-ones ceiling. The pool demands 18.
+    def lzbits(hexstr):
+        n = 0
+        for ch in hexstr:
+            v = int(ch, 16)
+            if v:
+                return n + 4 - v.bit_length()
+            n += 4
+        return n
+
+    NEED = 20
+    print("warming the chain up off LOWEST_DIFFICULTY (solo, no pool yet)...")
+    ready = False
+    for _ in range(40):
+        time.sleep(15)
+        h = get("http://127.0.0.1:18080/query/latest")["height"]
+        t = get("http://127.0.0.1:18080/query/miner/pending")["target_hash"]
+        n = lzbits(t)
+        print("  height %-4d target %s  zero bits %-3d share factor %d"
+              % (h, t[:16], n, min(24, n)))
+        if n >= NEED:
+            ready = True
+            break
+    warmup.terminate()
+    time.sleep(3)
+    open(CFG, "w").write(pool_cfg)
+    assert "18082" in open(CFG).read(), "the worker config must point at the pool for phase 2"
+    if not ready:
+        raise SystemExit("the target never reached %d zero bits, so a share would still cost "
+                         "almost nothing and the pool would refuse to start. It is right to." % NEED)
+
+    # PHASE 2: now the pool can serve work that costs something.
+    pool = spawn(["./hbit-pool-server", "http://127.0.0.1:18080", "pool-wallet.key",
+                  "127.0.0.1:18082", "24", "testnet:8:10", "120"], D, "/content/pool.log")
+    time.sleep(10)
+    print(open("/content/pool.log").read()[-800:])
+    if pool.poll() is not None:
+        raise SystemExit("the pool exited during startup; its message is above")
+
+    miner = spawn(["./poworker"], D, "/content/miner.log")
+    # The rival takes its config as an ABSOLUTE argument. Its own directory is
+    # only for the stats file; it cannot select the config, because poworker
+    # resolves the default against the EXECUTABLE's directory and current_exe()
+    # follows symlinks.
+    RIVAL_CFG = D + "/cpurival/poworker.config.ini"
+    rival = spawn([D + "/poworker", RIVAL_CFG], D + "/cpurival", "/content/cpu.log")
+    time.sleep(6)
+    _riv = open("/content/cpu.log").read()
+    # poworker prints the canonical path of the config it loaded, so check that
+    # rather than inferring from behaviour. A config that cannot be read is not
+    # fatal: load_config_path prints "[Config Error]" and returns an EMPTY map,
+    # so the rival would run on defaults and look entirely plausible.
+    if RIVAL_CFG not in _riv:
+        print(_riv[:800])
+        raise SystemExit("the rival did not load " + RIVAL_CFG + "; its log is above")
+    if re.search(r"Create CUDA block miner worker|\[CUDA\] Device #", _riv):
+        raise SystemExit("the rival came up as a CUDA worker: it must be the CPU worker on its "
+                         "own address, or the whole measurement is meaningless")
+
+    print("CUDA miner + single-thread CPU rival started, sampling for 10 minutes...")
+    stats = {}
+    for i in range(10):
+        time.sleep(60)
+        stats = get("http://127.0.0.1:18082/stats")
+        h = get("http://127.0.0.1:18080/query/latest")["height"]
+        counts = dict((a, n) for a, n in stats["workers"])
+        g, c = counts.get(GPU_WORKER, 0), counts.get(CPU_WORKER, 0)
+        pct = (100.0 * g / (g + c)) if (g + c) else 0.0
+        print("t+%2dmin node_h=%-4d diff=%-12d shares=%-6d pend=%d orph=%d conf=%d "
+              "| window gpu=%-6d cpu=%-5d gpu=%.1f%%"
+              % (i + 1, h, stats["difficulty"], stats["accepted_shares"], stats["blocks_pending"],
+                 stats["blocks_orphaned"], stats["blocks_confirmed"], g, c, pct))
+    json.dump(stats, open("/content/final_stats.json", "w"))
+finally:
+    for p in reversed(procs):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    time.sleep(2)
+    subprocess.run("pkill -9 -x fullnode; pkill -9 -x poworker; "
+                   "pkill -9 -x hbit-pool-server; pkill -9 -x hbit-pool-serve", shell=True)
 ```
 
 Watch `diff` leave 4294967294: that is ASERT engaging and the point where shares
