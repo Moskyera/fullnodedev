@@ -288,8 +288,8 @@ _riv = open("/content/cpu.log").read()
 # an unreadable config is not fatal: load_config_path prints "[Config Error]" and
 # hands back an EMPTY map, so the rival would run on defaults and look plausible.
 if RIVAL_CFG not in _riv:
-    raise SystemExit("the rival did not load %s. Its log says:
-%s" % (RIVAL_CFG, _riv[:800]))
+    print(_riv[:800])
+    raise SystemExit("the rival did not load " + RIVAL_CFG + "; its log is above")
 if re.search(r"Create CUDA block miner worker|\[CUDA\] Device #", _riv):
     raise SystemExit("the rival came up as a CUDA worker: it must be the CPU worker on its own "
                      "address, or the whole measurement is meaningless")
