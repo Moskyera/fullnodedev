@@ -183,7 +183,7 @@ processes are torn down, because Cell 6 needs the PPLNS window split and the
 pool is gone by then.
 
 ```python
-import subprocess, os, time, json, urllib.request
+import subprocess, os, time, json, urllib.request, re
 D = "/content/fullnodedev/target/release"
 GPU_WORKER = "1AVRuFXNFi3rdMrPH4hdqSgFrEBnWisWaS"
 CPU_WORKER = "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v"
@@ -200,12 +200,50 @@ for _ in range(60):
         print("NODE UP height =", get("http://127.0.0.1:18080/query/latest")["height"]); break
     except Exception: time.sleep(1)
 
+# PHASE 1: raise the difficulty before the pool exists.
+#
+# At height 0 the chain sits at LOWEST_DIFFICULTY, where the share target
+# saturates and every hash is a share. The pool REFUSES to start on that, by
+# design, because credit would track submission rate instead of hashrate. So the
+# GPU mines SOLO against the node first, until ASERT has pulled the difficulty
+# off its floor. Cell 3 set difficulty_adjust_blocks = 8, so this takes a couple
+# of minutes rather than the 289 blocks the default would need.
+import shutil
+solo_cfg = open(D + "/poworker.config.ini").read()
+open(D + "/poworker.config.ini", "w").write(solo_cfg.replace("connect = 127.0.0.1:18082",
+                                                            "connect = 127.0.0.1:18080"))
+warmup = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/warmup.log","w"),
+                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
+# /query/miner/pending returns target_hash, not a difficulty number. At
+# LOWEST_DIFFICULTY that target begins "fffffd"; once ASERT bites it gains
+# leading zeros. Reading a "difficulty" key that does not exist would default to
+# LOWEST forever and this loop would never finish early.
+print("warming the chain up off LOWEST_DIFFICULTY (solo, no pool yet)...")
+ready = False
+for _ in range(40):
+    time.sleep(15)
+    h = get("http://127.0.0.1:18080/query/latest")["height"]
+    t = get("http://127.0.0.1:18080/query/miner/pending").get("target_hash", "fffffd")
+    print("  height %-4d target %s" % (h, t[:16]))
+    if h >= 20 and not t.startswith("fffffd"):
+        ready = True
+        break
+if not ready:
+    print("WARNING: the difficulty never left its floor. The pool will refuse to start,")
+    print("and it is right to: a share would cost nothing. Give it longer or check the node.")
+warmup.terminate(); time.sleep(3)
+open(D + "/poworker.config.ini", "w").write(solo_cfg)   # back to the pool address
+
+# PHASE 2: now the pool can serve work that costs something.
 pool = subprocess.Popen(["./hbit-pool-server","http://127.0.0.1:18080","pool-wallet.key",
                          "127.0.0.1:18082","24","testnet:8:10","120"], cwd=D,
                         stdout=open("/content/pool.log","w"), stderr=subprocess.STDOUT,
                         env=env, start_new_session=True)
-time.sleep(8)
-print(open("/content/pool.log").read()[-600:])
+time.sleep(10)
+print(open("/content/pool.log").read()[-800:])
+if pool.poll() is not None:
+    raise SystemExit("the pool refused to start; read the message above. If it is the share "
+                     "target saturating, the warm-up did not raise the difficulty enough.")
 
 miner = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/miner.log","w"),
                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -214,11 +252,14 @@ miner = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/miner.log"
 rival = subprocess.Popen(["./poworker"], cwd=D + "/cpurival",
                          stdout=open("/content/cpu.log","w"), stderr=subprocess.STDOUT,
                          env=env, start_new_session=True)
-time.sleep(4)
-_rival_cfg = open("/content/cpu.log").read()
-if GPU_WORKER in _rival_cfg or "CUDA" in _rival_cfg:
-    raise SystemExit("the rival loaded the GPU config: it must be a CPU worker on its own address, "
-                     "or the whole measurement is meaningless")
+time.sleep(6)
+# Prove the rival really is the CPU worker. Match the lines poworker only prints
+# when it actually brought a CUDA device up, not the bare word, which appears in
+# ordinary status text and made this guard cry wolf.
+_riv = open("/content/cpu.log").read()
+if re.search(r"Create CUDA block miner worker|\[CUDA\] Device #", _riv):
+    raise SystemExit("the rival came up as a CUDA worker: it must be the CPU worker on its own "
+                     "address, or the whole measurement is meaningless")
 print("CUDA miner + single-thread CPU rival started, sampling for 10 minutes...")
 stats = {}
 for i in range(10):
