@@ -223,11 +223,12 @@ warmup = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/warmup.lo
 # target. The pool demands 18. So count N and wait for it, with a little margin
 # because ASERT keeps moving.
 #
-# Do not be tempted by a prefix test here. At LOWEST_DIFFICULTY the target is
-# fffffeffff..., not the fffffd this code first guessed, and that one wrong hex
-# digit would have made the check true from the first sample: the warm-up would
-# exit at height 20 with the difficulty still on its floor, the pool would refuse,
-# and the cell would look like the pool was broken.
+# Counting is also safer than prefix-matching the bootstrap target. That target
+# is not simply u32_to_hash(LOWEST_DIFFICULTY): the endpoint passes it through
+# right_00_to_ff, which decrements the last non-zero byte and fills the tail with
+# ff, so FF FF FE 00.. is published as fffffdffff... A prefix test has to get that
+# transform right to mean anything, and a wrong digit fails open, exiting the
+# warm-up while the chain is still on its floor.
 def lzbits(hexstr):
     n = 0
     for ch in hexstr:
