@@ -330,10 +330,22 @@ jobs:
           # no wallet, no config and no address; the pool refuses to start
           # without them.
           pooldir="dist/hbit-pool-linux-x86_64"
-          rm -rf "$pooldir" && mkdir -p "$pooldir"
+          rm -rf "$pooldir" && mkdir -p "$pooldir/systemd"
           cp target/release/hbit-pool-server target/release/hbit-pool-payout "$pooldir/"
+          # The full node ships WITH the pool. Without it the archive is not
+          # deployable at all: the pool gets its templates from a node and submits
+          # blocks to one, so an operator who downloaded only this would install
+          # something that cannot start. The first version of this package left it
+          # out, which is a packaging bug and not a documentation problem.
+          cp target/release/hacash "$pooldir/"
+          cp deploy/node/hacash.config.ini "$pooldir/hacash.config.ini.example"
+          cp deploy/systemd/hacash-node.service deploy/systemd/hbit-pool.service "$pooldir/systemd/"
+          cp deploy/hbit-wait-for-node.sh "$pooldir/"
+          cp deploy/README.md "$pooldir/DEPLOY.md"
           cp docs/POOL-OPERATOR.md docs/POOL-README.md "$pooldir/"
-          chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout
+          cp scripts/hbit-vps-setup.sh "$pooldir/SETUP-POOL.sh"
+          chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout \
+            "$pooldir"/hacash "$pooldir"/hbit-wait-for-node.sh "$pooldir"/SETUP-POOL.sh
           printf '%s' "$version" > "$pooldir/VERSION.txt"
           if [[ "$version" == v* ]]; then
             poolname="hbit-pool-linux-x86_64-$version.tar.gz"
