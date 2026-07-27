@@ -1540,11 +1540,50 @@ fn windows_current_principal() -> std::io::Result<(String, String)> {
     Ok((name, sid))
 }
 
+/// Principals it is not meaningful to lock a file against on Windows: LocalSystem
+/// and the local Administrators group.
+///
+/// Excluding these buys nothing. Anything running as either can take ownership of
+/// the file, read this process's memory, or load a driver, so a key they cannot
+/// read through the DACL is a key they can read another way five seconds later.
+/// What the DACL genuinely protects against is OTHER ordinary accounts on a
+/// shared machine, and that protection is unaffected by leaving these two in.
+///
+/// Refusing them instead made the pool fail CLOSED on machines where the OS keeps
+/// its own ACE, which for a pool means it will not write its wallet and therefore
+/// pays nobody. Availability lost, security unchanged.
+#[cfg(windows)]
+const WINDOWS_OS_PRINCIPAL_SIDS: [&str; 2] = [
+    "S-1-5-18",     // NT AUTHORITY\SYSTEM
+    "S-1-5-32-544", // BUILTIN\Administrators
+];
+
+/// Resolve an account name printed by icacls to its SID.
+///
+/// By SID and not by name on purpose: icacls prints LOCALISED names, so matching
+/// the strings "NT AUTHORITY\SYSTEM" or "BUILTIN\Administrators" would silently
+/// stop working on a German or Greek Windows and start rejecting the very
+/// principals this is meant to accept.
+#[cfg(windows)]
+fn windows_sid_of(principal: &str) -> Option<String> {
+    let script = format!(
+        "try {{ ([System.Security.Principal.NTAccount]'{}')\
+         .Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ '' }}",
+        principal.replace('\'', "''")
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    let sid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    sid.starts_with("S-1-").then_some(sid)
+}
+
 /// Read the DACL back and refuse to continue if any principal other than the
-/// current account is listed. Parsing icacls output is best-effort, so an
-/// unreadable listing only warns: the mandatory checks in the caller (icacls
-/// exit status plus the file still being readable) already rule out the
-/// empty-DACL and silent-failure cases this guards against.
+/// current account, or the operating system itself, is listed. Parsing icacls
+/// output is best-effort, so an unreadable listing only warns: the mandatory
+/// checks in the caller (icacls exit status plus the file still being readable)
+/// already rule out the empty-DACL and silent-failure cases this guards against.
 #[cfg(windows)]
 fn windows_verify_owner_only(path: &str, name: &str, sid: &str) -> std::io::Result<()> {
     let unverified = |why: &str| {
@@ -1581,6 +1620,19 @@ fn windows_verify_owner_only(path: &str, name: &str, sid: &str) -> std::io::Resu
         };
         aces += 1;
         if !principal.eq_ignore_ascii_case(name) && !principal.eq_ignore_ascii_case(sid) {
+            if let Some(resolved) = windows_sid_of(principal) {
+                if WINDOWS_OS_PRINCIPAL_SIDS.contains(&resolved.as_str()) {
+                    // Said out loud rather than passed over silently: the
+                    // operator should know exactly who else can read the key.
+                    eprintln!(
+                        "[wallet] NOTE: {path} is also readable by `{principal}` ({resolved}). \
+                         That is the operating system itself and cannot be excluded; anything \
+                         able to act as it already controls this machine. No other account can \
+                         read the file."
+                    );
+                    continue;
+                }
+            }
             return Err(std::io::Error::other(format!(
                 "{path} is still accessible to `{principal}`"
             )));
