@@ -65,9 +65,36 @@ jobs:
       - name: Verify Windows HACD binaries are CPU-only
         shell: pwsh
         run: |
-          $dumpbin = Get-ChildItem -Path "$env:ProgramFiles\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -File |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          # Do NOT hardcode the Visual Studio year. This step searched
+          # "Microsoft Visual Studio\2022\..." and started failing every release
+          # the moment the hosted runner moved on, and it failed loudly in the
+          # wrong place: GitHub runs pwsh with ErrorActionPreference = Stop, so
+          # Get-ChildItem threw on the missing directory before the script's own
+          # "dumpbin.exe not found" check could report anything useful.
+          #
+          # Ask the installer where Visual Studio is, then fall back to globbing
+          # every year and edition under both Program Files roots.
+          $dumpbin = $null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsRoot = & $vswhere -latest -products * -property installationPath 2>$null
+            if ($vsRoot) {
+              $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" `
+                -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            }
+          }
+          if (-not $dumpbin) {
+            $globs = @(
+              "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe",
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe"
+            )
+            $dumpbin = $globs | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe not found. HACD must be proven CPU-only before release, so this build stops rather than shipping unverified binaries."
+          }
+          Write-Host "using $($dumpbin.FullName)"
           foreach ($binary in @("hacash.exe", "diaworker.exe")) {
             $binaryPath = Join-Path "$env:GITHUB_WORKSPACE\target\release" $binary
             $dependencies = (& $dumpbin.FullName /DEPENDENTS $binaryPath | Out-String)

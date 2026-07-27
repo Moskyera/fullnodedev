@@ -21,10 +21,12 @@ pub(crate) const STUFF_BUFFER_CAP: usize = 512;
 /// 37.7 M nonces, about 0.38 s per batch. The expected hits per batch is
 /// therefore
 ///
-///     lambda = batch seconds * shares per second
+/// ```text
+/// lambda = batch seconds * shares per second
+/// ```
 ///
 /// and the second factor is what a pool CHOOSES: it sets `share_bits` so one
-/// worker submits on the order of one share a second (HBIT's default 24, its
+/// worker submits on the order of one share a second (HBIT ships 20, its
 /// 4096-share PPLNS window and its per-height cap all assume that order). At one
 /// share per second that is lambda = 0.012 on the tuned batch and lambda = 0.4 on
 /// the largest one, so 1024 carries three to five orders of magnitude of
