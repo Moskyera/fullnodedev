@@ -10,6 +10,15 @@ target2/
 */target/
 **/target/
 
+# Build directories from tooling that names them something other than "target".
+# The patterns above match a directory CALLED target, so they missed
+# .codex-target-security-20260719-reaudit entirely: 3.5 GB of compiler output
+# that went on being uploaded to the daemon on every build, 198 seconds of it.
+# Anything with "target" in the name is compiler output, wherever it sits.
+.codex-*/
+*target*/
+**/*target*/
+
 # Packaged releases and their staging directories. Deliberately broad: this tree
 # has accumulated dist, dist-final-*, dist-opencl-upgrade-* and will accumulate
 # more, and each is tens of megabytes of already-built output the image rebuilds
