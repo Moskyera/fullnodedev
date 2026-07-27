@@ -214,23 +214,44 @@ open(D + "/poworker.config.ini", "w").write(solo_cfg.replace("connect = 127.0.0.
                                                             "connect = 127.0.0.1:18080"))
 warmup = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/warmup.log","w"),
                           stderr=subprocess.STDOUT, env=env, start_new_session=True)
-# /query/miner/pending returns target_hash, not a difficulty number. At
-# LOWEST_DIFFICULTY that target begins "fffffd"; once ASERT bites it gains
-# leading zeros. Reading a "difficulty" key that does not exist would default to
-# LOWEST forever and this loop would never finish early.
+# Wait for the exact condition the pool checks, rather than a proxy for it.
+#
+# /query/miner/pending sends target_hash, not a difficulty number. With
+# share_bits = 24 the served share target is the network target made 24 bits
+# easier, but it cannot be made easier than the all-ones ceiling, so the factor a
+# worker really gets is min(24, N) where N is the leading zero bits of the network
+# target. The pool demands 18. So count N and wait for it, with a little margin
+# because ASERT keeps moving.
+#
+# Do not be tempted by a prefix test here. At LOWEST_DIFFICULTY the target is
+# fffffeffff..., not the fffffd this code first guessed, and that one wrong hex
+# digit would have made the check true from the first sample: the warm-up would
+# exit at height 20 with the difficulty still on its floor, the pool would refuse,
+# and the cell would look like the pool was broken.
+def lzbits(hexstr):
+    n = 0
+    for ch in hexstr:
+        v = int(ch, 16)
+        if v:
+            return n + 4 - v.bit_length()
+        n += 4
+    return n
+
+NEED = 20
 print("warming the chain up off LOWEST_DIFFICULTY (solo, no pool yet)...")
 ready = False
 for _ in range(40):
     time.sleep(15)
     h = get("http://127.0.0.1:18080/query/latest")["height"]
-    t = get("http://127.0.0.1:18080/query/miner/pending").get("target_hash", "fffffd")
-    print("  height %-4d target %s" % (h, t[:16]))
-    if h >= 20 and not t.startswith("fffffd"):
+    t = get("http://127.0.0.1:18080/query/miner/pending")["target_hash"]
+    n = lzbits(t)
+    print("  height %-4d target %s  zero bits %-3d share factor %d" % (h, t[:16], n, min(24, n)))
+    if n >= NEED:
         ready = True
         break
 if not ready:
-    print("WARNING: the difficulty never left its floor. The pool will refuse to start,")
-    print("and it is right to: a share would cost nothing. Give it longer or check the node.")
+    print("WARNING: the target never reached %d zero bits, so a share would still cost" % NEED)
+    print("almost nothing and the pool will refuse to start. It is right to. Give it longer.")
 warmup.terminate(); time.sleep(3)
 open(D + "/poworker.config.ini", "w").write(solo_cfg)   # back to the pool address
 
