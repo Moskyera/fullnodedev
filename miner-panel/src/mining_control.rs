@@ -589,6 +589,9 @@ pub(super) fn rpc_reachable(connect: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Stdio is cfg-gated out of the Windows build path, but the reaper test
+    // needs it on every target to silence its throwaway child.
+    use std::process::Stdio;
 
     const REAPER_CHILD_ENV: &str = "HACASH_PANEL_REAPER_CHILD";
 
