@@ -311,7 +311,27 @@ pub(crate) async fn receive_blocks(hdl: &MsgHandler, peer: Arc<Peer>, mut buf: V
     .await
     .unwrap();
     if let Err(e) = res {
+        // A failed batch used to end the sync outright: print, return, and never
+        // ask for anything again. The node then sat at that height forever,
+        // answering its RPC and looking healthy, while the chain moved on. That
+        // is how a single
+        //   [Block Sync Warning] insert N failed: diamond status HTAKES not found
+        // turned into a node that was dead for hours without saying so.
+        //
+        // One failure is not a reason to stop asking. Resume from where the
+        // chain ACTUALLY is rather than from this batch's end, because a partial
+        // batch may have inserted some of its blocks, and a wrong start height
+        // is refused by do_synchronize and would fail again immediately.
+        //
+        // The pause matters: without it a permanently bad block becomes a tight
+        // loop that floods the peer and the log. With it, a transient failure
+        // recovers on its own and a permanent one keeps saying so out loud,
+        // which is the outcome to prefer over silence.
         println!("{}", e);
+        let head = hdl.engine.latest_block().height().uint();
+        println!("[P2P] sync failed at height {}; retrying from {} in 10s", end_hei, head + 1);
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        send_req_block_msg(hdl, peer, head + 1).await;
         return;
     }
     println!("ok.");
