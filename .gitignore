@@ -105,6 +105,13 @@ hacash_*
 !mainnet-configs/*.ini
 !miner-pool/hac-pool.example.ini
 !hbit-pool/hbit-pool.example.ini
+!deploy/node/hacash.config.ini
+
+# The pool's wallet passphrase lives here at deploy time. It must NEVER be
+# committed: it is one half of the wallet, and the key file is the other. This
+# is listed AFTER the negations above on purpose, so nothing can re-include it.
+deploy/secrets/
+
 *.exe
 *_ubuntu
 *_windows
