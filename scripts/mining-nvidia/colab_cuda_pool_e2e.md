@@ -532,8 +532,43 @@ Measured on an AMD gfx1201 against a live pool, before and after the OpenCL fix:
 | share of the PPLNS window, REAL difficulty    |         | 99.8%   |
 
 The last row is the one that matters and the one this cell reproduces. The GPU is
-thousands of times faster than one CPU thread, so it must take essentially the
-whole window. Taking half of it, or a fifth, is the defect.
+far faster than one CPU thread, so it must take essentially the whole window.
+Taking half of it, or a fifth, is the defect.
+
+### Result on a Colab T4, 2026-07-27
+
+Run `20260727T154114`, against the real chain at a block cost of 2^42, with
+share_bits 22 leaving each share at about 2^20 hashes:
+
+| | CUDA T4 | one CPU thread |
+| --- | --- | --- |
+| hashrate | 6.92 MH/s | 21.01 KH/s |
+| submissions in 10 min | 2,493 | 6 |
+| share of the PPLNS window | 99.76% | 0.24% |
+| share it should have taken | 99.697% | |
+
+The window share and the hashrate share agree to 0.06 of a percentage point, and
+the split measured over the whole sample matches the window snapshot exactly. All
+five checks passed, with no stale submissions, no failed submissions and no share
+list overflow.
+
+Two things about those numbers are worth stating so they are not misread later.
+
+The 6.92 MH/s is not a regression against the 86 MH/s seen on the same card in
+earlier runs. `block_hash_repeat` is `height / 50000 + 1`, capped at 16, so
+mainnet heights hash with repeat 16 while a fresh chain at genesis uses repeat 1.
+Sixteen times the work per hash is the entire difference, and this figure is the
+mainnet-representative one.
+
+The control produced only 6 shares, so the Poisson noise on it is roughly plus or
+minus 2.4, which puts the measurable window share somewhere between 99.64% and
+99.84%. The expected value sits inside that, so the agreement is real, but its
+PRECISION is bounded by that count rather than by the GPU's. A longer sample, or a
+rival with more threads, tightens it. Two other things this particular run did not
+exercise: only one height change was observed, so template rolling and the stale
+path were barely touched, and the share list never overflowed, so the
+undersampling path was not reached outside the Cell 2 unit test that covers it
+directly.
 
 ```python
 import re, json, os, time
