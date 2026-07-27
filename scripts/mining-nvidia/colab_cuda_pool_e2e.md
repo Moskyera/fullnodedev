@@ -222,6 +222,10 @@ It is safe to re-run: the chain data persists under
 `/content/fullnodedev/target/release/hacash_mainnet_data`, so a second run
 resumes rather than starting over.
 
+Expect about 2.7 GB of chain data, measured from a completed sync of the same
+chain, which is comfortably inside Colab's disk. The time is dominated by
+download and validation rather than by anything on the GPU.
+
 ```python
 import subprocess, os, time, json, urllib.request
 D = "/content/fullnodedev/target/release"
