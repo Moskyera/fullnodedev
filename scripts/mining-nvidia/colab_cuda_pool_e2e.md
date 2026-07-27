@@ -133,20 +133,20 @@ stats_file = miner-stats.json
 # The rival: one CPU thread, no GPU, its own pool address and its own stats
 # file.
 #
-# It gets its OWN DIRECTORY, and that is not tidiness. poworker resolves
-# "./poworker.config.ini" relative to its working directory and never reads a
-# path from the command line (app/src/poworker.rs: `let default_config =
-# "./poworker.config.ini"`). Passing a filename as an argument is silently
-# ignored, so running the rival from this directory would load the GPU config
-# instead: two CUDA miners on one card, both paid to the same address, no rival
-# at all, and Cell 6 reporting PASS on a test that measured nothing.
+# It gets its own directory only so its stats file does not collide with the
+# GPU's. What actually selects its config is the command-line argument, and that
+# matters more than it looks (sys/src/config.rs resolve_config_path_from):
+#
+#   if args.len() == 2 { PathBuf::from(&args[1]) } else { executable_dir.join(..) }
+#
+# So an argument IS honoured, and without one the default is resolved against the
+# EXECUTABLE'S directory, not the working directory. current_exe() reads
+# /proc/self/exe, which follows symlinks, so launching a symlinked copy of the
+# binary from this directory lands back in the GPU's directory and loads the GPU
+# config: two CUDA miners on one card, both paid to the same address, no rival at
+# all. Hence an absolute config path, passed explicitly, and no symlink.
 RIVAL = D / "cpurival"
 RIVAL.mkdir(exist_ok=True)
-for name in ("poworker", "opencl"):
-    src = D / name
-    dst = RIVAL / name
-    if src.exists() and not dst.exists():
-        dst.symlink_to(src)
 (RIVAL/"poworker.config.ini").write_text("""connect = 127.0.0.1:18082
 pool_worker = %s
 supervene = 1
@@ -274,16 +274,22 @@ if pool.poll() is not None:
 
 miner = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/miner.log","w"),
                          stderr=subprocess.STDOUT, env=env, start_new_session=True)
-# cwd is the rival's OWN directory, because that is the only thing that selects
-# its config: poworker always reads ./poworker.config.ini and ignores arguments.
-rival = subprocess.Popen(["./poworker"], cwd=D + "/cpurival",
+# The rival takes its config as an ABSOLUTE argument. Its own directory is only
+# for the stats file; it cannot select the config, because poworker resolves the
+# default against the executable's directory and current_exe() follows symlinks.
+RIVAL_CFG = D + "/cpurival/poworker.config.ini"
+rival = subprocess.Popen([D + "/poworker", RIVAL_CFG], cwd=D + "/cpurival",
                          stdout=open("/content/cpu.log","w"), stderr=subprocess.STDOUT,
                          env=env, start_new_session=True)
 time.sleep(6)
-# Prove the rival really is the CPU worker. Match the lines poworker only prints
-# when it actually brought a CUDA device up, not the bare word, which appears in
-# ordinary status text and made this guard cry wolf.
 _riv = open("/content/cpu.log").read()
+# poworker prints the canonical path of the file it loaded. That is the direct
+# evidence, so check it rather than inferring from behaviour. It matters because
+# an unreadable config is not fatal: load_config_path prints "[Config Error]" and
+# hands back an EMPTY map, so the rival would run on defaults and look plausible.
+if RIVAL_CFG not in _riv:
+    raise SystemExit("the rival did not load %s. Its log says:
+%s" % (RIVAL_CFG, _riv[:800]))
 if re.search(r"Create CUDA block miner worker|\[CUDA\] Device #", _riv):
     raise SystemExit("the rival came up as a CUDA worker: it must be the CPU worker on its own "
                      "address, or the whole measurement is meaningless")
