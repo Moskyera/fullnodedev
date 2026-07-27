@@ -1,7 +1,14 @@
 # Packages Windows miner release ZIPs from target\release.
 # Produces TWO downloads:
 #   - hacash-miner-only-*  (workers + panel; you already have fullnode)
-#   - hacash-miner-full-*  (fullnode + workers + panel + HBIT pool; clean PC)
+#   - hacash-miner-full-*  (fullnode + workers + panel; clean PC)
+#
+# What is deliberately NOT in either download: the HBIT pool. hbit-pool-server
+# and hbit-pool-payout are the author's own infrastructure, run next to the
+# author's own fullnode, and they are not published. The miner merely LISTS HBIT
+# as a pool it can connect to. Nothing here may start shipping a wallet-holding
+# daemon to people who came for a miner; the release workflow asserts their
+# absence from every archive.
 param(
     [string]$Version = "dev",
     [string]$OutDir = "dist"
@@ -22,12 +29,6 @@ $requiredMainnetConfigs = @(
     "diaworker.mainnet.ini",
     "MAINNET-DIAMOND.md"
 )
-# HBIT pool operator files. The pool holds real miner money, so the runbook and
-# the argument worksheet ship WITH the binaries: a runbook on a web page the
-# operator never opens is the same as no runbook.
-$poolRunbook = Join-Path $Root "docs\POOL-OPERATOR.md"
-$poolWorksheet = Join-Path $Root "hbit-pool\hbit-pool.example.ini"
-$poolReadme = Join-Path $Root "README-POOL.txt"
 $requiredKernels = @(
     "aes_helper.cl", "blake.cl", "bmw.cl", "cubehash.cl", "echo.cl",
     "fugue.cl", "groestl.cl", "hamsi.cl", "hamsi_help.cl",
@@ -83,57 +84,6 @@ foreach ($template in @(Get-ChildItem -LiteralPath $mainnetConfigs -Filter "*.in
     }
 }
 
-foreach ($required in @($poolRunbook, $poolWorksheet, $poolReadme)) {
-    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-        $hint = ""
-        if ($required -eq $poolWorksheet) {
-            # .gitignore blanket-ignores *.ini and needs one explicit negation
-            # per shipped template, the way it already carries one for the
-            # sibling pool. Without that line the worksheet exists on the
-            # author's disk but never reaches a clone or a CI checkout, and this
-            # is the only place that says so.
-            $hint = ". A checkout missing only this file usually means .gitignore lacks the line" +
-                " '!hbit-pool/hbit-pool.example.ini', which belongs next to the existing" +
-                " '!miner-pool/hac-pool.example.ini'"
-        }
-        throw "Missing required HBIT pool file: $required$hint"
-    }
-}
-# The worksheet documents the ARGUMENTS hbit-pool-server takes; it must ship
-# with every operator-specific answer BLANK. A shipped node URL, wallet path,
-# listen address or chain is a value somebody pastes without reading, and one of
-# them decides which wallet holds other people's mining income.
-foreach ($field in @("node", "wallet_file", "listen", "chain", "pool_base")) {
-    $filled = @(
-        Get-Content -LiteralPath $poolWorksheet |
-            Where-Object { $_ -match "^\s*$field\s*=\s*\S" }
-    )
-    if ($filled.Count -gt 0) {
-        throw "hbit-pool.example.ini ships a filled-in '$field': $($filled -join '; ')"
-    }
-}
-# Nothing an operator receives may carry a live address, private key or
-# passphrase. An earlier audit found a shipped template with a valid third-party
-# reward address in it, which would have paid a stranger; these two files are
-# now scanned for the same class of mistake, comments included.
-foreach ($doc in @($poolWorksheet, $poolReadme)) {
-    $name = [System.IO.Path]::GetFileName($doc)
-    $text = Get-Content -LiteralPath $doc -Raw
-    if ($text -match '\b1[1-9A-HJ-NP-Za-km-z]{25,34}\b') {
-        throw "$name ships something shaped like a live HAC address: $($Matches[0])"
-    }
-    if ($text -match '\b[0-9a-fA-F]{64}\b') {
-        throw "$name ships something shaped like a private key: $($Matches[0])"
-    }
-    $secret = @(
-        Get-Content -LiteralPath $doc |
-            Where-Object { $_ -match '(?i)^\s*(password|passphrase|HBIT_WALLET_PASSWORD\w*)\s*=\s*\S' }
-    )
-    if ($secret.Count -gt 0) {
-        throw "$name must never carry a passphrase value: $($secret -join '; ')"
-    }
-}
-
 $minerOnlyExes = @(
     "poworker.exe",
     "diaworker.exe",
@@ -144,24 +94,10 @@ $minerOnlyExes = @(
 # Optional public pool binary (all-in-one panel host)
 $optionalExes = @("hac-pool.exe")
 $fullExes = @("hacash.exe") + $minerOnlyExes
-# HBIT payout pool. FULL package only: it needs a synced fullnode of its own to
-# fetch templates, submit blocks and settle, and the full package is the one
-# that ships that node. The miner-only package is the small worker-rig payload
-# for someone who just wants to mine, and a wallet-holding daemon they will
-# never start is clutter with a downside.
-$poolExes = @(
-    "hbit-pool-server.exe",
-    "hbit-pool-payout.exe"
-)
 
 foreach ($e in $fullExes) {
     if (-not (Test-Path (Join-Path $Release $e))) {
         throw "Missing binary: $(Join-Path $Release $e)"
-    }
-}
-foreach ($e in $poolExes) {
-    if (-not (Test-Path (Join-Path $Release $e))) {
-        throw "Missing binary: $(Join-Path $Release $e) - build it with: cargo build --release -p hbit-pool"
     }
 }
 foreach ($e in $optionalExes) {
@@ -224,27 +160,6 @@ function Copy-MainnetConfigs {
     }
 }
 
-function Copy-PoolAssets {
-    param([string]$Stage)
-
-    foreach ($e in $poolExes) {
-        Copy-Item -LiteralPath (Join-Path $Release $e) -Destination (Join-Path $Stage $e)
-    }
-    # The runbook and the worksheet travel with the binaries. Shipping the pool
-    # without them is what the earlier refusal to package it was about.
-    Copy-Item -LiteralPath $poolRunbook -Destination (Join-Path $Stage "POOL-OPERATOR.md")
-    Copy-Item -LiteralPath $poolWorksheet -Destination (Join-Path $Stage "hbit-pool.example.ini")
-
-    foreach ($name in @(
-        "hbit-pool-server.exe", "hbit-pool-payout.exe",
-        "POOL-OPERATOR.md", "hbit-pool.example.ini"
-    )) {
-        if (-not (Test-Path -LiteralPath (Join-Path $Stage $name) -PathType Leaf)) {
-            throw "Staged package is missing $name"
-        }
-    }
-}
-
 function Write-Sha256 {
     param([string]$Path)
 
@@ -260,8 +175,7 @@ function Pack-Flavor {
         [string]$PackageName,
         [string[]]$Exes,
         [string[]]$Extras,
-        [string]$Version,
-        [switch]$IncludePool
+        [string]$Version
     )
 
     foreach ($f in $Extras) {
@@ -287,11 +201,23 @@ function Pack-Flavor {
     Copy-Logo $Stage
     Copy-MiningAssets $Stage
     Copy-MainnetConfigs $Stage
-    if ($IncludePool) { Copy-PoolAssets $Stage }
 
     foreach ($f in $Extras) {
         $src = Join-Path $Root $f
         Copy-Item -LiteralPath $src -Destination (Join-Path $Stage $f)
+    }
+
+    # The download is the MINER. The HBIT pool is the author's own
+    # infrastructure and is never published, so no route through this function
+    # may leave a pool file staged: a wallet-holding daemon reaching people who
+    # came for a miner is the failure this asserts against.
+    foreach ($name in @(
+        "hbit-pool-server.exe", "hbit-pool-payout.exe",
+        "hbit-pool.example.ini", "POOL-OPERATOR.md", "README-POOL.txt"
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $Stage $name)) {
+            throw "$PackageName must not contain the pool file $name"
+        }
     }
 
     Set-Content -Path (Join-Path $Stage "VERSION.txt") -Value $Version -NoNewline
@@ -320,9 +246,8 @@ $zipMiner = Pack-Flavor `
 $zipFull = Pack-Flavor `
     -PackageName "hacash-miner-full-windows-x64" `
     -Exes $fullExes `
-    -Extras ($common + @("SETUP.bat", "README-RELEASE.txt", "README-POOL.txt")) `
-    -Version $Version `
-    -IncludePool
+    -Extras ($common + @("SETUP.bat", "README-RELEASE.txt")) `
+    -Version $Version
 
 Write-Host ""
 Write-Host "  Packaged (miner only): $zipMiner"

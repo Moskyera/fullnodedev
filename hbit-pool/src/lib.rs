@@ -729,6 +729,14 @@ pub const WALLET_PASSWORD_ENV: &str = "HBIT_WALLET_PASSWORD";
 /// cannot carry secrets in the environment.
 pub const WALLET_PASSWORD_FILE_ENV: &str = "HBIT_WALLET_PASSWORD_FILE";
 
+/// The shortest passphrase the pool will protect a real wallet with. Anything
+/// shorter is refused rather than silently accepted: it is the only thing
+/// standing between a stolen backup and every coin the pool holds.
+pub const WALLET_PASSWORD_MIN: usize = 8;
+
+/// Characters in an unencrypted wallet file: a 32-byte private key in hex.
+const WALLET_KEY_HEX_LEN: usize = 64;
+
 const WALLET_ENVELOPE_VERSION: u64 = 1;
 const WALLET_KDF_M_COST_KB: u32 = 19456;
 const WALLET_KDF_T_COST: u32 = 2;
@@ -740,25 +748,107 @@ const WALLET_KDF_MAX_T_COST: u32 = 16;
 const WALLET_KDF_MAX_P_COST: u32 = 16;
 
 /// The configured wallet passphrase, or None for the (loudly warned about)
-/// plaintext mode. A passphrase under 8 characters is refused outright rather
-/// than silently weakening the only thing protecting the pool's funds.
-fn wallet_password() -> Option<Zeroizing<String>> {
-    let mut pass = Zeroizing::new(std::env::var(WALLET_PASSWORD_ENV).unwrap_or_default());
-    if pass.is_empty()
-        && let Ok(f) = std::env::var(WALLET_PASSWORD_FILE_ENV)
-    {
-        match std::fs::read_to_string(&f) {
-            Ok(t) => pass = Zeroizing::new(t.trim().to_string()),
-            Err(e) => panic!("cannot read {WALLET_PASSWORD_FILE_ENV} ({f}): {e}"),
+/// plaintext mode.
+///
+/// Never prompts for anything: a service manager gives this process no terminal,
+/// so every input comes from the environment or a file and anything missing is a
+/// refusal that names what to set.
+fn wallet_password() -> Result<Option<Zeroizing<String>>, String> {
+    wallet_password_from(
+        std::env::var(WALLET_PASSWORD_ENV).ok(),
+        std::env::var(WALLET_PASSWORD_FILE_ENV).ok(),
+    )
+}
+
+/// The passphrase rule itself, with the two configured values passed in so the
+/// whole of it can be exercised without touching this process's environment.
+///
+/// The variable wins over the file, and an EMPTY variable means "not set" so a
+/// service unit that always exports it can still leave it blank. A file that
+/// exists but holds nothing is NOT the same as no passphrase at all: read that
+/// way, an encrypted wallet would be reported as "no passphrase is configured"
+/// to an operator who had configured one, and the fix they were told to apply is
+/// the one they had already applied.
+///
+/// No message built here ever carries the passphrase, or its length: these lines
+/// go to a journal that outlives the mistake.
+fn wallet_password_from(
+    direct: Option<String>,
+    file: Option<String>,
+) -> Result<Option<Zeroizing<String>>, String> {
+    let direct = Zeroizing::new(direct.unwrap_or_default());
+    if !direct.is_empty() {
+        if direct.len() < WALLET_PASSWORD_MIN {
+            return Err(format!(
+                "REFUSING to touch the pool wallet: the passphrase in {WALLET_PASSWORD_ENV} is \
+                 shorter than {WALLET_PASSWORD_MIN} characters.\n\
+                 Nothing was read and nothing was written.\n\
+                 What to do: set {WALLET_PASSWORD_ENV} to a longer passphrase, one you have \
+                 written down somewhere physical, and start again. If a wallet file already \
+                 exists, it must be the passphrase that wallet was created with."
+            ));
         }
+        return Ok(Some(direct));
     }
+    // No passphrase in the environment: fall back to the file, if one is named.
+    let Some(file) = file.filter(|f| !f.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if std::path::Path::new(&file).is_dir() {
+        return Err(format!(
+            "REFUSING to touch the pool wallet: {WALLET_PASSWORD_FILE_ENV} names {file}, which is \
+             a directory, not a file.\n\
+             What to do: point {WALLET_PASSWORD_FILE_ENV} at the FILE that holds the passphrase \
+             and nothing else, or unset it and put the passphrase in {WALLET_PASSWORD_ENV}."
+        ));
+    }
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => Zeroizing::new(t),
+        Err(e) => {
+            let why = match e.kind() {
+                std::io::ErrorKind::NotFound => "there is no file at that path".to_string(),
+                std::io::ErrorKind::PermissionDenied => {
+                    "this account is not allowed to read it".to_string()
+                }
+                std::io::ErrorKind::InvalidData => "it is not text".to_string(),
+                _ => format!("the operating system said: {e}"),
+            };
+            return Err(format!(
+                "REFUSING to touch the pool wallet: {WALLET_PASSWORD_FILE_ENV} names {file}, \
+                 which cannot be read ({why}).\n\
+                 Nothing was read and nothing was written.\n\
+                 What to do: point {WALLET_PASSWORD_FILE_ENV} at a readable file holding just the \
+                 passphrase, and make sure the account this service runs as can read it. Or unset \
+                 it and use {WALLET_PASSWORD_ENV} instead."
+            ));
+        }
+    };
+    // Trimmed, exactly as it always has been: a passphrase file written by an
+    // editor ends in a newline, and the wallets already on disk were encrypted
+    // with the trimmed form.
+    let pass = Zeroizing::new(text.trim().to_string());
     if pass.is_empty() {
-        return None;
+        return Err(format!(
+            "REFUSING to touch the pool wallet: {WALLET_PASSWORD_FILE_ENV} names {file}, which is \
+             empty, so there is no passphrase to use.\n\
+             Nothing was read and nothing was written. This is NOT being treated as \"no \
+             passphrase\": if the wallet is encrypted, running on without one would look like a \
+             configuration you never made.\n\
+             What to do: put the wallet's passphrase in {file}, or unset \
+             {WALLET_PASSWORD_FILE_ENV} and use {WALLET_PASSWORD_ENV}."
+        ));
     }
-    if pass.len() < 8 {
-        panic!("the wallet passphrase in {WALLET_PASSWORD_ENV} must be at least 8 characters");
+    if pass.len() < WALLET_PASSWORD_MIN {
+        return Err(format!(
+            "REFUSING to touch the pool wallet: the passphrase in {file} is shorter than \
+             {WALLET_PASSWORD_MIN} characters.\n\
+             Nothing was read and nothing was written.\n\
+             What to do: put a longer passphrase in that file, one you have written down \
+             somewhere physical, and start again. If a wallet file already exists, it must be the \
+             passphrase that wallet was created with."
+        ));
     }
-    Some(pass)
+    Ok(Some(pass))
 }
 
 fn wallet_derive_key(
@@ -815,49 +905,130 @@ fn encrypt_key_hex(key_hex: &str, pass: &str) -> Result<String, String> {
 fn envelope_u32(j: &Value, key: &str, default: u32, max: u32) -> Result<u32, String> {
     let v = j.get(key).and_then(|v| v.as_u64()).unwrap_or(default as u64);
     if v == 0 || v > max as u64 {
-        return Err(format!("{key} out of range"));
+        return Err(format!("its `{key}` is outside the range this build accepts"));
     }
     Ok(v as u32)
 }
 
+/// Why an encrypted wallet file would not open.
+///
+/// The three are kept apart on purpose, and the ONE distinction that costs money
+/// is `Shape` versus `Undecryptable`. Telling an operator their file is corrupt
+/// when they merely mistyped the passphrase invites them to restore a backup
+/// over the real wallet, or to delete it and let the pool create a fresh empty
+/// one, abandoning the funds in the file they still had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvelopeError {
+    /// The file is not an envelope this build can read. Decided from the file's
+    /// structure alone, BEFORE any passphrase is tried, so it is certain and it
+    /// is never a passphrase problem.
+    Shape(String),
+    /// The authentication tag did not verify. That is a wrong passphrase OR
+    /// damaged ciphertext, and AES-GCM cannot tell those apart: it is the same
+    /// check that fails either way. Neither can this pool, so neither may the
+    /// message it prints.
+    Undecryptable,
+    /// The tag DID verify, so the passphrase is right and the file is intact,
+    /// but what came out of it is not a private key.
+    Content(String),
+}
+
 /// Unwrap an envelope written by [`encrypt_key_hex`].
-fn decrypt_key_hex(body: &str, pass: &str) -> Result<Zeroizing<String>, String> {
+///
+/// No error carries any part of the passphrase, the ciphertext or the key: the
+/// caller turns these into lines that end up in a journal.
+fn decrypt_key_hex(body: &str, pass: &str) -> Result<Zeroizing<String>, EnvelopeError> {
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
-    let j: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let shape = |s: String| EnvelopeError::Shape(s);
+    // Everything down to the decrypt itself is a property of the FILE. None of
+    // it depends on the passphrase, which is what makes `Shape` certain.
+    let j: Value = serde_json::from_str(body)
+        .map_err(|_| shape("it is not the JSON this pool writes".to_string()))?;
     let ver = j.get("hbit_wallet").and_then(|v| v.as_u64()).unwrap_or(0);
     if ver != WALLET_ENVELOPE_VERSION {
-        return Err(format!("unsupported wallet file version {ver}"));
+        return Err(shape(format!(
+            "it declares wallet format {ver} and this build reads format {WALLET_ENVELOPE_VERSION}"
+        )));
     }
-    let hex_field = |k: &str| -> Result<Vec<u8>, String> {
+    let hex_field = |k: &str| -> Result<Vec<u8>, EnvelopeError> {
         let s = j
             .get(k)
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("wallet file is missing `{k}`"))?;
-        hex::decode(s).map_err(|_| format!("wallet file field `{k}` is not hex"))
+            .ok_or_else(|| shape(format!("it is missing the `{k}` field")))?;
+        hex::decode(s).map_err(|_| shape(format!("its `{k}` field is not hex")))
     };
     let salt = hex_field("kdf_salt")?;
     let nonce = hex_field("cipher_nonce")?;
     let ciphertext = hex_field("ciphertext")?;
     if nonce.len() != 12 {
-        return Err("wallet file nonce must be 12 bytes".to_string());
+        return Err(shape(format!(
+            "its nonce is {} bytes and must be 12",
+            nonce.len()
+        )));
     }
     let key = wallet_derive_key(
         pass,
         &salt,
-        envelope_u32(&j, "kdf_m_cost_kb", WALLET_KDF_M_COST_KB, WALLET_KDF_MAX_M_COST_KB)?,
-        envelope_u32(&j, "kdf_t_cost", WALLET_KDF_T_COST, WALLET_KDF_MAX_T_COST)?,
-        envelope_u32(&j, "kdf_p_cost", WALLET_KDF_P_COST, WALLET_KDF_MAX_P_COST)?,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&*key).map_err(|e| e.to_string())?;
+        envelope_u32(&j, "kdf_m_cost_kb", WALLET_KDF_M_COST_KB, WALLET_KDF_MAX_M_COST_KB)
+            .map_err(EnvelopeError::Shape)?,
+        envelope_u32(&j, "kdf_t_cost", WALLET_KDF_T_COST, WALLET_KDF_MAX_T_COST)
+            .map_err(EnvelopeError::Shape)?,
+        envelope_u32(&j, "kdf_p_cost", WALLET_KDF_P_COST, WALLET_KDF_MAX_P_COST)
+            .map_err(EnvelopeError::Shape)?,
+    )
+    .map_err(|e| shape(format!("its key-derivation settings cannot be used here ({e})")))?;
+    let cipher = Aes256Gcm::new_from_slice(&*key)
+        .map_err(|e| shape(format!("its cipher key could not be set up ({e})")))?;
+    // The one check that cannot say WHY it failed.
     let plain = cipher
         .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
         .map(Zeroizing::new)
-        .map_err(|_e: aes_gcm::Error| "wrong passphrase or corrupted wallet file".to_string())?;
+        .map_err(|_e: aes_gcm::Error| EnvelopeError::Undecryptable)?;
     let txt = String::from_utf8(plain.to_vec())
         .map(Zeroizing::new)
-        .map_err(|_| "decrypted wallet content is not text".to_string())?;
+        .map_err(|_| EnvelopeError::Content("what is inside it is not text".to_string()))?;
     Ok(txt)
+}
+
+/// The refusal for an envelope that would not open, said so that an operator
+/// cannot mistake one cause for the other.
+fn envelope_refusal(path: &str, e: &EnvelopeError) -> String {
+    match e {
+        EnvelopeError::Shape(why) => format!(
+            "REFUSING to open the pool wallet: {path} is not an encrypted wallet file this build \
+             can read ({why}).\n\
+             This is NOT about your passphrase. The file's structure is checked before any \
+             passphrase is tried, so a different passphrase would not change this.\n\
+             Nothing has been written to it and no new wallet has been created.\n\
+             What to do: check that {path} really is the pool's key file and not another file \
+             that ended up at that path, then restore it from your backup. Do not delete it \
+             first: nothing here says the key inside is gone."
+        ),
+        EnvelopeError::Undecryptable => format!(
+            "REFUSING to open the pool wallet: {path} did not open.\n\
+             This is EITHER the wrong passphrase OR a damaged file, and there is no way to tell \
+             which: the check that failed is the same one in both cases. Do not act as though you \
+             knew which it was.\n\
+             What to do, in this order:\n\
+             1. Check the passphrase. It is taken from {WALLET_PASSWORD_ENV} when that is set, \
+             otherwise from the file named in {WALLET_PASSWORD_FILE_ENV}. Look for a trailing \
+             space, a different keyboard layout, or a service unit still exporting an old value.\n\
+             2. Only once you are certain the passphrase is right, restore {path} from your \
+             backup.\n\
+             DO NOT delete, move or overwrite {path}, and do not let the pool create a new wallet \
+             in its place. If the passphrase is simply wrong, that file still holds the key to \
+             every coin this pool has mined; a new wallet is a new address, and the old money \
+             would be out of reach for good. Nothing has been written to it.",
+        ),
+        EnvelopeError::Content(why) => format!(
+            "REFUSING to open the pool wallet: {path} decrypted correctly, so the passphrase is \
+             right and the file is intact, but {why}.\n\
+             What to do: this is not a file this pool wrote. Check that {path} is the right file \
+             and restore it from your backup. Nothing has been written to it and no new wallet \
+             has been created; do not delete it."
+        ),
+    }
 }
 
 /// True the FIRST time this (tag, path) pair comes up in this process. The
@@ -883,136 +1054,369 @@ fn warn_plaintext_wallet(path: &str) {
     );
 }
 
-/// Load the pool wallet from `path`, creating a fresh random one if the file
-/// does not exist. The file holds either a 64-hex secp256k1 private key or, when
-/// a passphrase is configured, an encrypted envelope. The private key only ever
-/// lives in that file: it is never printed or logged; only the address is shown.
+/// Load the pool wallet, or print the refusal and stop.
+///
+/// Kept for callers that have no way to report a failure of their own; prefer
+/// [`try_load_or_create_wallet`], which hands the same text back for the caller
+/// to print in its own house style. A refusal exits with status 2, the same
+/// status the server uses for a configuration it will not start on, rather than
+/// panicking: a panic buries the one line that says what to fix under a
+/// backtrace note, in a journal, at 3am, on a machine nobody is logged in to.
 pub fn load_or_create_wallet(path: &str) -> Account {
+    match try_load_or_create_wallet(path) {
+        Ok(acc) => acc,
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(2)
+        }
+    }
+}
+
+/// Load the pool wallet from `path`, creating a fresh random one if, and only
+/// if, there is no file there at all. The file holds either a 64-hex secp256k1
+/// private key or, when a passphrase is configured, an encrypted envelope. The
+/// private key only ever lives in that file: it is never printed or logged, and
+/// no refusal below names anything but the FILE that failed.
+///
+/// Every failure is an `Err` an operator can act on, and NO failure creates,
+/// truncates or overwrites `path`. That is the money-critical property: the file
+/// on disk is the only copy of the key to the address the pool's income lands
+/// in, so a pool that "recovered" from a mistyped passphrase by making a new
+/// wallet would abandon every coin in the old one and start owing miners from an
+/// address with nothing in it.
+pub fn try_load_or_create_wallet(path: &str) -> Result<Account, String> {
+    // Resolve the passphrase FIRST, before anything opens the key file, so a
+    // passphrase that is missing, empty or too short is refused with the wallet
+    // untouched. Resolved once, and passed down, so the settlement loop does not
+    // re-read the passphrase file on every cycle either.
+    let pass = wallet_password()?;
+    load_or_create_wallet_with(path, pass.as_ref().map(|p| p.as_str()))
+}
+
+/// The wallet loader with the passphrase already resolved, so the whole of it can
+/// be exercised without this process's environment.
+fn load_or_create_wallet_with(path: &str, pass: Option<&str>) -> Result<Account, String> {
+    // A directory at the wallet path reads back as a different OS error on every
+    // platform (and as "permission denied" on Windows), so name it here rather
+    // than leave an operator chasing an ACL that is not the problem.
+    if std::path::Path::new(path).is_dir() {
+        return Err(format!(
+            "REFUSING to open the pool wallet: {path} is a directory, not a wallet file.\n\
+             Nothing was created inside it and nothing was written.\n\
+             What to do: pass the path of the key FILE as <wallet_file>. If you meant a file of \
+             that name inside a folder, spell out the whole path, for example \
+             {path}{sep}pool-wallet.key",
+            sep = std::path::MAIN_SEPARATOR,
+        ));
+    }
     match std::fs::read_to_string(path) {
         Ok(txt) => {
-            let acc = account_from_wallet_file(path, &txt);
+            let acc = account_from_wallet_file(path, &txt, pass)?;
             // Re-apply and re-verify the owner-only permissions on the LOAD path
             // too, not only at creation: a key that lost its ACL (restored from a
             // backup, copied by hand) must not keep serving funds.
-            secure_existing_key_file(path);
+            secure_existing_key_file(path)?;
             println!("pool wallet {} (from {path})", acc.readable());
-            acc
+            Ok(acc)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // No wallet yet: generate one and persist it owner-only.
-            let acc = loop {
-                let mut key = [0u8; 32];
-                getrandom::fill(&mut key).expect("system RNG");
-                if let Ok(a) = Account::create_by_secret_key_value(key) {
-                    break a;
-                }
-            };
-            let key_hex = Zeroizing::new(hex::encode(acc.secret_key().serialize()));
-            let pass = wallet_password();
-            let body = match pass.as_deref() {
-                Some(p) => match encrypt_key_hex(&key_hex, p) {
-                    Ok(b) => b,
-                    Err(e2) => panic!("cannot encrypt the new wallet key: {e2}"),
-                },
-                None => key_hex.to_string(),
-            };
-            if let Err(e2) = write_key_file(path, &body) {
-                // A key we could not protect must never be left lying around.
-                let _ = std::fs::remove_file(path);
-                panic!("cannot write wallet file {path} securely: {e2}");
-            }
-            println!("CREATED A NEW POOL WALLET -> {path}");
-            println!("  address: {}", acc.readable());
-            if pass.is_some() {
-                println!("  the file is ENCRYPTED with {WALLET_PASSWORD_ENV}.");
-                println!("  BACK UP THAT FILE **AND** THAT PASSPHRASE: neither one alone can spend,");
-                println!("  and losing either one loses the pool's funds for good.");
-            } else {
-                println!("  BACK UP THAT FILE. Whoever holds it controls the pool's funds.");
-                warn_plaintext_wallet(path);
-            }
-            acc
-        }
-        // Never generate-and-overwrite on a non-NotFound error: a locked or
+        // The ONE branch that may write a key: there is no file here at all.
+        // Nothing above can reach it, so no failure to read or decrypt an
+        // existing wallet can ever fall through into creating a new one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_wallet(path, pass),
+        // Never generate-and-overwrite on any other error: a locked or
         // transiently-unreadable key file must not be silently replaced.
-        Err(e) => panic!("cannot read wallet file {path}: {e} (refusing to overwrite it)"),
+        Err(e) => Err(unreadable_wallet_refusal(path, &e)),
     }
+}
+
+/// The refusal for a wallet file that exists but could not be read.
+///
+/// Split out from the loader so each cause can be tested, and so each one gets
+/// the fix that actually applies to it.
+fn unreadable_wallet_refusal(path: &str, e: &std::io::Error) -> String {
+    let (why, fix) = match e.kind() {
+        std::io::ErrorKind::PermissionDenied => (
+            "this account is not allowed to read it".to_string(),
+            format!(
+                "run the pool as the account that owns {path}, or give that account read access \
+                 to it (Windows: icacls, Linux: chown then chmod 600). The pool locks this file \
+                 down to one account on purpose, so the usual cause is that the service now runs \
+                 as somebody else."
+            ),
+        ),
+        std::io::ErrorKind::InvalidData => (
+            "it is not text".to_string(),
+            format!(
+                "a wallet file is either 64 hex characters or the JSON envelope this pool writes, \
+                 and both are plain ASCII. Check that {path} is really the pool's key file and \
+                 not some other file that ended up at that path, then restore it from your backup."
+            ),
+        ),
+        _ => (
+            format!("the operating system said: {e}"),
+            format!(
+                "make {path} readable by the account this pool runs as, then start it again. If \
+                 the file is on a network or removable drive, check that the drive is mounted."
+            ),
+        ),
+    };
+    format!(
+        "REFUSING to open the pool wallet: {path} exists but cannot be read ({why}).\n\
+         No new wallet has been created in its place, and nothing has been written to it. A new \
+         wallet would be a new address, and every coin already mined into this one would be left \
+         behind with no way back.\n\
+         What to do: {fix}"
+    )
+}
+
+/// Create the pool's wallet. The ONE path in this file that writes a key.
+fn create_wallet(path: &str, pass: Option<&str>) -> Result<Account, String> {
+    let acc = new_random_account()?;
+    let key_hex = Zeroizing::new(hex::encode(acc.secret_key().serialize()));
+    let body = match pass {
+        Some(p) => Zeroizing::new(encrypt_key_hex(&key_hex, p).map_err(|e| {
+            format!(
+                "REFUSING to create the pool wallet: the new key could not be encrypted ({e}).\n\
+                 Nothing has been written to {path}.\n\
+                 What to do: this is the machine's own crypto or randomness failing, not your \
+                 configuration. Try again; if it repeats, the pool must not run here, because a \
+                 wallet it cannot protect is a wallet anyone with the disk can empty."
+            )
+        })?),
+        None => Zeroizing::new(key_hex.to_string()),
+    };
+    if let Err(e) = write_key_file(path, &body) {
+        // A key we could not protect must never be left lying around. This runs
+        // only here, where a moment ago there was no file at that path, so
+        // nothing an operator already had is removed.
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "REFUSING to run with an unprotected pool wallet: {path} could not be written and \
+             locked down to this account only ({e}).\n\
+             The key that was generated has been discarded, so nothing was left half-written.\n\
+             What to do: check that the folder holding {path} exists and that this account may \
+             create files in it, then start again. That file is the private key to every coin the \
+             pool will hold, so the pool will not settle for leaving it readable by others."
+        ));
+    }
+    println!("CREATED A NEW POOL WALLET -> {path}");
+    println!("  address: {}", acc.readable());
+    if pass.is_some() {
+        println!("  the file is ENCRYPTED with {WALLET_PASSWORD_ENV}.");
+        println!("  BACK UP THAT FILE **AND** THAT PASSPHRASE: neither one alone can spend,");
+        println!("  and losing either one loses the pool's funds for good.");
+    } else {
+        println!("  BACK UP THAT FILE. Whoever holds it controls the pool's funds.");
+        warn_plaintext_wallet(path);
+    }
+    Ok(acc)
+}
+
+/// A fresh random account, or a refusal.
+///
+/// Bounded, so a broken generator that keeps returning a value the curve rejects
+/// is a refusal rather than a daemon spinning at 100% forever with nothing in the
+/// log. A wallet is only ever as good as the randomness behind it, so a failing
+/// RNG must stop the pool rather than be retried around.
+fn new_random_account() -> Result<Account, String> {
+    for _ in 0..64 {
+        let mut key = Zeroizing::new([0u8; 32]);
+        if let Err(e) = getrandom::fill(&mut *key) {
+            return Err(format!(
+                "REFUSING to create the pool wallet: this machine's random number generator \
+                 failed ({e}). Nothing has been written.\n\
+                 What to do: a key made without real randomness could be guessed and the wallet \
+                 emptied, so the pool will not make one. Fix the system entropy source (on Linux \
+                 that is getrandom on /dev/urandom) and start again."
+            ));
+        }
+        if let Ok(a) = Account::create_by_secret_key_value(*key) {
+            return Ok(a);
+        }
+    }
+    Err(
+        "REFUSING to create the pool wallet: 64 random keys in a row were all rejected by the \
+         curve, which cannot happen with a working random number generator. Nothing has been \
+         written.\n\
+         What to do: this machine's randomness is broken. Fix it and start again."
+            .to_string(),
+    )
+}
+
+/// Turn 64 hex characters into an Account, and refuse anything else.
+///
+/// Never `Account::create_by`: when its argument is not exactly 64 hex
+/// characters that function falls back to treating the text as a PASSPHRASE and
+/// returns the account of its sha2. A key file with one altered character would
+/// then load a completely different wallet, and the pool would quietly mine into
+/// an address whose key nobody holds while the operator's real funds sat in a
+/// file it had stopped using. A refusal is recoverable; a wrong wallet is not.
+///
+/// The reason it returns is a fragment for the caller's message and never
+/// contains any part of the key.
+fn account_from_key_hex(key_hex: &str) -> Result<Account, String> {
+    let raw = Zeroizing::new(hex::decode(key_hex).map_err(|_| "it is not hexadecimal")?);
+    if raw.len() != 32 {
+        return Err(format!(
+            "it is {} bytes of hex and a private key is 32",
+            raw.len()
+        ));
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&raw);
+    // The underlying reason is dropped on purpose: nothing derived from key
+    // material goes into a message.
+    Account::create_by_secret_key_value(*key)
+        .map_err(|_| "it is not a private key this curve accepts".to_string())
 }
 
 /// Turn the wallet file's contents into an Account, transparently handling both
 /// the encrypted envelope and the legacy plaintext-hex form.
-fn account_from_wallet_file(path: &str, txt: &str) -> Account {
+///
+/// Reads only. Every refusal here leaves `path` exactly as it was found.
+fn account_from_wallet_file(path: &str, txt: &str, pass: Option<&str>) -> Result<Account, String> {
     let body = txt.trim();
+    if body.is_empty() {
+        return Err(format!(
+            "REFUSING to open the pool wallet: {path} is empty, so it holds no private key.\n\
+             The pool has NOT written a new key into it. It creates a wallet only when there is \
+             no file at all, because a new wallet is a new address and any coins mined into the \
+             old one would be left behind.\n\
+             What to do: if this file is meant to be your pool wallet, restore it from your \
+             backup. If this really is a first run and the empty file was made by accident (a \
+             shell redirect, an editor), delete the empty file and start the pool again."
+        ));
+    }
+    // A JSON envelope is the encrypted form; anything else is the legacy
+    // plaintext key.
     if body.starts_with('{') {
-        let Some(pass) = wallet_password() else {
-            panic!(
-                "wallet file {path} is encrypted but no passphrase is configured; \
-                 set {WALLET_PASSWORD_ENV} (or {WALLET_PASSWORD_FILE_ENV})"
-            );
+        let Some(pass) = pass else {
+            return Err(format!(
+                "REFUSING to open the pool wallet: {path} is encrypted and no passphrase is \
+                 configured.\n\
+                 Nothing has been written to it and no new wallet has been created.\n\
+                 What to do: set {WALLET_PASSWORD_ENV} to the passphrase this wallet was created \
+                 with, or put that passphrase in a file of its own and name that file in \
+                 {WALLET_PASSWORD_FILE_ENV}. Then start again. Do NOT delete or move {path}: it \
+                 holds the only key to the address the pool's income is paid into."
+            ));
         };
-        let key_hex = match decrypt_key_hex(body, &pass) {
-            Ok(k) => k,
-            Err(e) => panic!("cannot decrypt wallet file {path}: {e}"),
+        let key_hex = decrypt_key_hex(body, pass).map_err(|e| envelope_refusal(path, &e))?;
+        // The tag verified, so the passphrase is right and the bytes are intact:
+        // anything wrong from here is the CONTENT, which is a different thing to
+        // tell the operator.
+        return account_from_key_hex(key_hex.trim())
+            .map_err(|why| envelope_refusal(path, &EnvelopeError::Content(why)));
+    }
+    if body.len() != WALLET_KEY_HEX_LEN {
+        let shape = if body.len() < WALLET_KEY_HEX_LEN {
+            "a truncated copy: a transfer that stopped early, or a backup taken while the file was \
+             still being written"
+        } else {
+            "a file with something extra in it: a second key, a note, or two files run together"
         };
-        return Account::create_by(key_hex.trim()).expect("invalid key in wallet file");
+        // Said only when it can help. A passphrase being set is exactly when an
+        // operator expects to be looking at an encrypted file.
+        let hint = if pass.is_some() {
+            "\nA passphrase IS configured, so if you expected this wallet to be encrypted: the \
+             encrypted form is JSON and starts with `{`. This file does not, so it is not that."
+        } else {
+            ""
+        };
+        return Err(format!(
+            "REFUSING to open the pool wallet: {path} holds {n} characters. An unencrypted wallet \
+             file is exactly {WALLET_KEY_HEX_LEN} (a 32-byte private key written in hex), and an \
+             encrypted one is JSON starting with `{{`.\n\
+             That looks like {shape}.{hint}\n\
+             Nothing has been written to it and no new wallet has been created.\n\
+             What to do: restore {path} from your backup. Keep the file you have until the \
+             restored one opens: deleting it is the one step that cannot be undone.",
+            n = body.len()
+        ));
     }
-    if body.len() != 64 {
-        panic!("wallet file {path} must hold a 64-hex private key");
-    }
-    let acc = Account::create_by(body).expect("invalid key in wallet file");
+    let acc = account_from_key_hex(body).map_err(|why| {
+        format!(
+            "REFUSING to open the pool wallet: {path} holds {WALLET_KEY_HEX_LEN} characters, but \
+             they are not a private key ({why}).\n\
+             Nothing has been written to it and no new wallet has been created, and this pool will \
+             not guess: text that is not a key can be turned into SOME wallet, and it would not be \
+             yours.\n\
+             What to do: restore {path} from your backup. Do not delete the file you have."
+        )
+    })?;
     // Plaintext on disk: move it into an encrypted envelope as soon as a
     // passphrase is configured, otherwise say plainly what is at risk.
-    match wallet_password() {
-        Some(pass) => migrate_key_file_to_encrypted(path, body, &pass),
+    match pass {
+        Some(pass) => migrate_key_file_to_encrypted(path, body, pass)?,
         None => warn_plaintext_wallet(path),
     }
-    acc
+    Ok(acc)
 }
 
 /// Re-write a legacy plaintext key file as an encrypted envelope. The envelope
 /// is decrypted back and compared BEFORE it replaces the only copy of the key,
 /// so a bad envelope can never cost the pool its wallet.
-fn migrate_key_file_to_encrypted(path: &str, key_hex: &str, pass: &str) {
+///
+/// Failing to encrypt is a warning, not a refusal: the pool ran yesterday with
+/// that plaintext file and can run today. Failing to WRITE what was already
+/// verified is a refusal, because at that point the state of the file on disk is
+/// the thing in doubt.
+fn migrate_key_file_to_encrypted(path: &str, key_hex: &str, pass: &str) -> Result<(), String> {
     let body = match encrypt_key_hex(key_hex, pass) {
-        Ok(b) => b,
+        Ok(b) => Zeroizing::new(b),
         Err(e) => {
             eprintln!("[wallet] WARNING: could not encrypt {path} ({e}); it stays plaintext.");
-            return;
+            return Ok(());
         }
     };
     match decrypt_key_hex(&body, pass) {
         Ok(back) if back.trim().eq_ignore_ascii_case(key_hex) => {}
         _ => {
             eprintln!("[wallet] WARNING: the encrypted form of {path} did not verify; leaving it as-is.");
-            return;
+            return Ok(());
         }
     }
+    // Only now does anything replace the file, and what replaces it has already
+    // been decrypted back to the very key that is in it.
     if let Err(e) = write_key_file(path, &body) {
-        panic!(
-            "cannot re-write {path} encrypted and owner-only: {e}\n\
-             The key controls ALL pool funds, so the pool refuses to run with it unprotected."
-        );
+        return Err(format!(
+            "REFUSING to run with an unprotected pool wallet: {path} could not be re-written \
+             encrypted and owner-only ({e}).\n\
+             The key controls ALL pool funds. Either the file is still the plaintext key it was, \
+             or it is the encrypted form that was verified before it was written; in both cases \
+             the key in it is yours and nothing was lost.\n\
+             What to do: check that this account may write in that folder and that no backup tool \
+             is holding the file open, then start again. To carry on without encryption for now, \
+             unset {WALLET_PASSWORD_ENV} and {WALLET_PASSWORD_FILE_ENV}, knowing that the key is \
+             then plaintext on this disk."
+        ));
     }
     println!("[wallet] {path} is now ENCRYPTED with {WALLET_PASSWORD_ENV}.");
     println!("[wallet] KEEP THAT PASSPHRASE: without it the file cannot be decrypted and the");
     println!("[wallet] pool's funds are unrecoverable. The previous plaintext copy may still");
     println!("[wallet] exist in backups and snapshots - treat those as sensitive.");
+    Ok(())
 }
 
 /// Re-apply and verify the key file's owner-only permissions, once per path per
 /// process. Settlement reloads the wallet every cycle, and spawning icacls each
 /// time would be pointless work that a transient hiccup could turn into a
 /// skipped payout.
-fn secure_existing_key_file(path: &str) {
+fn secure_existing_key_file(path: &str) -> Result<(), String> {
     if !first_time_for("secured", path) {
-        return;
+        return Ok(());
     }
-    if let Err(e) = restrict_key_file_permissions(path) {
-        panic!(
-            "cannot secure wallet file {path}: {e}\n\
-             The key controls ALL pool funds, so the pool refuses to run with it unprotected."
-        );
-    }
+    restrict_key_file_permissions(path).map_err(|e| {
+        format!(
+            "REFUSING to run with an unprotected pool wallet: the owner-only permissions on \
+             {path} could not be applied and verified ({e}).\n\
+             The contents of the wallet were not changed.\n\
+             What to do: that file is the private key to every coin the pool holds, so it must not \
+             be readable by other accounts on this machine. Make sure this account owns it \
+             (Windows: icacls {path} /inheritance:r /grant:r \"%USERNAME%\":F, Linux: chown then \
+             chmod 600), then start again."
+        )
+    })
 }
 
 /// Write the wallet file owner-only via a temp file + atomic rename, so a
@@ -1020,32 +1424,43 @@ fn secure_existing_key_file(path: &str) {
 /// ALL pool funds, so securing it is MANDATORY: if the owner-only permissions
 /// cannot be applied AND verified this returns Err, and the caller must not keep
 /// running with an unprotected key.
+///
+/// Every failure removes the temp file before it returns. That file holds the
+/// private key, and a refusal must not leave a copy of it lying next to the
+/// wallet under a name nobody will think to look at.
 fn write_key_file(path: &str, body: &str) -> std::io::Result<()> {
-    use std::io::Write;
     let tmp = format!("{path}.tmp.{}", std::process::id());
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        // Harden the (still empty) temp file BEFORE the secret reaches it. On
-        // Windows it is created with the directory's inherited ACL and NTFS
-        // carries that ACL across the rename, so hardening only the final path
-        // would leave a window in which the key is readable by other accounts.
-        #[cfg(windows)]
-        if let Err(e) = restrict_key_file_permissions(&tmp) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        writeln!(f, "{body}")?;
-        let _ = f.sync_all();
+    if let Err(e) = fill_key_tmp(&tmp, body) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     restrict_key_file_permissions(path)
+}
+
+/// Create the temp file, harden it, then put the key in it.
+fn fill_key_tmp(tmp: &str, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    // Harden the (still empty) temp file BEFORE the secret reaches it. On
+    // Windows it is created with the directory's inherited ACL and NTFS carries
+    // that ACL across the rename, so hardening only the final path would leave a
+    // window in which the key is readable by other accounts.
+    #[cfg(windows)]
+    restrict_key_file_permissions(tmp)?;
+    writeln!(f, "{body}")?;
+    let _ = f.sync_all();
+    Ok(())
 }
 
 /// Lock the wallet key down to the current user only, and prove it worked.

@@ -14,12 +14,6 @@ required_kernels=(
   simd.cl skein.cl util.cl whirlpool.cl x16rs.cl x16rs_diamond.cl x16rs_main.cl
 )
 OUT_DIR="$ROOT/dist"
-# HBIT pool operator files. The pool holds real miner money, so the runbook and
-# the argument worksheet ship WITH the binaries: a runbook on a web page the
-# operator never opens is the same as no runbook.
-POOL_RUNBOOK="$ROOT/docs/POOL-OPERATOR.md"
-POOL_WORKSHEET="$ROOT/hbit-pool/hbit-pool.example.ini"
-POOL_README="$ROOT/README-POOL.txt"
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH="x86_64" ;;
@@ -31,66 +25,10 @@ esac
 
 common_binaries=(poworker diaworker list_opencl diagnose_opencl miner-panel)
 full_binaries=(hacash "${common_binaries[@]}")
-# HBIT payout pool. FULL package only: it needs a synced fullnode of its own to
-# fetch templates, submit blocks and settle, and the full package is the one
-# that ships that node. The miner-only package is the small worker-rig payload
-# for someone who just wants to mine, and a wallet-holding daemon they will
-# never start is clutter with a downside.
-pool_binaries=(hbit-pool-server hbit-pool-payout)
 
 for binary in "${full_binaries[@]}"; do
   if [[ ! -f "$RELEASE/$binary" ]]; then
     echo "Missing binary: $RELEASE/$binary"
-    exit 1
-  fi
-done
-for binary in "${pool_binaries[@]}"; do
-  if [[ ! -f "$RELEASE/$binary" ]]; then
-    echo "Missing binary: $RELEASE/$binary"
-    echo "Build it with: cargo build --release -p hbit-pool"
-    exit 1
-  fi
-done
-for doc in "$POOL_RUNBOOK" "$POOL_WORKSHEET" "$POOL_README"; do
-  if [[ ! -f "$doc" ]]; then
-    echo "Missing required HBIT pool file: $doc"
-    if [[ "$doc" == "$POOL_WORKSHEET" ]]; then
-      # .gitignore blanket-ignores *.ini and needs one explicit negation per
-      # shipped template, the way it already carries one for the sibling pool.
-      # Without that line the worksheet exists on the author's disk but never
-      # reaches a clone or a CI checkout, and this is the only place that says so.
-      echo "A checkout missing only this file usually means .gitignore lacks the line"
-      echo "  !hbit-pool/hbit-pool.example.ini"
-      echo "which belongs next to the existing !miner-pool/hac-pool.example.ini"
-    fi
-    exit 1
-  fi
-done
-# The worksheet documents the ARGUMENTS hbit-pool-server takes; it must ship
-# with every operator-specific answer BLANK. A shipped node URL, wallet path,
-# listen address or chain is a value somebody pastes without reading, and one of
-# them decides which wallet holds other people's mining income.
-if filled=$(grep -nE '^[[:space:]]*(node|wallet_file|listen|chain|pool_base)[[:space:]]*=[[:space:]]*[^[:space:]]' \
-  "$POOL_WORKSHEET"); then
-  echo "hbit-pool.example.ini ships a filled-in operator value:"
-  echo "$filled"
-  exit 1
-fi
-# Nothing an operator receives may carry a live address, private key or
-# passphrase. An earlier audit found a shipped template with a valid third-party
-# reward address in it, which would have paid a stranger; these two files are
-# now scanned for the same class of mistake, comments included.
-for doc in "$POOL_WORKSHEET" "$POOL_README"; do
-  if hit=$(grep -oE '\b1[1-9A-HJ-NP-Za-km-z]{25,34}\b' "$doc"); then
-    echo "$(basename "$doc") ships something shaped like a live HAC address: $hit"
-    exit 1
-  fi
-  if hit=$(grep -oE '\b[0-9a-fA-F]{64}\b' "$doc"); then
-    echo "$(basename "$doc") ships something shaped like a private key: $hit"
-    exit 1
-  fi
-  if hit=$(grep -niE '^[[:space:]]*(password|passphrase|HBIT_WALLET_PASSWORD[A-Za-z_]*)[[:space:]]*=[[:space:]]*[^[:space:]]' "$doc"); then
-    echo "$(basename "$doc") must never carry a passphrase value: $hit"
     exit 1
   fi
 done
@@ -160,28 +98,6 @@ reward = YOUR_HACD_PRIVAKEY_3x
 EOF
 }
 
-copy_pool_assets() {
-  local stage="$1"
-
-  for binary in "${pool_binaries[@]}"; do
-    cp -f "$RELEASE/$binary" "$stage/$binary"
-    chmod u+x "$stage/$binary"
-  done
-  # The runbook and the worksheet travel with the binaries. Shipping the pool
-  # without them is what the earlier refusal to package it was about.
-  cp -f "$POOL_RUNBOOK" "$stage/POOL-OPERATOR.md"
-  cp -f "$POOL_WORKSHEET" "$stage/hbit-pool.example.ini"
-  cp -f "$POOL_README" "$stage/README-POOL.txt"
-
-  for name in hbit-pool-server hbit-pool-payout POOL-OPERATOR.md \
-    hbit-pool.example.ini README-POOL.txt; do
-    if [[ ! -f "$stage/$name" ]]; then
-      echo "Staged package is missing $name"
-      exit 1
-    fi
-  done
-}
-
 pack_flavor() {
   local flavor="$1"
   local package_name="hacash-miner-${flavor}-linux-${ARCH}"
@@ -204,7 +120,6 @@ pack_flavor() {
     write_fullnode_example "$stage/hacash.config.ini.example"
     cp -f "$ROOT/README-LINUX-RELEASE.txt" "$stage/README-LINUX.txt"
     chmod u+x "$stage/hacash"
-    copy_pool_assets "$stage"
   else
     cp -f "$ROOT/README-LINUX-MINER-ONLY.txt" "$stage/README-LINUX.txt"
   fi
