@@ -77,6 +77,25 @@ pub fn validate_hacd_wallet(wallet: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The password every Hacash tutorial uses. Its private key is public, so any
+/// balance held there can be swept by anyone. `sys::ini::ini_must_account_required`
+/// panics on it at node startup, so the panel must refuse it first and say why.
+pub const WELL_KNOWN_BID_PASSWORD: &str = "123456";
+
+/// Same rule as the node: the bid account password must be present and must not
+/// be the publicly known one. `Err("empty")` and `Err("well_known")` are marker
+/// codes the caller maps to a localized message.
+pub fn validate_bid_password(password: &str) -> Result<(), String> {
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return Err("empty".to_string());
+    }
+    if trimmed == WELL_KNOWN_BID_PASSWORD {
+        return Err("well_known".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct DiamondMinerSettings {
     pub reward: String,
@@ -104,9 +123,12 @@ pub fn validate_diamond_settings(d: &DiamondMinerSettings) -> Result<(), String>
 pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
     let Ok(content) = std::fs::read_to_string(path) else {
         return DiamondMinerSettings {
-            bid_min: "1:0".to_string(),
-            bid_max: "31:0".to_string(),
-            bid_step: "0:5".to_string(),
+            // Bid amounts are plain HAC (mei/decimal): "1" = 1 HAC, "0.5" = half a
+            // HAC. The colon form "X:Y" is coin(mantissa X, unit Y), so "1:0" is
+            // 10^-248 HAC (dust), NOT 1 HAC: do not use it here.
+            bid_min: "1".to_string(),
+            bid_max: "31".to_string(),
+            bid_step: "0.5".to_string(),
             ..Default::default()
         };
     };
@@ -115,15 +137,15 @@ pub fn read_diamond_miner(path: &Path) -> DiamondMinerSettings {
         bid_password: read_section_key(&content, "diamondminer", "bid_password"),
         bid_min: {
             let v = read_section_key(&content, "diamondminer", "bid_min");
-            if v.is_empty() { "1:0".into() } else { v }
+            if v.is_empty() { "1".into() } else { v }
         },
         bid_max: {
             let v = read_section_key(&content, "diamondminer", "bid_max");
-            if v.is_empty() { "31:0".into() } else { v }
+            if v.is_empty() { "31".into() } else { v }
         },
         bid_step: {
             let v = read_section_key(&content, "diamondminer", "bid_step");
-            if v.is_empty() { "0:5".into() } else { v }
+            if v.is_empty() { "0.5".into() } else { v }
         },
     }
 }
@@ -155,7 +177,18 @@ pub fn write_diamond_miner(
     d: &DiamondMinerSettings,
     rpc_port: Option<u16>,
 ) -> std::io::Result<()> {
-    let content = read_or_empty(path);
+    // Last line of defence: never persist a bid password the node refuses. A
+    // config written with a blank or well known password makes hacash panic at
+    // startup, and "123456" would put the bid funds on a public private key.
+    if let Err(reason) = validate_bid_password(&d.bid_password) {
+        let detail = if reason == "well_known" {
+            "the bid account password must not be the publicly known '123456'"
+        } else {
+            "the bid account password is required"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, detail));
+    }
+    let content = ensure_mainnet_node_section(&read_or_empty(path));
     let mut updated = upsert_section_fields(
         &content,
         "diamondminer",
@@ -190,7 +223,7 @@ pub fn write_hac_miner_only(
     wallet: &str,
     rpc_port: Option<u16>,
 ) -> std::io::Result<()> {
-    let content = read_or_empty(path);
+    let content = ensure_mainnet_node_section(&read_or_empty(path));
     let mut updated = upsert_miner_reward(&content, wallet);
     updated = upsert_section_fields(&updated, "diamondminer", &[("enable", "false")]);
     if let Some(port) = rpc_port {
@@ -211,6 +244,30 @@ pub fn write_hac_miner_only(
 
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Guarantee the fullnode joins MAINNET. Without a `[node]` section (boot nodes +
+/// `not_find_nodes = false`) hacash starts an ISOLATED LOCAL chain: the height stays
+/// near 0, so x16rs runs at repeat=1 (an inflated MH/s that is NOT real mining). The
+/// panel writes hacash.config.ini for the reward wallet, so it must ensure `[node]` is
+/// present — otherwise a config created before START-MAINNET.bat has run is off-network.
+/// An existing `[node]` section is left untouched (respects a user/launcher setup).
+fn ensure_mainnet_node_section(content: &str) -> String {
+    let has_node = content
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("[node]"));
+    if has_node {
+        return content.to_string();
+    }
+    // fast_sync is deliberately FALSE. Measured 2026-07-27: a chain synced with
+    // it on stops dead at a block whose state it never wrote, with
+    //   [Block Sync Warning] insert N failed: diamond status HTAKES not found
+    // and nothing retries, so the node sits at that height forever while looking
+    // perfectly healthy. Turning the flag off afterwards does not repair it,
+    // because the state was never written. A clean sync with it OFF reached the
+    // tip in seven minutes with no errors at all.
+    let node = "[node]\nname = rust_node\nlisten = 3337\nboots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337\nnot_find_nodes = false\nfast_sync = false\n\n";
+    format!("{node}{content}")
 }
 
 fn write_config(path: &Path, content: &str) -> std::io::Result<()> {
@@ -458,16 +515,60 @@ mod tests {
     #[test]
     fn validates_diamond_bid_range() {
         let valid = DiamondMinerSettings {
-            bid_min: "1:0".into(),
-            bid_max: "31:0".into(),
-            bid_step: "0:5".into(),
+            bid_min: "1".into(),
+            bid_max: "31".into(),
+            bid_step: "0.5".into(),
             ..Default::default()
         };
         assert!(validate_diamond_settings(&valid).is_ok());
 
         let mut invalid = valid;
-        invalid.bid_min = "40:0".into();
+        invalid.bid_min = "40".into();
         assert!(validate_diamond_settings(&invalid).is_err());
+    }
+
+    #[test]
+    fn bid_password_must_be_present_and_not_well_known() {
+        // The node panics at startup on both of these, so the panel has to catch
+        // them while the user can still read a message.
+        assert_eq!(validate_bid_password(""), Err("empty".to_string()));
+        assert_eq!(validate_bid_password("   "), Err("empty".to_string()));
+        assert_eq!(validate_bid_password("123456"), Err("well_known".to_string()));
+        assert_eq!(
+            validate_bid_password("  123456  "),
+            Err("well_known".to_string()),
+            "the node trims before comparing, so padding must not sneak it through"
+        );
+        assert!(validate_bid_password("a-real-wallet-password").is_ok());
+        assert!(
+            validate_bid_password("1234567").is_ok(),
+            "only the exact well known password is refused"
+        );
+    }
+
+    #[test]
+    fn diamond_config_is_never_written_with_a_refused_bid_password() {
+        let path = std::env::temp_dir().join(format!(
+            "hacash-bidpass-cfg-{}-{}.ini",
+            std::process::id(),
+            TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        for bad in ["", "   ", "123456"] {
+            let settings = DiamondMinerSettings {
+                bid_password: bad.into(),
+                ..Default::default()
+            };
+            let err = write_diamond_miner(
+                &path,
+                "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v",
+                &settings,
+                Some(8080),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "password '{bad}'");
+            assert!(!path.exists(), "a refused password must leave no config: '{bad}'");
+        }
     }
 
     #[test]
@@ -481,6 +582,56 @@ mod tests {
         assert!(raw.contains("listen = 8085"));
         assert!(raw.contains("bind = 127.0.0.1"));
         assert!(raw.contains("diamond_form = true"));
+    }
+
+    #[test]
+    fn fresh_hac_and_hacd_configs_get_mainnet_node_section() {
+        // A panel-written config on an empty file must join MAINNET. Without [node]
+        // (boots + not_find_nodes=false) hacash starts an isolated LOCAL chain
+        // (height ~0 -> x16rs repeat=1 -> inflated MH/s, not real mining).
+        let path = std::env::temp_dir().join(format!("hacash-node-cfg-{}.ini", std::process::id()));
+
+        let _ = std::fs::remove_file(&path);
+        write_hac_miner_only(&path, "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v", Some(8080)).unwrap();
+        let hac = std::fs::read_to_string(&path).unwrap();
+        assert!(hac.contains("[node]"), "HAC config missing [node]:\n{hac}");
+        assert!(hac.contains("not_find_nodes = false"), "{hac}");
+        assert!(hac.contains("boots = 54.193.49.59:3337"), "{hac}");
+
+        let _ = std::fs::remove_file(&path);
+        write_diamond_miner(
+            &path,
+            "1AhGNNrHUNaiwS2GWBPR4UuDXjEiDwoE3v",
+            &DiamondMinerSettings {
+                // A real password: the writer refuses a blank or well known one.
+                bid_password: "a-real-wallet-password".into(),
+                ..Default::default()
+            },
+            Some(8080),
+        )
+        .unwrap();
+        let hacd = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(hacd.contains("[node]"), "HACD config missing [node]:\n{hacd}");
+        assert!(hacd.contains("not_find_nodes = false"), "{hacd}");
+    }
+
+    #[test]
+    fn existing_node_section_is_preserved() {
+        // An existing [node] (from START-MAINNET.bat or a custom user setup) must not
+        // be clobbered or duplicated when the panel rewrites the miner fields.
+        let path =
+            std::env::temp_dir().join(format!("hacash-keepnode-cfg-{}.ini", std::process::id()));
+        std::fs::write(
+            &path,
+            "[node]\nlisten = 9999\nnot_find_nodes = false\n\n[miner]\nreward = old\n",
+        )
+        .unwrap();
+        write_hac_miner_only(&path, "1NewWallet", Some(8080)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(raw.contains("listen = 9999"), "custom [node] listen lost:\n{raw}");
+        assert_eq!(raw.matches("[node]").count(), 1, "duplicate [node]:\n{raw}");
     }
 
     #[test]

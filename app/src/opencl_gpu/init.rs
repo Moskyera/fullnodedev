@@ -8,7 +8,7 @@ use crate::efficiency::clamp_workgroups_for_vram_with_floor;
 use crate::gpu_arch::{self, ArchLimits, GpuVendor};
 use crate::opencl_diag::OpenClScan;
 use ocl::enums::DeviceInfo;
-use ocl::{Context, Device, Platform, Program};
+use ocl::{Context, Device, Program};
 
 use super::compile::{
     OPENCL_CACHE_PREFIX, compile_program_from_source, newest_opencl_source_mtime,
@@ -148,13 +148,23 @@ pub fn initialize_opencl(
     }
     let amd_icd_count = crate::opencl_diag::count_amd_platforms(&scan.platforms);
 
-    let platforms = Platform::list();
+    // Not Platform::list(): that panics when no vendor driver is registered,
+    // which would take the miner down instead of letting it fall back to CPU.
+    let platforms = crate::opencl_diag::platform_list();
     let Some(platform) = platforms.get(resolved_platform as usize).cloned() else {
-        eprintln!(
-            "[OpenCL] Platform {} is unavailable ({} platform(s) detected)",
-            resolved_platform,
-            platforms.len()
-        );
+        if platforms.is_empty() {
+            eprintln!(
+                "[OpenCL] No OpenCL platform is available on this machine. Install the GPU \
+                 driver's OpenCL runtime, then run ./list_opencl to confirm it. Mining \
+                 continues on the CPU."
+            );
+        } else {
+            eprintln!(
+                "[OpenCL] Platform {} is unavailable ({} platform(s) detected)",
+                resolved_platform,
+                platforms.len()
+            );
+        }
         return Vec::new();
     };
 
@@ -232,7 +242,9 @@ pub fn initialize_opencl(
                 wg = clamped;
             }
         }
-        let num_work_items = wg * localsize;
+        // Saturate rather than overflow: a large configured work_groups * localsize
+        // could wrap a u32, producing a tiny/zero global size and silent misconfig.
+        let num_work_items = wg.saturating_mul(*localsize);
         let global_work_size = num_work_items;
 
         println!("-----------------------------------------");

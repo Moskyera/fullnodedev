@@ -9,10 +9,12 @@ mod hacash_config;
 mod help_options;
 mod i18n;
 mod mining_control;
+mod node_sync;
 mod mining_kind;
 mod opencl_status;
 mod platform;
 mod presets;
+mod public_pool;
 mod stats_poll;
 mod theme;
 mod ui_dashboard_tab;
@@ -33,13 +35,36 @@ use config::{
     recover_interrupted_benchmark, restore_benchmark_backup, write_diaworker_config,
     write_poworker_benchmark_config, write_poworker_config,
 };
-use connect::{ConnectMode, SOLO_DEFAULT, connect_port, normalize_connect, pool_presets};
+use connect::{
+    ConnectMode, PoolInfo, SOLO_DEFAULT, connect_port, load_pool_directory, normalize_connect,
+};
+
+/// Small UI preference file kept next to the panel, so the view a user picked
+/// is still there next time they open it.
+fn ui_prefs_path(work_dir: &std::path::Path) -> std::path::PathBuf {
+    work_dir.join("panel-ui.json")
+}
+
+fn load_simple_mode(work_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(ui_prefs_path(work_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("simple_mode").and_then(|b| b.as_bool()))
+        .unwrap_or(true) // a first-time user starts in the simple view
+}
+
+fn save_simple_mode(work_dir: &std::path::Path, simple: bool) {
+    let _ = std::fs::write(
+        ui_prefs_path(work_dir),
+        format!("{{\n  \"simple_mode\": {simple}\n}}\n"),
+    );
+}
 use currency::{Currency, load_currency, save_currency};
 use eframe::egui;
 use hacash_config::{
     DiamondMinerSettings, find_hacash_config, read_diamond_miner, read_reward_wallet,
-    validate_diamond_settings, validate_hacd_wallet, validate_wallet, write_diamond_miner,
-    write_hac_miner_only,
+    validate_bid_password, validate_diamond_settings, validate_hacd_wallet, validate_wallet,
+    write_diamond_miner, write_hac_miner_only,
 };
 use i18n::{Lang, Strings, load_lang, save_lang, strings};
 use mining_kind::{MiningKind, load_mining_kind, save_mining_kind};
@@ -101,9 +126,20 @@ struct MinerApp {
     hac_price: f32,
     platform_id: u32,
     device_id: u32,
+    use_cuda: bool,
     connect: String,
     connect_mode: ConnectMode,
     pool_preset_idx: usize,
+    /// Built-in pools plus any from a `pools.json` next to the exe (updatable).
+    pool_directory: Vec<PoolInfo>,
+    /// poworker knobs surfaced in the GUI so no file editing is ever needed.
+    nonce_max: u32,
+    notice_wait: u64,
+    /// Result text of the last "Test connection" / "Test upstream" reachability probe.
+    connect_test_status: String,
+    upstream_test_status: String,
+    /// Newcomer view: three steps and one button. Remembered across restarts.
+    simple_mode: bool,
     max_temp_c: u32,
     pause_unprofitable: bool,
     work_groups: u32,
@@ -118,6 +154,9 @@ struct MinerApp {
     benchmark_last_log: String,
     stats_next_read: Instant,
     pending_start: Option<mining_control::PendingStart>,
+    /// Set only while a solo start is waiting for the node to catch up.
+    /// Drives the progress bar; None means nothing is syncing.
+    sync_status: Option<node_sync::SyncStatus>,
     mining: bool,
     child: Option<Child>,
     worker_stop_rx: Option<Receiver<Result<(), String>>>,
@@ -137,6 +176,11 @@ struct MinerApp {
     pending_opencl_action: Option<OpenClAction>,
     auto_select_detected_gpu: bool,
     fleet: fleet::FleetState,
+    /// Host public free-IP pool (hac-pool) from this panel.
+    public_pool: public_pool::PublicPoolSettings,
+    public_pool_child: Option<Child>,
+    public_pool_running: bool,
+    public_pool_status: String,
 }
 
 impl MinerApp {
@@ -164,6 +208,7 @@ impl MinerApp {
         };
         let stats_path = work_dir.join("miner-stats.json");
         let fleet = fleet::FleetState::load(&work_dir, &stats_path);
+        let public_pool = public_pool::load_settings(&work_dir);
         let poworker_path = platform::find_worker(&work_dir, "poworker");
         let diaworker_path = platform::find_worker(&work_dir, "diaworker");
         let cpus = cpu_presets();
@@ -178,6 +223,7 @@ impl MinerApp {
         let mut hac_price = 0.0f32;
         let mut platform_id = 0u32;
         let mut device_id = 0u32;
+        let mut use_cuda = false;
         let mut connect = SOLO_DEFAULT.to_string();
         let mut max_temp_c = 0u32;
         let mut pause_unprofitable = false;
@@ -199,6 +245,7 @@ impl MinerApp {
             &mut hac_price,
             &mut max_temp_c,
             &mut pause_unprofitable,
+            &mut use_cuda,
             currency,
         );
         if mining_kind == MiningKind::Hacd && cpus[cpu_idx].supervene == 0 {
@@ -249,7 +296,7 @@ impl MinerApp {
             }
         }
         let mut status_msg = if mining_kind == MiningKind::Hacd {
-            "HACD CPU miner ready — OpenCL is not used.".to_string()
+            "HACD CPU miner ready: OpenCL is not used.".to_string()
         } else if opencl_status.has_usable_device() {
             format!("OpenCL: {}", opencl_status.device_summary())
         } else {
@@ -271,6 +318,8 @@ impl MinerApp {
             }
         }
         let connect_mode = ConnectMode::for_connect(&connect);
+        let pool_directory = load_pool_directory(&work_dir);
+        let simple_mode = load_simple_mode(&work_dir);
         let mut app = Self {
             work_dir,
             config_path,
@@ -298,9 +347,16 @@ impl MinerApp {
             hac_price,
             platform_id,
             device_id,
+            use_cuda,
             connect,
             connect_mode,
             pool_preset_idx: 0,
+            pool_directory,
+            nonce_max: u32::MAX,
+            notice_wait: 45,
+            connect_test_status: String::new(),
+            upstream_test_status: String::new(),
+            simple_mode,
             max_temp_c,
             pause_unprofitable,
             work_groups,
@@ -315,6 +371,7 @@ impl MinerApp {
             benchmark_last_log: String::new(),
             stats_next_read: Instant::now(),
             pending_start: None,
+            sync_status: None,
             mining: false,
             child: None,
             worker_stop_rx: None,
@@ -334,6 +391,10 @@ impl MinerApp {
             pending_opencl_action: None,
             auto_select_detected_gpu: !gpu_configured_in_ini,
             fleet,
+            public_pool,
+            public_pool_child: None,
+            public_pool_running: false,
+            public_pool_status: String::new(),
         };
         if mining_kind == MiningKind::Hac {
             app.request_opencl_probe(OpenClAction::InitialScan {
@@ -489,6 +550,7 @@ impl MinerApp {
             hac_price: Currency::convert(self.hac_price as f64, Currency::Usd, Currency::Eur),
             platform_id: self.platform_id,
             device_id: self.device_id,
+            use_cuda: self.use_cuda,
             connect: self.connect.clone(),
             stats_file: self.stats_path.to_string_lossy().to_string(),
             opencl_dir: opencl_dir_for(&self.work_dir),
@@ -501,7 +563,21 @@ impl MinerApp {
             thermal_gpu_index: self.device_id,
             work_groups: self.work_groups,
             unit_size: self.unit_size,
+            nonce_max: self.nonce_max,
+            notice_wait: self.notice_wait,
+            // In Pool mode the address the user already typed doubles as the
+            // pool payout address, so payouts need no extra step. Solo leaves it
+            // empty, keeping worker requests identical to a plain fullnode's.
+            pool_worker: match self.connect_mode {
+                ConnectMode::Pool => self.wallet.trim().to_string(),
+                ConnectMode::Solo => String::new(),
+            },
         }
+    }
+
+    /// Master Panel tab: the fleet worker table (local miner + remote/VPS miners).
+    fn ui_master(&mut self, ui: &mut egui::Ui) {
+        self.fleet.show_master(ui, &self.stats);
     }
 
     fn set_mining_kind(&mut self, kind: MiningKind) {
@@ -524,7 +600,7 @@ impl MinerApp {
         }
         self.status_msg = match kind {
             MiningKind::Hac => "HAC OpenCL miner ready.".to_string(),
-            MiningKind::Hacd => "HACD CPU miner ready — OpenCL is not used.".to_string(),
+            MiningKind::Hacd => "HACD CPU miner ready: OpenCL is not used.".to_string(),
         };
         save_mining_kind(&self.work_dir, kind);
     }
@@ -698,6 +774,15 @@ impl MinerApp {
         }
     }
 
+    /// Switch between the newcomer view and the full settings, and remember it.
+    fn set_simple_mode(&mut self, simple: bool) {
+        if self.simple_mode == simple {
+            return;
+        }
+        self.simple_mode = simple;
+        save_simple_mode(&self.work_dir, simple);
+    }
+
     fn set_connect_mode(&mut self, mode: ConnectMode) {
         self.connect_mode = mode;
         if mode == ConnectMode::Solo {
@@ -707,11 +792,28 @@ impl MinerApp {
 
     fn apply_pool_preset(&mut self, idx: usize) {
         self.pool_preset_idx = idx;
-        let pools = pool_presets();
-        if let Some(p) = pools.get(idx) {
-            if !p.host.is_empty() {
-                self.connect = p.host.to_string();
-            }
+        let Some(p) = self.pool_directory.get(idx).cloned() else {
+            return;
+        };
+        // Empty connect = a pool whose address comes from its web config
+        // generator; keep whatever the user has typed and let the note guide them.
+        if !p.connect.is_empty() {
+            self.connect = p.connect;
+        }
+        if let Some(v) = p.nonce_max {
+            self.nonce_max = v;
+        }
+        if let Some(v) = p.notice_wait {
+            self.notice_wait = v;
+        }
+    }
+
+    /// Re-read `pools.json` next to the exe so freshly published pools appear
+    /// without restarting the panel.
+    fn refresh_pool_directory(&mut self) {
+        self.pool_directory = load_pool_directory(&self.work_dir);
+        if self.pool_preset_idx >= self.pool_directory.len() {
+            self.pool_preset_idx = 0;
         }
     }
 
@@ -1009,9 +1111,18 @@ impl MinerApp {
             };
             return false;
         }
-        if self.mining_kind == MiningKind::Hacd && self.bid_password.trim().is_empty() {
-            self.status_msg = t.bid_password_required.to_string();
-            return false;
+        if self.mining_kind == MiningKind::Hacd {
+            // The node refuses a blank password AND the publicly known "123456"
+            // (its private key is public). Catching both here keeps the user in
+            // the panel with a readable message instead of a startup panic.
+            if let Err(reason) = validate_bid_password(&self.bid_password) {
+                self.status_msg = if reason == "well_known" {
+                    t.bid_password_insecure.to_string()
+                } else {
+                    t.bid_password_required.to_string()
+                };
+                return false;
+            }
         }
         if self.mining_kind == MiningKind::Hacd {
             if let Err(e) = validate_diamond_settings(&self.diamond_settings()) {
@@ -1088,6 +1199,7 @@ impl eframe::App for MinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_opencl_probe();
         self.poll_stats();
+        self.poll_public_pool();
         self.fleet.poll();
         ctx.request_repaint_after(Duration::from_millis(500));
 
@@ -1171,6 +1283,37 @@ impl eframe::App for MinerApp {
                             .color(theme::colors::TEXT_MUTED)
                             .size(13.0),
                     );
+                    // In the footer on purpose: it is visible from every tab, so
+                    // a user who wandered off to Settings still sees that the
+                    // node is working rather than concluding it is broken. That
+                    // is the whole failure this replaces, a stalled sync and a
+                    // ready-looking panel being indistinguishable.
+                    if let Some(sync) = self.sync_status.clone() {
+                        let t = self.t();
+                        ui.add_space(12.0);
+                        ui.add(
+                            egui::ProgressBar::new(sync.progress)
+                                .desired_width(170.0)
+                                .text(format!("{:.1}%", sync.progress * 100.0)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}: {} ({} {})",
+                                t.sync_title,
+                                sync.height,
+                                sync.blocks_behind(),
+                                t.sync_behind
+                            ))
+                            .color(theme::colors::TEXT_MUTED)
+                            .size(13.0),
+                        )
+                        .on_hover_text(t.sync_note);
+                        // egui redraws on input; without this the bar would sit
+                        // frozen while the node works, which looks like the very
+                        // hang this is meant to disprove.
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
                 });
             });
 
@@ -1190,30 +1333,24 @@ impl eframe::App for MinerApp {
                     ) {
                         self.tab = 1;
                     }
+                    if theme::tab_pill(ui, self.tab == 3, theme::TabIcon::Dashboard, "Master Panel")
+                    {
+                        self.tab = 3;
+                    }
                     if theme::tab_pill(ui, self.tab == 2, theme::TabIcon::Help, t.tab_help) {
                         self.tab = 2;
                     }
                 });
                 ui.add_space(16.0);
 
-                match self.tab {
-                    0 | 2 => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if self.tab == 0 {
-                                    self.ui_settings(ui);
-                                } else {
-                                    self.ui_help(ui);
-                                }
-                            });
-                    }
-                    _ => {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.ui_dashboard(ui));
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.tab {
+                        0 => self.ui_settings(ui),
+                        2 => self.ui_help(ui),
+                        3 => self.ui_master(ui),
+                        _ => self.ui_dashboard(ui),
+                    });
             });
     }
 
@@ -1221,12 +1358,70 @@ impl eframe::App for MinerApp {
         // The app is already closing, so signal termination directly and do
         // not wait. Auto Tune's durable sidecar is recovered next launch.
         self.stop_mining_on_exit();
+        public_pool::stop_pool(&mut self.public_pool_child);
+        self.public_pool_running = false;
         if let Some(mut child) = self.benchmark_child.take() {
             let _ = child.kill();
         }
         self.benchmarking = false;
         self.benchmark_log_rx = None;
         self.fleet.stop();
+    }
+}
+
+impl MinerApp {
+    pub(crate) fn save_public_pool_settings(&mut self) {
+        if let Err(e) = public_pool::save_settings(&self.work_dir, &self.public_pool) {
+            self.public_pool_status = format!("Could not save pool settings: {e}");
+        }
+    }
+
+    pub(crate) fn start_public_pool(&mut self) {
+        if self.public_pool_running {
+            self.public_pool_status = "Public pool already running.".into();
+            return;
+        }
+        self.save_public_pool_settings();
+        match public_pool::start_pool(&self.work_dir, &self.public_pool) {
+            Ok(child) => {
+                self.public_pool_child = Some(child);
+                self.public_pool_running = true;
+                if self.public_pool.mine_through_pool {
+                    self.connect_mode = ConnectMode::Pool;
+                    self.connect = public_pool::local_pool_connect(self.public_pool.http_port);
+                }
+                self.public_pool_status = format!(
+                    "Public pool running - HTTP 0.0.0.0:{} · Stratum 0.0.0.0:{} · upstream {}",
+                    self.public_pool.http_port,
+                    self.public_pool.stratum_port,
+                    self.public_pool.upstream
+                );
+                self.status_msg = self.public_pool_status.clone();
+            }
+            Err(e) => {
+                self.public_pool_running = false;
+                self.public_pool_status = e.clone();
+                self.status_msg = e;
+            }
+        }
+    }
+
+    pub(crate) fn stop_public_pool(&mut self) {
+        public_pool::stop_pool(&mut self.public_pool_child);
+        self.public_pool_running = false;
+        self.public_pool_status = "Public pool stopped.".into();
+        self.status_msg = self.public_pool_status.clone();
+    }
+
+    pub(crate) fn poll_public_pool(&mut self) {
+        if !self.public_pool_running {
+            return;
+        }
+        if !public_pool::poll_pool(&mut self.public_pool_child) {
+            self.public_pool_running = false;
+            self.public_pool_status =
+                "Public pool process exited. Start it again from Settings.".into();
+        }
     }
 }
 

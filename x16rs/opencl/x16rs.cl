@@ -25,7 +25,16 @@
 typedef unsigned int sph_u32;
 typedef int sph_s32;
 #ifndef __OPENCL_VERSION__
-  typedef unsigned long long sph_u64;
+  #ifdef __CUDA__
+    // CUDA build: match the algorithm kernels (jh.cl etc.) which do
+    // `typedef ulong sph_u64`. ulong is supplied by ocl_compat.cuh. Using the same
+    // spelling keeps sph_u64 a single consistent type across the whole CUDA
+    // translation unit — nvcc rejects a conflicting `unsigned long long` here vs
+    // `ulong` in jh.cl as an "invalid redeclaration". OpenCL is unaffected (#else).
+    typedef ulong sph_u64;
+  #else
+    typedef unsigned long long sph_u64;
+  #endif
   typedef long long sph_s64;
 #else
   typedef unsigned long sph_u64;
@@ -542,7 +551,7 @@ X16RS_HASH_FN void hash_x16rs_func_1(hash_32* hash)
 }
 
 // groestl
-X16RS_HASH_FN void hash_x16rs_func_2(hash_32* ALIGN hash, OCL_LOCAL_PTR const ulong* ALIGN T0, OCL_LOCAL_PTR const ulong* ALIGN T1, OCL_LOCAL_PTR const ulong* ALIGN T2, OCL_LOCAL_PTR const ulong* ALIGN T3)
+X16RS_HASH_FN void hash_x16rs_func_2(hash_32* ALIGN_PARAM hash, OCL_LOCAL_PTR const ulong* ALIGN_PARAM T0, OCL_LOCAL_PTR const ulong* ALIGN_PARAM T1, OCL_LOCAL_PTR const ulong* ALIGN_PARAM T2, OCL_LOCAL_PTR const ulong* ALIGN_PARAM T3)
 {
   ulong ALIGN M[16];
   ulong ALIGN G[16];
@@ -1301,7 +1310,7 @@ X16RS_HASH_FN void hash_x16rs_func_13(hash_32* hash)
 }
 
 // whirlpool
-X16RS_HASH_FN void hash_x16rs_func_14(hash_32* hash, OCL_LOCAL_PTR const sph_u64* ALIGN LT0, OCL_LOCAL_PTR const sph_u64* ALIGN LT1, OCL_LOCAL_PTR const sph_u64* ALIGN LT2, OCL_LOCAL_PTR const sph_u64* ALIGN LT3, OCL_LOCAL_PTR const sph_u64* ALIGN LT4, OCL_LOCAL_PTR const sph_u64* ALIGN LT5, OCL_LOCAL_PTR const sph_u64* ALIGN LT6, OCL_LOCAL_PTR const sph_u64* ALIGN LT7)
+X16RS_HASH_FN void hash_x16rs_func_14(hash_32* hash, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT0, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT1, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT2, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT3, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT4, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT5, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT6, OCL_LOCAL_PTR const sph_u64* ALIGN_PARAM LT7)
 {
     sph_u64 n0 = hash->h8[0];
     sph_u64 n1 = hash->h8[1];

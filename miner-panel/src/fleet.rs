@@ -585,6 +585,158 @@ impl FleetState {
         });
     }
 
+    /// Dedicated "Master Panel" tab: a table of every worker reporting to this panel —
+    /// the local miner plus each remote / VPS miner that enabled sharing and was added
+    /// as a peer. One row per worker: status, live hashrate, estimated HAC/day, power and
+    /// the synced block height (so you can see at a glance which rigs are up and on tip).
+    pub fn show_master(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
+        let online: Vec<&PeerResult> =
+            self.results.iter().filter(|r| r.stats.is_some()).collect();
+        let mut total_hr = local.hashrate_hps;
+        let mut total_hac = local.hac_per_day;
+        let mut total_w = local.watts;
+        for r in &online {
+            if let Some(s) = &r.stats {
+                total_hr += s.hashrate_hps;
+                total_hac += s.hac_per_day;
+                total_w += s.watts;
+            }
+        }
+
+        theme::section_card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("MASTER PANEL • ALL WORKERS")
+                            .strong()
+                            .size(12.0)
+                            .color(theme::colors::ACCENT),
+                    );
+                    ui.label(
+                        egui::RichText::new("Local miner plus every remote / VPS miner reporting here")
+                            .color(theme::colors::TEXT_MUTED)
+                            .size(11.5),
+                    );
+                });
+                if self.poll_running_generation.is_some() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spinner();
+                    });
+                }
+            });
+            ui.add_space(10.0);
+            egui::Grid::new("master_totals")
+                .num_columns(4)
+                .spacing([12.0, 10.0])
+                .min_col_width(170.0)
+                .show(ui, |ui| {
+                    theme::show_stat_card(
+                        ui,
+                        theme::colors::ACCENT,
+                        "Total hashrate",
+                        &format_hashrate(total_hr),
+                    );
+                    theme::show_stat_card(
+                        ui,
+                        theme::colors::GOLD,
+                        "Workers online",
+                        &format!("{} / {}", online.len() + 1, self.config.peers.len() + 1),
+                    );
+                    theme::show_stat_card(
+                        ui,
+                        theme::colors::ACCENT,
+                        "Total power",
+                        &format!("{total_w:.0} W"),
+                    );
+                    theme::show_stat_card(
+                        ui,
+                        theme::colors::GOLD,
+                        "Est. HAC / day",
+                        &format!("{total_hac:.4}"),
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+            egui::Grid::new("master_workers")
+                .num_columns(6)
+                .striped(true)
+                .spacing([16.0, 8.0])
+                .min_col_width(90.0)
+                .show(ui, |ui| {
+                    for h in ["Status", "Worker", "Hashrate", "Est. HAC/day", "Power", "Height"] {
+                        ui.label(
+                            egui::RichText::new(h)
+                                .strong()
+                                .size(11.5)
+                                .color(theme::colors::TEXT_MUTED),
+                        );
+                    }
+                    ui.end_row();
+
+                    // Local miner row.
+                    ui.label(egui::RichText::new("\u{25cf}").color(theme::colors::ACCENT));
+                    ui.label("This PC (local)");
+                    ui.label(format_hashrate(local.hashrate_hps));
+                    ui.label(format!("{:.4}", local.hac_per_day));
+                    ui.label(format!("{:.0} W", local.watts));
+                    ui.label(if local.height > 0 {
+                        local.height.to_string()
+                    } else {
+                        "-".to_string()
+                    });
+                    ui.end_row();
+
+                    // One row per configured remote miner.
+                    for peer in &self.config.peers {
+                        let stats = self
+                            .results
+                            .iter()
+                            .find(|r| r.peer.address == peer.address)
+                            .and_then(|r| r.stats.as_ref());
+                        match stats {
+                            Some(s) => {
+                                ui.label(egui::RichText::new("\u{25cf}").color(theme::colors::ACCENT));
+                                ui.label(&peer.name);
+                                ui.label(format_hashrate(s.hashrate_hps));
+                                ui.label(format!("{:.4}", s.hac_per_day));
+                                ui.label(format!("{:.0} W", s.watts));
+                                ui.label(if s.height > 0 {
+                                    s.height.to_string()
+                                } else {
+                                    "-".to_string()
+                                });
+                            }
+                            None => {
+                                ui.label(
+                                    egui::RichText::new("\u{25cf}").color(theme::colors::TEXT_MUTED),
+                                );
+                                ui.label(&peer.name);
+                                ui.label(
+                                    egui::RichText::new("offline").color(theme::colors::TEXT_MUTED),
+                                );
+                                ui.label("-");
+                                ui.label("-");
+                                ui.label("-");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if self.config.peers.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "No remote miners yet. On each VPS/remote panel enable LAN sharing, then add it under the Dashboard tab -> Manage miners (name + address + token).",
+                    )
+                    .color(theme::colors::TEXT_MUTED)
+                    .size(11.0),
+                );
+            }
+        });
+    }
+
     pub fn show_dashboard(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
         let online: Vec<&PeerResult> = self
             .results

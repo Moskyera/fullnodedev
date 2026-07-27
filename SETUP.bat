@@ -92,8 +92,14 @@ powershell -NoProfile -Command ^
   "    Set-Content -Path $p -Value $t -NoNewline}}"
 
 :: --- 4. Fullnode config template ---
+:: Prefer the MAINNET template. The repo-root hacash.config.ini is a local
+:: development config (not_find_nodes = true) and would build an isolated
+:: chain from height 0, where the reported MH/s is about 16x the real rate.
 if not exist "%BIN%hacash.config.ini" (
-    if exist "%~dp0hacash.config.ini" (
+    if exist "%~dp0mainnet-configs\hacash.config.mainnet.ini" (
+        copy /Y "%~dp0mainnet-configs\hacash.config.mainnet.ini" "%BIN%hacash.config.ini" >nul
+        echo  [CREATED] hacash.config.ini - from the mainnet template
+    ) else if exist "%~dp0hacash.config.ini" (
         copy /Y "%~dp0hacash.config.ini" "%BIN%hacash.config.ini" >nul
         echo  [CREATED] hacash.config.ini - from template
     ) else (
@@ -167,7 +173,9 @@ echo     2. Settings - pick CPU/GPU, enter wallet, Save
 echo     3. Start mining (panel can auto-start fullnode)
 echo.
 echo   Solo mining needs hacash.exe running with RPC on port 8080.
-echo   Edit hacash.config.ini - set [miner] reward wallet before first run.
+echo   hacash.config.ini ships with the miner OFF and no reward address.
+echo   Before the first run set [miner] reward to YOUR OWN 1... address and
+echo   then set [miner] enable = true, or let the panel do both when you Save.
 echo.
 
 set /p "LAUNCH=  Open HAC Miner Panel now? [Y/N]: "
@@ -229,6 +237,22 @@ exit /b 0
 
 :write_default_hacash_ini
 (
+    echo ; Mainnet fullnode config written by SETUP.bat.
+    echo ; Both miners start OFF with no reward address. An address you did not
+    echo ; type yourself would be paid every block reward, permanently.
+    echo ; To mine HAC: uncomment reward with YOUR OWN address, then set
+    echo ; enable = true in [miner]. Reward addresses are PRIVAKEY addresses,
+    echo ; the ordinary kind, which start with 1 - not with 3.
+    echo ; enable = true with no reward stops the node with a config error.
+    echo ; It never picks an address for you.
+    echo.
+    echo [node]
+    echo name = rust_node
+    echo listen = 3337
+    echo boots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337
+    echo not_find_nodes = false
+    echo fast_sync = true
+    echo.
     echo [server]
     echo enable = true
     echo listen = 8080
@@ -237,11 +261,16 @@ exit /b 0
     echo.
     echo [miner]
     echo enable = false
-    echo reward = YOUR_HAC_WALLET_ADDRESS
+    echo ; reward = YOUR_HAC_PRIVAKEY_1x
+    echo message = hacashminer
     echo.
     echo [diamondminer]
     echo enable = false
-    echo reward = YOUR_HACD_PRIVAKEY_3x
+    echo ; reward = YOUR_HACD_PRIVAKEY_1x
+    echo ; bid_password = change-me
+    echo bid_min = 1
+    echo bid_max = 31
+    echo bid_step = 0.5
 ) > "%BIN%hacash.config.ini"
 exit /b 0
 

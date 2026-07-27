@@ -11,6 +11,11 @@
 
 **Status:** Kernels compile on Windows (CUDA 12.x/13.x). **GPU runtime not tested here** — needs an NVIDIA RTX machine.
 
+**No local NVIDIA?** Use Google Colab T4 instead:
+
+- [COLAB-T4.md](COLAB-T4.md)
+- `colab_cuda_smoke.sh` / `colab_cuda_smoke.ipynb`
+
 ---
 
 ## Quick start (English)

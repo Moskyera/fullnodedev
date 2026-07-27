@@ -110,14 +110,48 @@ pub fn discrete_device_indices(platforms: &[OpenClPlatformEntry], platform_id: u
         .unwrap_or_default()
 }
 
+/// Enumerate OpenCL platforms without dying when there are none.
+///
+/// `Platform::list()` PANICS. On a machine that has the ICD loader but no vendor
+/// driver, which is every fresh Linux install, every container and every WSL
+/// session, it aborts with
+/// `Platform::list: Error retrieving platform list: ApiWrapper(GetPlatformIdsPlatformListUnavailable(10))`
+/// and a path into the ocl crate.
+///
+/// That machine is exactly the one whose owner was told, by the release README,
+/// to run `./list_opencl` to find out whether their driver is installed. So the
+/// one tool whose job is to diagnose a missing OpenCL driver was the tool that
+/// crashed when the driver was missing, and it crashed without saying why.
+///
+/// No platforms is not an error here, it is an answer: the callers report it.
+#[cfg(feature = "ocl")]
+pub fn platform_list() -> Vec<ocl::Platform> {
+    match ocl::core::get_platform_ids() {
+        Ok(ids) => ids.into_iter().map(ocl::Platform::new).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(feature = "ocl")]
 pub fn scan_opencl() -> OpenClScan {
-    use ocl::{Device, Platform};
+    use ocl::Device;
 
     let mut platforms = Vec::new();
     let mut warnings = Vec::new();
 
-    for (pi, platform) in Platform::list().iter().enumerate() {
+    let found = platform_list();
+    if found.is_empty() {
+        warnings.push(
+            "No OpenCL platform was found. The loader is present but no vendor driver is \
+             registered, so nothing here can use a GPU. On Linux install the OpenCL runtime \
+             for your card (Mesa/ROCm for AMD, the NVIDIA driver for NVIDIA) and check that \
+             /etc/OpenCL/vendors contains an .icd file; on Windows reinstall the GPU driver. \
+             HACD diamond mining is CPU-only and is unaffected."
+                .to_string(),
+        );
+    }
+
+    for (pi, platform) in found.iter().enumerate() {
         let name = platform.name().unwrap_or_else(|_| "?".into());
         let vendor = platform.vendor().unwrap_or_else(|_| "?".into());
         let version = platform.version().unwrap_or_else(|_| "?".into());

@@ -156,6 +156,24 @@ pub(crate) async fn receive_status(hdl: &MsgHandler, peer: Arc<Peer>, buf: Vec<u
         if ubh > 255 {
             ubh = 255
         }
+        // A backlog deeper than `unstable_block` cannot be closed by asking for
+        // `unstable_block` hashes.
+        //
+        // That request exists to find the common ancestor of a SHALLOW fork, and
+        // it was the only thing on offer once a node was past height zero. Used
+        // on a real backlog it advances a handful of blocks per announcement,
+        // which on mainnet means four blocks every five minutes: a node three
+        // thousand blocks short of the tip would need days, while looking
+        // completely idle. Observed exactly that, twice, on a node that had just
+        // finished its history sync a little under the tip and then sat there.
+        //
+        // Batch sync is the same path a node takes from height zero and closes
+        // that gap in minutes, so use it whenever the gap is too deep for the
+        // hash walk to be the right tool.
+        if tar_hei.saturating_sub(my_hei) > ubh {
+            get_status_try_sync_blocks(hdl, peer, my_hei + 1, tar_hei).await;
+            return;
+        }
         let diff_hei = my_hei;
         let _ = hdl
             .sync_tracker
@@ -420,17 +438,27 @@ pub(crate) async fn handle_new_block(
     }
     if blkhei > lathei + 1 {
         if let Some(ref pr) = peer {
-            send_req_block_hash_msg(pr.clone(), (heispan + 1) as u8, lathei).await;
+            if lathei + heispan + 1 < blkhei {
+                // Too far behind for the hash walk to be the right tool: it
+                // would crawl `unstable_block` blocks per announcement. Ask this
+                // peer, which demonstrably has the newer chain since it just
+                // sent one, for a real batch instead.
+                get_status_try_sync_blocks(&hdl, pr.clone(), lathei + 1, blkhei).await;
+                println!(
+                    "[P2P] {} blocks behind at height {}, catching up from {}",
+                    blkhei - lathei,
+                    lathei,
+                    pr.name(),
+                );
+            } else {
+                send_req_block_hash_msg(pr.clone(), (heispan + 1) as u8, lathei).await;
+            }
         }
-        if lathei + heispan + 1 < blkhei {
-            println!(
-                "[P2P] ignore future block height={} root_height={} local_head={} store_height={} during history sync",
-                blkhei,
-                root_hei,
-                lathei,
-                status.last_height.uint(),
-            );
-        }
+        // The old message here said "ignore future block ... during history
+        // sync" and was printed once per arriving block while nothing advanced.
+        // It read as a node refusing work when in truth it was asking for four
+        // hashes at a time and getting nowhere. The line above now reports the
+        // gap and the catch-up, which is the fact an operator needs.
         return errf!(
             "future block height {} exceeds local head {}",
             blkhei,

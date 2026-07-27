@@ -104,7 +104,7 @@ __inline__ void keccak_theta(__generic ulong A[25])
 	THETA_STEP(4);
 }
 
-__inline__ void rhash_sha3_permutation(__generic ulong ALIGN state[25])
+__inline__ void rhash_sha3_permutation(__generic ulong ALIGN_PARAM state[25])
 {
 	ulong temp_state[25];
 	for (unsigned round = 0; round < NumberOfRounds; round++)
@@ -151,8 +151,19 @@ __inline__ void rhash_sha3_permutation(__generic ulong ALIGN state[25])
 	}
 }
 
+// Block path. The block intro is 89 bytes, but block_t only carries 11 ulongs
+// (88 bytes) and lane 11 is hardcoded to 0x0000000000000600 below, which pins
+// message byte 88 to 0x00 and puts the SHA3 pad at byte 89. That matches the CPU
+// reference ONLY while byte 88 is zero. Byte 88 is the low byte of
+// intro.witness_stage (protocol/src/block/intro.rs, Fixed2 at 87..89) and every
+// producer today writes Fixed2::default(), so mainnet agreement holds. If
+// witness_stage ever becomes non-zero, EVERY GPU batch would disagree with the CPU
+// and the miner would degrade to bounded CPU recovery with no clear cause. Closing
+// that properly needs block_t widened to 12 ulongs (util.cl) plus a mask-and-pad
+// lane 11 here, and/or a host-side reject of a non-zero witness_stage in
+// app/src/opencl_gpu/block.rs and x16rs-cuda/src/lib.rs.
 __inline__ void sha3_256_hash(const ulong *input, ulong *output)
-{	
+{
 	ulong ALIGN hash[25] = {
 		le2me_64(input[ 0]),
 		le2me_64(input[ 1]),
@@ -179,27 +190,50 @@ __inline__ void sha3_256_hash(const ulong *input, ulong *output)
 	output[3] = hash[3];
 }
 
-__inline__ void sha3_256_hash_diamond(const ulong *input, ulong *output)
-{	
-	ulong ALIGN hash[25] = {
-		le2me_64(input[ 0]),
-		le2me_64(input[ 1]),
-		le2me_64(input[ 2]),
-		le2me_64(input[ 3]),
-		le2me_64(input[ 4]),
-		le2me_64(input[ 5]),
-		le2me_64(input[ 6]),
-		le2me_64(input[ 7]),
-		le2me_64(input[ 8]),
-		le2me_64(input[ 9]),
-		le2me_64(input[10]),
-		(le2me_64(input[11]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL,
-		0,
-		0,
-		0,
-		0,
-		le2me_64(0x8000000000000000),
-	};
+// Diamond prehash is either 61 bytes (no custom message) or 93 bytes (32-byte custom).
+// Pad at the true message end so GPU matches CPU/consensus SHA3.
+__inline__ void sha3_256_hash_diamond(const ulong *input, ulong *output, const unsigned int msg_len)
+{
+	ulong ALIGN hash[25];
+	#pragma unroll 25
+	for (unsigned i = 0; i < 25; i++) hash[i] = 0;
+	if (msg_len == 61u) {
+		// 61 bytes = prev(32)+nonce(8)+addr(21); pad 0x06 starts at byte 61.
+		hash[0] = le2me_64(input[0]);
+		hash[1] = le2me_64(input[1]);
+		hash[2] = le2me_64(input[2]);
+		hash[3] = le2me_64(input[3]);
+		hash[4] = le2me_64(input[4]);
+		hash[5] = le2me_64(input[5]);
+		hash[6] = le2me_64(input[6]);
+		hash[7] = (le2me_64(input[7]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL;
+		hash[16] = le2me_64(0x8000000000000000);
+	} else if (msg_len == 93u) {
+		// 93-byte path (with custom message)
+		hash[0] = le2me_64(input[0]);
+		hash[1] = le2me_64(input[1]);
+		hash[2] = le2me_64(input[2]);
+		hash[3] = le2me_64(input[3]);
+		hash[4] = le2me_64(input[4]);
+		hash[5] = le2me_64(input[5]);
+		hash[6] = le2me_64(input[6]);
+		hash[7] = le2me_64(input[7]);
+		hash[8] = le2me_64(input[8]);
+		hash[9] = le2me_64(input[9]);
+		hash[10] = le2me_64(input[10]);
+		hash[11] = (le2me_64(input[11]) & (ulong)0x000000FFFFFFFFFFUL) | (ulong)0x0000060000000000UL;
+		hash[16] = le2me_64(0x8000000000000000);
+	} else {
+		// Unsupported pre-image length. Previously ANY length that was not 61 fell
+		// into the 93-byte branch and produced a plausible but wrong hash. Emit an
+		// obviously dead hash instead, so a host/kernel mismatch fails loudly. The
+		// host also refuses these lengths before enqueue (app/src/opencl_dia.rs).
+		output[0] = 0;
+		output[1] = 0;
+		output[2] = 0;
+		output[3] = 0;
+		return;
+	}
 	rhash_sha3_permutation(hash);
 	output[0] = hash[0];
 	output[1] = hash[1];

@@ -33,6 +33,10 @@ pub struct PoWorkConf {
     pub rpcaddr: String,
     /// Optional fullnode API token (`X-Api-Token`) when server requires auth.
     pub api_token: String,
+    /// Optional payout address announced to a POOL as `&worker=<address>` so it
+    /// can credit this miner's shares. Empty (default) = solo mining: the URLs
+    /// stay byte-identical to what a plain fullnode expects.
+    pub pool_worker: String,
     pub supervene: u32, // cpu core (configured)
     pub noncemax: u32,
     pub noticewait: u64,   // new block notice wait
@@ -54,7 +58,35 @@ pub struct PoWorkConf {
     pub runtime: Arc<MiningRuntimeState>,
 }
 
+/// Percent-encode a query-string component, leaving only the RFC 3986 unreserved
+/// characters. HAC addresses are already safe, but this guards against a
+/// misconfigured worker id breaking or injecting into the request URL.
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 impl PoWorkConf {
+    /// `&worker=<payout address>` suffix appended to pool requests so the pool
+    /// can credit shares to us. Empty string when solo mining. The value is
+    /// percent-encoded so a misconfigured worker id cannot break or inject into
+    /// the query string.
+    pub fn worker_param(&self) -> String {
+        if self.pool_worker.is_empty() {
+            String::new()
+        } else {
+            format!("&worker={}", percent_encode_component(&self.pool_worker))
+        }
+    }
+
     pub fn new(ini: &IniObj) -> PoWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let sec_gpu = &ini_section(ini, "gpu");
@@ -66,6 +98,7 @@ impl PoWorkConf {
         let cnf = PoWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
+            pool_worker: ini_must(sec, "pool_worker", "").trim().to_string(),
             supervene: configured_supervene,
             noncemax: ini_must_u64(sec, "nonce_max", u32::MAX as u64) as u32,
             noticewait: ini_must_u64(sec, "notice_wait", 45),
@@ -162,7 +195,7 @@ pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
         if cnf.runtime.paused_unprofitable.load(Relaxed) {
             delay_continue_ms!(3000);
         }
-        pull_pending_block_stuff(&cnf);
+        pull_pending_block_stuff(&cnf, &stop_flag);
         delay_continue_ms!(25);
     }
 }
@@ -173,14 +206,88 @@ fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
 
 ///////////////////////////////
 
-fn pull_pending_block_stuff(cnf: &PoWorkConf) {
+/// Per-request long-poll wait for the miner notice. When a supervisor can ask us
+/// to stop, cap it so the loop re-checks the stop flag every few seconds instead
+/// of blocking for the whole configured notice window.
+const NOTICE_POLL_WAIT_WITH_STOP: u64 = 3;
+
+/// How long to wait before polling again while the upstream says it is serving
+/// work it can no longer refresh. Long enough not to hammer a struggling pool or
+/// node, short enough to pick mining back up as soon as the outage clears.
+const STALE_UPSTREAM_BACKOFF_SECS: u64 = 10;
+
+/// Minimum period of one pending + notice cycle. A cooperating upstream already
+/// blocks inside the notice long-poll for the configured wait, so this floor never
+/// slows a healthy miner down. It exists only for the pathological upstream: one
+/// that answers the notice immediately (a saturated pool bridge, or a server with
+/// no long-poll at all). The cycle costs TWO requests, so without a floor a single
+/// miner would issue tens of requests per second forever and make the overload it
+/// is suffering from worse.
+const NOTICE_CYCLE_MIN: Duration = Duration::from_millis(200);
+
+/// Anti-spin sleep still owed by a notice cycle. Zero when the notice reported
+/// that the tip reached the height we are mining on top of: genuinely new work is
+/// money and is never delayed.
+fn notice_cycle_backoff(spent: Duration, new_work_ready: bool) -> Duration {
+    if new_work_ready {
+        return Duration::ZERO;
+    }
+    NOTICE_CYCLE_MIN.saturating_sub(spent)
+}
+
+/// Detect the "upstream is serving work it can no longer refresh" answer that the
+/// pool bridge returns on `/query/miner/pending` and `/query/miner/notice` during
+/// an upstream node outage. Both bodies stay backward compatible in shape (a
+/// plain `err` string), so anything else, including an unknown or malformed error
+/// body, is treated as an ordinary transient error and must not crash the miner.
+fn upstream_stale_reason(res: &JV) -> Option<&str> {
+    let err = res["err"].as_str()?;
+    if err.is_empty() {
+        return None;
+    }
+    if err.to_ascii_lowercase().contains("stale") {
+        Some(err)
+    } else {
+        None
+    }
+}
+
+/// Report an upstream stale-work outage once per transition and pause the mining
+/// threads: the installed template can no longer win a block or earn a share, so
+/// continuing to hash it only burns power.
+fn enter_upstream_stale(reason: &str, source: &str) {
+    if block_mining_runtime::set_upstream_stale(true) {
+        println!(
+            "\n[Mining] PAUSED: {source} reports stale work ({reason}). The template can no longer win anything, so hashing is idle until fresh work arrives. Check the pool or node this miner connects to."
+        );
+    }
+}
+
+/// Clear the stale-work pause once real work is available again.
+fn leave_upstream_stale() {
+    if block_mining_runtime::set_upstream_stale(false) {
+        println!("\n[Mining] Fresh work received, mining resumes.");
+    }
+}
+
+fn notice_poll_wait(notice_wait: u64, can_stop: bool) -> u64 {
+    if can_stop {
+        notice_wait.min(NOTICE_POLL_WAIT_WITH_STOP)
+    } else {
+        notice_wait
+    }
+}
+
+fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>>) {
+    let cycle_start = Instant::now();
     let curr_hei = block_mining_runtime::current_mining_height();
 
     // query pending
     let urlapi_pending = format!(
-        "http://{}/query/miner/pending?stuff=true&t={}",
+        "http://{}/query/miner/pending?stuff=true&t={}{}",
         &cnf.rpcaddr,
-        sys::curtimes()
+        sys::curtimes(),
+        cnf.worker_param()
     );
     let jsdata =
         match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
@@ -204,25 +311,49 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
     let jstr = |k| res[k].as_str().unwrap_or("");
     let jnum = |k| res[k].as_u64().unwrap_or(0);
     let JV::String(ref _blkhd) = res["block_intro"] else {
+        if let Some(reason) = upstream_stale_reason(&res) {
+            enter_upstream_stale(reason, "pending work");
+            delay_return!(STALE_UPSTREAM_BACKOFF_SECS);
+        }
         println!("Error: get block stuff error: {}", jstr("err"));
         delay_return!(15);
     };
     let pending_height = jnum("height");
 
-    // set pending block stuff
-    if pending_height > curr_hei {
-        if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
-            println!("Error: invalid block data from {urlapi_pending}: {e}");
-            delay_return!(10);
-        }
-        if curr_hei == 0 {
-            block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
-        }
+    // Install the refreshed template unconditionally. Comparing the raw block_intro
+    // hex to decide would call EVERY poll a template change: the fullnode
+    // increments the served coinbase nonce and recomputes the merkle root on every
+    // /query/miner/pending request, and the merkle root lives inside the serialized
+    // intro. Whether this is really a NEW job - and so whether workers must give up
+    // what they are mining - is decided inside set_pending_block_stuff from the
+    // job's identity (height + parent hash), which that re-serialization leaves
+    // untouched. A same-height reorg still changes the parent and is still detected.
+    if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
+        println!("Error: invalid block data from {urlapi_pending}: {e}");
+        delay_return!(10);
+    }
+    // Real work was served and installed, so any stale-work pause lifts.
+    leave_upstream_stale();
+    if curr_hei == 0 {
+        block_mining_runtime::may_print_turn_to_nex_block_mining(curr_hei, None);
     }
 
     // with notice
     let mut rpid = vec![0].repeat(16);
+    // The stop flag is only observable BETWEEN notice requests, so cap the
+    // per-request wait when a supervisor can ask us to stop (see
+    // notice_poll_wait); otherwise an in-flight long-poll would hold shutdown
+    // for the whole notice window.
+    let poll_wait = notice_poll_wait(cnf.noticewait, stop_flag.is_some());
+    let poll_timeout = if stop_flag.is_some() {
+        Duration::from_secs(poll_wait.saturating_add(5))
+    } else {
+        Duration::from_secs(300)
+    };
     loop {
+        if should_stop(stop_flag) {
+            return;
+        }
         if let Err(e) = getrandom::fill(&mut rpid) {
             println!("Error: cannot generate request id: {e}");
             delay_return!(1);
@@ -230,7 +361,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
         let urlapi_notice = format!(
             "http://{}/query/miner/notice?wait={}&height={}&rqid={}",
             &cnf.rpcaddr,
-            &cnf.noticewait,
+            &poll_wait,
             pending_height,
             &hex::encode(&rpid)
         );
@@ -239,7 +370,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
             &HTTP_CLIENT,
             &urlapi_notice,
             &cnf.api_token,
-            Some(Duration::from_secs(300)),
+            Some(poll_timeout),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -254,31 +385,47 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf) {
             println!("Error: invalid miner notice JSON at {urlapi_notice}");
             delay_return!(1);
         };
+        // The notice body carries the LAST known height alongside the error, so it
+        // must be checked before the height comparison below: otherwise a stale
+        // notice at our own height would look like new work and spin the miner
+        // between notice and pending while the workers grind dead work.
+        if let Some(reason) = upstream_stale_reason(&res2) {
+            enter_upstream_stale(reason, "block notice");
+            delay_return!(STALE_UPSTREAM_BACKOFF_SECS);
+        }
         let jnum = |k| res2[k].as_u64().unwrap_or(0);
         let res_hei = jnum("height");
-        // println!("\n++++++++ {} {} {}\n", &jsdata, res_hei, current_height);
-        if res_hei >= pending_height {
-            // next block discover
-            break;
+        // Fullnode notice reports chain tip height, while we long-poll with the
+        // pending (tip+1) height. When tip advances to pending_height, break for
+        // the next job. On timeout (or any other reply) also leave the wait so the
+        // outer loop re-fetches /query/miner/pending: that is how same-height tip
+        // reorgs (intro change without tip height advance) are detected. A second
+        // tight spin on the same tip would never re-read block_intro.
+        //
+        // Nothing new means the cycle must not be allowed to run free: it costs two
+        // requests, and an upstream that answers the notice instantly would
+        // otherwise be hammered at tens of requests per second (see NOTICE_CYCLE_MIN).
+        let new_work_ready = pending_height > 0 && res_hei >= pending_height;
+        let backoff = notice_cycle_backoff(cycle_start.elapsed(), new_work_ready);
+        if !backoff.is_zero() {
+            std::thread::sleep(backoff);
         }
-        // No new block yet. A compliant server long-polls (so this rarely loops),
-        // but a fast-returning/incompatible server or notice_wait=0 would otherwise
-        // spin this at 100% CPU — cap the spin with a small delay before re-polling.
-        std::thread::sleep(Duration::from_millis(200));
+        break;
     }
 }
 
 fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::BlockMiningResult) {
     let urlapi_success = format!(
-        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}",
+        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
         &cnf.rpcaddr,
         success.height,
         success.head_nonce,
         success.coinbase_nonce.to_hex(),
-        sys::curtimes()
+        sys::curtimes(),
+        cnf.worker_param()
     );
     // Submitting the winning block is the entire payoff of solo mining, and the
-    // result was already drained from the channel — so a single transient network
+    // result was already drained from the channel, so a single transient network
     // error must not silently lose it. Retry transport failures with backoff, and
     // only claim SUCCESS once the node confirms acceptance (ret == 0).
     const MAX_SUBMIT_ATTEMPTS: u32 = 5;
@@ -289,19 +436,37 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
             Ok(body) => {
                 let parsed = serde_json::from_str::<JV>(&body).ok();
                 let ret = parsed.as_ref().and_then(|j| j["ret"].as_i64());
-                last = body;
-                if ret == Some(0) {
-                    accepted = true;
-                } else if ret.is_some() {
-                    // Deterministic node rejection (stale height, invalid, etc.):
-                    // retrying will not help, so stop and report it honestly.
-                    let err = parsed
-                        .as_ref()
-                        .and_then(|j| j["err"].as_str())
-                        .unwrap_or("");
-                    println!("[submit] node rejected height {}: {}", success.height, err);
+                last = body.clone();
+                match ret {
+                    Some(0) => {
+                        accepted = true;
+                        break;
+                    }
+                    Some(_) => {
+                        // Deterministic node rejection (stale height, invalid,
+                        // etc.): retrying will not help, so stop and report it.
+                        let err = parsed
+                            .as_ref()
+                            .and_then(|j| j["err"].as_str())
+                            .unwrap_or("");
+                        println!("[submit] node rejected height {}: {}", success.height, err);
+                        break;
+                    }
+                    None => {
+                        // HTTP 200 but no parseable `ret` (proxy/load-balancer error
+                        // page, truncated or non-JSON body). This is NOT a node
+                        // decision, so treat it as transient and retry: a winning
+                        // block is not discarded on a front-end hiccup.
+                        let snippet: String = body.chars().take(120).collect();
+                        println!(
+                            "[submit] attempt {}/{} unrecognized response, retrying: {}",
+                            attempt, MAX_SUBMIT_ATTEMPTS, snippet
+                        );
+                        if attempt < MAX_SUBMIT_ATTEMPTS {
+                            std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
+                        }
+                    }
                 }
-                break;
             }
             Err(e) => {
                 last = format!("transport error: {e}");
@@ -723,7 +888,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
 
             let Some(base) = pick_benchmark_result(&bench_results, cnf.efficiency.mode) else {
                 println!(
-                    "[benchmark] No successful tuning points — config unchanged (check OpenCL driver)."
+                    "[benchmark] No successful tuning points; config unchanged (check OpenCL driver)."
                 );
                 continue;
             };
@@ -1066,6 +1231,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_upstream_stale_answer_is_recognized_on_both_miner_endpoints() {
+        // Exact bodies the pool bridge returns during an upstream node outage.
+        let pending = serde_json::json!({"err": "upstream stale; work is not being refreshed"});
+        assert_eq!(
+            upstream_stale_reason(&pending),
+            Some("upstream stale; work is not being refreshed")
+        );
+        let notice = serde_json::json!({
+            "err": "upstream stale; work is not being refreshed",
+            "height": 1234
+        });
+        assert!(upstream_stale_reason(&notice).is_some());
+    }
+
+    #[test]
+    fn an_unknown_or_missing_error_body_is_not_treated_as_stale() {
+        // Anything else must stay an ordinary transient error, and no shape may
+        // panic the miner.
+        assert_eq!(upstream_stale_reason(&serde_json::json!({})), None);
+        assert_eq!(upstream_stale_reason(&serde_json::json!({"err": ""})), None);
+        assert_eq!(
+            upstream_stale_reason(&serde_json::json!({"err": "no job yet; wait for upstream fullnode"})),
+            None
+        );
+        assert_eq!(upstream_stale_reason(&serde_json::json!({"err": 7})), None);
+        assert_eq!(
+            upstream_stale_reason(&serde_json::json!({"err": {"nested": true}})),
+            None
+        );
+        assert_eq!(upstream_stale_reason(&serde_json::json!(null)), None);
+        assert_eq!(
+            upstream_stale_reason(&serde_json::json!({"height": 9, "block_intro": "00"})),
+            None
+        );
+    }
+
+    #[test]
+    fn the_notice_cycle_has_an_anti_spin_floor_that_never_delays_new_work() {
+        // An upstream that answers the notice immediately must not be hammered:
+        // the cycle costs a pending request plus a notice request, so hold it to a
+        // minimum period instead of running it as fast as the network allows.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_millis(5), false),
+            NOTICE_CYCLE_MIN - Duration::from_millis(5)
+        );
+        assert_eq!(
+            notice_cycle_backoff(Duration::ZERO, false),
+            NOTICE_CYCLE_MIN
+        );
+        // A cooperating upstream already spent the whole notice window, so the
+        // floor costs it nothing.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_secs(45), false),
+            Duration::ZERO
+        );
+        // New work is a payout waiting to be mined and is never delayed.
+        assert_eq!(
+            notice_cycle_backoff(Duration::from_millis(5), true),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn notice_long_poll_is_capped_when_a_stop_flag_can_arrive() {
+        assert_eq!(notice_poll_wait(45, true), NOTICE_POLL_WAIT_WITH_STOP);
+        assert_eq!(notice_poll_wait(300, true), NOTICE_POLL_WAIT_WITH_STOP);
+        assert_eq!(notice_poll_wait(1, true), 1);
+        assert_eq!(notice_poll_wait(45, false), 45);
+        assert_eq!(notice_poll_wait(300, false), 300);
     }
 
     #[test]

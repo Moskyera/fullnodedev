@@ -48,6 +48,48 @@ inline bool diamond_more_power(const uchar *dst,
     return 0;
 }
 
+// Mainnet consensus: exactly DMD_L leading '0' chars, then 6 non-zero name chars.
+// Prefer a valid diamond over an invalid "stronger" overshoot (11+ leading zeros).
+#define DMD_L 10
+inline bool diamond_is_valid_name(const uchar *d)
+{
+    for (uint i = 0u; i < (uint)DMD_L; i++) {
+        if (d[i] != (uchar)'0') return 0;
+    }
+    for (uint i = (uint)DMD_L; i < (uint)DMD_M; i++) {
+        if (d[i] == (uchar)'0') return 0;
+    }
+    return 1;
+}
+
+// Return 1 when candidate `a` should replace current best `b`.
+//
+// KNOWN KERNEL-VS-CPU ASYMMETRY. The CPU is the authority and its acceptance test
+// is stricter than this one: app/src/diaworker.rs requires BOTH
+// x16rs::check_diamond_hash_result (the name shape checked below) AND
+// x16rs::check_diamond_difficulty, which is a function of the sha3 pre-hash bytes
+// and the medium-hash bytes, not of the name. This kernel cannot run that second
+// test: it never receives the diamond `number` (so it cannot derive shnumlp /
+// shmaxit / diffnum) and X16RS_RUN_REPEAT_LOOP overwrites the sha3 pre-hash in
+// place with the x16rs result, so the sha3 bytes are gone by the time the
+// reduction runs. Consequence: each work group reports exactly ONE candidate, so
+// a group holding a name-valid-but-difficulty-failing hash at a lower index AND a
+// fully qualifying hash at a higher index reports the former and the real diamond
+// is lost - the host at app/src/opencl_dia.rs can only inspect what was returned.
+// Two name-valid hits inside one work group is astronomically unlikely at mainnet
+// difficulty, so this is accepted for now. To close it properly the kernel needs a
+// `number` argument plus a second output buffer carrying the sha3 pre-hash, which
+// is a host ABI change in app/src/opencl_gpu/. Do NOT assume "kernel best" equals
+// "CPU accept" when re-enabling the GPU diamond path.
+inline bool diamond_better(const uchar *a, const uchar *b)
+{
+    bool va = diamond_is_valid_name(a);
+    bool vb = diamond_is_valid_name(b);
+    if (va && !vb) return 1;
+    if (!va && vb) return 0;
+    return diamond_more_power(a, b);
+}
+
 __attribute__((work_group_size_hint(256, 1, 1)))
 __kernel void x16rs_diamond(
     __constant const block_diamond_t* input_stuff,
@@ -57,7 +99,8 @@ __kernel void x16rs_diamond(
     __global hash_32* global_hashes,
     __global unsigned int* global_order,
     __global hash_32* best_hashes,
-    __global ulong* best_nonces
+    __global ulong* best_nonces,
+    const unsigned int stuff_len
 ) {
     const unsigned int local_id = get_local_id(0);
     const unsigned int local_size = get_local_size(0);
@@ -65,7 +108,8 @@ __kernel void x16rs_diamond(
     const unsigned int index = local_id * unit_size;
     hash_32* local_hashes = global_hashes + (group_id * local_size * unit_size);
     __local ulong local_nonces[256];
-    __local diamond_t local_names[256];
+    // No __local diamond_t local_names[256] here: the per-work-item best is the
+    // private `best_name` below, and an unused 4 KB LDS array only costs occupancy.
     __global unsigned int* local_order = global_order + (group_id * local_size * unit_size);
     __local unsigned int ALIGN histogram[16];
     __local unsigned int ALIGN starting_index[16];
@@ -90,10 +134,11 @@ __kernel void x16rs_diamond(
         } else {
             write_nonce_u64_to_bytes(32, base_stuff.h1, nonce);
         }
-        // Hash Block
-        sha3_256_hash_diamond(base_stuff.h8, local_hashes[index + i].h8);
-    }          
-    barrier(CLK_LOCAL_MEM_FENCE);
+        // Hash Block (stuff_len is 61 without custom message, 93 with)
+        sha3_256_hash_diamond(base_stuff.h8, local_hashes[index + i].h8, stuff_len);
+    }
+    // Hashes live in global memory (local_hashes aliases global_hashes) — need GLOBAL fence.
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
 #ifdef AMD_GFX_GFX1201
     X16RS_RUN_REPEAT_LOOP(
@@ -118,24 +163,26 @@ __kernel void x16rs_diamond(
         mixtab0, mixtab1, mixtab2, mixtab3
     );
 #endif
-    
-    unsigned int best_hash = 0;
+
+    // Seed from this work-item's first unit (index), matching x16rs_main.cl, so
+    // unit 0 is considered and best_name is never left uninitialized.
+    unsigned int best_hash = index;
     diamond_t best_name;
+    diamond_hash(local_hashes[index].h1, best_name.h1);
     for (unsigned int i = 1; i < unit_size; i++) {
-        // Get diamond name
         diamond_t now_name;
         diamond_hash(local_hashes[index + i].h1, now_name.h1);
-        if (diamond_more_power(now_name.h1, best_name.h1) == 1) {
+        if (diamond_better(now_name.h1, best_name.h1) == 1) {
             best_hash = index + i;
             best_name = now_name;
         }
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     local_hashes[index] = local_hashes[best_hash];
     local_nonces[local_id] = global_offset + best_hash - index;
     
-    barrier(CLK_LOCAL_MEM_FENCE);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     // Now perform the reduction across threads
     for (unsigned int smax = local_size >> 1; smax > 0; smax >>= 1) {
@@ -146,12 +193,12 @@ __kernel void x16rs_diamond(
             diamond_t pair_name;
             diamond_hash(local_hashes[idx_current].h1, current_name.h1);
             diamond_hash(local_hashes[idx_pair].h1, pair_name.h1);
-            if (diamond_more_power(pair_name.h1, current_name.h1) == 1) {
+            if (diamond_better(pair_name.h1, current_name.h1) == 1) {
                 local_hashes[idx_current] = local_hashes[idx_pair];
                 local_nonces[local_id] = local_nonces[local_id + smax];
             }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
     }
 
     if(local_id == 0) {

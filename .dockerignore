@@ -1,0 +1,61 @@
+# Without this file `docker build .` sends the whole working tree to the daemon.
+# Measured here: 113 GB of build context, which took nearly two hours and then
+# killed the daemon. The image needs the sources and nothing else; every build
+# artifact it needs is produced inside the builder stage.
+
+# Rust build output. This is the one that matters: it is almost all of the 113 GB.
+# target2 is a second build directory that exists here and is another 188 MB.
+target/
+target2/
+*/target/
+**/target/
+
+# Build directories from tooling that names them something other than "target".
+# The patterns above match a directory CALLED target, so they missed
+# .codex-target-security-20260719-reaudit entirely: 3.5 GB of compiler output
+# that went on being uploaded to the daemon on every build, 198 seconds of it.
+# Anything with "target" in the name is compiler output, wherever it sits.
+.codex-*/
+*target*/
+**/*target*/
+
+# Packaged releases and their staging directories. Deliberately broad: this tree
+# has accumulated dist, dist-final-*, dist-opencl-upgrade-* and will accumulate
+# more, and each is tens of megabytes of already-built output the image rebuilds
+# from source anyway.
+dist*/
+
+# Vendored Colab upload snapshots: a whole second copy of the app tree plus
+# prebuilt artifacts, 36 MB, none of which the build reads.
+scripts/mining-nvidia/colab-upload/
+
+# Git history. The build reads no VCS metadata.
+.git/
+.github/
+
+# Local test rigs, chain data and wallets. None of this belongs in an image, and
+# a wallet key reaching a layer would be a leak that survives every later layer.
+**/hacash_mainnet_data/
+**/hacash_testnet_data/
+**/*.key
+**/*.key.*
+deploy/secrets/
+*.log
+*.err
+*.out
+
+# Editor, OS and tooling noise.
+.vscode/
+.idea/
+.grok/
+.claude/
+Thumbs.db
+.DS_Store
+
+# The prebuilt Windows toolchain vendored for local builds. The image is Linux.
+.tools/
+osxcross/
+
+# Docker's own files: changing the compose file must not invalidate the build
+# cache for the source layers.
+deploy/docker-compose.yml

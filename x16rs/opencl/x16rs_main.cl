@@ -24,7 +24,16 @@ __kernel void x16rs_main(
     __global hash_32* global_hashes,
     __global unsigned int* global_order,
     __global hash_32* best_hashes,
-    __global unsigned int* best_nonces
+    __global unsigned int* best_nonces,
+    /* Pool share list. Purely an extra OUTPUT path: nothing below reads these
+       back into the hashing or the reduction, so the block a solo miner needs is
+       byte for byte the one it always was. `share_capacity` is 0 unless the host
+       is pool mining, and 0 skips the whole list. */
+    __global const hash_32* share_target,
+    __global unsigned int* share_found,
+    __global unsigned int* share_nonces,
+    __global hash_32* share_hashes,
+    const unsigned int share_capacity
 ) {
     const unsigned int local_id = get_local_id(0);
     const unsigned int local_size = get_local_size(0);
@@ -81,6 +90,28 @@ __kernel void x16rs_main(
     );
 #endif
     
+    /* Append every payable nonce BEFORE the reduction below overwrites
+       local_hashes[index] with this work item's best. Each item reads and writes
+       only its own unit_size slots here, so no barrier is needed and none of the
+       existing ones move.
+
+       A pool credits a PPLNS share for EVERY hash under the share target, so
+       reporting one per batch tied income to batch cadence instead of hashrate.
+       The counter is incremented for every hit, including hits that do not fit,
+       which is what lets the host say it is undersampling instead of quietly
+       losing money. */
+    if (share_capacity != 0) {
+        for (unsigned int i = 0; i < unit_size; i++) {
+            if (diff_big_hash(&local_hashes[index + i], &share_target[0]) == 0) {
+                const unsigned int slot = atomic_inc(&share_found[0]);
+                if (slot < share_capacity) {
+                    share_nonces[slot] = global_offset + i;
+                    share_hashes[slot] = local_hashes[index + i];
+                }
+            }
+        }
+    }
+
     unsigned int best_hash = index;
     X16RS_PRAGMA_UNROLL_8
     for (unsigned int i = 1; i < unit_size; i++) {

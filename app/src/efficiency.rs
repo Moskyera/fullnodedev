@@ -76,7 +76,9 @@ impl EfficiencyConf {
         let sec = sys::ini_section(ini, "efficiency");
         let mode_raw = ini_must(sec, "mode", "profit");
         let supervene_max = ini_must_u64(sec, "supervene_max", 0) as u32;
-        let supervene_min = ini_must_u64(sec, "supervene_min", 2) as u32;
+        // Default floor of 1, not 2: an explicit `supervene=1` must mean one
+        // thread, not be silently bumped to two by the minimum.
+        let supervene_min = ini_must_u64(sec, "supervene_min", 1) as u32;
         EfficiencyConf {
             mode: EfficiencyMode::from_str(&mode_raw),
             power_cost_kwh: ini_must_f64(sec, "power_cost_kwh", 0.15),
@@ -84,7 +86,7 @@ impl EfficiencyConf {
             cpu_watts_per_thread: ini_must_f64(sec, "cpu_watts_per_thread", 8.0),
             hac_price: ini_must_f64(sec, "hac_price", 0.0),
             dynamic_supervene: ini_must_bool(sec, "dynamic_supervene", true),
-            supervene_min: supervene_min.max(0),
+            supervene_min,
             supervene_max,
             oom_fallback: ini_must_bool(sec, "oom_fallback", true),
             max_temp_c: ini_must_u64(sec, "max_temp_c", 0) as u32,
@@ -109,10 +111,15 @@ impl EfficiencyConf {
             return 0;
         }
         let mut sv = configured.max(1);
-        if self.supervene_max > 0 {
-            sv = sv.min(self.supervene_max);
-        }
-        sv.max(self.supervene_min)
+        let hi = if self.supervene_max > 0 {
+            self.supervene_max
+        } else {
+            u32::MAX
+        };
+        sv = sv.min(hi);
+        // Apply the floor, but never let a misconfigured min exceed the max: a
+        // `supervene_min > supervene_max` must not spawn more threads than the cap.
+        sv.max(self.supervene_min.min(hi))
     }
 
     pub fn spawn_supervene(&self, configured: u32) -> u32 {

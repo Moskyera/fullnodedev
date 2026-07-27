@@ -1,0 +1,79 @@
+# Hacash fullnode, as the always-on half of an HBIT pool box.
+#
+# Install to /etc/systemd/system/hacash-node.service (deploy/install.sh does it).
+# Every path here is absolute on purpose: a service manager gives a process no
+# terminal, no login shell and no working directory of its own.
+#
+# Anything you change here needs `systemctl daemon-reload` afterwards.
+# Every directive is checked in docs/POOL-OPERATOR.md, section "The unit files,
+# line by line". Do not paste a hardening line you cannot explain to yourself.
+
+[Unit]
+Description=Hacash fullnode (the chain the HBIT pool mines on)
+Documentation=file:/opt/hbit/docs/POOL-OPERATOR.md
+# network-online.target means "an address is configured", which is what the P2P
+# code needs before it dials boot nodes.
+Wants=network-online.target
+After=network-online.target
+# No start rate limiting. The alternative is a node that gives up after five
+# quick failures and then stays down silently, which on a money box is worse
+# than one that retries every 15 seconds and prints the reason every time.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hbit
+Group=hbit
+WorkingDirectory=/var/lib/hbit/node
+# The config path is the ONLY argument this binary accepts, and it is worth
+# passing: with no argument the node looks for hacash.config.ini NEXT TO THE
+# BINARY (not in the working directory), and /opt is read-only for this service.
+ExecStart=/opt/hbit/bin/hacash /etc/hbit/hacash.config.ini
+Restart=always
+RestartSec=15s
+# The node installs its clean-shutdown handler on SIGINT (Ctrl-C) only. Sending
+# the systemd default SIGTERM would kill it where it stands, mid database write.
+# With this line `systemctl stop` runs the same path Ctrl-C does, and the journal
+# ends with "[Exit] Hacash fullnode closed."
+KillSignal=SIGINT
+# Closing the chain database can take a while on a large chain. After this,
+# systemd escalates to SIGKILL.
+TimeoutStopSec=180
+SyslogIdentifier=hacash-node
+# Files this service creates are owner-only. Nothing here is secret today, but a
+# chain database is not something other local accounts need to read.
+UMask=0077
+
+# ---- hardening: see POOL-OPERATOR.md for one line on each ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The ONLY directory this service may write. The pool wallet lives in a sibling
+# directory, so the node cannot touch it even though both run as the same user.
+ReadWritePaths=/var/lib/hbit/node
+# The node has no business reading the pool's passphrase. This makes the path
+# not merely unwritable but absent inside this service's mount namespace.
+InaccessiblePaths=/etc/hbit/wallet-passphrase
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+# AF_NETLINK is in the list on purpose: glibc's name resolution uses it to pick a
+# source address, so leaving it out breaks DNS in ways that look like a network
+# outage.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+RemoveIPC=yes
+# The ports here are all above 1024, so no capability is needed to bind them.
+CapabilityBoundingSet=
+# Optional, and NOT enabled by default because a wrong filter kills the node with
+# SIGSYS and no explanation. If you want it, add it, restart, and watch a full
+# sync before you trust it:
+# SystemCallFilter=@system-service
+# SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

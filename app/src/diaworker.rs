@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{RwLock, mpsc};
 
 use std::thread::*;
@@ -9,6 +9,9 @@ use reqwest::blocking::Client as HttpClient;
 use serde_json::Value as JV;
 
 use crate::efficiency::*;
+// Same panic firewall the block miner uses: one result thread owns every
+// submission, so a panic there would silently end all payouts.
+use crate::mining_guard::guard_mining_iteration;
 
 use basis::difficulty::*;
 use field::*;
@@ -16,7 +19,7 @@ use mint::action::*;
 use mint::genesis::*;
 use sys::*;
 
-use crate::hash_util::diamond_more_power;
+use crate::hash_util::diamond_better;
 
 #[cfg(feature = "ocl")]
 use crate::gpu_oom::GpuBatchError;
@@ -61,7 +64,21 @@ impl DiaWorkConf {
         let active = efficiency.initial_active_supervene(configured_supervene);
         let runtime = MiningRuntimeState::new(0, active);
         // HACD is officially CPU/full-node mining. Legacy GPU keys are ignored
-        // so a stale or hand-edited config cannot activate the OpenCL path.
+        // so a stale or hand-edited config cannot activate the OpenCL path. Warn
+        // loudly if the config still carries GPU keys, so it is clear they do
+        // nothing here (rather than silently forcing CPU).
+        let wants_gpu = ["useopencl", "usecuda"].iter().any(|k| {
+            matches!(
+                ini_must(sec, k, "").trim().to_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        }) || ini_must_u64(sec, "workgroups", 0) > 0;
+        if wants_gpu {
+            println!(
+                "[diamond] NOTE: HACD (diamond) mining is CPU / full-node only; the GPU keys \
+                 in this config (useopencl / usecuda / workgroups) are ignored."
+            );
+        }
         DiaWorkConf {
             rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
@@ -118,10 +135,27 @@ mod config_tests {
 /*************************************/
 
 const HASH_WIDTH: usize = 32;
+// Length of a diamond hash string (x16rs DMD_M): 10 leading '0' chars followed by
+// the 6-char diamond name. This is a fixed mainnet consensus constant.
+pub(crate) const DIAMOND_HASH_LEN: usize = 16;
 const MINING_INTERVAL: f64 = 3.0; // 3 secs
+/// Bounded result channel: an unbounded queue grows without limit whenever the
+/// drain thread stalls. Under backpressure a statistics-only batch may be
+/// dropped, but a batch carrying a mined diamond is real money and always waits.
+const RESULT_CHANNEL_CAPACITY: usize = 1024;
+/// Mined diamonds queued for the dedicated submit thread. A diamond is rare, so
+/// this only has to absorb a burst while one submission is in flight.
+const SUBMIT_QUEUE_CAPACITY: usize = 64;
 
 // current mining diamond number
 static MINING_DIAMOND_NUM: AtomicU32 = AtomicU32::new(0);
+/// Bumped once per installed diamond job, exactly like MINING_BLOCK_EPOCH in the
+/// block miner. A chain reorg can move the diamond tip DOWN (next_num < mining_num)
+/// or replace born.hash while the number stays the same, and the number alone
+/// cannot express either case, so a worker that only watched the number kept
+/// grinding a dead (number, prev_hash) pair. Every worker snapshots this too and
+/// restarts on any change.
+static MINING_DIAMOND_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 use std::sync::LazyLock;
 static HTTP_CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
@@ -129,6 +163,51 @@ static HTTP_CLIENT: LazyLock<HttpClient> = LazyLock::new(|| {
         .unwrap_or_else(|e| panic!("cannot create bounded RPC client: {e}"))
 });
 static MINING_DIAMOND_STUFF: LazyLock<RwLock<Hash>> = LazyLock::new(|| RwLock::default());
+
+fn current_diamond_epoch() -> u64 {
+    MINING_DIAMOND_EPOCH.load(Acquire)
+}
+
+/// Publish a diamond job (number + prev_hash) for the workers. Returns true only
+/// when something actually changed, so an unchanged re-poll never disturbs a
+/// running worker. The epoch is bumped on every real change, which is what makes
+/// a reorg to a LOWER number, or to a different born.hash at the SAME number,
+/// visible to a worker that already snapshotted its job.
+fn install_diamond_job(next_num: u32, new_hash: Hash) -> bool {
+    let mut stuff = MINING_DIAMOND_STUFF
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if MINING_DIAMOND_NUM.load(Acquire) == next_num && *stuff == new_hash {
+        return false; // nothing changed
+    }
+    *stuff = new_hash;
+    // Release: publish the STUFF write above before the number and the epoch, so
+    // a reader that sees either (with an Acquire load) also sees the matching
+    // prev_hash.
+    MINING_DIAMOND_NUM.store(next_num, Release);
+    MINING_DIAMOND_EPOCH.fetch_add(1, Release);
+    true
+}
+
+/// Snapshot the live job as one consistent `(number, epoch, prev_hash)` triple.
+/// install_diamond_job holds the STUFF write lock across all three updates, so
+/// reading them under the read lock rules out a worker pairing the number of one
+/// job with the prev_hash of another.
+fn snapshot_diamond_job() -> (u32, u64, Hash) {
+    let stuff = MINING_DIAMOND_STUFF
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    (
+        MINING_DIAMOND_NUM.load(Acquire),
+        current_diamond_epoch(),
+        stuff.clone(),
+    )
+}
+
+/// True while the job a worker snapshotted is still the live one.
+fn diamond_job_is_current(snapshot_number: u32, snapshot_epoch: u64) -> bool {
+    snapshot_number == MINING_DIAMOND_NUM.load(Acquire) && snapshot_epoch == current_diamond_epoch()
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
@@ -138,17 +217,102 @@ pub(crate) struct DiamondMiningResult {
     nonce_space: u64,
     u64_nonce: u64,
     msg_nonce: Vec<u8>,
-    dia_str: [u8; 10],
+    dia_str: [u8; DIAMOND_HASH_LEN],
     is_success: Option<DiamondMint>,
     use_secs: f64,
     is_gpu: bool,
     gpu_batch_ok: bool,
 }
 
+fn should_stop(stop_flag: &Option<Arc<AtomicBool>>) -> bool {
+    stop_flag.as_ref().map(|f| f.load(Relaxed)).unwrap_or(false)
+}
+
+/// Spawn a diamond mining thread that is registered with the runtime, exactly
+/// like the block miner registers its own threads, so a shutdown supervisor can
+/// wait for every HACD thread with `MiningRuntimeState::active_mining_threads`.
+/// The guard is taken BEFORE the thread starts, so the count can never read zero
+/// while a thread is still on its way up, and it is released by Drop, so a thread
+/// that returns (or unwinds) always acknowledges instead of hanging the wait.
+fn spawn_tracked_diamond_thread<F>(runtime: &Arc<MiningRuntimeState>, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let thread_guard = runtime.track_mining_thread();
+    spawn(move || {
+        let _thread_guard = thread_guard;
+        body();
+    });
+}
+
+/// Hand a batch result to the drain thread. Returns false only when the drain
+/// side is gone, so the worker knows to exit. Under backpressure a
+/// statistics-only result is dropped with a log, but a result carrying a mined
+/// diamond is a payout and waits for space instead.
+fn send_diamond_result(
+    result_ch_tx: &mpsc::SyncSender<DiamondMiningResult>,
+    res: DiamondMiningResult,
+) -> bool {
+    match result_ch_tx.try_send(res) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(res)) => {
+            if res.is_success.is_some() {
+                return result_ch_tx.send(res).is_ok();
+            }
+            eprintln!(
+                "[Mining] Diamond result queue full, dropped a statistics-only batch at number {}.",
+                res.number
+            );
+            true
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Disposition of a finished GPU batch: `(send the result, report a device error)`.
+///
+/// Device health and payout are two different questions. A driver-level failure
+/// (a queue.finish() error, an OOM, a corrupt read-back) says nothing about a
+/// DiamondMint the host has ALREADY verified on the CPU - that mint is a pure
+/// function of prev_hash/nonce/address/custom_message - so it is always forwarded
+/// and only the health signal is downgraded. Letting one flag gate both is how a
+/// driver hiccup silently threw away hours to days of mined value.
+#[cfg_attr(not(feature = "ocl"), allow(dead_code))]
+fn diamond_batch_disposition(gpu_batch_ok: bool, carries_payout: bool) -> (bool, bool) {
+    (gpu_batch_ok || carries_payout, !gpu_batch_ok)
+}
+
+/// Queue a mined diamond for the submit thread. If the queue is full or the
+/// thread is gone we submit inline rather than drop it: a dropped diamond is
+/// lost money.
+fn queue_diamond_mining_success(
+    cnf: &DiaWorkConf,
+    submit_tx: &mpsc::SyncSender<DiamondMint>,
+    success: DiamondMint,
+) {
+    match submit_tx.try_send(success) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(success)) => {
+            eprintln!(
+                "[Mining] Diamond submit queue full, submitting number {} inline.",
+                *success.d.number
+            );
+            push_diamond_mining_success(cnf, success);
+        }
+        Err(mpsc::TrySendError::Disconnected(success)) => {
+            push_diamond_mining_success(cnf, success);
+        }
+    }
+}
+
 /*
 * Diamond worker
 */
 pub fn diaworker() {
+    diaworker_with_stop(None)
+}
+
+pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
     let cnfp = "./diaworker.config.ini".to_string();
     let inicnf = sys::load_config(cnfp.clone());
     let mut cnf = DiaWorkConf::new(&inicnf);
@@ -161,7 +325,7 @@ pub fn diaworker() {
     // cnf.supervene = 1;
     // test end
 
-    let (res_tx, res_rx) = mpsc::channel();
+    let (res_tx, res_rx) = mpsc::sync_channel(RESULT_CHANNEL_CAPACITY);
 
     // init
     load_init(&mut cnf);
@@ -217,13 +381,37 @@ pub fn diaworker() {
     #[cfg(not(feature = "ocl"))]
     let vene: u32 = cnf.supervene;
 
+    // Submitting a mined diamond is a blocking HTTP round-trip (with retries), so
+    // it runs on a dedicated thread: doing it inline would stall the 77ms result
+    // drain and back the result channel up.
+    let (submit_tx, submit_rx) = mpsc::sync_channel::<DiamondMint>(SUBMIT_QUEUE_CAPACITY);
+    let cnf_submit = cnf.clone();
+    spawn_tracked_diamond_thread(&cnf.runtime, move || {
+        while let Ok(success) = submit_rx.recv() {
+            guard_mining_iteration("diamond submit thread", || {
+                push_diamond_mining_success(&cnf_submit, success);
+            });
+        }
+    });
+
     // deal results
     let cnf1 = cnf.clone();
-    spawn(move || {
-        let mut most_dia_str = [b'W'; 10];
+    let stop_flag_res = stop_flag.clone();
+    spawn_tracked_diamond_thread(&cnf.runtime, move || {
+        // submit_tx lives in this thread: when the drain loop returns on shutdown
+        // it drops, which is what tells the submit thread to finish and exit.
+        let mut most_dia_str = [b'W'; DIAMOND_HASH_LEN];
         let mut rstx = res_rx;
         loop {
-            deal_diamond_mining_results(&cnf1, &mut most_dia_str, &mut rstx, vene);
+            if should_stop(&stop_flag_res) {
+                return;
+            }
+            // A panic here must never end the thread: this is the only path that
+            // submits mined diamonds, so losing it means silent total payout loss
+            // while the miner still looks like it is running.
+            guard_mining_iteration("diamond result thread", || {
+                deal_diamond_mining_results(&cnf1, &mut most_dia_str, &mut rstx, vene, &submit_tx);
+            });
             delay_continue_ms!(77);
         }
     });
@@ -252,10 +440,22 @@ pub fn diaworker() {
                 let gpu = OpenclGpuHandle::new(resource, gpu_snapshot, scan.clone());
                 gpu.configure_oom_floor(vram, cnf.localsize, cnf.unitsize, cnf.workgroups, &arch);
                 let cnf2 = cnf.clone();
-                let rstx: mpsc::Sender<DiamondMiningResult> = res_tx.clone();
-                spawn(move || {
+                let rstx: mpsc::SyncSender<DiamondMiningResult> = res_tx.clone();
+                let stop_flag_worker = stop_flag.clone();
+                spawn_tracked_diamond_thread(&cnf.runtime, move || {
                     loop {
-                        run_diamond_worker_thread_opencl(&cnf2, thrid, rstx.clone(), gpu.clone());
+                        if should_stop(&stop_flag_worker) {
+                            return;
+                        }
+                        guard_mining_iteration("diamond GPU mining worker", || {
+                            run_diamond_worker_thread_opencl(
+                                &cnf2,
+                                thrid,
+                                rstx.clone(),
+                                gpu.clone(),
+                                &stop_flag_worker,
+                            );
+                        });
                         delay_continue_ms!(9);
                     }
                 });
@@ -271,9 +471,15 @@ pub fn diaworker() {
             for thrid in 0..thrnum {
                 let cnf2 = cnf.clone();
                 let rstx = res_tx.clone();
-                spawn(move || {
+                let stop_flag_worker = stop_flag.clone();
+                spawn_tracked_diamond_thread(&cnf.runtime, move || {
                     loop {
-                        run_diamond_worker_thread(&cnf2, thrid, rstx.clone());
+                        if should_stop(&stop_flag_worker) {
+                            return;
+                        }
+                        guard_mining_iteration("diamond mining worker", || {
+                            run_diamond_worker_thread(&cnf2, thrid, rstx.clone(), &stop_flag_worker);
+                        });
                         delay_continue_ms!(9);
                     }
                 });
@@ -291,9 +497,20 @@ pub fn diaworker() {
                 for thrid in 0..thrnum {
                     let cnf2 = cnf.clone();
                     let rstx = res_tx.clone();
-                    spawn(move || {
+                    let stop_flag_worker = stop_flag.clone();
+                    spawn_tracked_diamond_thread(&cnf.runtime, move || {
                         loop {
-                            run_diamond_worker_thread(&cnf2, thrid, rstx.clone());
+                            if should_stop(&stop_flag_worker) {
+                                return;
+                            }
+                            guard_mining_iteration("diamond CPU assist worker", || {
+                                run_diamond_worker_thread(
+                                    &cnf2,
+                                    thrid,
+                                    rstx.clone(),
+                                    &stop_flag_worker,
+                                );
+                            });
                             delay_continue_ms!(9);
                         }
                     });
@@ -306,9 +523,15 @@ pub fn diaworker() {
         for thrid in 0..thrnum {
             let cnf2 = cnf.clone();
             let rstx = res_tx.clone();
-            spawn(move || {
+            let stop_flag_worker = stop_flag.clone();
+            spawn_tracked_diamond_thread(&cnf.runtime, move || {
                 loop {
-                    run_diamond_worker_thread(&cnf2, thrid, rstx.clone());
+                    if should_stop(&stop_flag_worker) {
+                        return;
+                    }
+                    guard_mining_iteration("diamond mining worker", || {
+                        run_diamond_worker_thread(&cnf2, thrid, rstx.clone(), &stop_flag_worker);
+                    });
                     delay_continue_ms!(9);
                 }
             });
@@ -317,6 +540,9 @@ pub fn diaworker() {
 
     // pull loop
     loop {
+        if should_stop(&stop_flag) {
+            return;
+        }
         if !is_within_idle_schedule(cnf.efficiency.idle_start_hour, cnf.efficiency.idle_end_hour) {
             delay_continue!(5);
         }
@@ -324,20 +550,25 @@ pub fn diaworker() {
             delay_continue!(3);
         }
         // HACD is CPU-only; GPU temperature polling does not apply here.
-        pull_and_push_diamond(&cnf);
+        // This is the ONLY code that refreshes MINING_DIAMOND_NUM /
+        // MINING_DIAMOND_STUFF, so a panic here would unwind diaworker_with_stop
+        // and leave every worker grinding the job it last snapshotted, forever and
+        // invisibly. Same firewall as every other loop in this file.
+        guard_mining_iteration("diamond pull loop", || pull_and_push_diamond(&cnf));
         delay_continue!(MINING_INTERVAL as u64);
     }
 }
 
 fn deal_diamond_mining_results(
     cnf: &DiaWorkConf,
-    most_dia_str: &mut [u8; 10],
+    most_dia_str: &mut [u8; DIAMOND_HASH_LEN],
     result_ch_rx: &mut mpsc::Receiver<DiamondMiningResult>,
     vene: u32,
+    submit_tx: &mpsc::SyncSender<DiamondMint>,
 ) {
     let mut deal_number = 0u32;
     let mut most = DiamondMiningResult::default();
-    most.dia_str = [b'w'; 10];
+    most.dia_str = [b'w'; DIAMOND_HASH_LEN];
     let mut total_nonce_space = 0u64;
     let mut gpu_nonce_space = 0u64;
     let mut cpu_nonce_space = 0u64;
@@ -352,12 +583,12 @@ fn deal_diamond_mining_results(
             cpu_nonce_space += res.nonce_space as u64;
         }
         total_use_secs += res.use_secs;
-        if diamond_more_power(&res.dia_str, &most.dia_str) {
+        if diamond_better(&res.dia_str, &most.dia_str) {
             most = res.clone();
         }
         // upload success
         if let Some(success) = &res.is_success {
-            push_diamond_mining_success(cnf, success.clone());
+            queue_diamond_mining_success(cnf, submit_tx, success.clone());
         }
         recv_count += 1;
         if recv_count >= vene as usize * 4 {
@@ -368,15 +599,20 @@ fn deal_diamond_mining_results(
         return;
     }
     // total most
-    if diamond_more_power(&most.dia_str, most_dia_str) {
+    if diamond_better(&most.dia_str, most_dia_str) {
         *most_dia_str = most.dia_str.clone();
     }
     // print hashrate
     let diastr = String::from_utf8_lossy(&most.dia_str).into_owned();
     let most_diastr = String::from_utf8_lossy(most_dia_str).into_owned();
-    let avg_use_secs = total_use_secs / recv_count as f64;
-    let nonce_rates = if avg_use_secs.is_finite() && avg_use_secs > 0.0 {
-        total_nonce_space as f64 / avg_use_secs
+    // Aggregate hashrate = total nonces / wall-clock. The workers run in parallel,
+    // so wall-clock ~= total_use_secs / (parallel workers). Dividing by recv_count
+    // (batches drained) instead would multiply the rate by the number of batches
+    // each worker sent per drain, wildly overcounting for sequential batches.
+    let parallelism = (vene.max(1)) as f64;
+    let wall_secs = total_use_secs / parallelism;
+    let nonce_rates = if wall_secs.is_finite() && wall_secs > 0.0 {
+        total_nonce_space as f64 / wall_secs
     } else {
         0.0
     };
@@ -386,7 +622,7 @@ fn deal_diamond_mining_results(
     if should_pause_for_diamond_profit(&cnf.efficiency, &cnf.gpu_profile, active_cpu) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
         println!(
-            "\n[efficiency] HACD mining paused — daily power cost exceeds configured revenue target (hac_price)."
+            "\n[efficiency] HACD mining paused: daily power cost exceeds configured revenue target (hac_price)."
         );
     } else {
         cnf.runtime.paused_unprofitable.store(false, Relaxed);
@@ -394,7 +630,7 @@ fn deal_diamond_mining_results(
     let paused = cnf.runtime.paused_unprofitable.load(Relaxed);
     // HACD is strictly CPU-only, so there is no GPU power draw. Using the shared
     // estimate_gpu_watts("") here would print a phantom ~280 W (Unknown vendor)
-    // for a CPU miner — report CPU-only wattage instead.
+    // for a CPU miner, so report CPU-only wattage instead.
     let gpu_w = 0.0;
     let watts = gpu_w + active_cpu as f64 * cnf.efficiency.cpu_watts_per_thread;
     let hashrate_show = rates_to_show(nonce_rates);
@@ -432,13 +668,16 @@ fn deal_diamond_mining_results(
     may_print_turn_to_nex_diamond_mining(deal_number, Some(most_dia_str));
 }
 
-fn may_print_turn_to_nex_diamond_mining(curr_number: u32, most_dia_str: Option<&mut [u8; 10]>) {
-    let mining_number = MINING_DIAMOND_NUM.load(Relaxed);
+fn may_print_turn_to_nex_diamond_mining(
+    curr_number: u32,
+    most_dia_str: Option<&mut [u8; DIAMOND_HASH_LEN]>,
+) {
+    let mining_number = MINING_DIAMOND_NUM.load(Acquire);
     if mining_number <= curr_number {
         return; // not turn
     }
     if let Some(most_dia_str) = most_dia_str {
-        *most_dia_str = [b'W'; 10]; // reset 
+        *most_dia_str = [b'W'; DIAMOND_HASH_LEN]; // reset
     }
 
     println!(
@@ -452,12 +691,13 @@ fn may_print_turn_to_nex_diamond_mining(curr_number: u32, most_dia_str: Option<&
 fn run_diamond_worker_thread(
     cnf: &DiaWorkConf,
     _thrid: usize,
-    result_ch_tx: mpsc::Sender<DiamondMiningResult>,
+    result_ch_tx: mpsc::SyncSender<DiamondMiningResult>,
+    stop_flag: &Option<Arc<AtomicBool>>,
 ) {
     if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
         delay_return_ms!(2000);
     }
-    let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
+    let (cmdn, current_mining_epoch, current_mining_block_hash) = snapshot_diamond_job();
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
     }
@@ -473,12 +713,6 @@ fn run_diamond_worker_thread(
 
     let mut nonce_space: u64 = 15000;
     let current_mining_number: u32 = cmdn;
-    let current_mining_block_hash: Hash = {
-        MINING_DIAMOND_STUFF
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    };
 
     // start mining
     let mut custom_nonce = [0u8; HASH_WIDTH];
@@ -494,6 +728,14 @@ fn run_diamond_worker_thread(
     let mut nonce_start = 0;
 
     loop {
+        // This inner loop only ends when the diamond number turns over, which can
+        // be many minutes away, so it has to observe the stop flag itself for a
+        // shutdown supervisor to see this thread acknowledge in good time. With no
+        // stop flag (the standalone diaworker binary) this is always false, so the
+        // mining behavior is unchanged.
+        if should_stop(stop_flag) {
+            return;
+        }
         let ctn = Instant::now();
         // println!("- nonce_start: {}", nonce_start);
         let mut result = do_diamond_group_mining(
@@ -509,7 +751,7 @@ fn run_diamond_worker_thread(
         result.use_secs = use_secs;
         result.is_gpu = false;
         result.gpu_batch_ok = true;
-        if result_ch_tx.send(result).is_err() {
+        if !send_diamond_result(&result_ch_tx, result) {
             return;
         }
         let Some(ns) = nonce_start.checked_add(nonce_space) else {
@@ -521,9 +763,11 @@ fn run_diamond_worker_thread(
         }
         nonce_space = nonce_space.max(1);
 
-        // check next
-        if current_mining_number < MINING_DIAMOND_NUM.load(Relaxed) {
-            return; // turn to next number
+        // check next: a strict-advance test would miss a reorg that lowered the
+        // tip or replaced born.hash at the same number, and every hash after that
+        // would be unacceptable by construction.
+        if !diamond_job_is_current(current_mining_number, current_mining_epoch) {
+            return; // turn to the new job
         }
     }
 }
@@ -532,25 +776,20 @@ fn run_diamond_worker_thread(
 fn run_diamond_worker_thread_opencl(
     cnf: &DiaWorkConf,
     _thrid: usize,
-    result_ch_tx: mpsc::Sender<DiamondMiningResult>,
+    result_ch_tx: mpsc::SyncSender<DiamondMiningResult>,
     gpu: std::sync::Arc<OpenclGpuHandle>,
+    stop_flag: &Option<Arc<AtomicBool>>,
 ) {
     if mining_is_gated(&cnf.runtime, &cnf.efficiency) {
         delay_return_ms!(2000);
     }
-    let cmdn = MINING_DIAMOND_NUM.load(Relaxed);
+    let (cmdn, current_mining_epoch, current_mining_block_hash) = snapshot_diamond_job();
     if cmdn == 0 {
         delay_return_ms!(99); // not yet
     }
 
     let rwd_addr = cnf.rewardaddr.clone();
     let current_mining_number: u32 = cmdn;
-    let current_mining_block_hash: Hash = {
-        MINING_DIAMOND_STUFF
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    };
 
     let mut custom_nonce = [0u8; HASH_WIDTH];
     if let Err(e) = getrandom::fill(&mut custom_nonce) {
@@ -561,6 +800,18 @@ fn run_diamond_worker_thread_opencl(
     let mut nonce_start = 0;
 
     loop {
+        // Same reason as the CPU worker: acknowledge shutdown without waiting for
+        // the diamond number to turn over.
+        if should_stop(stop_flag) {
+            return;
+        }
+        // Gate each batch on the device health check, the same way the block
+        // backend does. While the card is held back, on_batch_error is a no-op, so
+        // launching batches anyway would run with every OOM back-off and
+        // context-rebuild path silently switched off.
+        if gpu.gpu_is_disabled() {
+            delay_return_ms!(1000);
+        }
         let wg_cap = gpu.workgroups(cnf.workgroups, cnf.runtime.thermal_workgroups_cap());
         let gpu_nonce_space = (wg_cap as u64)
             .saturating_mul(cnf.localsize as u64)
@@ -585,7 +836,13 @@ fn run_diamond_worker_thread_opencl(
         result.nonce_space = gpu_nonce_space;
         let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
         result.use_secs = use_secs;
-        if !result.gpu_batch_ok {
+        let (send_result, report_batch_error) =
+            diamond_batch_disposition(result.gpu_batch_ok, result.is_success.is_some());
+        if report_batch_error {
+            // Payout first, health second: see diamond_batch_disposition.
+            if send_result {
+                let _ = send_diamond_result(&result_ch_tx, result);
+            }
             gpu.on_batch_error(
                 GpuBatchError::Other("diamond OpenCL batch failed".into()),
                 cnf.efficiency.oom_fallback,
@@ -595,7 +852,7 @@ fn run_diamond_worker_thread_opencl(
             delay_return_ms!(50);
         }
         gpu.on_batch_success(cnf.workgroups, &cnf.runtime);
-        if result_ch_tx.send(result).is_err() {
+        if !send_diamond_result(&result_ch_tx, result) {
             return;
         }
 
@@ -604,7 +861,8 @@ fn run_diamond_worker_thread_opencl(
         };
         nonce_start = ns;
 
-        if current_mining_number < MINING_DIAMOND_NUM.load(Relaxed) {
+        // Same reorg-aware test as the CPU worker.
+        if !diamond_job_is_current(current_mining_number, current_mining_epoch) {
             return;
         }
     }
@@ -632,7 +890,7 @@ fn do_diamond_group_mining(
         nonce_space,
         u64_nonce: 0,
         msg_nonce: custom_nonce.to_vec(),
-        dia_str: [b'W'; 10],
+        dia_str: [b'W'; DIAMOND_HASH_LEN],
         is_success: None,
         use_secs: 0.0,
         is_gpu: false,
@@ -640,11 +898,11 @@ fn do_diamond_group_mining(
     };
     let mut most_firhx = [0u8; HASH_WIDTH];
     let mut most_resxh = [0u8; HASH_WIDTH];
-    let mut most_diastr = [b'W'; 10];
+    let mut most_diastr = [b'W'; DIAMOND_HASH_LEN];
     let mut most_noncebytes = [0u8; 8];
 
     // start mining
-    for nonce in nonce_start..nonce_start + nonce_space {
+    for nonce in nonce_start..nonce_start.saturating_add(nonce_space) {
         // std::thread::sleep(std::time::Duration::from_micros(333)); // test
         let nonce_bytes = nonce.to_be_bytes();
         let (firhx, resxh, diastr) =
@@ -664,7 +922,7 @@ fn do_diamond_group_mining(
             most_noncebytes = nonce_bytes;
             break;
         }
-        if diamond_more_power(&diastr, &most.dia_str) {
+        if diamond_better(&diastr, &most.dia_str) {
             most.u64_nonce = nonce;
             most.dia_str = diastr.clone();
             most_firhx = firhx;
@@ -689,15 +947,41 @@ fn do_diamond_group_mining(
     most
 }
 
+/// The diamond pre-image: prev_hash(32) || nonce big-endian(8) || address(21) ||
+/// custom_message(0 or 32). Byte-identical to what `x16rs::mine_diamond` builds
+/// on the CPU, and its LENGTH is what selects the SHA3 padding branch inside
+/// sha3_256_hash_diamond on the GPU (61 without a custom message, 93 with), so
+/// both sides build it here and nowhere else.
+#[cfg_attr(not(feature = "ocl"), allow(dead_code))]
+pub(crate) fn diamond_pre_image(
+    prevblockhash: &Hash,
+    nonce_bytes: &[u8; 8],
+    rwdaddr: &Address,
+    custom_message: &[u8],
+) -> Vec<u8> {
+    let prevhash: &[u8; HASH_WIDTH] = prevblockhash;
+    let address: &[u8; 21] = rwdaddr;
+    [
+        prevhash.as_slice(),
+        nonce_bytes.as_slice(),
+        address.as_slice(),
+        custom_message,
+    ]
+    .concat()
+}
+
 pub(crate) fn check_diamer_success(
     number: u32,
     firhx: [u8; HASH_WIDTH],
     resxh: [u8; HASH_WIDTH],
-    diastr: [u8; 10],
+    diastr: [u8; DIAMOND_HASH_LEN],
 ) -> Option<[u8; 6]> {
-    if let None = x16rs::check_diamond_hash_result(&diastr) {
+    // The 6-char name is derived by x16rs from positions DMD_L..DMD_M of the diamond
+    // string; take its result directly instead of hand-slicing so this stays correct
+    // no matter the leading-zero prefix length (mainnet DMD_L=10, DMD_M=16).
+    let Some(name) = x16rs::check_diamond_hash_result(&diastr) else {
         return None;
-    }
+    };
     if !x16rs::check_diamond_difficulty(number, &firhx, &resxh) {
         return None;
     }
@@ -710,10 +994,6 @@ pub(crate) fn check_diamer_success(
         number
     );
     flush!("\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n");
-    // The 6-char name is the tail after the leading-zero prefix: positions DMD_L..DMD_M of the
-    // diamond string. That prefix is 4 on this reduced-difficulty testnet build (upstream: 10).
-    let mut name = [0u8; 6];
-    name.copy_from_slice(&diastr[4..]);
     Some(name)
 }
 
@@ -764,7 +1044,7 @@ fn load_init(cnf: &mut DiaWorkConf) {
 }
 
 fn pull_and_push_diamond(cnf: &DiaWorkConf) {
-    let mining_num = MINING_DIAMOND_NUM.load(Relaxed);
+    let mining_num = MINING_DIAMOND_NUM.load(Acquire);
 
     let urlapi_latest = format!("http://{}/query/latest", &cnf.rpcaddr);
     // get next number
@@ -786,16 +1066,21 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     // println!("mining next num: {} {}", &mining_num, &next_num);
     if next_num == 1 {
         // println!("get latest: next_num == 1");
-        *MINING_DIAMOND_STUFF
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = genesis_block_hash();
-        MINING_DIAMOND_NUM.store(next_num, Relaxed);
+        install_diamond_job(next_num, genesis_block_hash());
         return; // first mining
     }
-    if next_num <= mining_num {
-        return; // no change
+    // Advance, or roll back after a chain reorg that lowered the diamond tip.
+    // Same number: still re-fetch prev_hash in case born.hash was replaced.
+    if next_num == mining_num {
+        // Refresh prev_hash for the same number when the node reorged the tip.
+        // Cheap GET; skip heavy work only when hash is unchanged.
+    } else if next_num < mining_num {
+        println!(
+            "[HACD] diamond tip reorg: number {} -> {}, refreshing job",
+            mining_num, next_num
+        );
     }
-    // query next!
+    // query prev diamond (or re-query when number did not advance)
     let urlapi_diamond = format!(
         "http://{}/query/diamond?number={}",
         &cnf.rpcaddr,
@@ -830,10 +1115,12 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     let Ok(hash_bytes) = hx.try_into() else {
         delay_return!(30);
     };
-    *MINING_DIAMOND_STUFF
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = Hash::from(hash_bytes);
-    MINING_DIAMOND_NUM.store(next_num, Relaxed);
+    let new_hash = Hash::from(hash_bytes);
+    // Same number and same prev_hash: nothing to do. Anything else is a new job
+    // and bumps the epoch, which is what tells the running workers to restart.
+    if !install_diamond_job(next_num, new_hash) {
+        return;
+    }
     // print first req msg
     if mining_num == 0 {
         may_print_turn_to_nex_diamond_mining(mining_num, None);
@@ -843,39 +1130,308 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
 fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
     let urlapi_success = format!("http://{}/submit/diamondminer/success", &cnf.rpcaddr);
     let actionbody = success.serialize();
-    // println!("\n\ncurl {}?hexbody=true -X POST -d '{}'", &urlapi_success, &actionbody.to_hex());
-    let body =
-        match crate::rpc_http::post_text(&HTTP_CLIENT, &urlapi_success, &cnf.api_token, actionbody)
-        {
-            Ok(t) => t,
-            Err(e) => {
-                println!("Error: cannot submit diamond success to {urlapi_success}: {e}");
-                return;
+    // Submitting the mined diamond is the whole payoff. Match the block submit
+    // path: retry transport failures AND unrecognized HTTP-200 bodies (proxy
+    // HTML / truncated JSON); stop only on a clear node accept or reject.
+    const MAX_SUBMIT_ATTEMPTS: u32 = 5;
+    let mut last = String::new();
+    for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
+        match crate::rpc_http::post_text(
+            &HTTP_CLIENT,
+            &urlapi_success,
+            &cnf.api_token,
+            actionbody.clone(),
+        ) {
+            Ok(body) => {
+                // Snippet only: a proxy error page can be up to MAX_RPC_BODY_BYTES
+                // (2 MiB) and this string is printed on the failure path.
+                last = body.chars().take(200).collect();
+                let Ok(res) = serde_json::from_str::<JV>(&body) else {
+                    let snippet: String = body.chars().take(120).collect();
+                    println!(
+                        "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} unrecognized response, retrying: {snippet}"
+                    );
+                    if attempt < MAX_SUBMIT_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            500u64 * attempt as u64,
+                        ));
+                    }
+                    continue;
+                };
+                let jstr = |k: &str| res[k].as_str().unwrap_or("");
+                let tx_err = jstr("err");
+                if !tx_err.is_empty() {
+                    println!(
+                        "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet\n     ERROR: {}\n",
+                        tx_err
+                    );
+                    return;
+                }
+                let tx_hash = jstr("tx_hash");
+                if tx_hash.len() == 64 {
+                    println!(
+                        "Success submit tx diamond mint {} ({}) to mainnet, \n        get tx hash: {}\n",
+                        success.d.diamond.to_readable(),
+                        *success.d.number,
+                        tx_hash
+                    );
+                    return;
+                }
+                // JSON but no usable tx_hash — treat as transient front-end noise.
+                println!(
+                    "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} missing tx_hash, retrying"
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500u64 * attempt as u64));
+                }
             }
-        };
-    let Ok(res) = serde_json::from_str::<JV>(&body) else {
-        println!("Error: invalid JSON from {urlapi_success}");
-        return;
-    };
-    let jstr = |k: &str| res[k].as_str().unwrap_or("");
-    let tx_err = jstr("err");
-    if tx_err.len() > 0 {
-        println!(
-            "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet\n     ERROR: {}\n",
-            tx_err
-        );
-        return;
-    }
-    let tx_hash = jstr("tx_hash");
-    if tx_hash.len() != 64 {
-        return; // err
+            Err(e) => {
+                last = format!("transport error: {e}");
+                println!(
+                    "Error: attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} cannot submit diamond success to {urlapi_success}: {e}"
+                );
+                if attempt < MAX_SUBMIT_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500u64 * attempt as u64));
+                }
+            }
+        }
     }
     println!(
-        "Success submit tx diamond mint {} ({}) to mainnet, \n        get tx hash: {}\n",
-        success.d.diamond.to_readable(),
-        *success.d.number,
-        tx_hash
+        "ㄨㄨㄨㄨ Failed submit tx diamond mint after {MAX_SUBMIT_ATTEMPTS} attempts ({last}). Check the node/connection."
     );
+}
+
+#[cfg(test)]
+mod result_channel_tests {
+    use super::*;
+
+    fn mined_diamond() -> DiamondMint {
+        DiamondMint::with(DiamondName::from(*b"ABCDEF"), DiamondNumber::from(1u32))
+    }
+
+    fn statistics_result(number: u32) -> DiamondMiningResult {
+        let mut res = DiamondMiningResult::default();
+        res.number = number;
+        res
+    }
+
+    fn success_result(number: u32) -> DiamondMiningResult {
+        let mut res = statistics_result(number);
+        res.is_success = Some(mined_diamond());
+        res
+    }
+
+    #[test]
+    fn a_full_diamond_queue_drops_statistics_but_never_a_mined_diamond() {
+        let (tx, rx) = mpsc::sync_channel::<DiamondMiningResult>(1);
+        assert!(send_diamond_result(&tx, statistics_result(5)));
+        // Queue is full now: a statistics-only batch is dropped, not blocked.
+        assert!(send_diamond_result(&tx, statistics_result(6)));
+        assert_eq!(rx.try_recv().map(|r| r.number), Ok(5));
+
+        assert!(send_diamond_result(&tx, success_result(9)));
+        assert_eq!(rx.try_recv().map(|r| r.number), Ok(9));
+        drop(rx);
+        assert!(!send_diamond_result(&tx, success_result(9)));
+    }
+
+    #[test]
+    fn a_mined_diamond_waits_for_queue_space_instead_of_being_dropped() {
+        let (tx, rx) = mpsc::sync_channel::<DiamondMiningResult>(1);
+        assert!(send_diamond_result(&tx, statistics_result(1)));
+
+        // The queue is full and this result is a payout, so the worker must block
+        // until the drain makes room rather than throw the diamond away.
+        let sender = spawn(move || send_diamond_result(&tx, success_result(42)));
+        assert_eq!(rx.recv().map(|r| r.number), Ok(1));
+        assert!(sender.join().unwrap());
+        let delivered = rx.recv().unwrap();
+        assert_eq!(delivered.number, 42);
+        assert!(delivered.is_success.is_some());
+    }
+
+    #[test]
+    fn a_panicking_drain_iteration_never_ends_the_diamond_result_thread() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (tx, rx) = mpsc::sync_channel::<DiamondMiningResult>(4);
+        let mut drained = 0u32;
+        for round in 0..3u32 {
+            assert!(send_diamond_result(&tx, statistics_result(round)));
+            guard_mining_iteration("diamond result test loop", || {
+                while rx.try_recv().is_ok() {
+                    drained += 1;
+                }
+                if round == 1 {
+                    panic!("simulated diamond result thread panic");
+                }
+            });
+        }
+        std::panic::set_hook(previous_hook);
+        assert_eq!(drained, 3);
+    }
+
+    #[test]
+    fn a_tracked_diamond_thread_acknowledges_shutdown_when_it_exits() {
+        // The shutdown supervisor waits on active_mining_threads(), so a HACD
+        // thread must be counted before it starts and must release the count when
+        // it returns.
+        let runtime = MiningRuntimeState::new(0, 1);
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        spawn_tracked_diamond_thread(&runtime, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        assert_eq!(started_rx.recv(), Ok(()));
+        assert_eq!(runtime.active_mining_threads(), 1);
+
+        drop(release_tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.active_mining_threads() > 0 && Instant::now() < deadline {
+            sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runtime.active_mining_threads(), 0);
+    }
+
+    #[test]
+    fn a_panicking_pull_iteration_never_ends_the_diamond_pull_loop() {
+        // The pull loop is the ONLY code that refreshes the mining job. Without a
+        // firewall a panic there unwinds diaworker_with_stop and every worker
+        // keeps grinding whatever job it last snapshotted, forever and invisibly.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut refreshes = 0u32;
+        for round in 0..3u32 {
+            guard_mining_iteration("diamond pull loop", || {
+                if round == 1 {
+                    panic!("simulated diamond pull loop panic");
+                }
+                refreshes += 1;
+            });
+        }
+        std::panic::set_hook(previous_hook);
+        assert_eq!(refreshes, 2);
+    }
+
+    #[test]
+    fn a_failed_gpu_batch_still_forwards_a_verified_diamond() {
+        // Healthy batch: forwarded, no error reported.
+        assert_eq!(diamond_batch_disposition(true, false), (true, false));
+        assert_eq!(diamond_batch_disposition(true, true), (true, false));
+        // Failed batch with nothing mined: just a health signal.
+        assert_eq!(diamond_batch_disposition(false, false), (false, true));
+        // The defect: a driver error on a batch that already produced a
+        // CPU-verified DiamondMint used to drop the mint on the floor. The mint
+        // must still be sent AND the device still reported unhealthy.
+        assert_eq!(diamond_batch_disposition(false, true), (true, true));
+    }
+
+    #[test]
+    fn a_stop_flag_is_observed_by_the_diamond_loops() {
+        assert!(!should_stop(&None));
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = Some(flag.clone());
+        assert!(!should_stop(&stop));
+        flag.store(true, Relaxed);
+        assert!(should_stop(&stop));
+    }
+}
+
+#[cfg(test)]
+mod diamond_job_reorg_tests {
+    use super::*;
+
+    fn hash_of(byte: u8) -> Hash {
+        Hash::from([byte; HASH_WIDTH])
+    }
+
+    fn snapshot() -> (u32, u64) {
+        // Exactly what a worker thread takes at entry.
+        let (number, epoch, _prev_hash) = snapshot_diamond_job();
+        (number, epoch)
+    }
+
+    fn live_prev_hash() -> Hash {
+        snapshot_diamond_job().2
+    }
+
+    #[test]
+    fn the_diamond_pre_image_matches_the_cpu_and_hits_only_the_two_sha3_branches() {
+        // sha3_256_hash_diamond picks its SHA3 padding purely from the pre-image
+        // LENGTH: 61 without a custom message, 93 with one. Any third length would
+        // be hashed with the wrong pad, so pin both the lengths and the fact that
+        // this builder reproduces x16rs::mine_diamond byte for byte. (A full GPU
+        // vector still needs real hardware; this is the CPU half of that net.)
+        let prev = Hash::from([7u8; HASH_WIDTH]);
+        let addr = Address::from([3u8; 21]);
+        let custom = Hash::from([9u8; HASH_WIDTH]);
+        let nonce_bytes = 0x0123_4567_89ab_cdefu64.to_be_bytes();
+
+        for number in [
+            1u32,
+            DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE,
+            DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE + 1,
+            60000,
+        ] {
+            let with_custom = number > DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE;
+            let custom_nonce: &[u8] = if with_custom { custom.as_bytes() } else { &[] };
+            let pre_image = diamond_pre_image(&prev, &nonce_bytes, &addr, custom_nonce);
+            assert_eq!(pre_image.len(), if with_custom { 93 } else { 61 });
+
+            let (ssshash, reshash, diastr) =
+                x16rs::mine_diamond(number, &prev, &nonce_bytes, &addr, custom_nonce);
+            // Same SHA3 input as consensus.
+            assert_eq!(x16rs::calculate_hash(pre_image), ssshash);
+            // Same medium hash and same name from that SHA3.
+            let repeat = x16rs::mine_diamond_hash_repeat(number);
+            assert_eq!(x16rs::x16rs_hash(repeat, &ssshash), reshash);
+            assert_eq!(x16rs::diamond_hash(&reshash), diastr);
+        }
+    }
+
+    #[test]
+    fn a_diamond_tip_reorg_retires_the_snapshotted_job_immediately() {
+        // These statics are process-wide, so this is the only test that installs
+        // jobs; it walks the whole reorg sequence in one function.
+        assert!(install_diamond_job(100, hash_of(1)));
+        let (snap_num, snap_epoch) = snapshot();
+        assert_eq!(snap_num, 100);
+        assert!(diamond_job_is_current(snap_num, snap_epoch));
+
+        // An unchanged re-poll (every MINING_INTERVAL) must not disturb a worker.
+        assert!(!install_diamond_job(100, hash_of(1)));
+        assert!(diamond_job_is_current(snap_num, snap_epoch));
+
+        // Case B: the node reorged and born.hash for the SAME number changed.
+        // Every hash the worker produces from here on carries a prev_hash from the
+        // dead branch and is rejected by the submit endpoint.
+        assert!(install_diamond_job(100, hash_of(2)));
+        assert_eq!(live_prev_hash(), hash_of(2));
+        // The old exit test was `snapshot < live`, which cannot see this at all.
+        assert!(!(snap_num < MINING_DIAMOND_NUM.load(Acquire)));
+        assert!(!diamond_job_is_current(snap_num, snap_epoch));
+
+        // Case A: the reorg rolled the diamond tip BACK to a lower number.
+        let (snap_num, snap_epoch) = snapshot();
+        assert!(install_diamond_job(98, hash_of(3)));
+        let live_num = MINING_DIAMOND_NUM.load(Acquire);
+        assert!(live_num < snap_num, "the tip must have rolled back");
+        // Again the old strict-advance test would have kept the worker grinding
+        // number 100 through the entire 98 -> 99 -> 100 recovery.
+        assert!(!(snap_num < live_num));
+        assert!(!diamond_job_is_current(snap_num, snap_epoch));
+
+        // Climbing back up is a new job every step, including the step that lands
+        // on the number the worker had originally snapshotted.
+        let (snap_num, snap_epoch) = snapshot();
+        assert!(install_diamond_job(99, hash_of(4)));
+        assert!(!diamond_job_is_current(snap_num, snap_epoch));
+        let (snap_num, snap_epoch) = snapshot();
+        assert!(install_diamond_job(100, hash_of(5)));
+        assert!(!diamond_job_is_current(snap_num, snap_epoch));
+        assert!(diamond_job_is_current(100, current_diamond_epoch()));
+    }
 }
 
 fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
@@ -892,7 +1448,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
             return;
         }
         println!(
-            "[benchmark] HACD: GPU tuning uses same profiles as HAC — run poworker benchmark or share ini."
+            "[benchmark] HACD: GPU tuning uses same profiles as HAC; run poworker benchmark or share ini."
         );
         let scan = crate::opencl_diag::scan_opencl();
         let init_unitsize = cnf.unitsize.max(128);

@@ -1,0 +1,9 @@
+# Every action in .github/workflows is pinned to a 40-hex commit SHA. A pin does
+# not follow upstream security fixes, so let Dependabot raise the pin instead of
+# letting it rot.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

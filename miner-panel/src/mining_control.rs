@@ -1,10 +1,18 @@
 //! Start/stop mining and worker process spawn.
 
+// Only the piped-log path uses these, and it is not compiled on Windows.
+#[cfg(not(windows))]
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender as Sender};
+use std::process::{Child, Command};
+// Only the piped path needs Stdio, and that path is not compiled on Windows,
+// where every child gets its own console instead.
+#[cfg(not(windows))]
+use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver};
+#[cfg(not(windows))]
+use std::sync::mpsc::SyncSender as Sender;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -48,7 +56,22 @@ pub(super) struct PendingStart {
     next_probe: Instant,
     probe_delay: Duration,
     cancel_flag: Arc<AtomicBool>,
+    /// Set once the RPC answers. From then on this is no longer a start that can
+    /// time out: the node is up and downloading the chain, which legitimately
+    /// takes an hour or more, so the 45 second deadline must stop applying or it
+    /// would abandon a node that is working perfectly well.
+    syncing: bool,
+    /// In flight sync probe. One at a time: `probe` does three blocking HTTP
+    /// requests and the UI thread must never wait on them.
+    sync_rx: Option<Receiver<Option<crate::node_sync::SyncStatus>>>,
+    next_sync_probe: Instant,
 }
+
+/// How often to ask the node how far it has got. The node syncs in batches of
+/// 10,000 blocks, so a faster poll only produces a bar that sits still between
+/// jumps; this is often enough to feel live and rare enough to stay out of the
+/// way of the node's own work.
+const SYNC_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 impl MinerApp {
     pub(super) fn start_mining(&mut self) {
@@ -61,6 +84,17 @@ impl MinerApp {
             || self.opencl_probe_active()
         {
             return;
+        }
+
+        // All-in-one: start local public pool before mining when hosting is enabled.
+        if self.mining_kind == MiningKind::Hac
+            && self.public_pool.host_enabled
+            && !self.public_pool_running
+        {
+            self.start_public_pool();
+            if !self.public_pool_running {
+                return;
+            }
         }
 
         self.restart_worker = None;
@@ -177,6 +211,9 @@ impl MinerApp {
                     next_probe: Instant::now(),
                     probe_delay: RPC_PROBE_INITIAL_DELAY,
                     cancel_flag,
+                    syncing: false,
+                    sync_rx: None,
+                    next_sync_probe: Instant::now(),
                 });
             }
             Err(error) => {
@@ -211,17 +248,32 @@ impl MinerApp {
         };
         let t = self.t();
         let now = Instant::now();
-        if now >= pending.deadline {
+        // The deadline governs GETTING the node up, not getting it caught up.
+        // Once it answers, waiting is the correct behaviour and may last hours.
+        if !pending.syncing && now >= pending.deadline {
             pending.cancel_flag.store(true, Ordering::Release);
             self.fullnode_log_rx = None;
             self.status_msg = format!("{} {}", t.fullnode_not_ready, self.connect);
             return;
         }
 
+        if pending.syncing {
+            self.poll_node_sync(pending);
+            return;
+        }
+
         if let Some(setup_rx) = pending.setup_rx.take() {
             match setup_rx.try_recv() {
                 Ok(FullnodeSetupResult::Ready) => {
-                    self.launch_worker(pending.worker_path);
+                    // NOT ready to mine, only ready to talk. Mining on a node
+                    // part way through the chain hashes against blocks the
+                    // network settled long ago: every solution is rejected, and
+                    // because block_hash_repeat is smaller down there the
+                    // reported hashrate is HIGHER than normal, so it reads as
+                    // success. Wait for the chain before starting the worker.
+                    pending.syncing = true;
+                    pending.next_sync_probe = Instant::now();
+                    self.pending_start = Some(pending);
                     return;
                 }
                 Ok(FullnodeSetupResult::Waiting {
@@ -363,21 +415,43 @@ impl MinerApp {
     pub(super) fn spawn_worker_with_logs(
         cmd: &mut Command,
     ) -> Result<(Child, Receiver<String>), String> {
-        platform::configure_background_command(cmd);
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        // Bounded so a hung UI cannot grow worker log memory without limit.
-        let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
-        if let Some(out) = child.stdout.take() {
-            spawn_log_drainer(out, tx.clone());
+        // On Windows the node and the workers get their OWN console window, so
+        // the operator can watch them. That is not decoration: a node
+        // downloading the chain prints every batch it inserts, and hiding that
+        // is how a stalled sync came to look identical to a healthy one from
+        // this panel.
+        //
+        // A child with its own console is not piping anything back, so the
+        // channel returned here stays empty and the panel quotes no log. Status
+        // is unaffected: it comes from polling the RPC and from the exit code.
+        // The detail is in the window the user can now see.
+        #[cfg(windows)]
+        {
+            platform::configure_visible_command(cmd);
+            let child = cmd.spawn().map_err(|e| e.to_string())?;
+            let (_tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
+            return Ok((child, rx));
         }
-        if let Some(err) = child.stderr.take() {
-            spawn_log_drainer(err, tx);
+        // Elsewhere a GUI-launched child has no terminal to attach to, so keep
+        // piping and let the panel show the log itself.
+        #[cfg(not(windows))]
+        {
+            platform::configure_background_command(cmd);
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            // Bounded so a hung UI cannot grow worker log memory without limit.
+            let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAP);
+            if let Some(out) = child.stdout.take() {
+                spawn_log_drainer(out, tx.clone());
+            }
+            if let Some(err) = child.stderr.take() {
+                spawn_log_drainer(err, tx);
+            }
+            Ok((child, rx))
         }
-        Ok((child, rx))
     }
 }
 
@@ -433,6 +507,9 @@ pub(super) fn queue_child_termination(mut child: Child) -> Receiver<Result<(), S
 /// Max queued log lines from worker stdout/stderr (oldest dropped when full).
 const LOG_CHANNEL_CAP: usize = 512;
 
+/// Drains a child's piped output into the panel. Not built on Windows: children
+/// there own a console and pipe nothing back.
+#[cfg(not(windows))]
 fn spawn_log_drainer<R: Read + Send + 'static>(stream: R, tx: Sender<String>) {
     thread::spawn(move || {
         let reader = BufReader::new(stream);
@@ -448,6 +525,58 @@ fn spawn_log_drainer<R: Read + Send + 'static>(stream: R, tx: Sender<String>) {
     });
 }
 
+impl MinerApp {
+    /// Wait for the node to catch up, showing how far it has got, and start the
+    /// worker only when it has.
+    ///
+    /// Never blocks the UI: the probe does three HTTP requests, so it runs on its
+    /// own thread and this reads the answer when it arrives.
+    pub(super) fn poll_node_sync(&mut self, mut pending: PendingStart) {
+        let now = Instant::now();
+
+        if let Some(rx) = pending.sync_rx.take() {
+            match rx.try_recv() {
+                Ok(Some(status)) => {
+                    let synced = status.is_synced();
+                    self.sync_status = Some(status);
+                    pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
+                    if synced {
+                        self.sync_status = None;
+                        self.launch_worker(pending.worker_path);
+                        return;
+                    }
+                }
+                // Could not tell. Not an error and not a reason to start mining:
+                // a node mid-batch can be briefly unresponsive, and treating
+                // silence as "caught up" is the whole bug being fixed here.
+                Ok(None) => pending.next_sync_probe = now + SYNC_PROBE_INTERVAL,
+                Err(std::sync::mpsc::TryRecvError::Empty) => pending.sync_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending.next_sync_probe = now + SYNC_PROBE_INTERVAL
+                }
+            }
+        }
+
+        if pending.sync_rx.is_none() && now >= pending.next_sync_probe {
+            let connect = self.connect.clone();
+            let (tx, rx) = mpsc::channel();
+            if std::thread::Builder::new()
+                .name("hacash-sync-probe".to_string())
+                .spawn(move || {
+                    let _ = tx.send(crate::node_sync::probe(&connect));
+                })
+                .is_ok()
+            {
+                pending.sync_rx = Some(rx);
+            } else {
+                pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
+            }
+        }
+
+        self.pending_start = Some(pending);
+    }
+}
+
 pub(super) fn rpc_reachable(connect: &str) -> bool {
     let Ok(addrs) = connect.trim().to_socket_addrs() else {
         return false;
@@ -460,6 +589,9 @@ pub(super) fn rpc_reachable(connect: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Stdio is cfg-gated out of the Windows build path, but the reaper test
+    // needs it on every target to silence its throwaway child.
+    use std::process::Stdio;
 
     const REAPER_CHILD_ENV: &str = "HACASH_PANEL_REAPER_CHILD";
 

@@ -9,10 +9,26 @@
   #define X16RS_PRAGMA_UNROLL_4
 #endif
 
+// Under CUDA these are made no-ops by ocl_compat.cuh (Windows nvcc/MSVC rejects the
+// __attribute__((aligned)) spelling). Only (re)define the OpenCL attribute versions when
+// not building for CUDA, so OpenCL builds are byte-identical to before.
+#ifndef __CUDA__
 #define ALIGN8 __attribute__((aligned(8)))
 #define ALIGN __attribute__((aligned(16)))
 #define ALIGN32 __attribute__((aligned(32)))
 #define ALIGN64 __attribute__((aligned(64)))
+#endif
+
+// Alignment qualifier for *function parameters*. C++/nvcc forbids an alignment
+// specifier on a parameter (an array param decays to a pointer), whereas OpenCL C
+// allows it. So ALIGN_PARAM keeps the OpenCL hint on OpenCL builds and is a no-op
+// under CUDA. Use ALIGN_PARAM (not ALIGN) on any parameter declaration; keep ALIGN
+// on struct/union/local/shared/constant declarations (nvcc accepts those).
+#ifdef __CUDA__
+  #define ALIGN_PARAM
+#else
+  #define ALIGN_PARAM ALIGN
+#endif
 
 typedef union ALIGN8 {
   unsigned char h1[88];

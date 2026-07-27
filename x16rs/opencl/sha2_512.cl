@@ -172,7 +172,7 @@ __inline__ void sha512_init(sha512_ctx_t *sha512_ctx, uint8_t *payload_addr)
  * @param   sha512_ctx        context of the sha384/512
  * @param   data              hash block data, 1024 bits.
  */
-__inline__ void sha512_hash_factory(sha512_ctx_t *ctx, __generic uint8_t ALIGN data[128])
+__inline__ void sha512_hash_factory(sha512_ctx_t *ctx, __generic uint8_t ALIGN_PARAM data[128])
 {
     uint32_t i = 0;
     uint64_t W[80];
@@ -272,7 +272,7 @@ __inline__ void easy_sha512_impl(uint8_t *payload,
  * @param   payload         address of the hash payload
  * @param   hash            output of hash value
  */
-__inline__ void easy_sha512(uint8_t *payload, uint8_t ALIGN hash[32])
+__inline__ void easy_sha512(uint8_t *payload, uint8_t ALIGN_PARAM hash[32])
 {
     return easy_sha512_impl(payload, hash);
 }

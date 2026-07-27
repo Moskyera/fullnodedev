@@ -133,6 +133,27 @@ impl MinerApp {
             });
         });
 
+        // Money goes directly under the overview, above the hardware numbers:
+        // this is the screen where someone decides whether the software is
+        // paying them, so it must not be below a fold.
+        let pool_money = self.pool_money();
+        if dashboard::shows_anything(&pool_money.view, &t) {
+            ui.add_space(12.0);
+            theme::section_card().show(ui, |ui| {
+                dashboard::show_pool_money(
+                    ui,
+                    &dashboard::PoolMoneyPanel {
+                        t: &t,
+                        money: &pool_money,
+                        worker_display: match self.connect_mode {
+                            ConnectMode::Pool => Self::truncate_wallet(&self.wallet),
+                            ConnectMode::Solo => String::new(),
+                        },
+                    },
+                );
+            });
+        }
+
         ui.add_space(12.0);
         theme::section_card().show(ui, |ui| {
             egui::Grid::new("dash_primary_stats")
@@ -240,7 +261,6 @@ impl MinerApp {
                     stats: s,
                     cpu_label: self.cpu_label(self.cpu_idx),
                     gpu_label: self.gpu_label(self.gpu_idx),
-                    gpu_slug: &self.gpu_presets[self.gpu_idx].slug,
                     connect_display,
                     wallet_display,
                     opencl_display,

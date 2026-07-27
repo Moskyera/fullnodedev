@@ -1,7 +1,7 @@
 [package]
 name = "hacash"
 default-run = "hacash"
-version = "0.4.0"
+version = "0.5.2"
 edition = "2024"
 
 [workspace]
@@ -24,6 +24,8 @@ members = [
     "sys",
     "x16rs",
     "x16rs-cuda",
+    "miner-pool",
+    "hbit-pool",
 ]
 exclude = [
     "chainv1",
@@ -69,10 +71,26 @@ db-rocksdb = ["db/db-rocksdb"]
 [profile.release]
 debug = false       # for RUST_BACKTRACE=1 
 opt-level = 3       # Optimize for size.
-lto = true          # Enable Link Time Optimization
+lto = "thin"        # Thin LTO: nearly the perf of fat LTO for this workload
+                    # (the hot path is x16rs / GPU kernels, not Rust glue) with far
+                    # less memory and no fat-LTO rustc crashes under panic=unwind.
 codegen-units = 1   # Reduce number of codegen units to increase optimizations.
-panic = 'abort'     # Abort on panic
+panic = 'unwind'    # Unwind (not abort): a panic in one request/mining thread must
+                    # become an error/skip, not kill the whole 24/7 pool or miner.
+                    # Handlers and the block/diamond mining threads wrap panic-prone
+                    # work in catch_unwind (app/src/mining_guard.rs); abort would make
+                    # that impossible and turn any panic into full downtime.
 strip = true        # Strip symbols from binary
+
+# Money crate only: hbit-pool owns the share accounting, payout splitting and settlement.
+# There a silent wrapping add or multiply would pay a miner the wrong amount and the pool
+# would never notice, so arithmetic overflow must panic. The settlement work is already
+# wrapped in catch_unwind, which turns such a panic into "skip this item and report it"
+# instead of a wrong transfer.
+# This is deliberately NOT workspace wide: overflow checks in the x16rs / CPU mining hot
+# path cost real hashrate, and that code is consensus defined and already range safe.
+[profile.release.package.hbit-pool]
+overflow-checks = true
 
 [profile.wasm-release]
 inherits = "release"

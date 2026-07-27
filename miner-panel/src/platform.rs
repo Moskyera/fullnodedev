@@ -1,4 +1,4 @@
-//! Cross-platform binary names — Windows keeps `.exe` first (unchanged behavior).
+//! Cross-platform binary names: Windows keeps `.exe` first (unchanged behavior).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +12,35 @@ pub fn configure_background_command(command: &mut Command) {
     }
     #[cfg(not(windows))]
     {
+        let _ = command;
+    }
+}
+
+/// Give the child its OWN console window instead of hiding it.
+///
+/// For the full node and the miners, which an operator has every reason to watch:
+/// a node downloading the chain prints its progress, and a panel that hides that
+/// leaves the user staring at a button with no idea whether anything is
+/// happening. That is not hypothetical. A node stuck part way through a sync
+/// looked identical, from the panel, to one that was ready.
+///
+/// The trade is real and worth stating: a process with its own console is NOT
+/// piping its output back here, so the panel cannot quote its log in an error
+/// message. Status still works, because it comes from polling the node's RPC and
+/// from the child's exit code, neither of which needs the pipe. The detail lives
+/// in the window the user can now see.
+pub fn configure_visible_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        command.creation_flags(CREATE_NEW_CONSOLE);
+    }
+    #[cfg(not(windows))]
+    {
+        // No equivalent: on Linux and macOS a GUI-launched child has no terminal
+        // to attach to, and spawning one would mean picking a terminal emulator
+        // that may not be installed. The panel keeps the piped log there.
         let _ = command;
     }
 }

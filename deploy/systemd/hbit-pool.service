@@ -1,0 +1,87 @@
+# HBIT mining pool: serves work to other people's miners and pays them.
+#
+# Install to /etc/systemd/system/hbit-pool.service (deploy/install.sh does it).
+#
+# THIS SERVICE HOLDS A WALLET THAT OWES REAL MONEY TO REAL PEOPLE. Read the two
+# rules before you edit it:
+#   1. The passphrase is NOT in this file. It is in a 0400 file named by
+#      HBIT_WALLET_PASSWORD_FILE below. Unit files are commonly world readable
+#      and `systemctl show hbit-pool` prints every Environment= value.
+#   2. The wallet path in ExecStart is the pool's identity. Change it and the
+#      pool starts empty, with a new wallet, while the money and the record of
+#      who is owed what sit in files nothing reads any more.
+#
+# Anything you change here needs `systemctl daemon-reload` afterwards.
+
+[Unit]
+Description=HBIT mining pool (serves work, counts shares, pays miners)
+Documentation=file:/opt/hbit/docs/POOL-OPERATOR.md
+# Wants, not Requires. Requires would stop the pool whenever the node unit fails,
+# and a unit stopped that way does NOT come back when its dependency returns. The
+# pool is meant to outlive a node hiccup, and ExecStartPre below is what actually
+# waits for the node to be ready.
+Wants=network-online.target hacash-node.service
+After=network-online.target hacash-node.service
+# No start rate limiting: a pool that gives up stays down until a human notices,
+# and nobody is logged in. Retrying every 30 seconds prints the refusal in the
+# journal each time and heals itself the moment the cause is fixed.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hbit
+Group=hbit
+WorkingDirectory=/var/lib/hbit/pool
+# A PATH, not a secret. This is safe in a unit file and safe in `systemctl show`.
+# It also means a pool started before the passphrase file exists REFUSES to start
+# rather than quietly creating a plaintext wallet.
+Environment=HBIT_WALLET_PASSWORD_FILE=/etc/hbit/wallet-passphrase
+# Ordering is not readiness. After= only means the node was started first, not
+# that it answers yet, and hbit-pool-server exits rather than serving work
+# against a node that is not there. This waits for the node's API, up to an hour.
+ExecStartPre=/opt/hbit/bin/hbit-wait-for-node.sh http://127.0.0.1:8080 3600
+# node | wallet file | listen | share_bits | chain
+# 0.0.0.0:9777 is the public face of the pool and the ONLY port that belongs on
+# the internet. See the firewall section of POOL-OPERATOR.md.
+ExecStart=/opt/hbit/bin/hbit-pool-server http://127.0.0.1:8080 /var/lib/hbit/pool/pool-wallet.key 0.0.0.0:9777 24 mainnet
+Restart=always
+RestartSec=30s
+# Must be larger than the ExecStartPre bound above, or systemd would kill the
+# wait before it gives up on its own.
+TimeoutStartSec=3900
+TimeoutStopSec=30
+SyslogIdentifier=hbit-pool
+# The wallet key file is forced to 0600 by the pool itself. This covers the
+# accounting file next to it, which records what every miner is owed.
+UMask=0077
+
+# ---- hardening: see POOL-OPERATOR.md for one line on each ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The ONLY directory this service may write: the wallet, the accounting file and
+# the settle lock. Not the chain database, which is the node's.
+ReadWritePaths=/var/lib/hbit/pool
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+# AF_NETLINK is in the list on purpose: glibc's name resolution uses it to pick a
+# source address, so leaving it out breaks DNS in ways that look like a network
+# outage.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+RemoveIPC=yes
+# Port 9777 is above 1024, so no capability is needed to bind it.
+CapabilityBoundingSet=
+# Optional, and NOT enabled by default because a wrong filter kills the pool with
+# SIGSYS and no explanation. If you want it, add it, restart, and watch a full
+# settlement cycle before you trust it:
+# SystemCallFilter=@system-service
+# SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

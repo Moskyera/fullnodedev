@@ -1,0 +1,3 @@
+# Local Colab / smoke evidence (keep offline; do not commit secrets)
+colab-results/
+colab-upload/

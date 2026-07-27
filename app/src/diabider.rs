@@ -176,7 +176,12 @@ fn check_bidding_step(
     // raise fee
     let mut my_tx = my_bid_txp.tx_clone();
     my_tx.set_fee(new_bid_fee.clone());
-    let _ = my_tx.fill_sign(&engcnf.dmer_bid_account);
+    // A failed sign must NOT be submitted: an unsigned / mis-signed raised-bid tx
+    // is rejected by the node, wasting the bid window and the fee bump.
+    if let Err(e) = my_tx.fill_sign(&engcnf.dmer_bid_account) {
+        printerr!("raise-bid tx sign error: {}", e);
+        retry!(3);
+    }
     let txp = TxPkg::create(my_tx);
 
     // submit tx

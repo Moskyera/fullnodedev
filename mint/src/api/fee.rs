@@ -38,9 +38,9 @@ fn fee_average(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
     api_data(data)
 }
 
-fn fee_raise(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
+fn fee_raise(ctx: &ApiExecCtx, mut req: ApiRequest) -> ApiResponse {
     let fee_s = q_string(&req, "fee", "");
-    let fee_prikey = q_string(&req, "fee_prikey", "");
+    let fee_prikey = take_secret_query(&mut req, "fee_prikey");
     let hash = q_string(&req, "hash", "");
     let Ok(fee) = Amount::from(&fee_s) else {
         return api_error("fee format invalid");
@@ -101,9 +101,6 @@ fn fee_raise(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
         ("hash".to_owned(), json!(txhash.to_hex())),
         ("hash_with_fee".to_owned(), json!(txhashwf.to_hex())),
         ("fee".to_owned(), json!(fee.to_fin_string())),
-        (
-            "tx_body".to_owned(),
-            json!(txpkg.tx().serialize().to_hex()),
-        ),
+        ("tx_body".to_owned(), json!(txpkg.tx().serialize().to_hex())),
     ]))
 }

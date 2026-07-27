@@ -1,0 +1,122 @@
+# HBIT on a VPS or a mini PC: one full node, one payout pool, one command.
+#
+# THE POINT OF RUNNING IT THIS WAY is what is NOT published. The node's RPC is
+# the miner API: anything that can reach it can ask for block templates and
+# submit blocks. On a bare host that port is one forgotten firewall rule away
+# from the internet. Here it is only ever reachable on the private compose
+# network, because nothing maps it to the host. The pool port is the single
+# published port, and it is the only one that has any business being open.
+#
+# Start:    docker compose -f deploy/docker-compose.yml up -d
+# Watch:    docker compose -f deploy/docker-compose.yml logs -f pool
+# Stop:     docker compose -f deploy/docker-compose.yml down
+#
+# Before the first start, read deploy/README.md. It covers the passphrase, the
+# backup you must take, and the payout procedure. Running a pool means holding
+# other people's money.
+
+name: hbit
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hbit:local
+    command: ["fullnode"]
+    working_dir: /var/lib/hbit/node
+    restart: unless-stopped
+    volumes:
+      # The chain. Losing it costs a resync, not money.
+      - node-data:/var/lib/hbit/node
+      # hacash.config.ini is resolved next to the executable's working dir.
+      # Read only: the node must never be able to rewrite its own consensus
+      # settings, and a config change should be a deliberate act on the host.
+      - ./node/hacash.config.ini:/var/lib/hbit/node/hacash.config.ini:ro
+    # NO ports: mapping. The RPC stays on the compose network where only the
+    # pool can reach it. Publishing 8080 here would hand the miner API to the
+    # internet, which is the single worst mistake available on this box.
+    expose:
+      - "8080"
+    healthcheck:
+      # Answering /query/latest is the honest test: the process being alive says
+      # nothing about whether it can serve the pool.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/query/latest"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  pool:
+    image: hbit:local
+    depends_on:
+      node:
+        # Not just "started". The pool refuses to serve work it cannot verify
+        # against the node, so starting it before the node answers just makes it
+        # exit and retry.
+        condition: service_healthy
+    working_dir: /var/lib/hbit/pool
+    restart: unless-stopped
+    # <node> <wallet_file> <listen> <share_bits> <chain> [settle_secs]
+    # Listening on 0.0.0.0 INSIDE the container is correct and not an exposure:
+    # only the published port below reaches the outside world.
+    #
+    # share_bits is how many powers of two EASIER a share is than a block, so
+    # what a share costs is (block work - share_bits). Measured on the live chain
+    # on 2026-07-27, a block costs 2^42, which makes 20 the right value here for
+    # two reasons.
+    #
+    # Margin. The pool refuses to start when a share would cost less than 2^16,
+    # because below that PPLNS credit tracks how fast a worker completes an HTTP
+    # round trip rather than how much it hashes. 24 leaves a share at 2^18: only
+    # two bits of headroom, so a network difficulty drop of 4x would take this
+    # pool offline at its next restart. 20 leaves 2^22, which is six bits.
+    #
+    # Payout memory. PPLNS pays on the last 4096 shares, so easier shares make
+    # that window cover LESS time. At 2^18 a single card of ordinary speed
+    # produces about 26 shares a second, and with ten miners attached the whole
+    # window turns over in roughly fifteen seconds: a miner that drops off for
+    # half a minute loses everything it was owed. At 2^22 the same pool keeps
+    # about four minutes of history, which is the difference between a payout
+    # scheme and a lottery on connection stability.
+    #
+    # Raise it only if miners report too few shares to be paid smoothly, and
+    # never past (block work - 16), which the pool enforces and explains.
+    command:
+      - "hbit-pool-server"
+      - "http://node:8080"
+      - "pool-wallet.key"
+      - "0.0.0.0:9777"
+      - "20"
+      - "mainnet"
+      - "300"
+    environment:
+      # A path, never the passphrase itself. An Environment value shows up in
+      # docker inspect and in any process listing inside the container; a file
+      # mounted read only does not.
+      HBIT_WALLET_PASSWORD_FILE: /run/secrets/hbit_wallet_passphrase
+    secrets:
+      - hbit_wallet_passphrase
+    volumes:
+      # The wallet, the PPLNS share window and the pending-payout ledger all
+      # live here. THIS is the volume that holds money and the record of who is
+      # owed what. Back it up. A lost chain is an afternoon; a lost wallet is
+      # everything the pool holds and everything it owes.
+      - pool-data:/var/lib/hbit/pool
+    ports:
+      # host:container. This is the only port reachable from outside, and it is
+      # the one miners connect to.
+      - "9777:9777"
+
+secrets:
+  hbit_wallet_passphrase:
+    # Create it before the first start, and keep a copy somewhere that is not
+    # this machine:
+    #   install -m 0400 /dev/null deploy/secrets/wallet-passphrase
+    #   printf '%s' 'your passphrase' > deploy/secrets/wallet-passphrase
+    # Without it the pool refuses to start rather than writing a plaintext key.
+    file: ./secrets/wallet-passphrase
+
+volumes:
+  node-data:
+  pool-data:

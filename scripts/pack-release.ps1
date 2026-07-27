@@ -2,6 +2,13 @@
 # Produces TWO downloads:
 #   - hacash-miner-only-*  (workers + panel; you already have fullnode)
 #   - hacash-miner-full-*  (fullnode + workers + panel; clean PC)
+#
+# What is deliberately NOT in either download: the HBIT pool. hbit-pool-server
+# and hbit-pool-payout are the author's own infrastructure, run next to the
+# author's own fullnode, and they are not published. The miner merely LISTS HBIT
+# as a pool it can connect to. Nothing here may start shipping a wallet-holding
+# daemon to people who came for a miner; the release workflow asserts their
+# absence from every archive.
 param(
     [string]$Version = "dev",
     [string]$OutDir = "dist"
@@ -13,6 +20,15 @@ $Release = Join-Path $Root "target\release"
 $opencl = Join-Path $Root "x16rs\opencl"
 $miningAssets = Join-Path $Root "scripts\mining-amd"
 $presets = Join-Path $miningAssets "presets"
+$mainnetConfigs = Join-Path $Root "mainnet-configs"
+# Templates the docs tell operators to copy. Missing ones must fail the build,
+# not ship a package that points at files the user never received.
+$requiredMainnetConfigs = @(
+    "hacash.config.mainnet.ini",
+    "poworker.mainnet.ini",
+    "diaworker.mainnet.ini",
+    "MAINNET-DIAMOND.md"
+)
 $requiredKernels = @(
     "aes_helper.cl", "blake.cl", "bmw.cl", "cubehash.cl", "echo.cl",
     "fugue.cl", "groestl.cl", "hamsi.cl", "hamsi_help.cl",
@@ -45,6 +61,29 @@ if (-not (Test-Path -LiteralPath $presets -PathType Container)) {
     throw "Missing presets folder: $presets"
 }
 
+if (-not (Test-Path -LiteralPath $mainnetConfigs -PathType Container)) {
+    throw "Missing mainnet-configs folder: $mainnetConfigs"
+}
+foreach ($name in $requiredMainnetConfigs) {
+    $templatePath = Join-Path $mainnetConfigs $name
+    if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
+        throw "Missing required mainnet template: $templatePath"
+    }
+}
+# A shipped template must never carry a live reward address or bid password: a
+# user who copies it as instructed would pay every block reward to whoever owns
+# that address, permanently and with no error. Only a commented placeholder is
+# allowed, so the node fails loudly until the operator supplies their own.
+foreach ($template in @(Get-ChildItem -LiteralPath $mainnetConfigs -Filter "*.ini" -File)) {
+    $offending = @(
+        Get-Content -LiteralPath $template.FullName |
+            Where-Object { $_ -match '^\s*(reward|bid_password)\s*=\s*\S' }
+    )
+    if ($offending.Count -gt 0) {
+        throw "$($template.Name) ships a pre-filled reward/bid_password: $($offending -join '; ')"
+    }
+}
+
 $minerOnlyExes = @(
     "poworker.exe",
     "diaworker.exe",
@@ -52,11 +91,18 @@ $minerOnlyExes = @(
     "diagnose_opencl.exe",
     "miner-panel.exe"
 )
+# Optional public pool binary (all-in-one panel host)
+$optionalExes = @("hac-pool.exe")
 $fullExes = @("hacash.exe") + $minerOnlyExes
 
 foreach ($e in $fullExes) {
     if (-not (Test-Path (Join-Path $Release $e))) {
         throw "Missing binary: $(Join-Path $Release $e)"
+    }
+}
+foreach ($e in $optionalExes) {
+    if (-not (Test-Path (Join-Path $Release $e))) {
+        Write-Warning "Optional binary missing (public pool UI needs it): $(Join-Path $Release $e)"
     }
 }
 
@@ -98,6 +144,22 @@ function Copy-MiningAssets {
     }
 }
 
+function Copy-MainnetConfigs {
+    param([string]$Stage)
+
+    $dest = Join-Path $Stage "mainnet-configs"
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Get-ChildItem -LiteralPath $mainnetConfigs -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+    }
+
+    foreach ($name in $requiredMainnetConfigs) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dest $name) -PathType Leaf)) {
+            throw "Staged package is missing mainnet-configs\$name"
+        }
+    }
+}
+
 function Write-Sha256 {
     param([string]$Path)
 
@@ -130,13 +192,32 @@ function Pack-Flavor {
     foreach ($e in $Exes) {
         Copy-Item (Join-Path $Release $e) (Join-Path $Stage $e)
     }
+    # Ship public pool when built (panel all-in-one host)
+    $hacPool = Join-Path $Release "hac-pool.exe"
+    if (Test-Path -LiteralPath $hacPool -PathType Leaf) {
+        Copy-Item -LiteralPath $hacPool -Destination (Join-Path $Stage "hac-pool.exe")
+    }
     Copy-OpenClKernels $Stage
     Copy-Logo $Stage
     Copy-MiningAssets $Stage
+    Copy-MainnetConfigs $Stage
 
     foreach ($f in $Extras) {
         $src = Join-Path $Root $f
         Copy-Item -LiteralPath $src -Destination (Join-Path $Stage $f)
+    }
+
+    # The download is the MINER. The HBIT pool is the author's own
+    # infrastructure and is never published, so no route through this function
+    # may leave a pool file staged: a wallet-holding daemon reaching people who
+    # came for a miner is the failure this asserts against.
+    foreach ($name in @(
+        "hbit-pool-server.exe", "hbit-pool-payout.exe",
+        "hbit-pool.example.ini", "POOL-OPERATOR.md", "README-POOL.txt"
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $Stage $name)) {
+            throw "$PackageName must not contain the pool file $name"
+        }
     }
 
     Set-Content -Path (Join-Path $Stage "VERSION.txt") -Value $Version -NoNewline

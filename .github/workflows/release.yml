@@ -23,21 +23,33 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-windows-ocl
 
       - name: Install OpenCL.lib (vcpkg)
         shell: pwsh
         run: |
+          # Pinned vcpkg release: the OpenCL import library is linked into every
+          # shipped GPU binary, so it must not come from a moving upstream head.
+          $vcpkgCommit = "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"  # tag 2026.06.24
           $vcpkgRoot = "$env:GITHUB_WORKSPACE\vcpkg-ci"
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          git init $vcpkgRoot
+          if ($LASTEXITCODE -ne 0) { throw "git init failed for $vcpkgRoot" }
+          git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
+          if ($LASTEXITCODE -ne 0) { throw "git remote add failed for $vcpkgRoot" }
+          git -C $vcpkgRoot fetch --depth 1 origin $vcpkgCommit
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of pinned vcpkg commit $vcpkgCommit failed" }
+          git -C $vcpkgRoot checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout of pinned vcpkg commit $vcpkgCommit failed" }
+          $head = (git -C $vcpkgRoot rev-parse HEAD).Trim()
+          if ($head -ne $vcpkgCommit) { throw "vcpkg is at $head, expected pinned $vcpkgCommit" }
           & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
           & "$vcpkgRoot\vcpkg.exe" install opencl:x64-windows
           $lib = "$vcpkgRoot\installed\x64-windows\lib"
@@ -53,9 +65,36 @@ jobs:
       - name: Verify Windows HACD binaries are CPU-only
         shell: pwsh
         run: |
-          $dumpbin = Get-ChildItem -Path "$env:ProgramFiles\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -File |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          # Do NOT hardcode the Visual Studio year. This step searched
+          # "Microsoft Visual Studio\2022\..." and started failing every release
+          # the moment the hosted runner moved on, and it failed loudly in the
+          # wrong place: GitHub runs pwsh with ErrorActionPreference = Stop, so
+          # Get-ChildItem threw on the missing directory before the script's own
+          # "dumpbin.exe not found" check could report anything useful.
+          #
+          # Ask the installer where Visual Studio is, then fall back to globbing
+          # every year and edition under both Program Files roots.
+          $dumpbin = $null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsRoot = & $vswhere -latest -products * -property installationPath 2>$null
+            if ($vsRoot) {
+              $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" `
+                -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+            }
+          }
+          if (-not $dumpbin) {
+            $globs = @(
+              "$env:ProgramFiles\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe",
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe"
+            )
+            $dumpbin = $globs | ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe not found. HACD must be proven CPU-only before release, so this build stops rather than shipping unverified binaries."
+          }
+          Write-Host "using $($dumpbin.FullName)"
           foreach ($binary in @("hacash.exe", "diaworker.exe")) {
             $binaryPath = Join-Path "$env:GITHUB_WORKSPACE\target\release" $binary
             $dependencies = (& $dumpbin.FullName /DEPENDENTS $binaryPath | Out-String)
@@ -68,6 +107,16 @@ jobs:
       - name: Build miner panel
         run: cargo build --locked --release -p miner-panel
 
+      - name: Build public free-IP pool (hac-pool)
+        run: cargo build --locked --release -p miner-pool
+
+      # HBIT payout pool: hbit-pool-server, hbit-settle-spike and
+      # hbit-pool-payout hold the pool wallet and compute real payouts, so they
+      # must compile in the release pipeline even though they are not packaged
+      # (operators self-build).
+      - name: Build HBIT payout pool server (hbit-pool)
+        run: cargo build --locked --release -p hbit-pool
+
       - name: Run Windows release tests
         run: |
           cargo test --locked -p x16rs
@@ -76,6 +125,7 @@ jobs:
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
+          cargo test --locked -p hbit-pool
 
       - name: Package release ZIPs
         shell: pwsh
@@ -90,11 +140,46 @@ jobs:
           }
           & "$env:GITHUB_WORKSPACE\scripts\pack-release.ps1" -Version $version
 
+      - name: Package HBIT pool (Windows)
+        shell: pwsh
+        run: |
+          # Packaged APART from the miner on purpose. This is server software an
+          # operator runs beside their own full node; bundling a wallet-holding
+          # binary into the miner archive would put it on every gaming PC that
+          # downloads this.
+          #
+          # Ships with NO wallet, NO config and NO address. The operator supplies
+          # all three and the pool refuses to start without them, so nothing here
+          # can pay a stranger by default.
+          $version = "manual"
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $version = $env:RELEASE_REF_NAME }
+          $ws = $env:GITHUB_WORKSPACE
+          $pooldir = Join-Path $ws "dist/hbit-pool-windows-x64"
+          if (Test-Path $pooldir) { Remove-Item $pooldir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $pooldir | Out-Null
+          foreach ($f in @("hbit-pool-server.exe", "hbit-pool-payout.exe")) {
+            Copy-Item (Join-Path $ws "target/release/$f") $pooldir
+          }
+          foreach ($f in @("POOL-OPERATOR.md", "POOL-README.md")) {
+            Copy-Item (Join-Path $ws "docs/$f") $pooldir
+          }
+          [IO.File]::WriteAllText((Join-Path $pooldir "VERSION.txt"), $version)
+          $name = if ($version -like "v*") { "hbit-pool-windows-x64-$version.zip" } else { "hbit-pool-windows-x64.zip" }
+          $poolzip = Join-Path $ws "dist/$name"
+          Compress-Archive -Path $pooldir -DestinationPath $poolzip -Force
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $poolzip).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$poolzip.sha256", "$h  $name")
+          if ((Get-Item $poolzip).Length -lt 1000) { throw "pool zip looks empty" }
+          Write-Host "packaged $name"
+
       - name: Validate Windows release ZIPs
         shell: pwsh
         run: |
-          $zips = @(Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter "*.zip" -File)
-          if ($zips.Count -ne 2) { throw "Expected 2 Windows ZIPs, found $($zips.Count)" }
+          # Miner ZIPs only. The pool ships its own archive beside these, and
+          # counting every zip would fail this build for the wrong reason the
+          # moment another package is added.
+          $zips = @(Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter "hacash-miner-*.zip" -File)
+          if ($zips.Count -ne 2) { throw "Expected 2 Windows miner ZIPs, found $($zips.Count)" }
           foreach ($zip in $zips) {
             $checksumPath = "$($zip.FullName).sha256"
             if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
@@ -138,7 +223,7 @@ jobs:
           }
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hacash-miner-windows-x64
           path: |
@@ -154,13 +239,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-linux-ocl
 
@@ -180,15 +265,21 @@ jobs:
             --bin poworker --bin list_opencl --bin diagnose_opencl
           cargo build --locked --release --bin hacash --bin diaworker
 
-      - name: Build and test miner panel
+      - name: Build and test miner panel, public pool and payout pool
         run: |
           cargo build --locked --release -p miner-panel
+          cargo build --locked --release -p miner-pool
+          # hbit-pool holds the payout pool wallet and the money math
+          # (split_payout, balance_units, off-node ASERT difficulty).
+          cargo build --locked --release -p hbit-pool
+          cargo test --locked -p miner-pool
           cargo test --locked -p x16rs
           cargo test --locked --release -p x16rs
           cargo test --locked -p sys
           cargo test --locked -p app --features ocl
           cargo test --locked -p miner-panel
           cargo test --locked -p basis --lib
+          cargo test --locked -p hbit-pool
 
       - name: Verify HACD CPU-only and release preset completeness
         run: bash scripts/verify-mining-presets.sh
@@ -232,6 +323,39 @@ jobs:
             version="$candidate"
           fi
           bash scripts/pack-release-linux.sh "$version"
+
+          # HBIT pool, packaged apart from the miner for the same reason as on
+          # Windows: it is server software that holds a wallet, and it has no
+          # business inside an archive aimed at people's gaming PCs. Ships with
+          # no wallet, no config and no address; the pool refuses to start
+          # without them.
+          pooldir="dist/hbit-pool-linux-x86_64"
+          rm -rf "$pooldir" && mkdir -p "$pooldir/systemd"
+          cp target/release/hbit-pool-server target/release/hbit-pool-payout "$pooldir/"
+          # The full node ships WITH the pool. Without it the archive is not
+          # deployable at all: the pool gets its templates from a node and submits
+          # blocks to one, so an operator who downloaded only this would install
+          # something that cannot start. The first version of this package left it
+          # out, which is a packaging bug and not a documentation problem.
+          cp target/release/hacash "$pooldir/"
+          cp deploy/node/hacash.config.ini "$pooldir/hacash.config.ini.example"
+          cp deploy/systemd/hacash-node.service deploy/systemd/hbit-pool.service "$pooldir/systemd/"
+          cp deploy/hbit-wait-for-node.sh "$pooldir/"
+          cp deploy/README.md "$pooldir/DEPLOY.md"
+          cp docs/POOL-OPERATOR.md docs/POOL-README.md "$pooldir/"
+          cp scripts/hbit-vps-setup.sh "$pooldir/SETUP-POOL.sh"
+          chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout \
+            "$pooldir"/hacash "$pooldir"/hbit-wait-for-node.sh "$pooldir"/SETUP-POOL.sh
+          printf '%s' "$version" > "$pooldir/VERSION.txt"
+          if [[ "$version" == v* ]]; then
+            poolname="hbit-pool-linux-x86_64-$version.tar.gz"
+          else
+            poolname="hbit-pool-linux-x86_64.tar.gz"
+          fi
+          tar -czf "dist/$poolname" -C dist hbit-pool-linux-x86_64
+          (cd dist && sha256sum "$poolname" > "$poolname.sha256")
+          test -s "dist/$poolname"
+
           archives=(dist/hacash-miner-*-linux-x86_64*.tar.gz)
           test "${#archives[@]}" -eq 2
           for archive in "${archives[@]}"; do
@@ -265,7 +389,7 @@ jobs:
           grep -Fxq 'connect = pool.example.test:9000' "$full/poworker.config.ini"
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: hacash-miner-linux-x86_64
           path: |
@@ -281,6 +405,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      # Build provenance is signed through GitHub's OIDC identity, so no
+      # maintainer key is stored in the repository.
+      id-token: write
+      attestations: write
     steps:
       - name: Validate release tag
         run: |
@@ -291,13 +419,25 @@ jobs:
           fi
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: release-assets
           merge-multiple: true
 
+      # Runs BEFORE the release is created: a package that cannot be attested
+      # must never reach a user. The .sha256 files ship next to the archives and
+      # therefore only detect corruption, not tampering; the attestation is the
+      # tamper-evident check because it is signed by GitHub, not by whoever
+      # serves the download.
+      - name: Attest release artifact provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            release-assets/*.zip
+            release-assets/*.tar.gz
+
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           files: release-assets/*
@@ -315,10 +455,30 @@ jobs:
             | `hacash-miner-only-linux-x86_64*.tar.gz` | Linux fullnode already exists |
 
             Windows: extract and run `SETUP.bat` or `SETUP-MINER.bat`.
-            Verify a ZIP with `Get-FileHash .\<file>.zip -Algorithm SHA256` and compare it with `<file>.zip.sha256`.
-
             Linux: extract and run `./SETUP-LINUX.sh` (or `bash SETUP-LINUX.sh`).
-            Verify an archive with `sha256sum -c <file>.tar.gz.sha256`.
+
+            ### Check the download before you run it
+
+            These binaries can hold mining rewards and wallet keys, so verify the
+            build provenance first. This is the only check that detects tampering,
+            because the signature is produced by GitHub and not by whoever serves
+            the file:
+
+            ```
+            gh attestation verify <file> --repo ${{ github.repository }}
+            ```
+
+            (`gh` is the GitHub CLI, available for Windows and Linux.)
+
+            The `.sha256` files detect a truncated or corrupted download only.
+            They are NOT tamper protection: they are published from the same place
+            as the archives, so anyone able to replace an archive can replace its
+            checksum too. Do not treat a matching checksum as proof the file is
+            genuine.
+
+            Corruption check, Windows: `Get-FileHash .\<file>.zip -Algorithm SHA256`
+            and compare with `<file>.zip.sha256`.
+            Corruption check, Linux: `sha256sum -c <file>.tar.gz.sha256`.
 
             HAC uses OpenCL GPU mining and supports automatic GPU detection/Auto Tune.
             Auto Tune supports one selected GPU per poworker config; use separate instances/configs for heterogeneous GPUs.
