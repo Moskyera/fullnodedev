@@ -208,10 +208,14 @@ for _ in range(60):
 # GPU mines SOLO against the node first, until ASERT has pulled the difficulty
 # off its floor. Cell 3 set difficulty_adjust_blocks = 8, so this takes a couple
 # of minutes rather than the 289 blocks the default would need.
-import shutil
-solo_cfg = open(D + "/poworker.config.ini").read()
-open(D + "/poworker.config.ini", "w").write(solo_cfg.replace("connect = 127.0.0.1:18082",
-                                                            "connect = 127.0.0.1:18080"))
+# Normalise to the pool address FIRST and keep that as the copy to restore.
+# Snapshotting the file as found would be a trap: if this cell dies during the
+# warm-up it leaves the config pointing at the node, and the next run would
+# "restore" that, so phase 2 would mine solo while the pool sat at zero shares
+# and nothing would report a problem.
+CFG = D + "/poworker.config.ini"
+pool_cfg = open(CFG).read().replace("connect = 127.0.0.1:18080", "connect = 127.0.0.1:18082")
+open(CFG, "w").write(pool_cfg.replace("connect = 127.0.0.1:18082", "connect = 127.0.0.1:18080"))
 warmup = subprocess.Popen(["./poworker"], cwd=D, stdout=open("/content/warmup.log","w"),
                           stderr=subprocess.STDOUT, env=env, start_new_session=True)
 # Wait for the exact condition the pool checks, rather than a proxy for it.
@@ -254,7 +258,8 @@ if not ready:
     print("WARNING: the target never reached %d zero bits, so a share would still cost" % NEED)
     print("almost nothing and the pool will refuse to start. It is right to. Give it longer.")
 warmup.terminate(); time.sleep(3)
-open(D + "/poworker.config.ini", "w").write(solo_cfg)   # back to the pool address
+open(CFG, "w").write(pool_cfg)   # back to the pool address
+assert "18082" in open(CFG).read(), "the worker config must point at the pool for phase 2"
 
 # PHASE 2: now the pool can serve work that costs something.
 pool = subprocess.Popen(["./hbit-pool-server","http://127.0.0.1:18080","pool-wallet.key",
