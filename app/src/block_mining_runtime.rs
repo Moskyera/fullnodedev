@@ -293,7 +293,7 @@ fn report_share_undersampling(dropped: u64) {
         return;
     }
     eprintln!(
-        "\n[Mining] UNDERSAMPLING: the GPU share list filled up, so {dropped} payable nonces from this batch were never submitted ({total} so far this session). This is lost income, and it means the pool's share target is far too easy for this card: ask the operator to raise share_bits. Nothing is wrong with the GPU."
+        "\n[Mining] UNDERSAMPLING: the GPU share list filled up, so {dropped} payable nonces from this batch were never submitted ({total} so far this session). This is lost income, and it means the pool's share target is far too easy for this card: ask the operator to LOWER share_bits, which makes each share harder. Raising it makes shares easier and loses more. Nothing is wrong with the GPU. This line is rate limited to one per 30 seconds, so it undercounts how often this happens; the session figure is the number that matters."
     );
 }
 
