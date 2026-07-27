@@ -12,7 +12,7 @@ use crate::mining_runtime::MiningRuntimeState;
 #[cfg(feature = "ocl")]
 use crate::opencl_gpu::OpenclGpuHandle;
 #[cfg(feature = "ocl")]
-use crate::opencl_gpu::block::do_group_block_mining_opencl;
+use crate::opencl_gpu::block::do_group_block_mining_opencl_shares;
 
 #[cfg(any(feature = "ocl", feature = "cuda", test))]
 const GPU_ERROR_CPU_RECOVERY_NONCES: u32 = 100_000;
@@ -56,6 +56,51 @@ pub struct BatchCtx {
     pub localsize: u32,
     pub unitsize: u32,
     pub thermal_wg_cap: Option<u32>,
+    /// Threshold for the pool share list, or `None` for solo mining.
+    ///
+    /// A pool serves its SHARE target as the template `target_hash`, so this is
+    /// that same value and there is no second threshold to carry. `None` is what
+    /// keeps solo mining byte identical: the OpenCL kernel is launched with
+    /// share_capacity=0, skips the appending block entirely, and the host neither
+    /// writes nor reads a share buffer.
+    pub share_target: Option<[u8; 32]>,
+}
+
+/// One nonce whose hash beat the share target, already re-hashed on the CPU.
+///
+/// Against a pool each of these is a separately payable PPLNS share, which is
+/// why a batch reports all of them instead of only its strongest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MinedShare {
+    pub nonce: u32,
+    pub hash: [u8; 32],
+}
+
+/// What a GPU backend produced for one batch, before the CPU tail is merged in.
+pub struct GpuBatchOutcome {
+    /// The single strongest nonce/hash. Solo mining and the block-found path
+    /// read only this, and it is produced exactly as it always was.
+    pub best: (u32, [u8; 32]),
+    pub gpu_nonce_space: u32,
+    /// Verified extra shares. Always empty for solo mining, and for CUDA, which
+    /// still reports one result per batch.
+    pub shares: Vec<MinedShare>,
+    /// Hits the kernel counted but could not store. Non-zero means the fixed
+    /// capacity was exceeded and the miner is being paid for less than it mined.
+    pub share_overflow: u64,
+}
+
+impl GpuBatchOutcome {
+    /// A best-only outcome, i.e. what every backend produced before the pool
+    /// share list existed.
+    pub fn best_only(best: (u32, [u8; 32]), gpu_nonce_space: u32) -> GpuBatchOutcome {
+        GpuBatchOutcome {
+            best,
+            gpu_nonce_space,
+            shares: Vec::new(),
+            share_overflow: 0,
+        }
+    }
 }
 
 /// Result of one batch including GPU/CPU nonce accounting for stats.
@@ -64,6 +109,34 @@ pub struct BatchResult {
     pub result_hash: [u8; 32],
     pub gpu_nonce_space: u32,
     pub cpu_nonce_space: u32,
+    /// Payable nonces BESIDES `head_nonce`, which is submitted on its own. Empty
+    /// for every solo batch and every CPU batch.
+    pub shares: Vec<MinedShare>,
+    /// Hits the GPU counted but could not store.
+    pub share_overflow: u64,
+}
+
+impl BatchResult {
+    /// Every submission this batch owes the upstream: the head result plus each
+    /// further share. One entry per payable nonce, which is the whole point -
+    /// reporting one per batch tied pool credit to batch cadence, not hashrate.
+    pub fn submission_nonces(&self) -> Vec<u32> {
+        let mut nonces = Vec::with_capacity(self.shares.len() + 1);
+        nonces.push(self.head_nonce);
+        nonces.extend(self.shares.iter().map(|share| share.nonce));
+        nonces
+    }
+}
+
+/// Split a kernel share readback into what was stored and what was lost.
+///
+/// `hits` is the kernel's atomic counter, which counts EVERY nonce under the
+/// share target including those that did not fit. Returning the overflow instead
+/// of silently truncating is what lets the miner tell its operator it is
+/// undersampling rather than quietly losing income.
+pub fn split_share_readback(hits: u64, capacity: usize) -> (usize, u64) {
+    let capacity = capacity as u64;
+    (hits.min(capacity) as usize, hits.saturating_sub(capacity))
 }
 
 pub struct GpuBatchPlan {
@@ -116,8 +189,12 @@ pub fn merge_cpu_tail(
     }
 }
 
-/// Verify the GPU's best nonce/hash pair before it can reach submission.
-pub fn verify_gpu_best_result(
+/// Verify one GPU nonce/hash pair before it can reach submission.
+///
+/// Used for the batch's best result AND for every entry of the pool share list:
+/// a card returning garbage has to be caught here, not forwarded to the pool as
+/// a hundred bad shares that get the miner throttled or banned.
+pub fn verify_gpu_nonce_result(
     height: u64,
     block_intro: &[u8],
     nonce_start: u32,
@@ -154,21 +231,57 @@ pub fn verify_gpu_best_result(
     Ok(())
 }
 
+/// Verify every entry of a GPU share list and reject the batch if any is wrong.
+///
+/// Two things are checked per entry: that the CPU reproduces the hash the card
+/// reported for that nonce, and that the hash really does beat the share target
+/// the kernel was told to filter on. A card that gets either wrong is faulty, and
+/// the existing policy for a faulty card is to fail the whole batch rather than
+/// pick out the entries that happen to look right.
+pub fn verify_gpu_shares(
+    height: u64,
+    block_intro: &[u8],
+    nonce_start: u32,
+    gpu_nonce_space: u32,
+    share_target: &[u8; 32],
+    raw: &[(u32, [u8; 32])],
+) -> Result<Vec<MinedShare>, String> {
+    let mut shares = Vec::with_capacity(raw.len());
+    for entry in raw {
+        verify_gpu_nonce_result(height, block_intro, nonce_start, gpu_nonce_space, entry)?;
+        // Equal-inclusive, the same test the node and the pool apply: a hash
+        // landing exactly on target is payable.
+        if hash_more_power(share_target, &entry.1) {
+            return Err(format!(
+                "GPU listed nonce {} as a share but its hash {} is above the share target {}",
+                entry.0,
+                hex::encode(entry.1),
+                hex::encode(share_target)
+            ));
+        }
+        shares.push(MinedShare {
+            nonce: entry.0,
+            hash: entry.1,
+        });
+    }
+    Ok(shares)
+}
+
 /// Finish a GPU batch: merge CPU tail nonces into the best hash.
 pub fn finish_gpu_batch(
     height: u64,
     block_intro: Vec<u8>,
     nonce_start: u32,
     nonce_space: u32,
-    gpu_best: (u32, [u8; 32]),
-    gpu_nonce_space: u32,
+    gpu: GpuBatchOutcome,
     cpu_mine: impl Fn(u64, Vec<u8>, u32, u32) -> (u32, [u8; 32]),
 ) -> BatchResult {
+    let gpu_nonce_space = gpu.gpu_nonce_space;
     let tail_space = nonce_space.saturating_sub(gpu_nonce_space);
     let (head_nonce, result_hash) = if tail_space > 0 {
         let tail_start = nonce_start.saturating_add(gpu_nonce_space);
         merge_cpu_tail(
-            gpu_best,
+            gpu.best,
             height,
             block_intro,
             tail_start,
@@ -176,13 +289,19 @@ pub fn finish_gpu_batch(
             cpu_mine,
         )
     } else {
-        gpu_best
+        gpu.best
     };
+    // The head result is submitted on its own, so keeping it in the list too
+    // would buy a second HTTP round trip and a `duplicate` answer for it.
+    let mut shares = gpu.shares;
+    shares.retain(|share| share.nonce != head_nonce);
     BatchResult {
         head_nonce,
         result_hash,
         gpu_nonce_space,
         cpu_nonce_space: tail_space,
+        shares,
+        share_overflow: gpu.share_overflow,
     }
 }
 
@@ -200,6 +319,8 @@ pub fn cpu_batch_fallback(
         result_hash,
         gpu_nonce_space: 0,
         cpu_nonce_space: nonce_space,
+        shares: Vec::new(),
+        share_overflow: 0,
     }
 }
 
@@ -296,7 +417,7 @@ impl BlockMinerBackend for OpenclBlockBackend {
 
         let gpu_result = {
             let opencl = self.gpu.lock_resources();
-            do_group_block_mining_opencl(
+            do_group_block_mining_opencl_shares(
                 &opencl,
                 ctx.height,
                 ctx.block_intro.clone(),
@@ -304,6 +425,7 @@ impl BlockMinerBackend for OpenclBlockBackend {
                 plan.workgroups_eff,
                 ctx.localsize,
                 ctx.unitsize,
+                ctx.share_target.as_ref(),
             )
         };
 
@@ -320,39 +442,63 @@ impl BlockMinerBackend for OpenclBlockBackend {
                     cpu_mine,
                 )
             }
-            Ok(best) => {
-                if let Err(message) = verify_gpu_best_result(
+            Ok(output) => {
+                // The best result is verified exactly as before, and every share
+                // in the list goes through the same check. Whichever fails, the
+                // batch is charged to the card and none of it is submitted.
+                let verified = verify_gpu_nonce_result(
                     ctx.height,
                     &ctx.block_intro,
                     ctx.nonce_start,
                     plan.gpu_nonce_space,
-                    &best,
-                ) {
-                    let integrity_error =
-                        GpuBatchError::Other(format!("GPU integrity error: {message}"));
-                    eprintln!("[OpenCL] {}", integrity_error.display());
-                    self.gpu.on_batch_error(
-                        integrity_error,
-                        false,
-                        ctx.configured_wg,
-                        &self.runtime,
-                    );
-                    return cpu_gpu_error_recovery(
+                    &output.best,
+                )
+                .and_then(|()| match ctx.share_target.as_ref() {
+                    Some(target) => verify_gpu_shares(
                         ctx.height,
-                        ctx.block_intro.clone(),
+                        &ctx.block_intro,
                         ctx.nonce_start,
-                        ctx.nonce_space,
-                        cpu_mine,
-                    );
-                }
+                        plan.gpu_nonce_space,
+                        target,
+                        &output.shares,
+                    ),
+                    None => Ok(Vec::new()),
+                });
+                let shares = match verified {
+                    Ok(shares) => shares,
+                    Err(message) => {
+                        let integrity_error =
+                            GpuBatchError::Other(format!("GPU integrity error: {message}"));
+                        eprintln!("[OpenCL] {}", integrity_error.display());
+                        self.gpu.on_batch_error(
+                            integrity_error,
+                            false,
+                            ctx.configured_wg,
+                            &self.runtime,
+                        );
+                        return cpu_gpu_error_recovery(
+                            ctx.height,
+                            ctx.block_intro.clone(),
+                            ctx.nonce_start,
+                            ctx.nonce_space,
+                            cpu_mine,
+                        );
+                    }
+                };
+                let (_, share_overflow) =
+                    split_share_readback(output.share_hits, crate::opencl_gpu::SHARE_LIST_CAPACITY);
                 self.gpu.on_batch_success(ctx.configured_wg, &self.runtime);
                 finish_gpu_batch(
                     ctx.height,
                     ctx.block_intro.clone(),
                     ctx.nonce_start,
                     ctx.nonce_space,
-                    best,
-                    plan.gpu_nonce_space,
+                    GpuBatchOutcome {
+                        best: output.best,
+                        gpu_nonce_space: plan.gpu_nonce_space,
+                        shares,
+                        share_overflow,
+                    },
                     cpu_mine,
                 )
             }
@@ -444,7 +590,7 @@ impl BlockMinerBackend for CudaBlockBackend {
             Ok(best) => {
                 // Re-verify the GPU's best hash on the CPU, like OpenCL, so a
                 // faulty card cannot make us submit a wrong solution.
-                if let Err(message) = verify_gpu_best_result(
+                if let Err(message) = verify_gpu_nonce_result(
                     ctx.height,
                     &ctx.block_intro,
                     ctx.nonce_start,
@@ -471,13 +617,14 @@ impl BlockMinerBackend for CudaBlockBackend {
                 }
                 // Clean batch: ramp effective work-groups back toward the max.
                 self.cuda.record_success();
+                // Best only for now: the CUDA kernel has no share list yet, so
+                // this backend keeps exactly the behaviour it has today.
                 finish_gpu_batch(
                     ctx.height,
                     ctx.block_intro.clone(),
                     ctx.nonce_start,
                     ctx.nonce_space,
-                    best,
-                    plan.gpu_nonce_space,
+                    GpuBatchOutcome::best_only(best, plan.gpu_nonce_space),
                     cpu_mine,
                 )
             }
@@ -499,12 +646,12 @@ mod tests {
         let result_hash = x16rs::block_hash(height, &verified_intro);
         let valid = (result_nonce, result_hash);
 
-        verify_gpu_best_result(height, &block_intro, nonce_start, 256, &valid).unwrap();
+        verify_gpu_nonce_result(height, &block_intro, nonce_start, 256, &valid).unwrap();
 
         let mut bad_hash = result_hash;
         bad_hash[0] ^= 1;
         assert!(
-            verify_gpu_best_result(
+            verify_gpu_nonce_result(
                 height,
                 &block_intro,
                 nonce_start,
@@ -514,7 +661,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            verify_gpu_best_result(
+            verify_gpu_nonce_result(
                 height,
                 &block_intro,
                 nonce_start,
@@ -588,14 +735,14 @@ mod tests {
         // charged against the card's failure budget for a host-side bug.
         let height = 1u64;
         let short_intro = vec![0u8; 85];
-        let err = verify_gpu_best_result(height, &short_intro, 0, 256, &(7, [0u8; 32]))
+        let err = verify_gpu_nonce_result(height, &short_intro, 0, 256, &(7, [0u8; 32]))
             .expect_err("an 85-byte intro must be rejected as a host-side length bug");
         assert!(
             err.contains("89 bytes"),
             "the error must name the 89-byte invariant, got: {err}"
         );
         assert!(
-            verify_gpu_best_result(
+            verify_gpu_nonce_result(
                 height,
                 &vec![0u8; BLOCK_INTRO_BYTES + 1],
                 0,
@@ -626,5 +773,177 @@ mod tests {
         assert_eq!(result.gpu_nonce_space, 0);
         assert_eq!(result.cpu_nonce_space, GPU_ERROR_CPU_RECOVERY_NONCES);
         assert_eq!(result.head_nonce, 7);
+    }
+
+    /// Hash of `nonce` under a fixed 89-byte intro, i.e. what an honest card
+    /// returns and what the CPU check recomputes.
+    fn honest_hit(height: u64, block_intro: &[u8], nonce: u32) -> (u32, [u8; 32]) {
+        let mut intro = block_intro.to_vec();
+        intro[79..83].copy_from_slice(&nonce.to_be_bytes());
+        (nonce, x16rs::block_hash(height, &intro))
+    }
+
+    #[test]
+    fn a_full_share_buffer_reports_what_it_could_not_store() {
+        // The capacity is fixed, so what matters is that the kernel's counter is
+        // the TOTAL and the overflow is surfaced. Losing shares silently is
+        // losing money silently, which is the whole defect being fixed.
+        assert_eq!(split_share_readback(0, 1024), (0, 0));
+        assert_eq!(split_share_readback(7, 1024), (7, 0));
+        assert_eq!(split_share_readback(1024, 1024), (1024, 0));
+        assert_eq!(split_share_readback(1025, 1024), (1024, 1));
+        assert_eq!(split_share_readback(9_000, 1024), (1024, 7_976));
+        // A degenerate capacity must not make the overflow look like zero.
+        assert_eq!(split_share_readback(5, 0), (0, 5));
+
+        // And the overflow travels with the batch instead of being dropped on
+        // the floor between the kernel and the host.
+        let batch = finish_gpu_batch(
+            1,
+            vec![0u8; BLOCK_INTRO_BYTES],
+            0,
+            256,
+            GpuBatchOutcome {
+                best: (3, [1u8; 32]),
+                gpu_nonce_space: 256,
+                shares: Vec::new(),
+                share_overflow: 7_976,
+            },
+            |_, _, nonce_start, _| (nonce_start, [0u8; 32]),
+        );
+        assert_eq!(batch.share_overflow, 7_976);
+    }
+
+    #[test]
+    fn a_batch_of_hits_yields_one_submission_each_not_one_for_the_batch() {
+        // The measured defect: 34 billion hashes produced 77 submissions because
+        // the card reported one result per batch. Every hit under the share
+        // target has to become its own submission or pool credit tracks batch
+        // cadence instead of hashrate.
+        let height = 7u64;
+        let block_intro = vec![0u8; BLOCK_INTRO_BYTES];
+        let easiest_target = [0xffu8; 32];
+        let raw: Vec<(u32, [u8; 32])> = (0..64u32)
+            .map(|nonce| honest_hit(height, &block_intro, nonce))
+            .collect();
+
+        let shares =
+            verify_gpu_shares(height, &block_intro, 0, 256, &easiest_target, &raw).unwrap();
+        assert_eq!(shares.len(), 64);
+
+        // The head result is whichever nonce the reduction picked; it is
+        // submitted on its own, so the list must not repeat it.
+        let best = raw[9];
+        let batch = finish_gpu_batch(
+            height,
+            block_intro.clone(),
+            0,
+            256,
+            GpuBatchOutcome {
+                best,
+                gpu_nonce_space: 256,
+                shares,
+                share_overflow: 0,
+            },
+            |_, _, nonce_start, _| (nonce_start, [0xffu8; 32]),
+        );
+        let submissions = batch.submission_nonces();
+        assert_eq!(
+            submissions.len(),
+            64,
+            "64 payable nonces must produce 64 submissions, not one"
+        );
+        assert_eq!(submissions[0], best.0);
+        let mut sorted = submissions.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 64, "no nonce may be submitted twice");
+    }
+
+    #[test]
+    fn a_share_the_card_cannot_prove_fails_the_batch_instead_of_reaching_the_pool() {
+        let height = 7u64;
+        let block_intro = vec![0u8; BLOCK_INTRO_BYTES];
+        let easiest_target = [0xffu8; 32];
+        let good = honest_hit(height, &block_intro, 11);
+
+        // A hash the CPU does not reproduce.
+        let mut wrong_hash = good;
+        wrong_hash.0 = 12;
+        assert!(
+            verify_gpu_shares(height, &block_intro, 0, 256, &easiest_target, &[good, wrong_hash])
+                .is_err()
+        );
+        // A nonce outside the batch window.
+        assert!(
+            verify_gpu_shares(
+                height,
+                &block_intro,
+                0,
+                8,
+                &easiest_target,
+                &[honest_hit(height, &block_intro, 900)]
+            )
+            .is_err()
+        );
+        // An honest hash the card listed even though it is ABOVE the target it
+        // was told to filter on: the compare is broken, so nothing is forwarded.
+        let strict_target = [0u8; 32];
+        assert!(
+            verify_gpu_shares(height, &block_intro, 0, 256, &strict_target, &[good]).is_err()
+        );
+    }
+
+    #[test]
+    fn solo_mining_returns_the_same_single_result_it_always_did() {
+        // (d) of the brief: with no pool there is no share target, the OpenCL
+        // kernel is launched with share_capacity=0 and skips the list entirely,
+        // so a batch carries exactly one result, the same nonce and the same
+        // hash as before the list existed.
+        let height = 7u64;
+        let block_intro = vec![0u8; BLOCK_INTRO_BYTES];
+        let best = honest_hit(height, &block_intro, 42);
+
+        let solo_ctx = BatchCtx {
+            height,
+            block_intro: block_intro.clone(),
+            nonce_start: 0,
+            nonce_space: 256,
+            configured_wg: 1,
+            localsize: 256,
+            unitsize: 1,
+            thermal_wg_cap: None,
+            share_target: None,
+        };
+        assert!(
+            solo_ctx.share_target.is_none(),
+            "a solo template must never carry a share target"
+        );
+
+        let batch = finish_gpu_batch(
+            height,
+            block_intro,
+            solo_ctx.nonce_start,
+            solo_ctx.nonce_space,
+            GpuBatchOutcome::best_only(best, 256),
+            |_, _, nonce_start, _| (nonce_start, [0xffu8; 32]),
+        );
+        assert_eq!(batch.head_nonce, best.0);
+        assert_eq!(batch.result_hash, best.1);
+        assert!(batch.shares.is_empty());
+        assert_eq!(batch.share_overflow, 0);
+        assert_eq!(batch.submission_nonces(), vec![best.0]);
+        assert_eq!(batch.gpu_nonce_space, 256);
+        assert_eq!(batch.cpu_nonce_space, 0);
+    }
+
+    #[test]
+    fn a_cpu_batch_never_carries_shares() {
+        let batch = cpu_batch_fallback(1, vec![0u8; BLOCK_INTRO_BYTES], 5, 16, |_, _, ns, _| {
+            (ns, [0u8; 32])
+        });
+        assert!(batch.shares.is_empty());
+        assert_eq!(batch.share_overflow, 0);
+        assert_eq!(batch.submission_nonces(), vec![5]);
     }
 }

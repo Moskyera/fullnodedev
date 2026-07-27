@@ -47,6 +47,19 @@ const RESULT_CHANNEL_CAPACITY: usize = 1024;
 /// Winning results queued for the dedicated submit thread. Deep enough that a
 /// burst of pool shares never blocks the result drain.
 const SUBMIT_QUEUE_CAPACITY: usize = 256;
+/// Floor on how many results one drain tick takes.
+///
+/// The old bound was four per worker per tick, which metered a GPU batch's pool
+/// shares out at a few dozen a second no matter how many the card actually
+/// found: the fix upstream would have been undone right here. It is deliberately
+/// equal to `SUBMIT_QUEUE_CAPACITY`, so one tick can fill the submit queue and no
+/// more, and raising it can never provoke the blocking inline-submit fallback on
+/// the result thread. Still hard bounded, so a tick cannot run long.
+const RESULT_DRAIN_MIN_PER_TICK: usize = SUBMIT_QUEUE_CAPACITY;
+/// How often the miner may say it is undersampling. A pool serving a share
+/// target far too easy for the card overflows the GPU share list on EVERY batch,
+/// and an unthrottled warning there is the next log that fills a disk.
+const SHARE_OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// How many recent heights the per-template submit gate remembers. A template
 /// this far behind the tip can no longer be submitted anywhere, so its
 /// bookkeeping is dropped: the gate must never grow for the life of the process.
@@ -87,6 +100,12 @@ static MINING_BLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
 static MINING_TEMPLATE_INSTALL_SEQ: AtomicU64 = AtomicU64::new(0);
 static MINING_BLOCK_STUFF: LazyLock<RwLock<Arc<BlockMiningStuff>>> =
     LazyLock::new(|| RwLock::default());
+/// Monotonic reference for the undersampling warning throttle.
+static MINER_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// Total share-list hits the GPU counted but could not hand back this session.
+static SHARE_HITS_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// `MINER_CLOCK` millis at the last undersampling line (0 = never).
+static SHARE_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) enum MinerBackend {
@@ -228,6 +247,54 @@ impl HashrateTracker {
                 totals
             })
     }
+}
+
+/// The threshold the GPU should build a pool share list against, or `None` for
+/// solo mining.
+///
+/// This is the entire guarantee that solo behaviour is unchanged. The decision
+/// is `worker_param()`, the one place that already decides whether this miner
+/// announces itself to a pool at all, so the two can never drift apart. `None`
+/// makes the OpenCL path launch the kernel with share_capacity=0: the kernel
+/// skips the whole appending block, the host writes and reads no share buffer,
+/// and the batch carries the same single best result it always did.
+///
+/// When there IS a pool, the served `target_hash` already IS the share target -
+/// HBIT's `/query/miner/pending` puts its share target in that field - so there
+/// is no second threshold to plumb and no way for the two to disagree.
+fn pool_share_target(cnf: &PoWorkConf, stuff: &BlockMiningStuff) -> Option<[u8; HASH_WIDTH]> {
+    if cnf.worker_param().is_empty() {
+        return None;
+    }
+    stuff.target_hash.to_vec().try_into().ok()
+}
+
+/// Say, at most twice a minute, that the card found more payable nonces than one
+/// batch can hand back.
+///
+/// Silence here would be the original defect wearing a different hat: the miner
+/// would be paid for a fraction of what it mined and nothing would say so.
+fn report_share_undersampling(dropped: u64) {
+    if dropped == 0 {
+        return;
+    }
+    let total = SHARE_HITS_DROPPED
+        .fetch_add(dropped, Relaxed)
+        .saturating_add(dropped);
+    let now_ms = MINER_CLOCK.elapsed().as_millis() as u64;
+    let last = SHARE_OVERFLOW_LAST_LOG_MS.load(Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < SHARE_OVERFLOW_LOG_INTERVAL.as_millis() as u64 {
+        return;
+    }
+    if SHARE_OVERFLOW_LAST_LOG_MS
+        .compare_exchange(last, now_ms, Relaxed, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    eprintln!(
+        "\n[Mining] UNDERSAMPLING: the GPU share list filled up, so {dropped} payable nonces from this batch were never submitted ({total} so far this session). This is lost income, and it means the pool's share target is far too easy for this card: ask the operator to raise share_bits. Nothing is wrong with the GPU."
+    );
 }
 
 /// True when this result independently meets its own PoW target. The node
@@ -1459,6 +1526,9 @@ fn run_block_mining_item(
         _ => false,
     };
     let height = mining_hei;
+    // Fixed for the life of this template: solo mining resolves to None here and
+    // never touches the GPU share path at all.
+    let share_target = pool_share_target(_cnf, &stuff);
     let prevhash = stuff.block_intro.prevhash().to_vec();
     let mut coinbase_tx = stuff.coinbase_tx.clone();
     coinbase_tx.set_nonce(coinbase_nonce);
@@ -1499,6 +1569,7 @@ fn run_block_mining_item(
             localsize: _cnf.localsize,
             unitsize: _cnf.unitsize,
             thermal_wg_cap: _cnf.runtime.thermal_workgroups_cap(),
+            share_target,
         };
         let cpu_mine = &do_group_block_mining;
         let batch = match &backend {
@@ -1552,6 +1623,36 @@ fn run_block_mining_item(
         if !send_mining_result(&result_ch_tx, mlres.into()) {
             return;
         }
+
+        // Against a pool every nonce under the share target is separately
+        // payable, so each one gets its own submission. Reporting only the batch
+        // best made GPU credit track batch cadence instead of hashrate.
+        //
+        // These carry NO nonce accounting and no elapsed time: the head result
+        // above already counted the whole batch once, and `record_sample`
+        // returns early on a zero duration, so the hashrate display cannot be
+        // inflated by counting one batch once per share it found.
+        for share in &batch.shares {
+            let share_res = BlockMiningResult {
+                worker_id: thrid,
+                height,
+                prevhash: prevhash.clone(),
+                nonce_start,
+                nonce_space: 0,
+                gpu_nonce_space: 0,
+                cpu_nonce_space: 0,
+                head_nonce: share.nonce,
+                coinbase_nonce: coinbase_nonce.to_vec(),
+                result_hash: share.hash.to_vec(),
+                target_hash: stuff.target_hash.to_vec(),
+                use_secs: 0.0,
+                is_gpu: is_gpu_backend,
+            };
+            if !send_mining_result(&result_ch_tx, share_res.into()) {
+                return;
+            }
+        }
+        report_share_undersampling(batch.share_overflow);
 
         nonce_space = next_nonce_space(current_nonce_space, use_secs, is_gpu_backend);
 
@@ -1644,6 +1745,7 @@ fn deal_block_mining_results(
     gate: &SubmitGateHandle,
 ) {
     let vene = worker_qty.max(1) as u32;
+    let drain_cap = (vene as usize * 4).max(RESULT_DRAIN_MIN_PER_TICK);
     let mut deal_hei = 0u64;
     let mut most = Arc::new(BlockMiningResult::new());
     let mut total_nonce_space = 0u64;
@@ -1683,7 +1785,7 @@ fn deal_block_mining_results(
             record_winner(&mut winners, &res);
         }
         recv_count += 1;
-        if recv_count >= vene as usize * 4 {
+        if recv_count >= drain_cap {
             break;
         }
     }
@@ -2633,6 +2735,106 @@ mod tests {
             lock_gate(&gate).templates[&(710u64, vec![0x11u8; HASH_WIDTH])].suppressed,
             0
         );
+    }
+
+    #[test]
+    fn an_overflowing_share_list_is_counted_and_reported_not_silently_dropped() {
+        // (b) of the brief. The list is bounded on purpose; what must never
+        // happen is losing shares QUIETLY. The kernel counts every hit including
+        // the ones that did not fit, and the host adds them up so the operator
+        // can see the miner is being paid for less than it mined.
+        let before = SHARE_HITS_DROPPED.load(Relaxed);
+        report_share_undersampling(0);
+        assert_eq!(
+            SHARE_HITS_DROPPED.load(Relaxed),
+            before,
+            "a batch that fitted has nothing to report"
+        );
+        report_share_undersampling(7_976);
+        assert_eq!(SHARE_HITS_DROPPED.load(Relaxed), before + 7_976);
+        // The LINE is throttled, the COUNT is not: a pool serving a target far
+        // too easy for the card would otherwise either spam the log or hide the
+        // real cost, and the running total is the honest number.
+        report_share_undersampling(24);
+        assert_eq!(SHARE_HITS_DROPPED.load(Relaxed), before + 8_000);
+        assert!(SHARE_OVERFLOW_LOG_INTERVAL >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn solo_mining_never_asks_the_gpu_for_a_share_list() {
+        let _guard = mining_state_guard();
+        // (d) of the brief, at the one place that decides it. With no pool there
+        // is no share target, so the OpenCL kernel is launched with
+        // share_capacity=0, skips the appending block and the host moves not one
+        // extra byte over the bus: a solo rig runs exactly what it ran before.
+        set_pending_block_stuff(820, pending_template_json(820, 0x11, 0xe1)).unwrap();
+        let stuff = MINING_BLOCK_STUFF.read().unwrap().clone();
+
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        assert!(cnf.worker_param().is_empty(), "test defaults must be solo");
+        assert_eq!(pool_share_target(&cnf, &stuff), None);
+
+        // Pooled: the served target_hash IS the share target (HBIT puts it in
+        // that field), so there is no second threshold that could disagree.
+        cnf.pool_worker = "1AVRuFXNFi3rdMrPH4hdqSgFrEBnWisWaS".to_string();
+        assert_eq!(
+            pool_share_target(&cnf, &stuff),
+            Some([0x0fu8; HASH_WIDTH]),
+            "a pooled miner filters on exactly the target it was served"
+        );
+    }
+
+    #[test]
+    fn a_gpu_batch_of_pool_shares_is_not_metered_out_by_the_drain_tick() {
+        let _guard = mining_state_guard();
+        // The drain used to take four results per worker per tick, so a single
+        // GPU worker handed the pool four shares every 123 ms however many it
+        // found: the whole fix would have been throttled away one layer down.
+        set_pending_block_stuff(830, pending_template_json(830, 0x11, 0xe2)).unwrap();
+        let cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        let (res_tx, mut res_rx) =
+            mpsc::sync_channel::<Arc<BlockMiningResult>>(RESULT_CHANNEL_CAPACITY);
+        let (submit_tx, submit_rx) =
+            mpsc::sync_channel::<Arc<BlockMiningResult>>(SUBMIT_QUEUE_CAPACITY);
+
+        // One earlier share proves this upstream credits them.
+        let gate = test_gate();
+        let primer = winner_for_template(830, 0x11, u32::MAX);
+        assert!(lock_gate(&gate).admit(&primer));
+        lock_gate(&gate).record_verdict(&primer, SubmitVerdict::ShareCredited, 1);
+
+        let shares = RESULT_DRAIN_MIN_PER_TICK as u32;
+        for head_nonce in 0..shares {
+            res_tx
+                .send(winner_for_template(830, 0x11, head_nonce))
+                .unwrap();
+        }
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        // ONE worker, so the old bound would have been four.
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            1,
+            &mut tracker,
+            1,
+            &submit_tx,
+            &gate,
+        );
+
+        let mut queued = Vec::new();
+        while let Ok(win) = submit_rx.try_recv() {
+            queued.push(win.head_nonce);
+        }
+        assert_eq!(
+            queued,
+            (0..shares).collect::<Vec<u32>>(),
+            "one tick must carry a whole batch of shares, not four of them"
+        );
+        // And the floor is exactly the submit queue, so a bigger drain can never
+        // provoke the blocking inline submit on the result thread.
+        assert_eq!(RESULT_DRAIN_MIN_PER_TICK, SUBMIT_QUEUE_CAPACITY);
     }
 
     #[test]
