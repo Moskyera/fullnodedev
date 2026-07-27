@@ -63,6 +63,25 @@ pub fn achieved_share_factor(network_target: &[u8; 32], share_target: &[u8; 32])
     leading_zero_bits(network_target).saturating_sub(leading_zero_bits(share_target))
 }
 
+/// What one share COSTS, as a power of two hashes, on the target actually served.
+///
+/// [`achieved_share_factor`] answers a different question - how much easier a
+/// share is than a block - and the two can disagree in the direction that costs
+/// money. On a chain whose network target has 22 leading zero bits, asking for a
+/// factor of 24 saturates to the all-0xff ceiling: the achieved factor reads 22,
+/// which clears any ratio bound comfortably, and yet EVERY hash beats the share
+/// target. Credit then measures how fast a worker completes an HTTP round trip,
+/// not how much it hashed, which is precisely what the ratio bound exists to
+/// prevent. A ratio is only meaningful once the thing being divided costs
+/// something, so this is the number that has to be checked first.
+///
+/// The two are related: `leading_zero_bits(network) == achieved + cost`. Lowering
+/// the configured factor moves work from the first to the second, up to the
+/// factor floor; below that the chain itself is too easy and nothing helps.
+pub fn share_cost_bits(share_target: &[u8; 32]) -> u32 {
+    leading_zero_bits(share_target)
+}
+
 /// The PoW hash of a serialized 89-byte block header.
 pub fn hash_of(height: u64, header: &[u8]) -> [u8; 32] {
     x16rs::block_hash(height, header)

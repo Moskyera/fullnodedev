@@ -116,6 +116,19 @@ const HANDLER_STACK_BYTES: usize = 1024 * 1024;
 /// a network block. See `check_share_factor` for why both ends matter.
 const MIN_SHARE_FACTOR: u32 = 18;
 const MAX_SHARE_FACTOR: u32 = 40;
+/// The least work one share may cost, as a power of two hashes.
+///
+/// `MIN_SHARE_FACTOR` bounds a RATIO - how much easier a share is than a block -
+/// and a ratio says nothing about what the share itself costs. Both bounds are
+/// needed. A chain whose target has 22 leading zero bits, served with
+/// `share_bits` 24, saturates to the all-0xff ceiling: the achieved factor reads
+/// 22, clears the ratio bound, and every hash on earth beats the share target.
+///
+/// 2^16 is the floor at which a share is unambiguously work rather than a round
+/// trip: even a single CPU thread produces well under one per second, so credit
+/// tracks hashing. Real mainnet difficulty is far above this at any legal
+/// `share_bits`, so this bound only ever bites on a chain too easy to account on.
+const MIN_SHARE_COST_BITS: u32 = 16;
 /// Consecutive above-target submissions from one worker before the pool shouts.
 /// A worker that hashes the same header the pool reconstructs essentially never
 /// produces one, because it only submits what already beat the target it was
@@ -713,25 +726,76 @@ fn check_share_factor(factor: u32) -> Result<(), String> {
 /// tight loop takes the whole payout window from everyone else. That is not a
 /// tuning wrinkle, it is the pool paying the wrong people, so it is refused.
 ///
-/// The bound is the SAME `MIN_SHARE_FACTOR` the operator's `share_bits` must
-/// clear, applied to the factor the pool really achieves.
-fn check_share_target(factor: u32, achieved: u32, difficulty: u32) -> Result<(), String> {
-    if achieved >= MIN_SHARE_FACTOR {
-        return Ok(());
+/// TWO bounds are applied, because a ratio alone does not make a share honest.
+///
+/// `achieved` is a ratio: how much easier a share is than a block. `cost_bits` is
+/// what the share itself costs, as a power of two hashes. The first bound was
+/// here alone, and it has a hole exactly wide enough to lose money through: on a
+/// chain whose target has 22 leading zero bits, `share_bits` 24 saturates to the
+/// all-0xff ceiling, `achieved` reads 22, clears `MIN_SHARE_FACTOR`, and every
+/// hash beats the share target anyway. That is the very condition this function
+/// was written to refuse, passing its own check.
+///
+/// `leading_zero_bits(network) == achieved + cost_bits`, so lowering `share_bits`
+/// moves work from the ratio into the cost, down to `MIN_SHARE_FACTOR`. Below
+/// that the chain is too easy at any setting, and the two cases need different
+/// advice, so they are reported differently.
+fn check_share_target(
+    factor: u32,
+    achieved: u32,
+    cost_bits: u32,
+    difficulty: u32,
+) -> Result<(), String> {
+    if achieved < MIN_SHARE_FACTOR {
+        return Err(format!(
+            "the network difficulty in force ({difficulty}) is too low to serve a fair share.\n\
+             share_bits={factor} asks for a share 2^{factor} easier than a block, but the \
+             derived share target saturates and what workers actually get is 2^{achieved} \
+             (minimum {MIN_SHARE_FACTOR}).\n\
+             At that point a share costs almost no work, so PPLNS credit tracks how fast a \
+             worker can submit rather than how much it hashes, and one worker can take the \
+             whole {PPLNS_WINDOW}-share payout window from everyone else. This pool will not \
+             distribute real money on that basis.\n\
+             What to do: point the pool at a chain whose difficulty has risen (mainnet is far \
+             above this), or wait for this one to adjust upward and start it again. Lowering \
+             <share_bits> does not help: the ceiling is the chain's, not yours."
+        ));
     }
-    Err(format!(
-        "the network difficulty in force ({difficulty}) is too low to serve a fair share.\n\
-         share_bits={factor} asks for a share 2^{factor} easier than a block, but the derived \
-         share target saturates and what workers actually get is 2^{achieved} \
-         (minimum {MIN_SHARE_FACTOR}).\n\
-         At that point a share costs almost no work, so PPLNS credit tracks how fast a worker \
-         can submit rather than how much it hashes, and one worker can take the whole \
-         {PPLNS_WINDOW}-share payout window from everyone else. This pool will not distribute \
-         real money on that basis.\n\
-         What to do: point the pool at a chain whose difficulty has risen (mainnet is far above \
-         this), or wait for this one to adjust upward and start it again. Lowering <share_bits> \
-         does not help: the ceiling is the chain's, not yours."
-    ))
+    if cost_bits < MIN_SHARE_COST_BITS {
+        // network_bits is what the chain offers in total; the best a legal
+        // share_bits can leave for the cost is network_bits - MIN_SHARE_FACTOR.
+        let network_bits = achieved + cost_bits;
+        let best_cost = network_bits.saturating_sub(MIN_SHARE_FACTOR);
+        let advice = if best_cost >= MIN_SHARE_COST_BITS {
+            let highest = network_bits.saturating_sub(MIN_SHARE_COST_BITS);
+            format!(
+                "What to do: lower <share_bits> to {highest} or less. The chain offers \
+                 2^{network_bits} of work per block and share_bits spends {factor} of it on \
+                 making shares frequent, leaving 2^{cost_bits} for the share itself. Spending \
+                 less leaves more."
+            )
+        } else {
+            format!(
+                "What to do: nothing here helps. The chain offers only 2^{network_bits} of work \
+                 per block, and share_bits cannot go below {MIN_SHARE_FACTOR}, so the most a \
+                 share could ever cost on it is 2^{best_cost}. Point the pool at a chain whose \
+                 difficulty has risen; mainnet is far above this."
+            )
+        };
+        return Err(format!(
+            "the network difficulty in force ({difficulty}) is too low to serve a share worth \
+             counting.\n\
+             share_bits={factor} leaves each share costing 2^{cost_bits} hashes on average \
+             (minimum 2^{MIN_SHARE_COST_BITS}). The ratio looks healthy - a share is 2^{achieved} \
+             easier than a block - but a ratio only means something once the share itself costs \
+             work.\n\
+             At 2^{cost_bits} a worker is credited for completing an HTTP round trip rather than \
+             for hashing, so the fastest submitter takes the {PPLNS_WINDOW}-share window from \
+             miners doing more work. This pool will not distribute real money on that basis.\n\
+             {advice}"
+        ));
+    }
+    Ok(())
 }
 
 /// Plan a settlement on the pool's ADVERTISED terms.
@@ -1497,7 +1561,10 @@ fn main() {
     // money, on a share nobody had to work for.
     let share_target = pool_core::share_target_hash(tpl.difficulty, share_factor);
     let share_factor_achieved = pool_core::achieved_share_factor(&network_target, &share_target);
-    if let Err(e) = check_share_target(share_factor, share_factor_achieved, tpl.difficulty) {
+    let share_cost = pool_core::share_cost_bits(&share_target);
+    if let Err(e) =
+        check_share_target(share_factor, share_factor_achieved, share_cost, tpl.difficulty)
+    {
         refuse(&format!("REFUSING to start: {e}"));
     }
 
@@ -3449,7 +3516,8 @@ mod tests {
         let served = pool_core::share_target_hash(LOWEST_DIFFICULTY, 24);
         let achieved = pool_core::achieved_share_factor(&net, &served);
         assert_eq!(achieved, 0, "24 asked for, 0 actually served");
-        let e = check_share_target(24, achieved, LOWEST_DIFFICULTY).expect_err("refused");
+        let cost = pool_core::share_cost_bits(&served);
+        let e = check_share_target(24, achieved, cost, LOWEST_DIFFICULTY).expect_err("refused");
         assert!(e.contains("too low"), "{e}");
         assert!(e.contains("submit"), "{e}");
 
@@ -3460,12 +3528,50 @@ mod tests {
         let net = pool_core::network_target_hash(d);
         let served = pool_core::share_target_hash(d, 24);
         assert_eq!(pool_core::achieved_share_factor(&net, &served), 24);
-        assert!(check_share_target(24, 24, d).is_ok());
+        assert!(check_share_target(24, 24, pool_core::share_cost_bits(&served), d).is_ok());
+    }
 
-        // The bound is the SAME one share_bits must clear, applied to what is
-        // really served.
-        assert!(check_share_target(24, MIN_SHARE_FACTOR, 1).is_ok());
-        assert!(check_share_target(24, MIN_SHARE_FACTOR - 1, 1).is_err());
+    #[test]
+    fn a_healthy_ratio_over_a_free_share_is_refused() {
+        // The hole the ratio bound alone left open, and it is not hypothetical:
+        // it is the ASERT activation target every non-mainnet chain lands on.
+        // 0xe9cfffff has 255 - 0xe9 = 22 leading zero bits, so asking for 24
+        // saturates to the all-0xff ceiling. The achieved factor then reads 22,
+        // sails past MIN_SHARE_FACTOR, and EVERY hash beats the share target.
+        // The pool would have started and credited HTTP round trips as work.
+        let d = 0xe9cf_ffffu32;
+        let net = pool_core::network_target_hash(d);
+        let served = pool_core::share_target_hash(d, 24);
+        assert_eq!(served, [0xff; 32], "saturated to the ceiling");
+        let achieved = pool_core::achieved_share_factor(&net, &served);
+        let cost = pool_core::share_cost_bits(&served);
+        assert_eq!(achieved, 22, "the ratio looks fine");
+        assert!(achieved >= MIN_SHARE_FACTOR, "and clears the ratio bound");
+        assert_eq!(cost, 0, "while a share costs one hash");
+
+        let e = check_share_target(24, achieved, cost, d).expect_err("refused");
+        assert!(e.contains("worth counting"), "{e}");
+        // 22 bits of chain, 18 the lowest legal factor: 4 is the most a share
+        // could ever cost here, so lowering share_bits cannot rescue it.
+        assert!(e.contains("nothing here helps"), "{e}");
+
+        // Where the chain DOES have room, the advice is the opposite, and names
+        // the number: 40 bits of work, 16 needed for the share, so 24 or less.
+        let d = 0xd7ff_ffffu32; // 255 - 0xd7 = 40 leading zero bits
+        let net = pool_core::network_target_hash(d);
+        let served = pool_core::share_target_hash(d, 30);
+        let achieved = pool_core::achieved_share_factor(&net, &served);
+        let cost = pool_core::share_cost_bits(&served);
+        assert_eq!((achieved, cost), (30, 10));
+        let e = check_share_target(30, achieved, cost, d).expect_err("refused");
+        assert!(e.contains("lower <share_bits> to 24 or less"), "{e}");
+
+        // Spending less on frequency leaves enough on the share itself.
+        let served = pool_core::share_target_hash(d, 24);
+        let achieved = pool_core::achieved_share_factor(&net, &served);
+        let cost = pool_core::share_cost_bits(&served);
+        assert_eq!((achieved, cost), (24, 16));
+        assert!(check_share_target(24, achieved, cost, d).is_ok());
     }
 
     #[test]
