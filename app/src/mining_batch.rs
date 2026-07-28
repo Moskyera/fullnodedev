@@ -902,8 +902,15 @@ mod tests {
         let mut wrong_hash = good;
         wrong_hash.0 = 12;
         assert!(
-            verify_gpu_shares(height, &block_intro, 0, 256, &easiest_target, &[good, wrong_hash])
-                .is_err()
+            verify_gpu_shares(
+                height,
+                &block_intro,
+                0,
+                256,
+                &easiest_target,
+                &[good, wrong_hash]
+            )
+            .is_err()
         );
         // A nonce outside the batch window.
         assert!(
@@ -920,9 +927,7 @@ mod tests {
         // An honest hash the card listed even though it is ABOVE the target it
         // was told to filter on: the compare is broken, so nothing is forwarded.
         let strict_target = [0u8; 32];
-        assert!(
-            verify_gpu_shares(height, &block_intro, 0, 256, &strict_target, &[good]).is_err()
-        );
+        assert!(verify_gpu_shares(height, &block_intro, 0, 256, &strict_target, &[good]).is_err());
     }
 
     #[test]
@@ -1005,7 +1010,10 @@ mod tests {
             thermal_wg_cap: None,
             share_target: None,
         };
-        assert_eq!(x16rs_cuda::share_capacity_for(solo.share_target.as_ref()), 0);
+        assert_eq!(
+            x16rs_cuda::share_capacity_for(solo.share_target.as_ref()),
+            0
+        );
 
         let pooled_target = [0x0fu8; 32];
         assert_eq!(

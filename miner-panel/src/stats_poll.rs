@@ -484,7 +484,10 @@ fn fetch_payout_view(query: &PoolQuery, has_terms: bool, was_pool: bool) -> Payo
         was_pool: was_pool || has_terms,
     };
     if !query.worker.is_empty() {
-        match http_get(&query.connect, &format!("/earnings?worker={}", query.worker)) {
+        match http_get(
+            &query.connect,
+            &format!("/earnings?worker={}", query.worker),
+        ) {
             Err(error) => return unreachable(error),
             Ok((200, body)) => match parse_earnings(&body, &query.worker) {
                 EarningsAnswer::Earnings(e) => return PayoutView::Earnings(e),
@@ -631,7 +634,11 @@ fn read_last_payout(v: &Value) -> Option<LastPayout> {
     let unix_ms = last
         .get("unix_ms")
         .and_then(Value::as_u64)
-        .or_else(|| last.get("unix_sec").and_then(Value::as_u64).map(|s| s * 1000))
+        .or_else(|| {
+            last.get("unix_sec")
+                .and_then(Value::as_u64)
+                .map(|s| s * 1000)
+        })
         .unwrap_or(0);
     if amount.is_none() && tx.is_empty() && unix_ms == 0 {
         return None;
@@ -853,9 +860,10 @@ fn split_head(raw: &[u8]) -> Option<(&[u8], &[u8])> {
 fn content_length(head: &[u8]) -> Option<usize> {
     let head = std::str::from_utf8(head).ok()?;
     head.lines()
-        .find_map(|line| line.split_once(':').filter(|(k, _)| {
-            k.trim().eq_ignore_ascii_case("content-length")
-        }))
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        })
         .and_then(|(_, v)| v.trim().parse().ok())
 }
 
@@ -960,7 +968,8 @@ mod tests {
 
     #[test]
     fn a_refusal_is_repeated_to_the_miner_instead_of_being_swallowed() {
-        let body = r#"{"ok":false,"err":"set pool_worker=<your HAC address> so the pool can pay you"}"#;
+        let body =
+            r#"{"ok":false,"err":"set pool_worker=<your HAC address> so the pool can pay you"}"#;
         let EarningsAnswer::Refused(message) = parse_earnings(body, "1abc") else {
             panic!("a refusal must reach the miner");
         };
@@ -1006,7 +1015,10 @@ mod tests {
 
     #[test]
     fn an_endpoint_without_terms_publishes_none() {
-        assert_eq!(parse_terms(r#"{"ok":false,"err":"no such endpoint"}"#), None);
+        assert_eq!(
+            parse_terms(r#"{"ok":false,"err":"no such endpoint"}"#),
+            None
+        );
         assert_eq!(parse_terms(r#"{"ret":0,"height":9}"#), None);
         assert_eq!(parse_terms("nonsense"), None);
     }

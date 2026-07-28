@@ -792,7 +792,10 @@ mod driver {
             return;
         }
         if let Err(e) = check(unsafe { cudaSetDevice(miner.device) }) {
-            eprintln!("[cuda] re-selecting device #{} after reset failed: {e}", miner.device);
+            eprintln!(
+                "[cuda] re-selecting device #{} after reset failed: {e}",
+                miner.device
+            );
             return;
         }
         match unsafe { alloc_device_buffers(miner.workgroups, miner.local_size, miner.unit_size) } {
@@ -1225,7 +1228,10 @@ mod gpu_share_list_tests {
         let mut cpu: Vec<(u32, [u8; HASH_BYTES])> = (NONCE_START..NONCE_START + BATCH_NONCES)
             .map(|nonce| (nonce, cpu_hash(&intro, nonce)))
             .collect();
-        let cpu_best = *cpu.iter().min_by(|a, b| a.1.cmp(&b.1)).expect("non empty window");
+        let cpu_best = *cpu
+            .iter()
+            .min_by(|a, b| a.1.cmp(&b.1))
+            .expect("non empty window");
 
         // 1. SOLO: no share target, so the kernel skips the whole added block and
         //    the single best result has to be the CPU's, byte for byte.
@@ -1267,13 +1273,21 @@ mod gpu_share_list_tests {
         let mut seen: Vec<u32> = pool.shares.iter().map(|(nonce, _)| *nonce).collect();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), pool.shares.len(), "no nonce may be listed twice");
+        assert_eq!(
+            seen.len(),
+            pool.shares.len(),
+            "no nonce may be listed twice"
+        );
         for (nonce, hash) in &pool.shares {
             assert!(
                 (NONCE_START..NONCE_START + BATCH_NONCES).contains(nonce),
                 "share nonce {nonce} is outside the batch window"
             );
-            assert_eq!(*hash, cpu_hash(&intro, *nonce), "share hash must match the CPU");
+            assert_eq!(
+                *hash,
+                cpu_hash(&intro, *nonce),
+                "share hash must match the CPU"
+            );
         }
 
         // 3. POOL, a target only three nonces beat: exactly those three, and
@@ -1298,7 +1312,10 @@ mod gpu_share_list_tests {
         assert_eq!(strict.share_hits, 3);
         let mut got: Vec<u32> = strict.shares.iter().map(|(nonce, _)| *nonce).collect();
         got.sort_unstable();
-        assert_eq!(got, expected, "the kernel must list exactly the payable nonces");
+        assert_eq!(
+            got, expected,
+            "the kernel must list exactly the payable nonces"
+        );
 
         // 4. And back to solo on the SAME miner: the counter is cleared per batch,
         //    so a pool batch cannot leak its hits into the next solo one.
@@ -1327,7 +1344,9 @@ mod tests {
         // These poison the CUDA context: every later runtime call returns the same
         // code, so only a device reset can bring the card back. Missing one of them
         // means a 24/7 rig silently mines on capped CPU recovery until restarted.
-        for code in [214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 999] {
+        for code in [
+            214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 999,
+        ] {
             assert!(
                 driver_error(code).is_sticky(),
                 "cuda code {code} must be treated as sticky"
@@ -1427,9 +1446,18 @@ mod tests {
         // to the pool as mined shares.
         assert_eq!(stored_share_count(0), 0);
         assert_eq!(stored_share_count(1), 1);
-        assert_eq!(stored_share_count(SHARE_LIST_CAPACITY as u64 - 1), SHARE_LIST_CAPACITY - 1);
-        assert_eq!(stored_share_count(SHARE_LIST_CAPACITY as u64), SHARE_LIST_CAPACITY);
-        assert_eq!(stored_share_count(SHARE_LIST_CAPACITY as u64 + 1), SHARE_LIST_CAPACITY);
+        assert_eq!(
+            stored_share_count(SHARE_LIST_CAPACITY as u64 - 1),
+            SHARE_LIST_CAPACITY - 1
+        );
+        assert_eq!(
+            stored_share_count(SHARE_LIST_CAPACITY as u64),
+            SHARE_LIST_CAPACITY
+        );
+        assert_eq!(
+            stored_share_count(SHARE_LIST_CAPACITY as u64 + 1),
+            SHARE_LIST_CAPACITY
+        );
         assert_eq!(stored_share_count(9_000), SHARE_LIST_CAPACITY);
         assert_eq!(stored_share_count(u64::MAX), SHARE_LIST_CAPACITY);
     }
@@ -1443,7 +1471,11 @@ mod tests {
             (7, 7, 0),
             (SHARE_LIST_CAPACITY as u64, SHARE_LIST_CAPACITY, 0),
             (SHARE_LIST_CAPACITY as u64 + 1, SHARE_LIST_CAPACITY, 1),
-            (9_000, SHARE_LIST_CAPACITY, 9_000 - SHARE_LIST_CAPACITY as u64),
+            (
+                9_000,
+                SHARE_LIST_CAPACITY,
+                9_000 - SHARE_LIST_CAPACITY as u64,
+            ),
         ] {
             let stored = stored_share_count(hits);
             assert_eq!(stored, want_stored, "stored count for {hits} hits");
@@ -1471,6 +1503,9 @@ mod tests {
         // index on the device. A capacity that did not fit would wrap and turn the
         // bounds check into a way to write off the end of the list.
         assert!(SHARE_LIST_CAPACITY as u64 <= u32::MAX as u64);
-        assert_eq!(share_capacity_for(Some(&[0u8; HASH_BYTES])) as usize, SHARE_LIST_CAPACITY);
+        assert_eq!(
+            share_capacity_for(Some(&[0u8; HASH_BYTES])) as usize,
+            SHARE_LIST_CAPACITY
+        );
     }
 }

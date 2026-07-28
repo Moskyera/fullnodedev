@@ -590,4 +590,153 @@ mod difficulty_tests {
 
         assert!(slow_target.big > fast_target.big);
     }
+
+    // ===================================================================
+    // The claims scripts/hbit-local-chain-rig depends on.
+    //
+    // That rig builds a private chain the HBIT pool will serve, which needs a
+    // network target with >= 34 leading zero bits (server.rs MIN_SHARE_FACTOR
+    // 18 + MIN_SHARE_COST_BITS 16). It gets there with config alone, by raising
+    // [mint].each_block_target_time. These tests pin the two facts that makes
+    // it rest on: that the lever works, and that it cannot reach mainnet.
+    // ===================================================================
+
+    /// Leading zero BITS of a target, which is what the pool's admission check
+    /// counts (pool_core::share_cost_bits). 34 is the threshold that matters.
+    fn target_zero_bits(hash: &[u8; 32]) -> u32 {
+        let mut n = 0u32;
+        for b in hash {
+            if *b == 0 {
+                n += 8;
+            } else {
+                n += b.leading_zeros();
+                break;
+            }
+        }
+        n
+    }
+
+    /// Difficulty for a chain mined at one block per second since the anchor,
+    /// which is the fastest a release node allows (block_build.rs floors the
+    /// next timestamp at prev+1, chain/src/verify.rs rejects <= prev and any
+    /// timestamp in the future).
+    fn one_second_blocks_target(
+        adjust_blocks: u64,
+        target_time: u64,
+        blocks_past_anchor: u64,
+    ) -> DifficultyTarget {
+        let dgnr = new_test_dgnr_with(adjust_blocks, 4, target_time, 7);
+        let anchor = dgnr.asert_upgrade_height();
+        let anchor_time = 1_000u64;
+        let hei = anchor + blocks_past_anchor;
+        let mut blocks = HashMap::new();
+        blocks.insert(anchor, build_intro(anchor, anchor_time, ASERT_START_TARGET_NUM));
+        let src = TestIntroSource::new(hei, blocks);
+        // prevdiff only feeds the 2x easing cap, which bites when the chain is
+        // BEHIND schedule; the rig is always ahead, so the anchor value is a
+        // faithful stand-in and keeps the vector readable.
+        dgnr.target_asert(
+            ASERT_START_TARGET_NUM,
+            anchor_time + blocks_past_anchor - 1,
+            hei,
+            anchor_time + blocks_past_anchor,
+            &src,
+        )
+    }
+
+    #[test]
+    fn off_mainnet_a_fresh_chain_starts_at_exactly_22_bits() {
+        let _setup = scoped_protocol_setup();
+        // Why the rig has to exist at all. Off mainnet the ASERT anchor sits at
+        // difficulty_adjust_blocks + 2 and its target is the fixed constant
+        // ASERT_START_TARGET_NUM, whatever the window config is. 22 is twelve
+        // bits short of what the pool will serve, so a chain cannot simply be
+        // started and used.
+        for (adjust, target_time) in [(288u64, 10u64), (8, 455), (8, 10), (16, 300)] {
+            let dgnr = new_test_dgnr_with(adjust, 4, target_time, 7);
+            assert_eq!(
+                dgnr.asert_upgrade_height(),
+                adjust + 2,
+                "off-mainnet anchor is difficulty_adjust_blocks + 2"
+            );
+            let src = TestIntroSource::new(0, HashMap::new());
+            let at_anchor = dgnr.target_asert(0, 0, adjust + 2, 0, &src);
+            assert_eq!(at_anchor.num, ASERT_START_TARGET_NUM);
+            assert_eq!(
+                target_zero_bits(&at_anchor.hash),
+                22,
+                "fresh non-mainnet chain must start at 22 bits (adjust={adjust} tt={target_time})"
+            );
+        }
+    }
+
+    #[test]
+    fn each_block_target_time_is_the_lever_that_reaches_a_pool_servable_chain() {
+        let _setup = scoped_protocol_setup();
+        // 292 blocks past the anchor at one second each. Both columns describe
+        // the SAME mining run; only [mint].each_block_target_time differs.
+        const BLOCKS: u64 = 292;
+        const POOL_MIN_NETWORK_BITS: u32 = 34;
+
+        // The documented testnet target time gets nowhere: each block can buy at
+        // most 9 seconds of "ahead of schedule" and one bit costs 10800 of them.
+        let documented = one_second_blocks_target(8, 10, BLOCKS);
+        assert_eq!(
+            target_zero_bits(&documented.hash),
+            22,
+            "at each_block_target_time=10 the chain has not moved off the anchor"
+        );
+        assert!(
+            target_zero_bits(&documented.hash) < POOL_MIN_NETWORK_BITS,
+            "a documented testnet must NOT be pool-servable, or this rig is pointless"
+        );
+
+        // The rig's target time, same 292 blocks, same one-second cadence.
+        let rig = one_second_blocks_target(8, 455, BLOCKS);
+        assert_eq!(
+            target_zero_bits(&rig.hash),
+            34,
+            "at each_block_target_time=455, 292 one-second blocks reach exactly 34 bits"
+        );
+        assert!(rig.big < documented.big, "the lever must TIGHTEN the target");
+
+        // Monotone in the lever, which is what makes the planner's search sound.
+        let mut prev_bits = 0u32;
+        for tt in [10u64, 57, 114, 228, 455, 910] {
+            let bits = target_zero_bits(&one_second_blocks_target(8, tt, BLOCKS).hash);
+            assert!(
+                bits >= prev_bits,
+                "raising each_block_target_time must never lower the difficulty \
+                 (tt={tt} gave {bits}, previous gave {prev_bits})"
+            );
+            prev_bits = bits;
+        }
+        assert!(prev_bits > POOL_MIN_NETWORK_BITS);
+    }
+
+    #[test]
+    fn the_rig_config_cannot_move_mainnet_asert() {
+        let _setup = scoped_protocol_setup();
+        // The rig sets difficulty_adjust_blocks = 8 and each_block_target_time
+        // = 455 in the SAME [mint] section a mainnet node reads. Neither key may
+        // move mainnet's ASERT anchor or its start target; if either did, a node
+        // that picked up the rig's file would fork off mainnet.
+        let stock = new_test_dgnr_with(288, 4, 300, 0);
+        let with_rig_values = new_test_dgnr_with(8, 4, 455, 0);
+        for dgnr in [&stock, &with_rig_values] {
+            assert_eq!(
+                dgnr.asert_upgrade_height(),
+                ASERT_UPGRADE_HEIGHT,
+                "mainnet ASERT must anchor at the consensus constant, not at a config value"
+            );
+            let src = TestIntroSource::new(0, HashMap::new());
+            let at_anchor = dgnr.target_asert(0, 0, ASERT_UPGRADE_HEIGHT, 0, &src);
+            assert_eq!(at_anchor.num, ASERT_START_TARGET_NUM);
+            assert_eq!(target_zero_bits(&at_anchor.hash), 22);
+        }
+        // And the rig's own chain_id is not mainnet, which is what routes it to
+        // the non-mainnet branch in the first place.
+        assert!(!new_test_dgnr_with(8, 4, 455, 7).cnf.is_mainnet());
+        assert!(new_test_dgnr_with(8, 4, 455, 0).cnf.is_mainnet());
+    }
 }

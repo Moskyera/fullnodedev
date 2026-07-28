@@ -590,8 +590,7 @@ impl FleetState {
     /// as a peer. One row per worker: status, live hashrate, estimated HAC/day, power and
     /// the synced block height (so you can see at a glance which rigs are up and on tip).
     pub fn show_master(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
-        let online: Vec<&PeerResult> =
-            self.results.iter().filter(|r| r.stats.is_some()).collect();
+        let online: Vec<&PeerResult> = self.results.iter().filter(|r| r.stats.is_some()).collect();
         let mut total_hr = local.hashrate_hps;
         let mut total_hac = local.hac_per_day;
         let mut total_w = local.watts;

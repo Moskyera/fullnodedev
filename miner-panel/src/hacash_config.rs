@@ -537,7 +537,10 @@ mod tests {
         // them while the user can still read a message.
         assert_eq!(validate_bid_password(""), Err("empty".to_string()));
         assert_eq!(validate_bid_password("   "), Err("empty".to_string()));
-        assert_eq!(validate_bid_password("123456"), Err("well_known".to_string()));
+        assert_eq!(
+            validate_bid_password("123456"),
+            Err("well_known".to_string())
+        );
         assert_eq!(
             validate_bid_password("  123456  "),
             Err("well_known".to_string()),
@@ -571,7 +574,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "password '{bad}'");
-            assert!(!path.exists(), "a refused password must leave no config: '{bad}'");
+            assert!(
+                !path.exists(),
+                "a refused password must leave no config: '{bad}'"
+            );
         }
     }
 
@@ -616,7 +622,10 @@ mod tests {
         .unwrap();
         let hacd = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(hacd.contains("[node]"), "HACD config missing [node]:\n{hacd}");
+        assert!(
+            hacd.contains("[node]"),
+            "HACD config missing [node]:\n{hacd}"
+        );
         assert!(hacd.contains("not_find_nodes = false"), "{hacd}");
     }
 
@@ -634,7 +643,10 @@ mod tests {
         write_hac_miner_only(&path, "1NewWallet", Some(8080)).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(raw.contains("listen = 9999"), "custom [node] listen lost:\n{raw}");
+        assert!(
+            raw.contains("listen = 9999"),
+            "custom [node] listen lost:\n{raw}"
+        );
         assert_eq!(raw.matches("[node]").count(), 1, "duplicate [node]:\n{raw}");
     }
 

@@ -329,7 +329,11 @@ pub(crate) async fn receive_blocks(hdl: &MsgHandler, peer: Arc<Peer>, mut buf: V
         // which is the outcome to prefer over silence.
         println!("{}", e);
         let head = hdl.engine.latest_block().height().uint();
-        println!("[P2P] sync failed at height {}; retrying from {} in 10s", end_hei, head + 1);
+        println!(
+            "[P2P] sync failed at height {}; retrying from {} in 10s",
+            end_hei,
+            head + 1
+        );
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         send_req_block_msg(hdl, peer, head + 1).await;
         return;

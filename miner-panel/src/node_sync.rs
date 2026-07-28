@@ -82,7 +82,8 @@ pub fn probe(connect: &str) -> Option<SyncStatus> {
     let (_, latest) = crate::stats_poll::http_get(connect, "/query/latest").ok()?;
     let height = parse_height(&latest)?;
     let (_, intro) =
-        crate::stats_poll::http_get(connect, &format!("/query/block/intro?height={height}")).ok()?;
+        crate::stats_poll::http_get(connect, &format!("/query/block/intro?height={height}"))
+            .ok()?;
     let tip_unix = parse_timestamp(&intro)?;
     // Genesis is fetched once per probe rather than cached: it is one small
     // request against a local node, and caching it would mean carrying state
@@ -132,7 +133,11 @@ mod tests {
         // The real case: height 70,000, tip block from 2022, clock in 2026.
         let s = status_from(70_000, 1_666_000_000, 1_500_000_000, 1_785_181_634);
         assert!(!s.is_synced(), "a tip years old must not count as synced");
-        assert!(s.progress > 0.5 && s.progress < 0.65, "progress {}", s.progress);
+        assert!(
+            s.progress > 0.5 && s.progress < 0.65,
+            "progress {}",
+            s.progress
+        );
         assert!(s.blocks_behind() > 300_000);
     }
 
@@ -140,7 +145,10 @@ mod tests {
     fn a_tip_a_few_minutes_old_is_following_the_chain() {
         let now = 1_785_181_634;
         let s = status_from(812_345, now - 600, 1_500_000_000, now);
-        assert!(s.is_synced(), "ten minutes behind is two blocks, not a resync");
+        assert!(
+            s.is_synced(),
+            "ten minutes behind is two blocks, not a resync"
+        );
         assert_eq!(s.blocks_behind(), 2);
         assert!(s.progress > 0.999);
     }
@@ -177,7 +185,10 @@ mod tests {
         // Zero would read as "genesis", which is a plausible-looking lie. The
         // callers wait instead.
         assert_eq!(parse_height("not json at all"), None);
-        assert_eq!(parse_timestamp(r#"{"ret":1,"err":"pending block not ready"}"#), None);
+        assert_eq!(
+            parse_timestamp(r#"{"ret":1,"err":"pending block not ready"}"#),
+            None
+        );
         assert_eq!(parse_height(r#"{"height":}"#), None);
     }
 }

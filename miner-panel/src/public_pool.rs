@@ -1,9 +1,9 @@
 //! Host a public free-IP pool (hac-pool) from the panel — all-in-one.
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use serde::{Deserialize, Serialize};
 
 use crate::platform;
 
@@ -109,7 +109,8 @@ pub fn start_pool(work_dir: &Path, s: &PublicPoolSettings) -> Result<Child, Stri
     let mut cmd = Command::new(&bin);
     cmd.current_dir(work_dir);
     cmd.arg("--upstream").arg(upstream);
-    cmd.arg("--http-bind").arg(format!("0.0.0.0:{}", s.http_port));
+    cmd.arg("--http-bind")
+        .arg(format!("0.0.0.0:{}", s.http_port));
     cmd.arg("--stratum-bind")
         .arg(format!("0.0.0.0:{}", s.stratum_port));
     if !s.token.trim().is_empty() {
@@ -161,6 +162,9 @@ mod tests {
             "upstream":"127.0.0.1:8080","token":""}"#;
         let s: PublicPoolSettings = serde_json::from_str(raw).expect("old settings must parse");
         assert_eq!(s.max_conns_per_ip, 128);
-        assert_eq!(s.max_conns_per_ip, PublicPoolSettings::default().max_conns_per_ip);
+        assert_eq!(
+            s.max_conns_per_ip,
+            PublicPoolSettings::default().max_conns_per_ip
+        );
     }
 }

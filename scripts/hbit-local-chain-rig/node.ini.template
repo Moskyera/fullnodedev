@@ -1,0 +1,92 @@
+; ============================================================================
+; HBIT LOCAL CHAIN RIG - fullnode config template
+;
+; Rendered by Run-Rig.ps1, which substitutes the @@...@@ placeholders. Do not
+; run this file directly; run the script.
+;
+; WHAT THIS IS FOR
+; ----------------
+; The HBIT pool refuses to serve work unless the NETWORK target has at least 34
+; leading zero bits (server.rs: MIN_SHARE_FACTOR 18 + MIN_SHARE_COST_BITS 16).
+; A fresh non-mainnet chain starts at 22: off mainnet ASERT anchors at
+; difficulty_adjust_blocks + 2 and its target is the fixed constant
+; ASERT_START_TARGET_NUM = 0xe9cfffff, which is exactly 22 leading zero bits.
+;
+; The lever that closes the gap is each_block_target_time, and NOTHING ELSE.
+; ASERT is an equilibrium controller: it moves the target until a block takes
+; each_block_target_time seconds. So on a private chain the resting difficulty
+; is whatever YOUR hashrate can do in that time:
+;
+;     resting network bits ~= log2(hashrate * each_block_target_time)
+;
+; Pick the target time, and you have picked the difficulty. That is the whole
+; rig. It is a config change only - not one line of consensus code is touched,
+; so mainnet is byte-identical by construction rather than by inspection.
+;
+; CHOOSING each_block_target_time
+; -------------------------------
+;   cargo run --release -p hbit-pool --example testnet_rig_plan -- <MH/s>
+; prints the trade-off table. Higher target time = reaches 34 bits sooner (the
+; chain is further from equilibrium so it climbs harder) but slower blocks once
+; it gets there. 455 is the balance point for ~300 MH/s.
+;
+; USE YOUR repeat=1 HASHRATE. x16rs repeats height/50000 + 1 times (capped at
+; 16), so a private chain below height 50000 runs at repeat=1. On the box this
+; was measured on that is 294.47 MH/s, against 26.07 MH/s at mainnet's
+; repeat=16 - a factor of 11. Using the mainnet figure would put the target
+; time out by more than 3 bits.
+;
+; WHY NOT JUST MINE A NORMAL TESTNET UP
+; -------------------------------------
+; Because blocks cannot arrive faster than one per second. block_build.rs sets
+; nextts = max(now, prev_ts + 1) and chain/src/verify.rs rejects
+; blk_time <= prev_blk_time in a release build (and blk_time > now, so you
+; cannot stamp ahead either). At the documented testnet target time of 10s each
+; block can therefore buy at most 9 seconds of "ahead of schedule", and one bit
+; of difficulty costs 10800 of them: 1200 blocks, 20 minutes, per bit. Twelve
+; bits that way is four hours of wall clock and it stalls long before. Raising
+; the target time raises the per-block budget from 9 seconds to 454.
+; ============================================================================
+
+; Root section. Absolute so it does not resolve against the exe directory.
+data_dir = @@DATA_DIR@@
+
+[node]
+; No peers, ever. This chain must never see mainnet and mainnet must never see
+; it. It is built from genesis locally.
+fast_sync = false
+not_find_nodes = true
+listen = @@P2P_PORT@@
+
+[mint]
+; NOT MAINNET. chain_id != 0 is what selects the non-mainnet difficulty rules
+; (mint/src/config.rs: is_mainnet() is chain_id == 0). It also means difficulty
+; is actually ENFORCED from height 1: block_accept.rs skips the difficulty
+; check below height difficulty_adjust_blocks*200 only when is_mainnet().
+chain_id = 7
+
+; ASERT anchors at difficulty_adjust_blocks + 2 = height 10, and heights 1..9
+; are bootstrap blocks at LOWEST_DIFFICULTY. Small so the climb starts at once.
+; difficulty_adjust_blocks must be divisible by difficulty_group_blocks.
+difficulty_adjust_blocks = 8
+difficulty_group_blocks = 4
+
+; THE ONE NUMBER THAT MATTERS. See above.
+each_block_target_time = @@TARGET_TIME@@
+
+[server]
+enable = true
+listen = @@RPC_PORT@@
+bind = 127.0.0.1
+diamond_form = true
+debug_open = false
+
+[miner]
+; Serves block templates at /query/miner/pending and accepts solutions at
+; /query/miner/success. The node does not hash; poworker does.
+enable = true
+reward = @@REWARD_ADDRESS@@
+message = hbit_rig
+
+[diamondminer]
+enable = false

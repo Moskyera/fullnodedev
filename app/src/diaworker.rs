@@ -478,7 +478,12 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
                             return;
                         }
                         guard_mining_iteration("diamond mining worker", || {
-                            run_diamond_worker_thread(&cnf2, thrid, rstx.clone(), &stop_flag_worker);
+                            run_diamond_worker_thread(
+                                &cnf2,
+                                thrid,
+                                rstx.clone(),
+                                &stop_flag_worker,
+                            );
                         });
                         delay_continue_ms!(9);
                     }

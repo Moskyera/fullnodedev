@@ -244,8 +244,7 @@ struct PoolJson {
 
 /// Neutral replacement for a note that promised something the panel cannot
 /// check.
-pub const UNVERIFIED_TERMS_NOTE: &str =
-    "Payout terms are not verified by this panel. The dashboard shows the pool's own terms once you connect.";
+pub const UNVERIFIED_TERMS_NOTE: &str = "Payout terms are not verified by this panel. The dashboard shows the pool's own terms once you connect.";
 
 /// Refuse to repeat a payout claim about a service the panel has never checked.
 /// `pools.json` is an unsigned data file that anyone can drop next to the exe,

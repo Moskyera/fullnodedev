@@ -1,0 +1,55 @@
+; ============================================================================
+; HBIT LOCAL CHAIN RIG - poworker (GPU) config template
+;
+; Rendered by Run-Rig.ps1. Do not run this file directly.
+;
+; This is the miner that drives the chain up. It polls the node for a template,
+; hashes on the GPU and posts solutions back. The node itself never hashes.
+;
+; poworker MUST be built with the ocl feature or it refuses to start:
+;   cargo build --release --features ocl --bin poworker
+; ============================================================================
+
+connect = @@RPC_HOST_PORT@@
+supervene = 4
+nonce_max = 4294967295
+
+; How long the worker will sit on one template before asking for a fresh one.
+; Kept short: during the cheap part of the climb the chain advances a block
+; every second, and a worker holding a stale template is a worker not
+; contributing to the climb.
+notice_wait = 5
+
+[efficiency]
+mode = profit
+power_cost_kwh = 0
+gpu_watts = 0
+cpu_watts_per_thread = 8
+hac_price = 0
+; Fixed, not adaptive: the point of this rig is a REPRODUCIBLE hashrate, and a
+; supervene that drifts makes the measured climb time unreproducible.
+dynamic_supervene = false
+supervene_min = 4
+supervene_max = 4
+oom_fallback = true
+max_temp_c = 0
+throttle_work_groups = 1024
+thermal_file =
+idle_start_hour = 255
+idle_end_hour = 255
+pause_if_unprofitable = false
+benchmark_seconds = 0
+stats_file = @@STATS_FILE@@
+
+[gpu]
+use_opencl = true
+use_cuda = false
+cpu_assist = true
+gpu_profile = amd_profit
+platform_id = 0
+device_ids = 0
+opencl_dir = @@OPENCL_DIR@@
+work_groups = 64
+local_size = 256
+unit_size = 64
+debug = 0

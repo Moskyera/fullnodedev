@@ -136,10 +136,7 @@ impl JobHub {
     }
 
     pub fn current(&self) -> Option<MiningJob> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The current job only while it is younger than `ttl`; None once upstream
@@ -188,7 +185,11 @@ mod tests {
         hub.update(100, json!({"height": 100, "block_intro": "aa"}));
         let j = hub.current().unwrap();
         assert_eq!(j.height, 100);
-        assert!(j.job_id.starts_with("h100_"), "unexpected job_id {}", j.job_id);
+        assert!(
+            j.job_id.starts_with("h100_"),
+            "unexpected job_id {}",
+            j.job_id
+        );
         let first = j.job_id;
         // Same height, different intro -> new job_id (same-height reorg).
         hub.update(100, json!({"height": 100, "block_intro": "bb"}));

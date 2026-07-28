@@ -13,12 +13,12 @@ use crate::efficiency::*;
 use crate::hash_util::{hash_left_zero_pad3, hash_more_power};
 // The panic firewall is shared with the diamond (HACD) worker, which has exactly
 // the same "one result thread owns every submission" shape.
-use crate::mining_guard::guard_mining_iteration;
 #[cfg(feature = "cuda")]
 use crate::mining_batch::CudaBlockBackend;
 #[cfg(feature = "ocl")]
 use crate::mining_batch::OpenclBlockBackend;
 use crate::mining_batch::{BatchCtx, BlockMinerBackend, CpuBlockBackend};
+use crate::mining_guard::guard_mining_iteration;
 
 use basis::difficulty::*;
 use basis::interface::*;
@@ -1434,15 +1434,8 @@ fn backend_nonce_space(_cnf: &PoWorkConf, backend: &MinerBackend) -> u32 {
             // Match run_batch: the planned window must reflect the same effective
             // work-groups (OOM/error backoff) and thermal cap the batch will use,
             // otherwise the nonce accounting overstates what the GPU covered.
-            let thermal = _cnf
-                .runtime
-                .thermal_workgroups_cap()
-                .unwrap_or(u32::MAX);
-            let wg = res
-                .effective_wg()
-                .min(_cnf.workgroups)
-                .min(thermal)
-                .max(1);
+            let thermal = _cnf.runtime.thermal_workgroups_cap().unwrap_or(u32::MAX);
+            let wg = res.effective_wg().min(_cnf.workgroups).min(thermal).max(1);
             wg.saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
                 .saturating_mul(res.unit_size)
                 .max(1)

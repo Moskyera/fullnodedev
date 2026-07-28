@@ -1255,7 +1255,9 @@ mod tests {
         assert_eq!(upstream_stale_reason(&serde_json::json!({})), None);
         assert_eq!(upstream_stale_reason(&serde_json::json!({"err": ""})), None);
         assert_eq!(
-            upstream_stale_reason(&serde_json::json!({"err": "no job yet; wait for upstream fullnode"})),
+            upstream_stale_reason(
+                &serde_json::json!({"err": "no job yet; wait for upstream fullnode"})
+            ),
             None
         );
         assert_eq!(upstream_stale_reason(&serde_json::json!({"err": 7})), None);

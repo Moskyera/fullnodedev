@@ -278,7 +278,10 @@ impl Strings {
     /// "<amount>, paid <age> ago". The whole sentence is per language so each
     /// locale can put the time where its grammar wants it.
     pub fn pool_pay_last_display(&self, amount: &str, age: &str) -> String {
-        apply_format_template(self.pool_pay_last_line, &[amount.to_string(), age.to_string()])
+        apply_format_template(
+            self.pool_pay_last_line,
+            &[amount.to_string(), age.to_string()],
+        )
     }
 
     pub fn pool_pay_checked_display(&self, age: &str) -> String {
@@ -1694,7 +1697,8 @@ mod tests {
                 lang.code()
             );
             assert_ne!(
-                msg, s.bid_password_required,
+                msg,
+                s.bid_password_required,
                 "{} must not reuse the blank password message",
                 lang.code()
             );

@@ -68,10 +68,98 @@ pub fn find_value<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// The recipient's "hacash" balance string (e.g. "1:248"), or "" if none.
-pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> String {
-    let j = get_json(client, &format!("{base}/query/balance?address={addr}"));
-    find_str(&j, "hacash").unwrap_or_default()
+/// What the node said when it was asked for an address's balance.
+///
+/// Three states, not two. This used to be a bare `String` that folded every
+/// failure into "", which `balance_units` then valued as a confident zero. A
+/// node that was down, restarting, or answering with its own error object read
+/// exactly like a wallet holding nothing: settlement published "matured = 0" and
+/// flagged it CURRENT, so every miner polling `/earnings` was told it was owed
+/// nothing for as long as the outage lasted, and the template loop re-poisoned
+/// the same figure every 30 seconds. Miners whose shares rolled out of the PPLNS
+/// window during the outage were never paid for that work.
+///
+/// A wallet holding nothing is NOT this state: the node always emits the
+/// `hacash` field and renders an empty wallet as "0:0", which is
+/// [`Reported`](BalanceAnswer::Reported) and values as a real zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalanceAnswer {
+    /// The node gave a balance string for the address, e.g. "1:248" or "0:0".
+    Reported(String),
+    /// The node answered, but not with a balance: its own `{"ret":1,...}` error
+    /// object, or a body carrying no `hacash` field at all.
+    Refused(String),
+    /// Nothing usable came back: connection refused, a timeout, a proxy's error
+    /// page. The wallet is UNKNOWN, not empty.
+    NoAnswer(String),
+}
+
+impl BalanceAnswer {
+    /// The balance in whole units of 0.1 HAC, or `None` when the pool must not
+    /// act on this answer at all. Anything but a reported balance is `None`:
+    /// callers already treat `None` as "skip this cycle, keep the last good
+    /// figure and mark it stale", which is exactly right for a silent node.
+    pub fn units(&self) -> Option<u64> {
+        match self {
+            BalanceAnswer::Reported(s) => balance_units(s),
+            BalanceAnswer::Refused(_) | BalanceAnswer::NoAnswer(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for BalanceAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BalanceAnswer::Reported(s) => write!(f, "{s}"),
+            BalanceAnswer::Refused(s) => write!(f, "the node refused to report a balance: {s}"),
+            BalanceAnswer::NoAnswer(s) => write!(f, "no answer from the node: {s}"),
+        }
+    }
+}
+
+/// How much of an unusable answer goes into a log line. A non-JSON body can be a
+/// whole HTML error page, and a log that scrolls the real message away is a log
+/// nobody can read during the outage it is describing.
+const ANSWER_EXCERPT_CHARS: usize = 200;
+
+/// Truncate on a CHARACTER boundary: this text comes off the wire and slicing it
+/// by bytes would panic the caller on any multi-byte error message.
+fn excerpt(s: &str) -> String {
+    s.chars().take(ANSWER_EXCERPT_CHARS).collect()
+}
+
+/// Classify a `/query/balance` response. Fails SAFE: only an answer that really
+/// carries a balance becomes [`BalanceAnswer::Reported`], and everything else is
+/// a state the caller must refuse to pay on.
+pub fn balance_answer(j: &Value) -> BalanceAnswer {
+    // get_json encodes a transport failure as {"http_error": "..."} and a
+    // non-JSON body as a bare string. Neither is the node speaking.
+    if let Some(e) = j.get("http_error").and_then(|v| v.as_str()) {
+        return BalanceAnswer::NoAnswer(excerpt(e));
+    }
+    if !j.is_object() {
+        return BalanceAnswer::NoAnswer(excerpt(&j.to_string()));
+    }
+    // The node answered, and its answer is "no": a bad address, too many
+    // addresses, an unreadable state. There is no balance in it to pay on.
+    if find_u64(j, "ret").is_some_and(|r| r != 0) {
+        return BalanceAnswer::Refused(excerpt(&j.to_string()));
+    }
+    match find_str(j, "hacash") {
+        Some(s) if !s.trim().is_empty() => BalanceAnswer::Reported(s),
+        // ret=0 with no `hacash` is a shape this pool does not recognise. The
+        // node always emits the field, so its absence means we are not talking
+        // to one - never that the wallet is empty.
+        _ => BalanceAnswer::Refused(excerpt(&j.to_string())),
+    }
+}
+
+/// The address's "hacash" balance as the node reported it, or why it did not.
+pub fn balance(client: &reqwest::blocking::Client, base: &str, addr: &str) -> BalanceAnswer {
+    balance_answer(&get_json(
+        client,
+        &format!("{base}/query/balance?address={addr}"),
+    ))
 }
 
 /// The largest balance the pool will act on, in units of 0.1 HAC. Hacash's whole
@@ -92,12 +180,15 @@ pub const MAX_PLAUSIBLE_UNITS: u64 = 1_000_000_000_000;
 /// larger than any real wallet: the caller must SKIP settlement rather than pay
 /// out on it. Saturating to u64::MAX here (as this used to) means "infinite
 /// money" to `distributable_units` and `split_payout`, which then plan a payout
-/// of the whole u64 range off one malformed response. An EMPTY string is not an
-/// error: the node simply omits the field for an address holding nothing.
+/// of the whole u64 range off one malformed response.
+///
+/// An EMPTY string is one of those refusals, and it is the important one. The
+/// node always emits the `hacash` field and renders a wallet holding nothing as
+/// "0:0", so "" is never something it reported: it is what the old reader
+/// produced when there was no answer at all. Valuing it as `Some(0)` told the
+/// settlement that a wallet it could not see was empty, and told every miner
+/// polling `/earnings` that it was owed nothing for the length of the outage.
 pub fn balance_units(bal: &str) -> Option<u64> {
-    if bal.trim().is_empty() {
-        return Some(0);
-    }
     let (m, u) = bal.split_once(':')?;
     let (Ok(m), Ok(u)) = (m.trim().parse::<u64>(), u.trim().parse::<i64>()) else {
         return None;
@@ -118,11 +209,202 @@ pub fn balance_units(bal: &str) -> Option<u64> {
     (units <= MAX_PLAUSIBLE_UNITS).then_some(units)
 }
 
-/// The coinbase subsidy of the block at `height`, in units of 0.1 HAC. The pool
-/// mines coinbase-only blocks, so this is the entire income a found block brings
-/// into the wallet (`block_reward` is a whole number of HAC = unit 248).
+/// The coinbase subsidy of the block at `height`, in units of 0.1 HAC
+/// (`block_reward` is a whole number of HAC = unit 248).
+///
+/// This is NOT the whole income a found block brings in. The pool packs the
+/// node's transactions, and the chain credits the sum of their fees to the
+/// coinbase address as well - the same wallet the pool settles from. See
+/// [`block_fees`] for that half of it.
 pub fn block_reward_units(height: u64) -> u64 {
     mint::genesis::block_reward_number(height) as u64 * 10
+}
+
+/// Fine steps in one payout unit of 0.1 HAC; one step is 10^-9 HAC.
+///
+/// A transaction fee is routinely a thousandth of a payout unit, so a block's
+/// fees are summed on this finer scale and rounded up to whole units only once,
+/// at the end. Rounding each fee up on its own would hold back a whole unit per
+/// transaction and freeze real money for a whole maturity window.
+const FEE_FINE_PER_UNIT: u128 = 100_000_000;
+
+/// The largest fee total this pool will believe, on the fine scale. Past the
+/// whole coin supply the answer is corrupt or hostile, not a rich block, and
+/// turning it into a hold-back would stop every payout the pool ever makes.
+const MAX_FEE_FINE: u128 = MAX_PLAUSIBLE_UNITS as u128 * FEE_FINE_PER_UNIT;
+
+/// A node "mantissa:unit" amount on the fine scale, ROUNDED UP.
+///
+/// Rounds UP because this number becomes money the pool refuses to pay out yet.
+/// Rounding a fee down to nothing is exactly how the fee ends up distributed at
+/// zero confirmations, which is the failure this exists to stop.
+///
+/// `None` is "this is not an amount I can value" - a negative mantissa, a
+/// missing separator, an exponent no wallet could hold - and the caller must
+/// then refuse to settle rather than read it as a zero fee.
+pub fn fin_fine_ceil(amount: &str) -> Option<u128> {
+    let (m, u) = amount.split_once(':')?;
+    let (Ok(m), Ok(u)) = (m.trim().parse::<u128>(), u.trim().parse::<i64>()) else {
+        return None;
+    };
+    if !(0..=255).contains(&u) {
+        return None; // the chain's unit is a u8; anything else is not its answer
+    }
+    if m == 0 {
+        return Some(0); // a real zero, at any unit
+    }
+    // value = m * 10^(u-248) HAC, and one fine step is 10^-9 HAC.
+    let exp = u - 239;
+    let fine = if exp >= 0 {
+        let scale = u32::try_from(exp)
+            .ok()
+            .and_then(|e| 10u128.checked_pow(e))?;
+        m.checked_mul(scale)?
+    } else {
+        match u32::try_from(-exp).ok().and_then(|e| 10u128.checked_pow(e)) {
+            Some(d) => m.div_ceil(d),
+            // Finer than a fine step by more orders of magnitude than a u128 can
+            // express. It is still money, so it still counts as one step.
+            None => 1,
+        }
+    };
+    (fine <= MAX_FEE_FINE).then_some(fine)
+}
+
+/// Fine steps as whole payout units of 0.1 HAC, rounded UP.
+///
+/// The wallet balance the pool settles against is itself floored to whole units,
+/// and a fee that straddles a unit boundary can push that floor up by one. The
+/// ceiling is what makes the hold-back cover that case instead of leaving one
+/// unit payable out of income a reorg can still revoke.
+pub fn fine_to_units_ceil(fine: u128) -> u64 {
+    fine.div_ceil(FEE_FINE_PER_UNIT)
+        .min(MAX_PLAUSIBLE_UNITS as u128) as u64
+}
+
+/// What the node says about the transaction fees one of OUR blocks credited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockFees {
+    /// The chain holds our block at that height, and it credited this much fee
+    /// income to the pool wallet, in units of 0.1 HAC rounded up.
+    Counted(u64),
+    /// The node answered, and the chain does NOT hold our block at that height.
+    /// It credited nothing there - no subsidy and no fee - so there is no fee
+    /// income to hold back.
+    NotOnChain,
+    /// No usable answer. This is NOT a zero fee: the wallet may be holding fee
+    /// income the pool cannot value, so the caller must refuse to settle.
+    Unknown(String),
+}
+
+/// Which transactions the chain says are in our block, or why it cannot say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockTxs {
+    /// The chain holds OUR block at that height, and these are the hashes of the
+    /// transactions in it. The coinbase is not among them: it pays no fee.
+    Ours(Vec<String>),
+    /// The node answered, and the chain does not hold our block there.
+    NotOnChain,
+    /// No usable answer.
+    Unknown(String),
+}
+
+/// Read a `/query/block/intro?tx_hash_list=true` answer for one of OUR blocks.
+///
+/// Split out from [`block_fees`] so the decision - price it, ignore it, or stop
+/// settling - is testable without a node. Fails SAFE: only an answer that really
+/// carries our block's transaction list is [`BlockTxs::Ours`].
+pub fn block_txs_of(j: &Value, our_hash_hex: &str) -> BlockTxs {
+    // get_json encodes a transport failure as {"http_error": "..."} and a
+    // non-JSON body as a bare string. Neither is the node speaking.
+    if !j.is_object() || j.get("http_error").is_some() {
+        return BlockTxs::Unknown(excerpt(&j.to_string()));
+    }
+    let Some(ret) = find_u64(j, "ret") else {
+        return BlockTxs::Unknown(excerpt(&j.to_string()));
+    };
+    if ret != 0 {
+        // The node is up and has no block at that height: ours was refused, or
+        // has not been inserted yet. Either way it has credited nothing.
+        return BlockTxs::NotOnChain;
+    }
+    let Some(hash) = find_str(j, "hash") else {
+        return BlockTxs::Unknown(excerpt(&j.to_string()));
+    };
+    if !hash.eq_ignore_ascii_case(our_hash_hex) {
+        return BlockTxs::NotOnChain; // another block won that height
+    }
+    // ret=0 for our block but no list at all is an answer this pool does not
+    // recognise - never "the block had no transactions". A node that quietly
+    // dropped the field would otherwise read as a zero fee on every block.
+    let Some(list) = find_value(j, "tx_hash_list").and_then(|v| v.as_array()) else {
+        return BlockTxs::Unknown(excerpt(&j.to_string()));
+    };
+    match list
+        .iter()
+        .map(|h| h.as_str().map(|s| s.to_string()))
+        .collect::<Option<Vec<String>>>()
+    {
+        Some(hs) => BlockTxs::Ours(hs),
+        None => BlockTxs::Unknown(excerpt(&j.to_string())),
+    }
+}
+
+/// The `fee_got` in an answer to `/query/transaction`, on the fine scale.
+///
+/// `fee_got` and not `fee`: what the chain adds to the coinbase address is the
+/// fee the transaction actually PAID for its place in the block, which a
+/// fee-raise or a gas refund can make smaller than the fee it declared.
+pub fn fee_got_fine(j: &Value) -> Option<u128> {
+    if !j.is_object() || j.get("http_error").is_some() {
+        return None;
+    }
+    if find_u64(j, "ret") != Some(0) {
+        return None;
+    }
+    fin_fine_ceil(&find_str(j, "fee_got")?)
+}
+
+/// What the chain credited the pool wallet in TRANSACTION FEES for our block at
+/// `height`, in units of 0.1 HAC rounded up.
+///
+/// The figure cannot be taken from the block the pool built: its transaction
+/// bodies are raw bytes the pool deliberately has no codec for, and
+/// `/submit/block` answers only `{"ok":true}`. So it is read back off the node
+/// once the block exists, one `/query/transaction` per packed transaction.
+///
+/// Answers `Unknown` on anything short of a definitive reply, because the caller
+/// turns that into "settle nothing this cycle". The alternative - treating an
+/// unreachable node as a zero fee - pays that fee income out at zero
+/// confirmations, and an orphan then leaves the operator funding a payout out of
+/// a block the chain no longer has.
+pub fn block_fees(
+    client: &reqwest::blocking::Client,
+    node: &str,
+    height: u64,
+    our_hash_hex: &str,
+) -> BlockFees {
+    let j = get_json(
+        client,
+        &format!("{node}/query/block/intro?height={height}&tx_hash_list=true"),
+    );
+    let hashes = match block_txs_of(&j, our_hash_hex) {
+        BlockTxs::Ours(hs) => hs,
+        BlockTxs::NotOnChain => return BlockFees::NotOnChain,
+        BlockTxs::Unknown(why) => return BlockFees::Unknown(why),
+    };
+    let mut fine: u128 = 0;
+    for h in &hashes {
+        let t = get_json(client, &format!("{node}/query/transaction?hash={h}"));
+        let Some(f) = fee_got_fine(&t) else {
+            return BlockFees::Unknown(format!("transaction {h}: {}", excerpt(&t.to_string())));
+        };
+        fine = fine.saturating_add(f);
+        if fine > MAX_FEE_FINE {
+            return BlockFees::Unknown(format!("fees at height {height} exceed any real block"));
+        }
+    }
+    BlockFees::Counted(fine_to_units_ceil(fine))
 }
 
 /// How deep a payout transaction must be buried before the pool stops tracking
@@ -227,11 +509,7 @@ pub fn admission_of(j: &Value) -> Admission {
 /// Ask the node whether it really holds `txhash`, retrying while it has not made
 /// up its mind. The insert runs on a background task, so an immediate "not
 /// found" only becomes a verdict once the node has had time to do it.
-pub fn verify_admitted(
-    client: &reqwest::blocking::Client,
-    node: &str,
-    txhash: &str,
-) -> Admission {
+pub fn verify_admitted(client: &reqwest::blocking::Client, node: &str, txhash: &str) -> Admission {
     let mut last = Admission::Unresolved;
     for attempt in 0..ADMIT_POLL_TRIES {
         let j = get_json(client, &format!("{node}/query/transaction?hash={txhash}"));
@@ -250,10 +528,14 @@ pub fn verify_admitted(
 /// reorg could still take back, MINUS the fee reserve. `None` means "nothing
 /// spendable, do not settle this cycle".
 ///
-/// `immature_units` is the coinbase of blocks the pool found that are not yet
-/// buried deep enough to be final. Distributing that and then losing the block
-/// to a reorg is an unrecoverable operator loss: the income disappears from the
-/// canonical chain while the payout transaction that spent it stays valid.
+/// `immature_units` is the WHOLE income of blocks the pool found that are not
+/// yet buried deep enough to be final. Whole, because the chain credits the
+/// coinbase address both the subsidy and the sum of the fees of every
+/// transaction in the block, and this pool packs the node's transactions: a
+/// hold-back of the subsidy alone leaves the fees payable here. Distributing
+/// either and then losing the block to a reorg is an unrecoverable operator
+/// loss: the income disappears from the canonical chain while the payout
+/// transaction that spent it stays valid.
 ///
 /// All arithmetic saturates, so an out-of-range reserve can never wrap the
 /// guard open the way `reserve + 1` used to.
@@ -271,7 +553,8 @@ pub fn distributable_units(
 
 /// Atomic file write (temp + optional fsync + rename) so a crash or a full disk
 /// mid-write can never leave a truncated or corrupt file behind. `durable`
-/// fsyncs before the rename.
+/// fsyncs the bytes before the rename and the directory after it, and FAILS if
+/// either fsync fails.
 pub fn atomic_write(path: &str, body: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = format!("{path}.tmp.{}", std::process::id());
@@ -279,10 +562,53 @@ pub fn atomic_write(path: &str, body: &[u8], durable: bool) -> std::io::Result<(
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(body)?;
         if durable {
-            let _ = f.sync_all();
+            // This used to be `let _ = f.sync_all()`. `durable` is the promise
+            // the settlement path broadcasts a payout on, and a discarded error
+            // here answers "recorded" for bytes that only ever reached the page
+            // cache - a full disk, an I/O error, or a network mount that went
+            // away all report themselves at flush time and nowhere else. Lose
+            // power in the seconds that follow and the pool restarts with no
+            // memory of the transaction it signed, so the next cycle signs a
+            // SECOND payout for the same PPLNS window and the operator funds
+            // the difference out of their own wallet.
+            f.sync_all()?;
         }
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    if durable {
+        // The bytes can be on the platter while the directory entry pointing at
+        // them is not: the rename is its own metadata change and is lost on its
+        // own. That leaves the PREVIOUS state file in place - the one without
+        // the payout hash or without the immature hold-back - which costs
+        // exactly what the paragraph above costs.
+        fsync_parent_dir(path)?;
+    }
+    Ok(())
+}
+
+/// fsync the directory that holds `path`, so a rename into it survives a power
+/// cut rather than only the bytes it points at.
+///
+/// A bare filename (a relative `wallet_file` in the config) has no directory
+/// component and must fall back to the working directory: treating that as a
+/// failure would make every durable write fail and stop the pool paying anyone.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &str) -> std::io::Result<()> {
+    let dir = match std::path::Path::new(path).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Windows has no directory fsync: a directory handle cannot be opened for
+/// `FlushFileBuffers`, so there is nothing to call and the durability of the
+/// rename is NTFS's own metadata journal. Reporting that as a failure would
+/// refuse every settlement the pool ever tried, which is worse than the gap it
+/// would be reporting. The data fsync above still holds on this platform.
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The pool's accounting file for `wallet_file`. The auto-settle server and the
@@ -317,13 +643,100 @@ pub fn load_pending_payout_txs(state_file: &str) -> Vec<String> {
 /// Rolling PPLNS window: the last N accepted shares decide the payout split.
 pub const PPLNS_WINDOW: usize = 4096;
 
-/// Rebuild the PPLNS share counts from the pool's own accounting file.
+/// How long a share may go on earning credit, and how long the credit an evicted
+/// share already earned survives, expressed in settlement intervals.
+///
+/// One interval is the unit that matters because that is the longest a miner can
+/// usefully sit on shares: the pool pins a template for a block interval, and it
+/// publishes the settlement interval in `/terms`. Anything shorter would let a
+/// hoarder time its dump; much longer and the split stops tracking who is mining
+/// now.
+const PPLNS_HORIZON_INTERVALS: u64 = 1;
+
+/// The documented default settlement interval. `hbit-pool-server`'s `usage()`
+/// quotes it and `hbit-pool-payout` falls back to it when it has to read an
+/// accounting file that does not record the interval the server was running.
+pub const DEFAULT_SETTLE_SECS: u64 = 300;
+
+/// The credit horizon in milliseconds for a pool settling every `settle_secs`.
+pub fn pplns_horizon_ms(settle_secs: u64) -> u64 {
+    settle_secs
+        .saturating_mul(PPLNS_HORIZON_INTERVALS)
+        .saturating_mul(1_000)
+        .max(1_000)
+}
+
+/// Read the persisted share window, accepting BOTH the timestamped form this
+/// pool writes now and the bare list of worker ids older builds wrote.
+///
+/// An older file carries no arrival times at all. Every share in it is given the
+/// SAME stamp, `fallback_ms`, because that is the only assumption that treats
+/// every miner alike: credit is proportional, so one common start time preserves
+/// the split exactly, while inventing different ages would silently move money
+/// between miners on a restart.
+pub fn parse_share_order(j: &Value, fallback_ms: u64) -> Vec<(String, u64)> {
+    j.get("order")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    if let Some(s) = x.as_str() {
+                        return Some((s.to_string(), fallback_ms));
+                    }
+                    let row = x.as_array()?;
+                    let w = row.first()?.as_str()?.to_string();
+                    let at = row.get(1)?.as_u64().unwrap_or(fallback_ms);
+                    Some((w, at))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the banked credit of shares that have already left the window. Absent in
+/// a file written before shares were timed, which reads as "none banked" rather
+/// than as a corrupt file.
+pub fn parse_banked_credit(j: &Value) -> Vec<(u64, Vec<(String, u64)>)> {
+    j.get("banked")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    let at = x.get("at").and_then(|v| v.as_u64())?;
+                    let rows = x
+                        .get("rows")
+                        .and_then(|v| v.as_array())
+                        .map(|r| {
+                            r.iter()
+                                .filter_map(|e| {
+                                    let row = e.as_array()?;
+                                    Some((
+                                        row.first()?.as_str()?.to_string(),
+                                        row.get(1)?.as_u64()?,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some((at, rows))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rebuild the PPLNS payout credit from the pool's own accounting file.
 ///
 /// The manual payout tool needs this because the server holds the wallet's
 /// settlement lock for its whole run: if the tool is able to settle at all then
 /// the server is stopped, so its `/stats` endpoint cannot answer and the file it
 /// left behind is the authority on who is owed what.
-pub fn load_pplns_counts(state_file: &str) -> Vec<(String, u64)> {
+///
+/// It returns CREDIT, not share counts, for the same reason the server settles on
+/// credit: a headcount taken at the instant of a payout is a number one miner can
+/// own outright by dumping a window's worth of withheld shares, and this tool
+/// signs the same money.
+pub fn load_pplns_credit(state_file: &str) -> Vec<(String, u64)> {
     let Some(j) = read_state_json(state_file) else {
         return Vec::new();
     };
@@ -331,36 +744,119 @@ pub fn load_pplns_counts(state_file: &str) -> Vec<(String, u64)> {
         .get("window")
         .and_then(|v| v.as_u64())
         .unwrap_or(PPLNS_WINDOW as u64) as usize;
-    let order: Vec<String> = j
-        .get("order")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if order.is_empty() {
+    // The horizon the SERVER was running, so the manual tool splits money the
+    // same way the automatic settlement would have.
+    let horizon = j
+        .get("credit_horizon_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|h| *h > 0)
+        .unwrap_or_else(|| pplns_horizon_ms(DEFAULT_SETTLE_SECS));
+    let at = credit_anchor_ms(&j, pool_core::now_ms());
+    // A file with no arrival times is read as if every share landed one horizon
+    // before that instant: they are all treated alike, so the split is the one
+    // the old build would have made, and no share reads as newer than it is.
+    let order = parse_share_order(&j, at.saturating_sub(horizon));
+    let banked = parse_banked_credit(&j);
+    if order.is_empty() && banked.is_empty() {
         return Vec::new();
     }
-    pool_core::Pplns::restore(window, order).counts()
+    pool_core::Pplns::restore(window, horizon, order, banked).credit(at)
 }
 
-/// Total held-back (not yet final) block income recorded by the pool server, in
-/// units of 0.1 HAC. The manual payout tool reads it so it applies the SAME
-/// maturity gate as the automatic settlement instead of paying at the tip.
-pub fn load_immature_units(state_file: &str) -> u64 {
+/// The instant a stored share window is worth valuing at: the last moment the
+/// pool that wrote the file was actually accounting.
+///
+/// NOT the wall clock. Credit is residence in the window, and nothing enters or
+/// leaves that window while the server is stopped - which it always is when this
+/// tool runs, because the tool can only get the settlement lock if it is. Valuing
+/// at the wall clock let the whole window age together while nothing happened,
+/// and past one horizon that undoes the fix this file exists to carry: every
+/// share caps at the horizon, so the split flattens back to a HEADCOUNT, and the
+/// banked credit of the miners a dump evicted expires entirely. A miner that
+/// withheld a window's worth and dumped it before the server stopped would then
+/// take the lot - the exact attack, back again, on the settler an operator
+/// reaches for when the server is down. Five minutes between stopping the pool
+/// and running the payout is all it took.
+///
+/// Anchoring here also makes the payout DETERMINISTIC: the same file settles the
+/// same way whether the operator runs the tool immediately or an hour later.
+///
+/// The tool's own clock is deliberately not consulted when the file has times of
+/// its own. Every credit figure is a DIFFERENCE against this instant, so a
+/// consistent anchor taken from the file makes the split independent of what the
+/// machine running the settlement thinks the time is.
+///
+/// Falls back to `now_ms` when the file carries no times at all (a window written
+/// before shares were stamped), because there is nothing to anchor to and the
+/// fallback stamp one horizon back then weighs every share alike, as it must.
+pub fn credit_anchor_ms(j: &Value, now_ms: u64) -> u64 {
+    let newest_share = j
+        .get("order")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.iter().filter_map(|x| x.as_array()?.get(1)?.as_u64()).max());
+    let newest_bank = j
+        .get("banked")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.iter().filter_map(|x| x.get("at")?.as_u64()).max());
+    newest_share
+        .into_iter()
+        .chain(newest_bank)
+        .max()
+        .unwrap_or(now_ms)
+}
+
+/// One block of not-yet-final income the pool server is holding back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmatureBlock {
+    pub height: u64,
+    /// OUR block's hash at that height, hex. The income is only real while the
+    /// chain still holds this hash there.
+    pub hash: String,
+    /// What it put into the pool wallet so far, in units of 0.1 HAC.
+    pub units: u64,
+    /// Are that block's TRANSACTION FEES already inside `units`?
+    ///
+    /// False means `units` is the coinbase subsidy alone, and the block's fees -
+    /// which the chain credits to the very same wallet - are still sitting in
+    /// the balance unaccounted for. Paying against that balance hands those fees
+    /// out at zero confirmations.
+    pub fees_counted: bool,
+}
+
+/// Every block of not-yet-final income the pool server recorded. The manual
+/// payout tool reads it so it applies the SAME maturity gate as the automatic
+/// settlement instead of paying at the tip.
+///
+/// `fees_counted` defaults to FALSE when the field is absent, because a file
+/// written by a build that held back only the subsidy really does carry the
+/// subsidy alone. Defaulting the other way would silently distribute those
+/// blocks' fees on the first settlement after an upgrade.
+pub fn load_immature_blocks(state_file: &str) -> Vec<ImmatureBlock> {
     let Some(j) = read_state_json(state_file) else {
-        return 0;
+        return Vec::new();
     };
     j.get("immature")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|x| x.get("units").and_then(|v| v.as_u64()))
-                .sum()
+                .filter_map(|x| {
+                    Some(ImmatureBlock {
+                        height: x.get("height").and_then(|v| v.as_u64())?,
+                        hash: x
+                            .get("hash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        units: x.get("units").and_then(|v| v.as_u64())?,
+                        fees_counted: x
+                            .get("fees_counted")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
         })
-        .unwrap_or(0)
+        .unwrap_or_default()
 }
 
 /// Replace `settle_pending_txs` in the pool state file, preserving every other
@@ -436,6 +932,17 @@ pub struct PayoutRecord {
     /// submitted but the node's verdict could not be read: it may well be in
     /// flight, so it stays tracked, but nothing about it is claimed.
     pub node_holds: bool,
+    /// The exact signed bytes that were submitted, hex-encoded.
+    ///
+    /// Kept because a node that once HELD this transaction also relayed it, and
+    /// the mempool is memory-only: a routine node restart empties it, and the
+    /// pool then asks about a hash the node no longer knows. Re-splitting and
+    /// re-signing that window makes a DIFFERENT transaction (fresh timestamp,
+    /// so a different hash); replay protection on this chain is by hash alone,
+    /// so both can be mined and the operator pays the same miners twice out of
+    /// its own wallet. With the bytes here the pool re-broadcasts the identical
+    /// transaction, which can only ever be included once.
+    pub body_hex: String,
     /// (worker address, units of 0.1 HAC) exactly as the transaction pays them.
     pub rows: Vec<(String, u64)>,
 }
@@ -443,7 +950,10 @@ pub struct PayoutRecord {
 impl PayoutRecord {
     /// Total this transaction pays, in units of 0.1 HAC.
     pub fn units(&self) -> u64 {
-        self.rows.iter().map(|(_, u)| *u).fold(0u64, |a, b| a.saturating_add(b))
+        self.rows
+            .iter()
+            .map(|(_, u)| *u)
+            .fold(0u64, |a, b| a.saturating_add(b))
     }
 
     /// What this transaction pays ONE worker.
@@ -460,6 +970,7 @@ impl PayoutRecord {
             "hash": self.hash,
             "at": self.at,
             "node_holds": self.node_holds,
+            "body_hex": self.body_hex,
             "rows": self.rows.iter()
                 .map(|(w, u)| serde_json::json!([w, u]))
                 .collect::<Vec<_>>(),
@@ -490,6 +1001,15 @@ impl PayoutRecord {
                 .get("node_holds")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
+            // A record written before the bytes were kept reads as "no bytes",
+            // which `gone_action` treats as un-rebroadcastable rather than as
+            // safe to re-issue. Missing evidence must never become permission
+            // to sign the same window again.
+            body_hex: v
+                .get("body_hex")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
             rows,
         })
     }
@@ -632,6 +1152,232 @@ pub fn drop_payout(records: &mut Vec<PayoutRecord>, hash: &str) -> Option<Payout
     Some(records.remove(i))
 }
 
+/// What to do about a payout the node answers "I do not know that hash" for.
+///
+/// [`PayoutTxState::Gone`] is NOT the same fact as "nothing was paid". The node's
+/// mempool lives in memory, so the very same answer comes back for a transaction
+/// the node validated, accepted, inserted and RELAYED, and then lost to a restart
+/// or an eviction. That transaction is still signed, still valid, and any peer
+/// holding it can still mine it.
+///
+/// Treating that as "nothing was paid" is what costs real money: the pool
+/// re-splits the same window and signs a second transaction with a fresh
+/// timestamp, so a different hash, and this chain's replay protection is by hash
+/// alone. Both confirm, and the operator has paid the same miners twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoneAction {
+    /// Nothing to put back and nothing that could have been relayed: a tracked
+    /// hash with no record behind it, or a record from a build that kept neither
+    /// the bytes nor any sighting of the node holding it. Forget the hash; its
+    /// rows (if there are any) are genuinely still owed.
+    Forget,
+    /// The bytes are still on hand and this transaction's fate is unknown - the
+    /// node held it once, or the pool never got a usable answer about it.
+    /// Re-broadcast the IDENTICAL signed bytes (same hash, so it can only be
+    /// mined once) and keep tracking it. Never re-sign the window.
+    Rebroadcast,
+    /// The node held it, but there are no stored bytes to re-broadcast (a record
+    /// from a build that did not keep them). Keep tracking it and say so: a
+    /// stalled payout the operator can see beats a duplicate payout nobody can
+    /// take back.
+    Stuck,
+}
+
+/// Decide [`GoneAction`] from what the pool recorded about the payout.
+///
+/// The test is whether there are BYTES, not whether `node_holds` was ever set.
+///
+/// `node_holds` is set only when [`verify_admitted`] came back `Held`, and the
+/// two answers that leave it false are exactly the two where relay cannot be
+/// ruled out: a submit that timed out ([`SubmitVerdict::Unresolved`]) and a
+/// verification that could not be read ([`Admission::Unresolved`]). In both the
+/// bytes went onto the wire, and the node may have validated, inserted and
+/// relayed them before the answer was lost. Keying on `node_holds` therefore
+/// read "I have no proof it was relayed" as "it was never relayed": the rows went
+/// back on the owed ledger, the next cycle re-split them into a transaction with
+/// a fresh timestamp and so a different hash, and with replay protection by hash
+/// alone BOTH could be mined. That is the double payout this whole enum exists to
+/// prevent, arriving through the pool's own submit path.
+///
+/// A record only ever exists because the pool was about to post those exact
+/// bytes: it is written durably immediately before the post, and the two verdicts
+/// that definitively rule relay out - the node's own validator refusing it, and
+/// `Admission::Missing` - drop the record inline and never reach here. So a
+/// record that still has its bytes is one whose fate is unknown, and the only
+/// safe move is to put the SAME transaction back on the wire. It can be mined
+/// once however many peers hold it, and if it never lands the payout stalls where
+/// an operator can see it rather than being paid twice where nobody can take it
+/// back. Nothing on this chain expires a signed transaction, so a re-broadcast
+/// the node accepts always resolves.
+///
+/// `None` (a tracked hash with no record behind it) has no bytes to re-broadcast
+/// and no rows to owe anyone, so keeping it forever would freeze every later
+/// payout with nothing to show for it.
+pub fn gone_action(rec: Option<&PayoutRecord>) -> GoneAction {
+    match rec {
+        Some(r) if !r.body_hex.is_empty() => GoneAction::Rebroadcast,
+        Some(r) if r.node_holds => GoneAction::Stuck,
+        _ => GoneAction::Forget,
+    }
+}
+
+/// What `/submit/transaction` said about a payout we just posted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitVerdict {
+    /// `ret=0`: the API took the bytes. Still not proof the node holds it - only
+    /// [`verify_admitted`] is that.
+    Accepted,
+    /// The node itself answered with a non-zero `ret`: it refused the
+    /// transaction during synchronous validation, so it never inserted it into
+    /// the mempool and never relayed it.
+    Rejected,
+    /// No verdict at all: [`post_hex`] returns the plain string
+    /// `"http_error: ..."` when the request times out or the connection drops,
+    /// and a timeout happens AFTER the node may have already taken and relayed
+    /// the transaction. Reading that as a rejection and forgetting the hash is
+    /// how a payout gets issued a second time.
+    Unresolved,
+}
+
+/// Classify a `/submit/transaction` response body.
+///
+/// Fails SAFE: anything that is not the node speaking a `ret` we can read is
+/// `Unresolved`, which keeps the payout tracked for the next cycle's poll.
+pub fn submit_verdict(resp: &str) -> SubmitVerdict {
+    let Ok(j) = serde_json::from_str::<Value>(resp) else {
+        return SubmitVerdict::Unresolved; // "http_error: ..." lands here
+    };
+    if j.get("http_error").is_some() {
+        return SubmitVerdict::Unresolved;
+    }
+    match find_u64(&j, "ret") {
+        Some(0) => SubmitVerdict::Accepted,
+        Some(_) => SubmitVerdict::Rejected,
+        None => SubmitVerdict::Unresolved,
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * The owed ledger.
+ *
+ * When a settlement chunk definitively does not happen, the money it carried
+ * does not simply return to the pot: it is owed to the exact miners that chunk
+ * named. Dropping the rows and letting the next cycle re-split the whole balance
+ * over the live PPLNS window hands that money to whoever is mining now -
+ * including the miners whose chunks DID go through, who are then paid twice for
+ * the same window while the miners in the failed chunk are paid once, or never.
+ *
+ * These rows are therefore persisted and paid FIRST, before a single unit of
+ * fresh income is split.
+ * ------------------------------------------------------------------------- */
+
+/// Add the rows of a payout that definitively did not happen to the owed ledger.
+pub fn owe_rows(owed: &mut Vec<(String, u64)>, rows: &[(String, u64)]) {
+    for (w, u) in rows {
+        if *u == 0 {
+            continue;
+        }
+        match owed.iter_mut().find(|(x, _)| x == w) {
+            Some(e) => e.1 = e.1.saturating_add(*u),
+            None => owed.push((w.clone(), *u)),
+        }
+    }
+}
+
+/// Take off the owed ledger what a payout the pool has now RECORDED carries.
+///
+/// Saturating, and only ever downward: a row paying more than is owed (an owed
+/// row and a fresh share to the same miner, merged into one action) clears the
+/// debt and no more.
+pub fn deduct_owed(owed: &mut Vec<(String, u64)>, rows: &[(String, u64)]) {
+    for (w, u) in rows {
+        if let Some(e) = owed.iter_mut().find(|(x, _)| x == w) {
+            e.1 = e.1.saturating_sub(*u);
+        }
+    }
+    owed.retain(|(_, u)| *u > 0);
+}
+
+/// The rows this cycle must pay BEFORE it splits any fresh income, and what is
+/// left to split after them.
+///
+/// Owed rows are taken in order and partially where the balance runs out, so one
+/// large debt cannot starve while smaller ones keep being paid around it. What is
+/// not taken stays on the ledger for the next cycle.
+pub fn take_owed(owed: &[(String, u64)], distributable: u64) -> (Vec<(String, u64)>, u64) {
+    let mut left = distributable;
+    let mut rows: Vec<(String, u64)> = Vec::new();
+    for (w, u) in owed {
+        if left == 0 {
+            break;
+        }
+        let pay = (*u).min(left);
+        if pay == 0 {
+            continue;
+        }
+        left -= pay;
+        rows.push((w.clone(), pay));
+    }
+    (rows, left)
+}
+
+/// Fold rows paying the same address into one action, keeping first-seen order.
+///
+/// An owed row and a fresh share for the same miner would otherwise be two
+/// actions in one transaction, and each action costs against the node's
+/// TX_ACTIONS_MAX limit that `PAYOUT_CHUNK` is sized against.
+pub fn merge_payout_rows(rows: &mut Vec<(String, u64)>) {
+    let mut at: HashMap<String, usize> = HashMap::with_capacity(rows.len());
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(rows.len());
+    for (w, u) in rows.drain(..) {
+        match at.get(&w) {
+            Some(i) => out[*i].1 = out[*i].1.saturating_add(u),
+            None => {
+                at.insert(w.clone(), out.len());
+                out.push((w, u));
+            }
+        }
+    }
+    *rows = out;
+}
+
+/// The owed ledger as it is stored in the pool state file.
+pub fn owed_to_json(owed: &[(String, u64)]) -> Value {
+    Value::Array(
+        owed.iter()
+            .map(|(w, u)| serde_json::json!([w, u]))
+            .collect(),
+    )
+}
+
+/// Read the owed ledger out of an already-parsed state document. A row the file
+/// cannot describe is dropped rather than guessed at: an unreadable amount must
+/// never become a payment.
+pub fn parse_owed(j: &Value) -> Vec<(String, u64)> {
+    j.get("owed")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    let x = r.as_array()?;
+                    let w = x.first()?.as_str()?.to_string();
+                    let u = x.get(1)?.as_u64()?;
+                    (!w.is_empty() && u > 0).then_some((w, u))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The owed ledger. Losing it means the miners in a failed chunk are never paid
+/// for that window, so it is persisted with everything else.
+pub fn load_owed(state_file: &str) -> Vec<(String, u64)> {
+    let Some(j) = read_state_json(state_file) else {
+        return Vec::new();
+    };
+    parse_owed(&j)
+}
+
 /// The per-transaction rows of every payout this pool has in flight.
 pub fn load_payout_records(state_file: &str) -> Vec<PayoutRecord> {
     let Some(j) = read_state_json(state_file) else {
@@ -661,21 +1407,25 @@ pub fn parse_paid_ledger(j: &Value) -> PaidLedger {
     j.get("paid").map(PaidLedger::from_json).unwrap_or_default()
 }
 
-/// Replace the WHOLE settlement ledger (pending hashes, per-transaction rows and
-/// confirmed totals) in the pool state file, preserving every other field.
+/// Replace the WHOLE settlement ledger (pending hashes, per-transaction rows,
+/// what is still owed, and confirmed totals) in the pool state file, preserving
+/// every other field.
 ///
-/// One write, because the three move together: a payout leaves the in-flight
-/// rows at the same instant it enters the paid totals, and a crash between the
-/// two would either lose a payment or count it twice.
+/// One write, because the four move together: a payout leaves the in-flight rows
+/// at the same instant it enters the paid totals, and a chunk that failed leaves
+/// them at the same instant its rows become owed. A crash between any two would
+/// either lose a payment or count it twice.
 pub fn save_settlement_ledger(
     state_file: &str,
     hashes: &[String],
     records: &[PayoutRecord],
+    owed: &[(String, u64)],
     paid: &PaidLedger,
 ) -> std::io::Result<()> {
     let mut j = read_state_json(state_file).unwrap_or_else(|| serde_json::json!({}));
     j["settle_pending_txs"] = serde_json::json!(hashes);
     j["payouts_inflight"] = Value::Array(records.iter().map(|r| r.to_json()).collect());
+    j["owed"] = owed_to_json(owed);
     j["paid"] = paid.to_json();
     atomic_write(state_file, j.to_string().as_bytes(), true)
 }
@@ -903,9 +1653,14 @@ fn encrypt_key_hex(key_hex: &str, pass: &str) -> Result<String, String> {
 }
 
 fn envelope_u32(j: &Value, key: &str, default: u32, max: u32) -> Result<u32, String> {
-    let v = j.get(key).and_then(|v| v.as_u64()).unwrap_or(default as u64);
+    let v = j
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default as u64);
     if v == 0 || v > max as u64 {
-        return Err(format!("its `{key}` is outside the range this build accepts"));
+        return Err(format!(
+            "its `{key}` is outside the range this build accepts"
+        ));
     }
     Ok(v as u32)
 }
@@ -970,14 +1725,23 @@ fn decrypt_key_hex(body: &str, pass: &str) -> Result<Zeroizing<String>, Envelope
     let key = wallet_derive_key(
         pass,
         &salt,
-        envelope_u32(&j, "kdf_m_cost_kb", WALLET_KDF_M_COST_KB, WALLET_KDF_MAX_M_COST_KB)
-            .map_err(EnvelopeError::Shape)?,
+        envelope_u32(
+            &j,
+            "kdf_m_cost_kb",
+            WALLET_KDF_M_COST_KB,
+            WALLET_KDF_MAX_M_COST_KB,
+        )
+        .map_err(EnvelopeError::Shape)?,
         envelope_u32(&j, "kdf_t_cost", WALLET_KDF_T_COST, WALLET_KDF_MAX_T_COST)
             .map_err(EnvelopeError::Shape)?,
         envelope_u32(&j, "kdf_p_cost", WALLET_KDF_P_COST, WALLET_KDF_MAX_P_COST)
             .map_err(EnvelopeError::Shape)?,
     )
-    .map_err(|e| shape(format!("its key-derivation settings cannot be used here ({e})")))?;
+    .map_err(|e| {
+        shape(format!(
+            "its key-derivation settings cannot be used here ({e})"
+        ))
+    })?;
     let cipher = Aes256Gcm::new_from_slice(&*key)
         .map_err(|e| shape(format!("its cipher key could not be set up ({e})")))?;
     // The one check that cannot say WHY it failed.
@@ -1372,7 +2136,9 @@ fn migrate_key_file_to_encrypted(path: &str, key_hex: &str, pass: &str) -> Resul
     match decrypt_key_hex(&body, pass) {
         Ok(back) if back.trim().eq_ignore_ascii_case(key_hex) => {}
         _ => {
-            eprintln!("[wallet] WARNING: the encrypted form of {path} did not verify; leaving it as-is.");
+            eprintln!(
+                "[wallet] WARNING: the encrypted form of {path} did not verify; leaving it as-is."
+            );
             return Ok(());
         }
     }
@@ -1587,7 +2353,9 @@ fn windows_sid_of(principal: &str) -> Option<String> {
 #[cfg(windows)]
 fn windows_verify_owner_only(path: &str, name: &str, sid: &str) -> std::io::Result<()> {
     let unverified = |why: &str| {
-        eprintln!("[wallet] WARNING: could not verify the ACL of {path} ({why}); check it manually.");
+        eprintln!(
+            "[wallet] WARNING: could not verify the ACL of {path} ({why}); check it manually."
+        );
     };
     let Ok(out) = std::process::Command::new("icacls").arg(path).output() else {
         unverified("icacls did not run");
@@ -1701,6 +2469,61 @@ pub struct Template {
     pub txs: Arc<PackedTxs>,
 }
 
+/// The header timestamp a pool has ALREADY handed out for a height, so a restart
+/// can reproduce the same header bytes instead of inventing new ones.
+///
+/// The stamp is `max(now, prev_ts + 1)` at the moment the template is first
+/// fetched, and it lives in the 89-byte header every worker hashes. A pool pins
+/// one template per height, so a restart part-way through a height would
+/// otherwise serve a DIFFERENT header for the SAME height: measured on a rig, a
+/// restart at height 350 served a stamp 68 seconds later than the one already in
+/// flight. `/query/miner/notice` signals only a HEIGHT change, so nothing tells a
+/// worker to reload - it goes on hashing the dead header until its current scan
+/// pass ends, and every share it finds in the meantime is thrown away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StampPin {
+    pub height: u64,
+    pub prevhash: Hash,
+    pub timestamp: u64,
+}
+
+/// The header timestamp to serve for `height` on `prevhash`.
+///
+/// `pin` is honoured ONLY when it describes this exact block and would produce a
+/// header the node still accepts. Both guards cost a whole block reward when they
+/// are wrong: `chain::verify::block_verify` rejects a block whose timestamp is
+/// `<= prev_blk_time` or `> curtimes()`, and a rejected block is reported
+/// asynchronously, so the pool would mine a full round into nothing and only
+/// notice because the tip never reached its height.
+///
+/// The upper guard is `fresh`, not `now`: a pin may never move the stamp FORWARD
+/// past what a fresh fetch would produce, so a stale or tampered state file
+/// cannot talk the pool into mining a future-stamped block. Moving it BACKWARD to
+/// a stamp this pool already served is exactly what a pool that never restarted
+/// would be serving.
+pub fn template_timestamp(
+    pin: Option<&StampPin>,
+    height: u64,
+    prevhash: &Hash,
+    prev_ts: u64,
+    now: u64,
+) -> u64 {
+    let fresh = std::cmp::max(now, prev_ts.saturating_add(1));
+    let Some(pin) = pin else {
+        return fresh;
+    };
+    // A pin from another block says nothing about this one. Height alone is not
+    // enough: after a same-height reorg the parent differs, and the old stamp was
+    // computed against a parent whose timestamp this block no longer follows.
+    if pin.height != height || pin.prevhash != *prevhash {
+        return fresh;
+    }
+    if pin.timestamp <= prev_ts || pin.timestamp > fresh {
+        return fresh;
+    }
+    pin.timestamp
+}
+
 /// Read the chain tip and build a template for the next block, computing the
 /// next difficulty off-node with the same rule the node will validate against.
 ///
@@ -1713,6 +2536,18 @@ pub fn fetch_template(
     coinbase_addr: &str,
     params: &ChainParams,
 ) -> Option<Template> {
+    fetch_template_pinned(client, base, coinbase_addr, params, None)
+}
+
+/// `fetch_template`, reusing an already-served header timestamp when `pin`
+/// describes the block being built. See `template_timestamp`.
+pub fn fetch_template_pinned(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    coinbase_addr: &str,
+    params: &ChainParams,
+    pin: Option<&StampPin>,
+) -> Option<Template> {
     let coinbase = Address::from_readable(coinbase_addr).ok()?;
     let latest = get_json(client, &format!("{base}/query/latest"));
     let prev_hei = find_u64(&latest, "height")?;
@@ -1720,7 +2555,10 @@ pub fn fetch_template(
     let (prevhash, prev_ts, prev_diff) = if prev_hei == 0 {
         (mint::genesis::genesis_block_hash(), 1549250700u64, 0u32)
     } else {
-        let ij = get_json(client, &format!("{base}/query/block/intro?height={prev_hei}"));
+        let ij = get_json(
+            client,
+            &format!("{base}/query/block/intro?height={prev_hei}"),
+        );
         let ph = find_str(&ij, "hash")?;
         (
             Hash::from_hex(ph.as_bytes()).ok()?,
@@ -1728,7 +2566,10 @@ pub fn fetch_template(
             find_u64(&ij, "difficulty")? as u32,
         )
     };
-    let timestamp = std::cmp::max(curtimes(), prev_ts.saturating_add(1));
+    // The stamp is chosen BEFORE the difficulty below, because the difficulty is
+    // computed from it. Reusing a pinned stamp and then recomputing the target
+    // from a fresh one would put two disagreeing numbers in the same header.
+    let timestamp = template_timestamp(pin, height, &prevhash, prev_ts, curtimes());
     // ASERT anchors on the activation block's timestamp; only needed above it.
     let anchor_time = if params.needs_anchor(height) {
         let aj = get_json(
@@ -1777,16 +2618,14 @@ pub fn mrkl_modify_len_for(n: usize) -> usize {
 /// Returns `Err` with an operator-readable reason on ANY doubt. The caller then
 /// mines a coinbase-only block, which is always valid, rather than gambling a
 /// whole block reward on a transaction set that may not belong to this height.
-pub fn parse_node_packed_txs(
-    j: &Value,
-    height: u64,
-    prevhash: &Hash,
-) -> Result<PackedTxs, String> {
+pub fn parse_node_packed_txs(j: &Value, height: u64, prevhash: &Hash) -> Result<PackedTxs, String> {
     if find_u64(j, "ret") != Some(0) {
         let err = find_str(j, "err")
             .or_else(|| find_str(j, "http_error"))
             .unwrap_or_else(|| j.to_string());
-        return Err(format!("the node would not serve its pending block ({err})"));
+        return Err(format!(
+            "the node would not serve its pending block ({err})"
+        ));
     }
     let Some(node_hei) = find_u64(j, "height") else {
         return Err("the node's pending block carries no height".to_string());
@@ -1812,7 +2651,8 @@ pub fn parse_node_packed_txs(
             prevhash.to_hex()
         ));
     }
-    let Some(bodies_json) = find_value(j, "transaction_body_list").and_then(|v| v.as_array()) else {
+    let Some(bodies_json) = find_value(j, "transaction_body_list").and_then(|v| v.as_array())
+    else {
         return Err("the node's pending block carries no transaction_body_list".to_string());
     };
     let Some(mkrl_json) = find_value(j, "mkrl_modify_list").and_then(|v| v.as_array()) else {
@@ -1827,7 +2667,9 @@ pub fn parse_node_packed_txs(
     let mut bodies = Vec::with_capacity(bodies_json.len() - 1);
     for item in bodies_json.iter().skip(1) {
         let Some(text) = item.as_str() else {
-            return Err("a transaction body in the node's pending block is not a string".to_string());
+            return Err(
+                "a transaction body in the node's pending block is not a string".to_string(),
+            );
         };
         let Ok(raw) = hex::decode(text) else {
             return Err("a transaction body in the node's pending block is not hex".to_string());
@@ -1897,6 +2739,13 @@ fn packed_txs_still_apply(current: Option<&Template>, fresh: &Template) -> Optio
 /// Pass the template the pool is currently serving as `current` so an unchanged
 /// tip does not re-download the node's whole transaction set.
 ///
+/// `pin` carries the header timestamp a PREVIOUS run of this pool already handed
+/// out, read back off the state file, so a restart part-way through a height
+/// serves the same header bytes rather than silently invalidating every worker's
+/// in-flight scan pass. It is only consulted when `current` is `None`: while the
+/// pool is running the live template is the pin, and a fresh template for the
+/// same height and parent is discarded by the caller anyway.
+///
 /// The second element is `None` when the node's transactions really are in the
 /// template, and otherwise an operator-readable reason why they are not. The
 /// caller MUST surface it. A coinbase-only block earns no transaction fees, and
@@ -1909,8 +2758,15 @@ pub fn fetch_pool_template(
     coinbase_addr: &str,
     params: &ChainParams,
     current: Option<&Template>,
+    pin: Option<&StampPin>,
 ) -> Option<(Template, Option<String>)> {
-    let mut tpl = fetch_template(client, base, coinbase_addr, params)?;
+    let live = current.map(|t| StampPin {
+        height: t.height,
+        prevhash: t.prevhash.clone(),
+        timestamp: t.timestamp,
+    });
+    let pin = live.as_ref().or(pin);
+    let mut tpl = fetch_template_pinned(client, base, coinbase_addr, params, pin)?;
     if let Some(txs) = packed_txs_still_apply(current, &tpl) {
         tpl.txs = txs;
         return Some((tpl, None));
@@ -2001,7 +2857,10 @@ pub fn coinbase_message() -> Fixed16 {
 }
 
 /// The template's coinbase carrying `extranonce` in its miner_nonce field.
-pub fn coinbase_with_extranonce(tpl: &Template, extranonce: &[u8; 32]) -> mint::TransactionCoinbase {
+pub fn coinbase_with_extranonce(
+    tpl: &Template,
+    extranonce: &[u8; 32],
+) -> mint::TransactionCoinbase {
     let mut cb =
         mint::create_coinbase_tx(tpl.height, coinbase_message(), tpl.coinbase_addr.clone());
     let en = Hash::from_hex(hex::encode(extranonce).as_bytes()).expect("extranonce");
@@ -2071,11 +2930,7 @@ pub fn assemble_block(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32
 }
 
 /// Submit already-serialized block bytes.
-pub fn submit_block_bytes(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    bytes: &[u8],
-) -> String {
+pub fn submit_block_bytes(client: &reqwest::blocking::Client, base: &str, bytes: &[u8]) -> String {
     post_hex(
         client,
         &format!("{base}/submit/block?hexbody=true"),
@@ -2103,7 +2958,9 @@ pub fn mine_and_submit_block(
 
     let mut trshxs: Vec<Hash> = vec![cbtx.hash_with_fee()];
     let mut transactions = DynVecTransaction::default();
-    transactions.push(Box::new(cbtx.clone())).expect("push coinbase");
+    transactions
+        .push(Box::new(cbtx.clone()))
+        .expect("push coinbase");
     for tx in extra_txs {
         trshxs.push(tx.hash_with_fee());
         transactions.push(tx).expect("push extra tx");
@@ -2145,7 +3002,10 @@ pub fn mine_and_submit_block(
         }
     }
 
-    let block = BlockV1 { intro, transactions };
+    let block = BlockV1 {
+        intro,
+        transactions,
+    };
     let resp = post_hex(
         client,
         &format!("{base}/submit/block?hexbody=true"),
@@ -2167,12 +3027,127 @@ mod tests {
         p.to_string_lossy().to_string()
     }
 
+    /// The exact figures a rig measured when a pool was restarted inside height
+    /// 350: the pool already had 1785252287 in flight, and the parent block on the
+    /// chain carried 1785252219, 68 seconds earlier.
+    const RIG_HEIGHT: u64 = 350;
+    const RIG_PREV_TS: u64 = 1785252219;
+    const RIG_STAMP: u64 = 1785252287;
+
+    fn rig_parent() -> Hash {
+        Hash::from([0x5au8; 32])
+    }
+
+    fn rig_pin() -> StampPin {
+        StampPin {
+            height: RIG_HEIGHT,
+            prevhash: rig_parent(),
+            timestamp: RIG_STAMP,
+        }
+    }
+
+    #[test]
+    fn a_restart_inside_a_height_serves_the_same_header_timestamp() {
+        // The pool pins one template per height and `/query/miner/notice` signals
+        // only a HEIGHT change, so nothing tells a worker that the bytes under it
+        // moved. A restart that re-stamps the template therefore invalidates every
+        // connected worker's in-flight scan pass in silence, and every share found
+        // during it is thrown away.
+        //
+        // Restart 68 seconds later, at the same height on the same parent: the
+        // stamp already in flight is served again, so the 89-byte header is
+        // byte-identical and nobody's work is lost.
+        assert_eq!(
+            template_timestamp(
+                Some(&rig_pin()),
+                RIG_HEIGHT,
+                &rig_parent(),
+                RIG_PREV_TS,
+                RIG_STAMP + 68,
+            ),
+            RIG_STAMP
+        );
+        // With no pin - a first run, or a state file that predates the stamp -
+        // nothing changes from what the pool always did.
+        assert_eq!(
+            template_timestamp(None, RIG_HEIGHT, &rig_parent(), RIG_PREV_TS, RIG_STAMP + 68),
+            RIG_STAMP + 68
+        );
+    }
+
+    #[test]
+    fn a_pinned_stamp_is_refused_unless_it_belongs_to_this_exact_block() {
+        // The guards here are not symmetric with the one above. Ignoring a good
+        // pin costs one height of in-flight worker work and heals itself; honouring
+        // a WRONG one puts a timestamp in a real block, and chain::verify rejects a
+        // block whose timestamp is <= its parent's or in the future. /submit/block
+        // answers before it validates, so such a block is refused silently and its
+        // whole reward - the round every miner in the window is being paid from -
+        // is gone.
+        let fresh_now = RIG_STAMP + 68;
+
+        // The chain moved on: this pin describes the previous block.
+        assert_eq!(
+            template_timestamp(
+                Some(&rig_pin()),
+                RIG_HEIGHT + 1,
+                &rig_parent(),
+                RIG_PREV_TS,
+                fresh_now,
+            ),
+            fresh_now
+        );
+        // Same height, different parent: a same-height reorg. The old stamp was
+        // only ever checked against the parent it was built on.
+        assert_eq!(
+            template_timestamp(
+                Some(&rig_pin()),
+                RIG_HEIGHT,
+                &Hash::from([0xa5u8; 32]),
+                RIG_PREV_TS,
+                fresh_now,
+            ),
+            fresh_now
+        );
+        // A stamp at or below the parent's: the node refuses the block outright.
+        let stale = StampPin {
+            timestamp: RIG_PREV_TS,
+            ..rig_pin()
+        };
+        assert_eq!(
+            template_timestamp(
+                Some(&stale),
+                RIG_HEIGHT,
+                &rig_parent(),
+                RIG_PREV_TS,
+                fresh_now
+            ),
+            fresh_now
+        );
+        // A stamp LATER than a fresh fetch would produce. A pin may only ever move
+        // the header back to bytes this pool already served, never forward into a
+        // future the node would reject.
+        let ahead = StampPin {
+            timestamp: fresh_now + 3_600,
+            ..rig_pin()
+        };
+        assert_eq!(
+            template_timestamp(
+                Some(&ahead),
+                RIG_HEIGHT,
+                &rig_parent(),
+                RIG_PREV_TS,
+                fresh_now
+            ),
+            fresh_now
+        );
+    }
+
     /// The predicate the settlement guard used before this fix: a hash was kept
     /// only while the node reported it in the mempool. Every test below shows a
     /// case where it says "resolved" and the payout is in fact still undoable.
     fn old_guard_kept_the_hash(j: &Value) -> bool {
-        find_u64(j, "ret") == Some(0)
-            && j.get("pending").and_then(|v| v.as_bool()).unwrap_or(false)
+        find_u64(j, "ret") == Some(0) && j.get("pending").and_then(|v| v.as_bool()).unwrap_or(false)
     }
 
     #[test]
@@ -2225,11 +3200,73 @@ mod tests {
         assert_eq!(balance_units("1:248"), Some(10)); // 1 HAC = 10 units
         assert_eq!(balance_units("1:247"), Some(1));
         assert_eq!(balance_units("5:240"), Some(0)); // finer than 0.1 HAC
-        // The node omits the field for an address holding nothing: not an error.
-        assert_eq!(balance_units(""), Some(0));
+        // An address holding nothing comes back as "0:0", which is a real zero.
+        assert_eq!(balance_units("0:0"), Some(0));
         // Anything past the plausibility ceiling is a corrupt answer, not money.
-        assert_eq!(balance_units(&format!("{MAX_PLAUSIBLE_UNITS}:247")), Some(MAX_PLAUSIBLE_UNITS));
-        assert_eq!(balance_units(&format!("{}:247", MAX_PLAUSIBLE_UNITS + 1)), None);
+        assert_eq!(
+            balance_units(&format!("{MAX_PLAUSIBLE_UNITS}:247")),
+            Some(MAX_PLAUSIBLE_UNITS)
+        );
+        assert_eq!(
+            balance_units(&format!("{}:247", MAX_PLAUSIBLE_UNITS + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_node_that_does_not_answer_is_not_a_zero_balance() {
+        // What it costs when this is wrong: the pool publishes matured = 0 and
+        // flags it CURRENT, /earnings tells every miner it is owed nothing for
+        // the whole outage, and the miners whose shares leave the PPLNS window
+        // while the node is away are never paid for that work.
+        //
+        // Every body get_json can hand the balance reader is here. Only the last
+        // two are the node reporting a wallet.
+
+        // The node is down: get_json wraps the transport error.
+        let down = serde_json::json!({"http_error":"error sending request: connection refused"});
+        assert!(matches!(balance_answer(&down), BalanceAnswer::NoAnswer(_)));
+        assert_eq!(balance_answer(&down).units(), None);
+
+        // Wrong port, or a proxy in front: a body that is not JSON at all.
+        let html = Value::String("<html><body>502 Bad Gateway</body></html>".into());
+        assert!(matches!(balance_answer(&html), BalanceAnswer::NoAnswer(_)));
+        assert_eq!(balance_answer(&html).units(), None);
+
+        // The node answered, and the answer is not a balance.
+        let refused = serde_json::json!({"ret":1,"errmsg":"address format invalid"});
+        assert!(matches!(
+            balance_answer(&refused),
+            BalanceAnswer::Refused(_)
+        ));
+        assert_eq!(balance_answer(&refused).units(), None);
+
+        // ret=0 but no `hacash` field: not a node this pool understands.
+        let odd = serde_json::json!({"ret":0,"list":[{"diamond":0}]});
+        assert!(matches!(balance_answer(&odd), BalanceAnswer::Refused(_)));
+        assert_eq!(balance_answer(&odd).units(), None);
+
+        // A wallet holding nothing. The node renders it "0:0", and that IS a
+        // balance: settlement must go on treating it as a real, actionable zero,
+        // or an empty pool wallet would freeze payouts forever.
+        let empty = serde_json::json!({"ret":0,"list":[{"hacash":"0:0"}]});
+        assert_eq!(
+            balance_answer(&empty),
+            BalanceAnswer::Reported("0:0".into())
+        );
+        assert_eq!(balance_answer(&empty).units(), Some(0));
+
+        // A funded wallet values exactly as it always did.
+        let funded = serde_json::json!({"ret":0,"list":[{"hacash":"1:248"}]});
+        assert_eq!(balance_answer(&funded).units(), Some(10));
+
+        // The two halves of the old bug, asserted where they lived. The reader
+        // was `find_str(&j, "hacash").unwrap_or_default()`, so every failure
+        // above collapsed to ""; and "" was then valued as a confident zero.
+        for bad in [&down, &html, &refused, &odd] {
+            assert_eq!(find_str(bad, "hacash"), None);
+        }
+        assert_eq!(balance_units(""), None);
     }
 
     #[test]
@@ -2253,13 +3290,21 @@ mod tests {
         // the node what it holds, and must treat "no answer" as unresolved
         // rather than as either outcome.
         let j = |s: &str| serde_json::from_str::<Value>(s).expect("json");
-        assert_eq!(admission_of(&j(r#"{"ret":0,"pending":true}"#)), Admission::Held);
         assert_eq!(
-            admission_of(&j(&format!(r#"{{"ret":0,"confirm":{PAYOUT_MATURITY_DEPTH}}}"#))),
+            admission_of(&j(r#"{"ret":0,"pending":true}"#)),
+            Admission::Held
+        );
+        assert_eq!(
+            admission_of(&j(&format!(
+                r#"{{"ret":0,"confirm":{PAYOUT_MATURITY_DEPTH}}}"#
+            ))),
             Admission::Held
         );
         // Mined but shallow is still the node holding it.
-        assert_eq!(admission_of(&j(r#"{"ret":0,"confirm":1}"#)), Admission::Held);
+        assert_eq!(
+            admission_of(&j(r#"{"ret":0,"confirm":1}"#)),
+            Admission::Held
+        );
         // The node answered: it does not know this transaction.
         assert_eq!(
             admission_of(&j(r#"{"ret":1,"err":"transaction not found"}"#)),
@@ -2271,7 +3316,10 @@ mod tests {
             Admission::Unresolved
         );
         assert_eq!(admission_of(&j(r#"{"ret":0}"#)), Admission::Unresolved);
-        assert_eq!(admission_of(&Value::String("<html>502</html>".into())), Admission::Unresolved);
+        assert_eq!(
+            admission_of(&Value::String("<html>502</html>".into())),
+            Admission::Unresolved
+        );
     }
 
     #[test]
@@ -2282,6 +3330,139 @@ mod tests {
             block_reward_units(2_500_000),
             mint::genesis::block_reward_number(2_500_000) as u64 * 10
         );
+    }
+
+    #[test]
+    fn a_transaction_fee_is_valued_finer_than_a_payout_unit_and_always_upwards() {
+        // The chain's own rendering: 1 HAC, 0.1 HAC (one payout unit), 0.01 HAC.
+        assert_eq!(fin_fine_ceil("1:248"), Some(1_000_000_000));
+        assert_eq!(fin_fine_ceil("1:247"), Some(100_000_000));
+        assert_eq!(fin_fine_ceil("1:246"), Some(10_000_000));
+        assert_eq!(fin_fine_ceil("0:0"), Some(0));
+        // A real transaction fee is a small fraction of a payout unit. Valuing
+        // it at payout-unit granularity would floor every one of them to nothing
+        // and hand the whole of a block's fee income out at zero confirmations,
+        // so it is summed on a scale that can actually hold it.
+        assert_eq!(fine_to_units_ceil(fin_fine_ceil("1:246").unwrap()), 1);
+        // Rounding is always UP, because this figure is money the pool refuses
+        // to pay yet: a fee smaller than the finest step still counts as one.
+        assert_eq!(fin_fine_ceil("1:230"), Some(1));
+        assert_eq!(fin_fine_ceil("1:2"), Some(1));
+        assert_eq!(fine_to_units_ceil(1), 1);
+        assert_eq!(fine_to_units_ceil(0), 0);
+        assert_eq!(fine_to_units_ceil(100_000_001), 2);
+        // Not amounts at all. Each one must refuse rather than read as a zero
+        // fee, which is what lets the fee be distributed unheld.
+        assert_eq!(fin_fine_ceil(""), None);
+        assert_eq!(fin_fine_ceil("12"), None);
+        assert_eq!(fin_fine_ceil("-1:248"), None); // no such thing as a negative fee
+        assert_eq!(fin_fine_ceil("x:248"), None);
+        assert_eq!(fin_fine_ceil("1:256"), None); // the chain's unit is a u8
+        assert_eq!(fin_fine_ceil("1:999"), None);
+        // Larger than the whole coin supply: a corrupt or hostile answer, and
+        // believing it would hold back every unit the pool will ever earn.
+        assert_eq!(fin_fine_ceil("999999999:255"), None);
+    }
+
+    #[test]
+    fn only_a_definitive_node_answer_prices_our_blocks_fees() {
+        let j = |s: &str| serde_json::from_str::<Value>(s).expect("json");
+        let ours = "aa".repeat(32);
+        let theirs = "bb".repeat(32);
+        // Our block, with two transactions to price.
+        assert_eq!(
+            block_txs_of(
+                &j(&format!(
+                    r#"{{"ret":0,"hash":"{ours}","tx_hash_list":["11","22"]}}"#
+                )),
+                &ours
+            ),
+            BlockTxs::Ours(vec!["11".to_string(), "22".to_string()])
+        );
+        // Our block, carrying nothing but its coinbase: no fees, and that is a
+        // real answer rather than a refusal.
+        assert_eq!(
+            block_txs_of(
+                &j(&format!(r#"{{"ret":0,"hash":"{ours}","tx_hash_list":[]}}"#)),
+                &ours
+            ),
+            BlockTxs::Ours(vec![])
+        );
+        // Another block won that height, or the chain has not reached it: it
+        // credited this pool nothing, so there are no fees to hold back.
+        assert_eq!(
+            block_txs_of(
+                &j(&format!(
+                    r#"{{"ret":0,"hash":"{theirs}","tx_hash_list":[]}}"#
+                )),
+                &ours
+            ),
+            BlockTxs::NotOnChain
+        );
+        assert_eq!(
+            block_txs_of(&j(r#"{"ret":1,"err":"cannot find block"}"#), &ours),
+            BlockTxs::NotOnChain
+        );
+        // Everything else is UNKNOWN, and the caller must stop settling. Reading
+        // any of these as "no fees" pays a block's fee income out at zero
+        // confirmations, and an orphan then leaves the operator funding it.
+        for not_an_answer in [
+            r#"{"http_error":"connection refused"}"#,
+            r#"{"hash":"x"}"#,
+            &format!(r#"{{"ret":0,"hash":"{ours}"}}"#), // no list: an unknown shape
+            &format!(r#"{{"ret":0,"hash":"{ours}","tx_hash_list":[7]}}"#),
+        ] {
+            assert!(
+                matches!(block_txs_of(&j(not_an_answer), &ours), BlockTxs::Unknown(_)),
+                "{not_an_answer} was treated as an answer"
+            );
+        }
+        assert!(matches!(
+            block_txs_of(&Value::String("<html>502</html>".into()), &ours),
+            BlockTxs::Unknown(_)
+        ));
+
+        // And the per-transaction half: `fee_got` is what the transaction really
+        // paid for its place in the block, which is what the chain hands the
+        // coinbase address.
+        assert_eq!(
+            fee_got_fine(&j(r#"{"ret":0,"fee":"2:246","fee_got":"1:246"}"#)),
+            Some(10_000_000)
+        );
+        assert_eq!(fee_got_fine(&j(r#"{"ret":0,"fee":"1:246"}"#)), None);
+        assert_eq!(fee_got_fine(&j(r#"{"ret":1,"err":"not found"}"#)), None);
+        assert_eq!(
+            fee_got_fine(&j(r#"{"http_error":"connection refused"}"#)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_durable_write_reports_whether_it_was_really_made_durable() {
+        // What this costs when it goes wrong: `durable` is the promise the
+        // settlement path broadcasts a payout on. The fsync result used to be
+        // thrown away, so a full disk or a network mount that went away - both
+        // of which surface at flush time and nowhere else - returned Ok, and the
+        // payout went out against a state file that existed only in the page
+        // cache. A power cut there loses the record of a signed transaction and
+        // the next cycle pays the same window again.
+        let path = tmp_path("durable.state.json");
+        let _ = std::fs::remove_file(&path);
+        atomic_write(&path, b"recorded", true).expect("durable write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"recorded");
+        // The temp file is renamed, never left behind pointing at half a state.
+        assert!(!std::path::Path::new(&format!("{path}.tmp.{}", std::process::id())).exists());
+
+        // A bare filename is what a relative `wallet_file` in the config
+        // produces. The directory fsync must fall back to the working directory
+        // rather than fail: a durable write that always fails is a pool that
+        // refuses to pay anyone at all.
+        assert!(fsync_parent_dir("hbit-pool-no-such.state.json").is_ok());
+
+        // And a write that cannot happen is still an error, not a quiet success:
+        // this path has a FILE where it needs a directory.
+        assert!(atomic_write(&format!("{path}/nested.json"), b"x", true).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2303,7 +3484,19 @@ mod tests {
         )
         .expect("write state");
         assert_eq!(load_pending_payout_txs(&path), vec!["deadbeef".to_string()]);
-        assert_eq!(load_immature_units(&path), 30);
+        // The hold-back survives, and an entry written before the pool held back
+        // transaction fees reads as "fees NOT counted": that file really does
+        // carry the subsidy alone, and reading it the other way would pay the
+        // block's fees out on the first settlement after the upgrade.
+        assert_eq!(
+            load_immature_blocks(&path),
+            vec![ImmatureBlock {
+                height: 9,
+                hash: "ab".to_string(),
+                units: 30,
+                fees_counted: false,
+            }]
+        );
         // The payout tool writes the SAME ledger, without losing the accounting.
         save_pending_payout_txs(&path, &["cafe".to_string()]).expect("save ledger");
         assert_eq!(load_pending_payout_txs(&path), vec!["cafe".to_string()]);
@@ -2311,14 +3504,71 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
         assert_eq!(j["accepted"].as_u64(), Some(7));
         assert_eq!(j["order"].as_array().map(|a| a.len()), Some(2));
-        assert_eq!(load_immature_units(&path), 30);
-        // The share window is readable from the same file, so the payout tool can
-        // still settle correctly with the pool server stopped.
         assert_eq!(
-            load_pplns_counts(&path),
-            vec![("a".to_string(), 1u64), ("b".to_string(), 1u64)]
+            load_immature_blocks(&path)
+                .iter()
+                .map(|b| b.units)
+                .sum::<u64>(),
+            30
+        );
+        // The share window is readable from the same file, so the payout tool can
+        // still settle correctly with the pool server stopped. This file is in the
+        // OLD shape, written before shares were timed: it must still read, and
+        // every share in it must weigh the same, or upgrading the pool would
+        // reshuffle who is owed what.
+        let credit = load_pplns_credit(&path);
+        assert_eq!(credit.len(), 2);
+        assert_eq!(credit[0].1, credit[1].1);
+        assert!(credit[0].1 > 0);
+        assert_eq!(
+            credit.iter().map(|(w, _)| w.clone()).collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_share_window_written_before_shares_were_timed_still_reads() {
+        // The accounting file is the only record of who is owed what when the
+        // server is stopped. A pool upgraded in place has one on disk in the OLD
+        // shape - bare worker ids, no arrival times - and failing to read it does
+        // not lose money quietly: it pays the whole balance to whoever mines
+        // next.
+        let old = serde_json::json!({"order": ["a", "b", "a"]});
+        let rows = parse_share_order(&old, 5_000);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), 5_000),
+                ("b".to_string(), 5_000),
+                ("a".to_string(), 5_000),
+            ],
+            "every share in an untimed file must weigh the same"
+        );
+        assert!(parse_banked_credit(&old).is_empty());
+
+        // The shape the pool writes now: (worker, arrival time in ms).
+        let new = serde_json::json!({
+            "order": [["a", 1_000], ["b", 2_500]],
+            "banked": [{"at": 3, "rows": [["c", 700]]}],
+        });
+        assert_eq!(
+            parse_share_order(&new, 5_000),
+            vec![("a".to_string(), 1_000), ("b".to_string(), 2_500)]
+        );
+        assert_eq!(
+            parse_banked_credit(&new),
+            vec![(3u64, vec![("c".to_string(), 700u64)])]
+        );
+
+        // A row the file cannot describe is dropped, never guessed at, and a
+        // missing time falls back rather than reading as time zero (which would
+        // hand that share the maximum credit the horizon allows).
+        let ragged = serde_json::json!({"order": [["a"], ["b", 9], 7, ["c", null]]});
+        assert_eq!(
+            parse_share_order(&ragged, 5_000),
+            vec![("b".to_string(), 9), ("c".to_string(), 5_000)]
+        );
     }
 
     #[test]
@@ -2345,10 +3595,12 @@ mod tests {
             hash: "aa11".to_string(),
             at: 1_100,
             node_holds: true,
+            body_hex: "beef".to_string(),
             rows: vec![("w1".to_string(), 12), ("w2".to_string(), 3)],
         }];
         let mut paid = PaidLedger::started(1_000);
-        save_settlement_ledger(&path, &["aa11".to_string()], &records, &paid).expect("save");
+        let owed = vec![("w3".to_string(), 8u64)];
+        save_settlement_ledger(&path, &["aa11".to_string()], &records, &owed, &paid).expect("save");
 
         // Everything else in the file is untouched.
         let j: Value =
@@ -2356,11 +3608,17 @@ mod tests {
         assert_eq!(j["accepted"].as_u64(), Some(3));
         assert_eq!(load_pending_payout_txs(&path), vec!["aa11".to_string()]);
         assert_eq!(load_payout_records(&path), records);
+        // The signed bytes travel with the hash: without them a payout the node
+        // relayed and then forgot can only be re-signed, which pays twice.
+        assert_eq!(load_payout_records(&path)[0].body_hex, "beef");
+        // What a failed chunk owes survives the same write, and the pool server
+        // and the manual tool read it from the same place.
+        assert_eq!(load_owed(&path), owed);
 
         // Confirm it, save again, and reload: the money is in the paid ledger and
         // out of the in-flight rows, in both memory and on disk.
         confirm_payout(&mut records, &mut paid, "aa11", 1_200).expect("credited");
-        save_settlement_ledger(&path, &[], &records, &paid).expect("save");
+        save_settlement_ledger(&path, &[], &records, &owed, &paid).expect("save");
         assert!(load_payout_records(&path).is_empty());
         let back = load_paid_ledger(&path);
         assert_eq!(back, paid);
@@ -2419,7 +3677,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         write_key_file(&path, "deadbeef").expect("write and secure the key file");
         assert_eq!(
-            std::fs::read_to_string(&path).expect("owner can still read").trim(),
+            std::fs::read_to_string(&path)
+                .expect("owner can still read")
+                .trim(),
             "deadbeef"
         );
         // Re-applying on the load path must be idempotent, not a failure.
@@ -2432,7 +3692,10 @@ mod tests {
     fn wallet_envelope_round_trips_and_rejects_a_wrong_passphrase() {
         let key_hex = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
         let body = encrypt_key_hex(key_hex, "correct horse battery").expect("encrypt");
-        assert!(!body.contains(key_hex), "the key must not survive in the clear");
+        assert!(
+            !body.contains(key_hex),
+            "the key must not survive in the clear"
+        );
         let back = decrypt_key_hex(&body, "correct horse battery").expect("decrypt");
         assert_eq!(back.trim(), key_hex);
         assert!(decrypt_key_hex(&body, "wrong passphrase").is_err());
@@ -2557,7 +3820,10 @@ mod tests {
             "the pool's block must be exactly the block the node verifies"
         );
         let intro = build_intro(&tpl, &cb, 77);
-        assert_eq!(*intro.head.transaction_count, 4, "coinbase plus 3 packed txs");
+        assert_eq!(
+            *intro.head.transaction_count, 4,
+            "coinbase plus 3 packed txs"
+        );
         assert_eq!(
             intro.head.mrklroot,
             calculate_mrklroot(&hashes),
@@ -2574,7 +3840,10 @@ mod tests {
         let tpl = tpl_with(PackedTxs::default());
         let intro = build_intro(&tpl, &cb, 5);
         assert_eq!(*intro.head.transaction_count, 1);
-        assert_eq!(intro.head.mrklroot, calculate_mrklroot(&vec![cb.hash_with_fee()]));
+        assert_eq!(
+            intro.head.mrklroot,
+            calculate_mrklroot(&vec![cb.hash_with_fee()])
+        );
         let mut only_cb = DynVecTransaction::default();
         only_cb.push(Box::new(cb.clone())).expect("push coinbase");
         let want = BlockV1 {
@@ -2619,7 +3888,11 @@ mod tests {
         let got = parse_node_packed_txs(&j, 50, &prev).expect("a matching template is usable");
         assert_eq!(got.bodies, vec![vec![0x0b, 0xb0], vec![0x0c, 0xc0]]);
         assert_eq!(got.mrklrts, vec![leaf(1), leaf(2)]);
-        assert_eq!(got.block_tx_count(), 3, "our coinbase plus the node's two txs");
+        assert_eq!(
+            got.block_tx_count(),
+            3,
+            "our coinbase plus the node's two txs"
+        );
         // An empty mempool is a legitimate answer, not a failure.
         let empty = pending_reply(50, &prev, &["00aa"], &[]);
         let got = parse_node_packed_txs(&empty, 50, &prev).expect("an empty mempool is fine");
@@ -2635,7 +3908,9 @@ mod tests {
         let sib = [leaf(1), leaf(2)];
         // The chain moved under us: those transactions were validated for another
         // height, and mining them here risks the whole block reward.
-        assert!(parse_node_packed_txs(&pending_reply(51, &prev, &bodies, &sib), 50, &prev).is_err());
+        assert!(
+            parse_node_packed_txs(&pending_reply(51, &prev, &bodies, &sib), 50, &prev).is_err()
+        );
         // Same height, different parent: a reorg repacked against another state.
         assert!(
             parse_node_packed_txs(&pending_reply(50, &other, &bodies, &sib), 50, &prev).is_err()

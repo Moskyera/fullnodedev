@@ -10,9 +10,9 @@ use std::process::{Child, Command};
 // where every child gets its own console instead.
 #[cfg(not(windows))]
 use std::process::Stdio;
-use std::sync::mpsc::{self, Receiver};
 #[cfg(not(windows))]
 use std::sync::mpsc::SyncSender as Sender;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},

@@ -235,7 +235,9 @@ pub fn payout_explanation<'a>(view: &'a PayoutView, t: &'a Strings) -> Option<&'
         // Never confirmed to be a pool and not answering now: it could be a
         // stopped full node. Say nothing rather than call it a pool that owes
         // money.
-        PayoutView::Unreachable { was_pool: false, .. } => None,
+        PayoutView::Unreachable {
+            was_pool: false, ..
+        } => None,
     }
 }
 
@@ -362,7 +364,12 @@ fn show_earnings_detail(ui: &mut egui::Ui, t: &Strings, e: &PoolEarnings, worker
         }
     };
     theme::show_detail_row(ui, t.pool_pay_last, &last);
-    if let Some(tx) = e.last_payout.as_ref().map(|l| l.tx.as_str()).filter(|tx| !tx.is_empty()) {
+    if let Some(tx) = e
+        .last_payout
+        .as_ref()
+        .map(|l| l.tx.as_str())
+        .filter(|tx| !tx.is_empty())
+    {
         theme::show_detail_row(ui, t.pool_pay_last_tx, tx);
     }
     theme::show_detail_row(
@@ -382,12 +389,7 @@ fn show_earnings_detail(ui: &mut egui::Ui, t: &Strings, e: &PoolEarnings, worker
 /// Terms are only worth a heading where a pool exists to have them. A full node
 /// and a relay have no payout terms, and saying "terms unavailable" about them
 /// would imply they should.
-fn show_pool_terms(
-    ui: &mut egui::Ui,
-    t: &Strings,
-    terms: Option<&PoolTerms>,
-    view: &PayoutView,
-) {
+fn show_pool_terms(ui: &mut egui::Ui, t: &Strings, terms: Option<&PoolTerms>, view: &PayoutView) {
     let is_pool = matches!(
         view,
         PayoutView::Earnings(_)
@@ -485,7 +487,10 @@ mod tests {
             absent.display(&t, t.pool_pay_nothing_paid)
         );
         // And a confirmed zero never renders as a bare number.
-        assert_eq!(zero.display(&t, t.pool_pay_nothing_paid), t.pool_pay_nothing_paid);
+        assert_eq!(
+            zero.display(&t, t.pool_pay_nothing_paid),
+            t.pool_pay_nothing_paid
+        );
         assert!(!zero.display(&t, t.pool_pay_nothing_paid).contains('0'));
     }
 
@@ -493,8 +498,14 @@ mod tests {
     fn the_same_zero_reads_differently_under_a_total_and_under_a_balance() {
         let t = en();
         let zero = money_cell(Some(&units_to_amount(0)));
-        assert_eq!(zero.display(&t, t.pool_pay_nothing_paid), t.pool_pay_nothing_paid);
-        assert_eq!(zero.display(&t, t.pool_pay_nothing_owed), t.pool_pay_nothing_owed);
+        assert_eq!(
+            zero.display(&t, t.pool_pay_nothing_paid),
+            t.pool_pay_nothing_paid
+        );
+        assert_eq!(
+            zero.display(&t, t.pool_pay_nothing_owed),
+            t.pool_pay_nothing_owed
+        );
         assert_ne!(t.pool_pay_nothing_paid, t.pool_pay_nothing_owed);
     }
 
@@ -587,7 +598,10 @@ mod tests {
             shares_in_window: Some(17),
         });
         let summary = PoolMoneySummary::for_view(&view);
-        assert_eq!(summary.total_paid.display(&t, t.pool_pay_nothing_paid), "25:248");
+        assert_eq!(
+            summary.total_paid.display(&t, t.pool_pay_nothing_paid),
+            "25:248"
+        );
         assert_eq!(summary.owed.display(&t, t.pool_pay_nothing_owed), "3:247");
         assert_eq!(
             summary.in_flight.display(&t, t.pool_pay_nothing_owed),
