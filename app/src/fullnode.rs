@@ -77,7 +77,7 @@ impl FullnodeRuntime {
         if panic_count > 0 {
             return errf!("{} thread panicked", panic_count);
         }
-        println!("[Exit] Hacash fullnode closed.");
+        wlogln!("[Exit] Hacash fullnode closed.");
         Ok(())
     }
 }

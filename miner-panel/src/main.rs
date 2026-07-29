@@ -7,10 +7,11 @@ mod fleet;
 mod fonts;
 mod hacash_config;
 mod help_options;
+mod history;
 mod i18n;
 mod mining_control;
-mod node_sync;
 mod mining_kind;
+mod node_sync;
 mod opencl_status;
 mod platform;
 mod presets;
@@ -19,8 +20,10 @@ mod stats_poll;
 mod theme;
 mod ui_dashboard_tab;
 mod ui_help_tab;
+mod ui_logs_tab;
 mod ui_settings;
 mod ui_settings_tab;
+mod worker_log_tail;
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -140,6 +143,12 @@ struct MinerApp {
     upstream_test_status: String,
     /// Newcomer view: three steps and one button. Remembered across restarts.
     simple_mode: bool,
+    /// Does this package ship a full node? A miner-only package does not, and
+    /// then "mine with my own full node" cannot work: the setup screen greys
+    /// that choice out and says why, instead of letting Start fail later.
+    /// Re-checked periodically so dropping hacash.exe in works without a restart.
+    fullnode_present: bool,
+    fullnode_checked_at: Instant,
     max_temp_c: u32,
     pause_unprofitable: bool,
     work_groups: u32,
@@ -320,6 +329,7 @@ impl MinerApp {
         let connect_mode = ConnectMode::for_connect(&connect);
         let pool_directory = load_pool_directory(&work_dir);
         let simple_mode = load_simple_mode(&work_dir);
+        let fullnode_present = platform::find_fullnode(&work_dir).is_file();
         let mut app = Self {
             work_dir,
             config_path,
@@ -357,6 +367,8 @@ impl MinerApp {
             connect_test_status: String::new(),
             upstream_test_status: String::new(),
             simple_mode,
+            fullnode_present,
+            fullnode_checked_at: Instant::now(),
             max_temp_c,
             pause_unprofitable,
             work_groups,
@@ -783,6 +795,19 @@ impl MinerApp {
         save_simple_mode(&self.work_dir, simple);
     }
 
+    /// Is there a full node binary this panel could actually start?
+    ///
+    /// Cheap to call every frame: the filesystem is only asked every two
+    /// seconds, which is often enough that a user who copies hacash.exe next to
+    /// the panel sees the solo option come alive while they watch.
+    fn refresh_fullnode_presence(&mut self) {
+        if self.fullnode_checked_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.fullnode_checked_at = Instant::now();
+        self.fullnode_present = platform::find_fullnode(&self.work_dir).is_file();
+    }
+
     fn set_connect_mode(&mut self, mode: ConnectMode) {
         self.connect_mode = mode;
         if mode == ConnectMode::Solo {
@@ -1195,42 +1220,246 @@ impl MinerApp {
     }
 }
 
+/// The five screens. `tab` keeps its historical indices, because
+/// `ui_settings_tab` writes it too and renumbering would be a rename that buys
+/// nothing; a new screen takes the next free number rather than a tidy one.
+const TAB_SETUP: usize = 0;
+const TAB_OVERVIEW: usize = 1;
+const TAB_HELP: usize = 2;
+const TAB_MASTER: usize = 3;
+const TAB_LOGS: usize = 4;
+
+/// Cut a label down so a long pool address cannot push the value out of the
+/// sidebar. Counts characters, not bytes, so it cannot split a Thai or Cyrillic
+/// name in the middle of one.
+fn shorten(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+impl MinerApp {
+    /// Name of the screen currently shown, for the header strip.
+    fn page_title(&self) -> &'static str {
+        let t = self.t();
+        match self.tab {
+            TAB_SETUP => t.tab_settings,
+            TAB_HELP => t.tab_help,
+            TAB_MASTER => t.nav_master_panel,
+            TAB_LOGS => i18n::log_labels(self.lang).nav_logs,
+            _ => t.tab_dashboard,
+        }
+    }
+
+    /// What the worker is actually pointed at, in a few characters.
+    ///
+    /// A pool is named only while the address in the settings box is still the
+    /// one that preset wrote. The moment the operator edits it, the address is
+    /// the truth and the preset name would be a comfortable lie.
+    fn sidebar_connection_label(&self, t: &Strings) -> String {
+        if self.connect_mode == ConnectMode::Solo {
+            return shorten(t.connect_solo, 20);
+        }
+        let named = self
+            .pool_directory
+            .get(self.pool_preset_idx)
+            .filter(|p| !p.connect.is_empty() && p.connect == self.connect)
+            .map(|p| p.name.as_str());
+        shorten(named.unwrap_or(self.connect.as_str()), 20)
+    }
+
+    /// The left navigation column from mockup 1: brand, two labelled groups of
+    /// screens, and the live status block pinned to the bottom.
+    ///
+    /// Five entries, not the mockup's nine. "HAC Mining", "HACD Mining",
+    /// "Pools", "Hardware" and "Full Node" are drawn there as separate
+    /// destinations, and this build has no such screens: they are sections
+    /// inside Setup and the Overview. A nav item that leads nowhere is worse
+    /// than an absent one, so they are absent. "Logs" is here because the
+    /// worker's own output is now read and kept, so there is a screen behind it.
+    fn ui_sidebar(&mut self, ctx: &egui::Context, t: &Strings) {
+        let (online, total) = self.fleet.workers_online();
+        let fleet_badge = format!("{online}/{total}");
+        let live = self.mining;
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(236.0)
+            .frame(theme::sidebar_frame())
+            .show(ctx, |ui| {
+                // Nav items carry their own 40px height and read as a list, so
+                // the page's 12px paragraph spacing between them is wrong here.
+                ui.spacing_mut().item_spacing.y = 4.0;
+                theme::sidebar_brand(
+                    ui,
+                    self.logo_texture.as_ref(),
+                    "HAC Miner",
+                    t.header_subtitle,
+                );
+
+                theme::nav_section_label(ui, t.nav_section_mining);
+                if theme::nav_item(
+                    ui,
+                    self.tab == TAB_OVERVIEW,
+                    theme::TabIcon::Overview,
+                    t.tab_dashboard,
+                    if live { Some("live") } else { None },
+                ) {
+                    self.tab = TAB_OVERVIEW;
+                }
+                if theme::nav_item(
+                    ui,
+                    self.tab == TAB_SETUP,
+                    theme::TabIcon::Setup,
+                    t.tab_settings,
+                    None,
+                ) {
+                    self.tab = TAB_SETUP;
+                }
+
+                theme::nav_section_label(ui, t.nav_section_control);
+                if theme::nav_item(
+                    ui,
+                    self.tab == TAB_MASTER,
+                    theme::TabIcon::Fleet,
+                    t.nav_master_panel,
+                    Some(fleet_badge.as_str()),
+                ) {
+                    self.tab = TAB_MASTER;
+                }
+                // The badge is the number of lines actually held, so the entry
+                // says whether there is anything to read before it is opened.
+                let log_lines = worker_log_tail::line_count();
+                let log_badge = (log_lines > 0).then(|| log_lines.to_string());
+                if theme::nav_item(
+                    ui,
+                    self.tab == TAB_LOGS,
+                    theme::TabIcon::Logs,
+                    i18n::log_labels(self.lang).nav_logs,
+                    log_badge.as_deref(),
+                ) {
+                    self.tab = TAB_LOGS;
+                }
+                if theme::nav_item(
+                    ui,
+                    self.tab == TAB_HELP,
+                    theme::TabIcon::Help,
+                    t.tab_help,
+                    None,
+                ) {
+                    self.tab = TAB_HELP;
+                }
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    self.ui_sidebar_status(ui, t);
+                });
+            });
+    }
+
+    /// Four facts, none of them decorative: is the worker hashing, how far
+    /// along is the node when it is catching up, what is the worker talking to,
+    /// and has auto-recovery started spending its retries.
+    fn ui_sidebar_status(&self, ui: &mut egui::Ui, t: &Strings) {
+        use theme::colors;
+        let (dot, tint) = match self.miner_badge_state() {
+            theme::MinerBadgeState::Mining => (colors::ACCENT, colors::ACCENT),
+            theme::MinerBadgeState::Paused => (colors::GOLD_DIM, colors::GOLD),
+            theme::MinerBadgeState::Stopped => (colors::TEXT_DIM, colors::TEXT_MUTED),
+        };
+        let worker = shorten(self.miner_status_label(), 20);
+        let connection = self.sidebar_connection_label(t);
+        let retrying = self.restart_attempts > 0 || self.restart_worker.is_some();
+        let recovery = if retrying {
+            format!(
+                "{}/{}",
+                self.restart_attempts,
+                stats_poll::MAX_RESTART_ATTEMPTS
+            )
+        } else {
+            t.status_ready.to_string()
+        };
+        let sync = self
+            .sync_status
+            .as_ref()
+            .map(|s| format!("{:.0}%", s.progress * 100.0));
+
+        let mut rows = vec![theme::SidebarStatus {
+            dot: Some(dot),
+            label: t.status_worker,
+            value: &worker,
+            tint,
+        }];
+        // The node row appears only while a start is waiting on the node. The
+        // panel does not otherwise know the chain tip, and inventing "Synced"
+        // out of silence is the exact failure this block exists to prevent.
+        if let Some(sync) = sync.as_ref() {
+            rows.push(theme::SidebarStatus {
+                dot: None,
+                label: t.status_node,
+                value: sync,
+                tint: colors::ACCENT,
+            });
+        }
+        rows.push(theme::SidebarStatus {
+            dot: None,
+            label: t.status_pool,
+            value: &connection,
+            tint: colors::TEXT,
+        });
+        rows.push(theme::SidebarStatus {
+            dot: None,
+            label: t.status_recovery,
+            value: &recovery,
+            tint: if retrying {
+                colors::GOLD
+            } else {
+                colors::TEXT_MUTED
+            },
+        });
+        theme::sidebar_status_card(ui, &rows);
+    }
+}
+
 impl eframe::App for MinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_opencl_probe();
         self.poll_stats();
         self.poll_public_pool();
+        self.refresh_fullnode_presence();
         self.fleet.poll();
         ctx.request_repaint_after(Duration::from_millis(500));
 
         let t = self.t();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.window_title.to_string()));
 
+        // The header is now a title strip, as in mockup 1: the product name,
+        // then the name of the screen you are on. The logo moved into the
+        // sidebar, which is where the mockup puts it and where it no longer
+        // competes with the page heading directly beneath it.
         egui::TopBottomPanel::top("header")
             .frame(theme::header_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(tex) = self.logo_texture.as_ref() {
-                        theme::show_logo(ui, tex, 44.0);
-                    } else {
-                        theme::logo_fallback(ui);
-                    }
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("HAC Miner Panel")
-                                .size(20.0)
-                                .strong()
-                                .color(theme::colors::TEXT),
-                        );
-                        ui.label(
-                            egui::RichText::new(t.header_subtitle)
-                                .size(12.5)
-                                .color(theme::colors::GOLD_DIM),
-                        );
-                    });
+                    ui.label(
+                        egui::RichText::new("HAC MINER PANEL")
+                            .size(12.5)
+                            .strong()
+                            .color(theme::colors::TEXT_MUTED),
+                    );
+                    ui.label(
+                        egui::RichText::new("·")
+                            .size(12.5)
+                            .color(theme::colors::TEXT_DIM),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.page_title().to_uppercase())
+                            .size(12.5)
+                            .color(theme::colors::ACCENT),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         egui::ComboBox::from_id_salt("lang")
+                            .icon(theme::combo_chevron)
                             .selected_text(self.lang.name())
                             .width(140.0)
                             .show_ui(ui, |ui| {
@@ -1251,6 +1480,7 @@ impl eframe::App for MinerApp {
                         );
                         ui.add_space(14.0);
                         egui::ComboBox::from_id_salt("currency")
+                            .icon(theme::combo_chevron)
                             .selected_text(self.currency.name())
                             .width(120.0)
                             .show_ui(ui, |ui| {
@@ -1317,38 +1547,18 @@ impl eframe::App for MinerApp {
                 });
             });
 
+        self.ui_sidebar(ctx, &t);
+
         egui::CentralPanel::default()
             .frame(theme::content_frame())
             .show(ctx, |ui| {
-                theme::tab_bar(ui, |ui| {
-                    if theme::tab_pill(ui, self.tab == 0, theme::TabIcon::Settings, t.tab_settings)
-                    {
-                        self.tab = 0;
-                    }
-                    if theme::tab_pill(
-                        ui,
-                        self.tab == 1,
-                        theme::TabIcon::Dashboard,
-                        t.tab_dashboard,
-                    ) {
-                        self.tab = 1;
-                    }
-                    if theme::tab_pill(ui, self.tab == 3, theme::TabIcon::Dashboard, "Master Panel")
-                    {
-                        self.tab = 3;
-                    }
-                    if theme::tab_pill(ui, self.tab == 2, theme::TabIcon::Help, t.tab_help) {
-                        self.tab = 2;
-                    }
-                });
-                ui.add_space(16.0);
-
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.tab {
-                        0 => self.ui_settings(ui),
-                        2 => self.ui_help(ui),
-                        3 => self.ui_master(ui),
+                        TAB_SETUP => self.ui_settings(ui),
+                        TAB_HELP => self.ui_help(ui),
+                        TAB_MASTER => self.ui_master(ui),
+                        TAB_LOGS => self.ui_logs(ui),
                         _ => self.ui_dashboard(ui),
                     });
             });

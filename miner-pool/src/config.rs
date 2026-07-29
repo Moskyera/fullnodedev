@@ -34,11 +34,7 @@ pub struct PoolArgs {
     /// Max concurrent stratum connections from one source IP (0 = unlimited).
     /// Stops one peer pinning every connection slot; raise it for a large farm
     /// behind a single NAT.
-    #[arg(
-        long,
-        env = "HAC_POOL_MAX_CONNS_PER_IP",
-        default_value_t = 128
-    )]
+    #[arg(long, env = "HAC_POOL_MAX_CONNS_PER_IP", default_value_t = 128)]
     pub max_conns_per_ip: usize,
 }
 

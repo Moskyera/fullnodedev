@@ -10,9 +10,9 @@ use std::process::{Child, Command};
 // where every child gets its own console instead.
 #[cfg(not(windows))]
 use std::process::Stdio;
-use std::sync::mpsc::{self, Receiver};
 #[cfg(not(windows))]
 use std::sync::mpsc::SyncSender as Sender;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -31,6 +31,17 @@ const RPC_PROBE_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RPC_PROBE_MAX_DELAY: Duration = Duration::from_secs(1);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Where a worker writes its rolling log.
+///
+/// The worker resolves its config from its own executable directory, and
+/// `app::worker_log` puts the log beside that config under the worker's name, so
+/// deriving both from the binary path is what makes reader and writer agree.
+fn worker_log_path(worker_path: &Path) -> Option<PathBuf> {
+    let dir = worker_path.parent()?;
+    let stem = worker_path.file_stem()?.to_str()?;
+    Some(app::worker_log::log_path(dir, stem))
+}
+
 pub(super) fn clear_worker_stats(stats: &mut MiningStatsSnapshot, stats_path: &Path) {
     *stats = MiningStatsSnapshot::default();
     let _ = std::fs::remove_file(stats_path);
@@ -46,6 +57,23 @@ enum FullnodeSetupResult {
     Failed(String),
 }
 
+/// How far a solo start has got. The three conditions are separate questions
+/// with separate answers, and each was learned from a start that went wrong:
+/// the node was not up, or it was up but years behind, or it was caught up but
+/// still inside its own refusal window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPhase {
+    /// Waiting for the node process to answer its RPC port at all.
+    NodeUp,
+    /// The RPC answers. From here this is no longer a start that can time out:
+    /// the node is downloading the chain, which legitimately takes an hour or
+    /// more, so the 120 second deadline must stop applying or it would abandon a
+    /// node that is working perfectly well.
+    Syncing,
+    /// Caught up, waiting for the node to actually serve mining work.
+    WorkGate,
+}
+
 pub(super) struct PendingStart {
     pub worker_path: PathBuf,
     pub deadline: Instant,
@@ -56,15 +84,15 @@ pub(super) struct PendingStart {
     next_probe: Instant,
     probe_delay: Duration,
     cancel_flag: Arc<AtomicBool>,
-    /// Set once the RPC answers. From then on this is no longer a start that can
-    /// time out: the node is up and downloading the chain, which legitimately
-    /// takes an hour or more, so the 45 second deadline must stop applying or it
-    /// would abandon a node that is working perfectly well.
-    syncing: bool,
+    phase: StartPhase,
     /// In flight sync probe. One at a time: `probe` does three blocking HTTP
     /// requests and the UI thread must never wait on them.
     sync_rx: Option<Receiver<Option<crate::node_sync::SyncStatus>>>,
     next_sync_probe: Instant,
+    /// In flight work probe, and when to give up waiting for work.
+    work_rx: Option<Receiver<crate::node_sync::WorkReadiness>>,
+    next_work_probe: Instant,
+    work_deadline: Instant,
 }
 
 /// How often to ask the node how far it has got. The node syncs in batches of
@@ -72,6 +100,17 @@ pub(super) struct PendingStart {
 /// jumps; this is often enough to feel live and rare enough to stay out of the
 /// way of the node's own work.
 const SYNC_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How often to ask the node whether it will serve work yet.
+const WORK_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long to wait for the node to start serving work before starting the
+/// worker anyway. The node's own refusal window is 30 seconds from ITS launch,
+/// which has already partly elapsed by the time the chain is caught up, so this
+/// is generous. It exists because the gate is here to remove a spurious error
+/// line, not to become a new way for a start to hang: past it the worker starts
+/// and prints whatever the node really says.
+const WORK_GATE_TIMEOUT: Duration = Duration::from_secs(45);
 
 impl MinerApp {
     pub(super) fn start_mining(&mut self) {
@@ -211,9 +250,12 @@ impl MinerApp {
                     next_probe: Instant::now(),
                     probe_delay: RPC_PROBE_INITIAL_DELAY,
                     cancel_flag,
-                    syncing: false,
+                    phase: StartPhase::NodeUp,
                     sync_rx: None,
                     next_sync_probe: Instant::now(),
+                    work_rx: None,
+                    next_work_probe: Instant::now(),
+                    work_deadline: Instant::now(),
                 });
             }
             Err(error) => {
@@ -224,6 +266,14 @@ impl MinerApp {
 
     pub(super) fn launch_worker(&mut self, worker_path: PathBuf) {
         let t = self.t();
+        // Start tailing the worker's rolling log BEFORE the spawn. The tail
+        // begins at the length the file has right now, so the previous run's
+        // lines are never replayed as if they had just been printed, and no
+        // line this run writes is missed.
+        match worker_log_path(&worker_path) {
+            Some(path) => crate::worker_log_tail::start(&path),
+            None => crate::worker_log_tail::stop(),
+        }
         let mut cmd = Command::new(&worker_path);
         cmd.current_dir(&self.work_dir);
         match Self::spawn_worker_with_logs(&mut cmd) {
@@ -250,16 +300,55 @@ impl MinerApp {
         let now = Instant::now();
         // The deadline governs GETTING the node up, not getting it caught up.
         // Once it answers, waiting is the correct behaviour and may last hours.
-        if !pending.syncing && now >= pending.deadline {
+        if pending.phase == StartPhase::NodeUp && now >= pending.deadline {
             pending.cancel_flag.store(true, Ordering::Release);
             self.fullnode_log_rx = None;
             self.status_msg = format!("{} {}", t.fullnode_not_ready, self.connect);
             return;
         }
 
-        if pending.syncing {
-            self.poll_node_sync(pending);
-            return;
+        // A node this panel launched can exit at any point, including hours into
+        // a chain download, so its log and its exit code are read in every phase
+        // rather than only while waiting for the RPC to come up.
+        if let Some(rx) = &self.fullnode_log_rx {
+            while let Ok(line) = rx.try_recv() {
+                if !line.trim().is_empty() {
+                    self.last_worker_log = line;
+                }
+            }
+        }
+        if let Some(child) = &mut pending.fullnode_child {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    self.fullnode_log_rx = None;
+                    self.sync_status = None;
+                    self.status_msg = if self.last_worker_log.is_empty() {
+                        format!("{} {exit}", t.fullnode_not_ready)
+                    } else {
+                        format!("{} {exit}: {}", t.fullnode_not_ready, self.last_worker_log)
+                    };
+                    return;
+                }
+                Err(e) => {
+                    self.fullnode_log_rx = None;
+                    self.sync_status = None;
+                    self.status_msg = format!("{} {e}", t.fullnode_not_ready);
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
+
+        match pending.phase {
+            StartPhase::Syncing => {
+                self.poll_node_sync(pending);
+                return;
+            }
+            StartPhase::WorkGate => {
+                self.poll_work_gate(pending);
+                return;
+            }
+            StartPhase::NodeUp => {}
         }
 
         if let Some(setup_rx) = pending.setup_rx.take() {
@@ -271,7 +360,7 @@ impl MinerApp {
                     // because block_hash_repeat is smaller down there the
                     // reported hashrate is HIGHER than normal, so it reads as
                     // success. Wait for the chain before starting the worker.
-                    pending.syncing = true;
+                    pending.phase = StartPhase::Syncing;
                     pending.next_sync_probe = Instant::now();
                     self.pending_start = Some(pending);
                     return;
@@ -304,37 +393,17 @@ impl MinerApp {
             }
         }
 
-        if let Some(rx) = &self.fullnode_log_rx {
-            while let Ok(line) = rx.try_recv() {
-                if !line.trim().is_empty() {
-                    self.last_worker_log = line;
-                }
-            }
-        }
-        if let Some(child) = &mut pending.fullnode_child {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    self.fullnode_log_rx = None;
-                    self.status_msg = if self.last_worker_log.is_empty() {
-                        format!("{} {exit}", t.fullnode_not_ready)
-                    } else {
-                        format!("{} {exit}: {}", t.fullnode_not_ready, self.last_worker_log)
-                    };
-                    return;
-                }
-                Err(e) => {
-                    self.fullnode_log_rx = None;
-                    self.status_msg = format!("{} {e}", t.fullnode_not_ready);
-                    return;
-                }
-                Ok(None) => {}
-            }
-        }
-
         if let Some(readiness_rx) = pending.readiness_rx.take() {
             match readiness_rx.try_recv() {
                 Ok(true) => {
-                    self.launch_worker(pending.worker_path);
+                    // The RPC answering means the node is alive, nothing more.
+                    // A node this panel just started is the LIKELIEST one to be
+                    // mid-download, so it goes through the same chain gate as a
+                    // node that was already running; that gate used to be
+                    // skipped on exactly this path.
+                    pending.phase = StartPhase::Syncing;
+                    pending.next_sync_probe = now;
+                    self.pending_start = Some(pending);
                     return;
                 }
                 Ok(false) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -380,6 +449,7 @@ impl MinerApp {
         self.worker_started_at = None;
         self.log_rx = None;
         self.fullnode_log_rx = None;
+        crate::worker_log_tail::stop();
         clear_worker_stats(&mut self.stats, &self.stats_path);
         self.last_worker_log.clear();
         if let Some(rx) = stop_rx {
@@ -410,6 +480,7 @@ impl MinerApp {
         self.worker_started_at = None;
         self.log_rx = None;
         self.fullnode_log_rx = None;
+        crate::worker_log_tail::stop();
     }
 
     pub(super) fn spawn_worker_with_logs(
@@ -422,9 +493,15 @@ impl MinerApp {
         // this panel.
         //
         // A child with its own console is not piping anything back, so the
-        // channel returned here stays empty and the panel quotes no log. Status
-        // is unaffected: it comes from polling the RPC and from the exit code.
-        // The detail is in the window the user can now see.
+        // channel returned here stays empty. That is why the workers also write
+        // every line they print to a rolling log beside their config
+        // (`app::worker_log`), which `worker_log_tail` reads: the operator gets
+        // the console window AND the panel gets the lines. Status was never
+        // affected either way, since it comes from the RPC and the exit code.
+        //
+        // The node is not covered by that log. Its output comes from the node,
+        // chain, server and mint crates, none of which can depend on `app`, so
+        // for the node the console window really is the only copy.
         #[cfg(windows)]
         {
             platform::configure_visible_command(cmd);
@@ -542,7 +619,7 @@ impl MinerApp {
                     pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
                     if synced {
                         self.sync_status = None;
-                        self.launch_worker(pending.worker_path);
+                        self.enter_work_gate(pending);
                         return;
                     }
                 }
@@ -570,6 +647,77 @@ impl MinerApp {
                 pending.sync_rx = Some(rx);
             } else {
                 pending.next_sync_probe = now + SYNC_PROBE_INTERVAL;
+            }
+        }
+
+        self.pending_start = Some(pending);
+    }
+
+    /// The chain is caught up. Last question before the worker starts: will the
+    /// node serve it any work?
+    fn enter_work_gate(&mut self, mut pending: PendingStart) {
+        let now = Instant::now();
+        pending.phase = StartPhase::WorkGate;
+        pending.next_work_probe = now;
+        pending.work_deadline = now + WORK_GATE_TIMEOUT;
+        self.status_msg = self.t().node_warmup.to_string();
+        self.poll_work_gate(pending);
+    }
+
+    /// Hold the worker back until the node stops refusing work.
+    ///
+    /// The node rejects `/query/miner/pending` for the first 30 seconds after
+    /// ITS start, and the panel used to spawn the worker inside that window, so
+    /// every single solo start put a red `Error: get block stuff error` line in
+    /// the worker log. It recovered on its own, which is the problem: it taught
+    /// the operator to read past red lines.
+    ///
+    /// The wait is on the node's answer, not on a 30 second sleep, because the
+    /// window is counted from the node's launch and the node is usually already
+    /// past it by the time the chain check finishes, or was started by someone
+    /// else long ago and never had one.
+    fn poll_work_gate(&mut self, mut pending: PendingStart) {
+        use crate::node_sync::WorkReadiness;
+        let now = Instant::now();
+
+        if let Some(rx) = pending.work_rx.take() {
+            match rx.try_recv() {
+                Ok(WorkReadiness::Serving) => {
+                    self.launch_worker(pending.worker_path);
+                    return;
+                }
+                // Still refusing, or could not tell. Neither starts the worker.
+                Ok(WorkReadiness::StartupWindow) | Ok(WorkReadiness::Unknown) => {
+                    pending.next_work_probe = now + WORK_PROBE_INTERVAL;
+                }
+                Err(mpsc::TryRecvError::Empty) => pending.work_rx = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pending.next_work_probe = now + WORK_PROBE_INTERVAL;
+                }
+            }
+        }
+
+        // Never a way to hang. A node that keeps refusing past the deadline is
+        // no longer inside a startup window, and whatever it says next belongs
+        // in the worker's log where the operator can read it.
+        if now >= pending.work_deadline {
+            self.launch_worker(pending.worker_path);
+            return;
+        }
+
+        if pending.work_rx.is_none() && now >= pending.next_work_probe {
+            let connect = self.connect.clone();
+            let (tx, rx) = mpsc::channel();
+            if thread::Builder::new()
+                .name("hacash-work-probe".to_string())
+                .spawn(move || {
+                    let _ = tx.send(crate::node_sync::probe_work(&connect));
+                })
+                .is_ok()
+            {
+                pending.work_rx = Some(rx);
+            } else {
+                pending.next_work_probe = now + WORK_PROBE_INTERVAL;
             }
         }
 

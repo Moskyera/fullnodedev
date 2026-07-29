@@ -45,7 +45,7 @@ impl CudaMiningResources {
     /// a clean batch, so throughput recovers once memory pressure clears.
     pub fn record_success(&self) {
         if self.quarantine.record_success() {
-            println!(
+            wlogln!(
                 "[CUDA] GPU RECOVERED: the re-probe succeeded, quarantine cleared and GPU mining has resumed."
             );
         }
@@ -71,7 +71,7 @@ impl CudaMiningResources {
         // smallest, most likely to succeed grid.
         self.eff_wg
             .store(self.floor_wg.max(1), std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
+        wlogerr!(
             "[CUDA] ALERT GPU quarantined after {} consecutive failed batches ({} this session): no GPU work for {}, then the card is re-probed automatically. Mining continues on capped CPU recovery. {} Check the driver, cooling, power and the PCIe riser.",
             report.consecutive_failures,
             report.total_failures,
@@ -93,7 +93,7 @@ impl CudaMiningResources {
                 notify,
             } => {
                 if notify {
-                    eprintln!(
+                    wlogerr!(
                         "[CUDA] GPU QUARANTINED (level {level}, {total_failures} failed batches): no GPU work for another {}, mining continues on capped CPU recovery. The card is re-probed automatically, no restart needed.",
                         crate::gpu_oom::format_backoff(retry_in)
                     );
@@ -106,7 +106,7 @@ impl CudaMiningResources {
             } => {
                 let wg = self.floor_wg.max(1);
                 self.eff_wg.store(wg, std::sync::atomic::Ordering::Relaxed);
-                println!(
+                wlogln!(
                     "[CUDA] GPU quarantine (level {level}, {total_failures} failed batches) expired: re-probing the device at work_groups={wg}."
                 );
                 false
@@ -131,7 +131,7 @@ pub fn initialize_cuda(
     unit_size: u32,
 ) -> Vec<Arc<CudaMiningResources>> {
     if !CudaMiner::is_available() {
-        eprintln!(
+        wlogerr!(
             "[CUDA] x16rs-cuda built without kernels; rebuild with: cargo build -p poworker --features cuda"
         );
         return Vec::new();
@@ -140,21 +140,21 @@ pub fn initialize_cuda(
     match CudaMiner::list_devices() {
         Ok(devices) => {
             for d in &devices {
-                println!(
+                wlogln!(
                     "[CUDA] Device #{}: {} (SM {}.{}, MP={})",
                     d.index, d.name, d.compute_major, d.compute_minor, d.multiprocessor_count
                 );
             }
         }
         Err(e) => {
-            eprintln!("[CUDA] enumerate devices failed: {e}");
+            wlogerr!("[CUDA] enumerate devices failed: {e}");
             return Vec::new();
         }
     }
 
     match CudaMiner::new(device_index, workgroups, unit_size) {
         Ok(miner) => {
-            println!(
+            wlogln!(
                 "[CUDA] Initialized device #{device_index} work_groups={workgroups} unit_size={unit_size}"
             );
             vec![Arc::new(CudaMiningResources {
@@ -167,7 +167,7 @@ pub fn initialize_cuda(
             })]
         }
         Err(e) => {
-            eprintln!("[CUDA] init failed: {e}");
+            wlogerr!("[CUDA] init failed: {e}");
             Vec::new()
         }
     }

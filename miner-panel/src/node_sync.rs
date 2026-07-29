@@ -82,7 +82,8 @@ pub fn probe(connect: &str) -> Option<SyncStatus> {
     let (_, latest) = crate::stats_poll::http_get(connect, "/query/latest").ok()?;
     let height = parse_height(&latest)?;
     let (_, intro) =
-        crate::stats_poll::http_get(connect, &format!("/query/block/intro?height={height}")).ok()?;
+        crate::stats_poll::http_get(connect, &format!("/query/block/intro?height={height}"))
+            .ok()?;
     let tip_unix = parse_timestamp(&intro)?;
     // Genesis is fetched once per probe rather than cached: it is one small
     // request against a local node, and caching it would mean carrying state
@@ -94,6 +95,57 @@ pub fn probe(connect: &str) -> Option<SyncStatus> {
         .ok()?
         .as_secs() as i64;
     Some(status_from(height, tip_unix, genesis_unix, now_unix))
+}
+
+/// The node's own refusal, verbatim from `mint/src/api/miner_pending.rs`:
+///
+/// ```text
+/// if ctx.engine.config().is_mainnet() && !gotdmintx && curtimes() < ctx.launch_time + 30 {
+///     return api_error("miner worker must be launched at least 30 secs after node start");
+/// }
+/// ```
+///
+/// A worker started inside that window gets one red `Error:` line in its log,
+/// recovers by itself about fifteen seconds later, and teaches the operator that
+/// red lines at startup are normal. That is how a real error becomes invisible.
+const WORK_REFUSAL_MARKER: &str = "at least 30 secs after node start";
+
+/// Whether the node will hand a worker something to mine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkReadiness {
+    /// The node answered with something other than its startup refusal. That is
+    /// deliberately not the same as "there is a template ready": any other
+    /// answer, including a different error, means the refusal window is over,
+    /// and everything past it is the worker's own retry loop to handle.
+    Serving,
+    /// Inside the node's 30 second post-start refusal window.
+    StartupWindow,
+    /// No usable answer. Never treated as ready, and never as an error either:
+    /// a node mid-batch can be briefly unresponsive.
+    Unknown,
+}
+
+/// Classify one `/query/miner/pending` body.
+pub fn work_readiness_from(body: &str) -> WorkReadiness {
+    if body.contains(WORK_REFUSAL_MARKER) {
+        WorkReadiness::StartupWindow
+    } else {
+        WorkReadiness::Serving
+    }
+}
+
+/// Ask the node the same question the worker is about to ask. Blocking; call it
+/// from the poller thread.
+///
+/// This is the observable condition rather than a 30 second sleep on the panel
+/// side: the window is counted from the node's own launch time, and the node may
+/// have been started minutes ago by someone else, in which case there is nothing
+/// to wait for at all.
+pub fn probe_work(connect: &str) -> WorkReadiness {
+    match crate::stats_poll::http_get(connect, "/query/miner/pending") {
+        Ok((_, body)) => work_readiness_from(&body),
+        Err(_) => WorkReadiness::Unknown,
+    }
 }
 
 /// Pull `"height"` out of a `/query/latest` body.
@@ -132,7 +184,11 @@ mod tests {
         // The real case: height 70,000, tip block from 2022, clock in 2026.
         let s = status_from(70_000, 1_666_000_000, 1_500_000_000, 1_785_181_634);
         assert!(!s.is_synced(), "a tip years old must not count as synced");
-        assert!(s.progress > 0.5 && s.progress < 0.65, "progress {}", s.progress);
+        assert!(
+            s.progress > 0.5 && s.progress < 0.65,
+            "progress {}",
+            s.progress
+        );
         assert!(s.blocks_behind() > 300_000);
     }
 
@@ -140,7 +196,10 @@ mod tests {
     fn a_tip_a_few_minutes_old_is_following_the_chain() {
         let now = 1_785_181_634;
         let s = status_from(812_345, now - 600, 1_500_000_000, now);
-        assert!(s.is_synced(), "ten minutes behind is two blocks, not a resync");
+        assert!(
+            s.is_synced(),
+            "ten minutes behind is two blocks, not a resync"
+        );
         assert_eq!(s.blocks_behind(), 2);
         assert!(s.progress > 0.999);
     }
@@ -173,11 +232,33 @@ mod tests {
     }
 
     #[test]
+    fn the_nodes_own_startup_refusal_is_recognised() {
+        // The body a node inside its first 30 seconds returns.
+        let refusal = r#"{"ret":1,"err":"miner worker must be launched at least 30 secs after node start"}"#;
+        assert_eq!(work_readiness_from(refusal), WorkReadiness::StartupWindow);
+
+        // A node serving work. Only the first fields matter here.
+        let serving = r#"{"height":768567,"coinbase_nonce":"0000000000000000","block_intro":"01","target_hash":"000000000048deff","ret":0}"#;
+        assert_eq!(work_readiness_from(serving), WorkReadiness::Serving);
+
+        // Any OTHER error is not this gate's business: the worker retries, and
+        // holding the start back on it would hang the panel on a node that is
+        // never going to say anything different.
+        let other = r#"{"ret":1,"err":"pending block not ready"}"#;
+        assert_eq!(work_readiness_from(other), WorkReadiness::Serving);
+        let disabled = r#"{"ret":1,"err":"miner not enabled"}"#;
+        assert_eq!(work_readiness_from(disabled), WorkReadiness::Serving);
+    }
+
+    #[test]
     fn an_unreadable_body_is_unknown_rather_than_zero() {
         // Zero would read as "genesis", which is a plausible-looking lie. The
         // callers wait instead.
         assert_eq!(parse_height("not json at all"), None);
-        assert_eq!(parse_timestamp(r#"{"ret":1,"err":"pending block not ready"}"#), None);
+        assert_eq!(
+            parse_timestamp(r#"{"ret":1,"err":"pending block not ready"}"#),
+            None
+        );
         assert_eq!(parse_height(r#"{"height":}"#), None);
     }
 }

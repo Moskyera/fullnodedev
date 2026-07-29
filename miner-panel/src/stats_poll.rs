@@ -20,8 +20,105 @@ use crate::mining_kind::MiningKind;
 
 const STATS_FILE_POLL_INTERVAL: Duration = Duration::from_millis(350);
 
+/// How old the worker's own snapshot may be before the panel stops drawing the
+/// measurements inside it as current.
+///
+/// The worker withholds a temperature whose sensor has gone quiet, but that rule
+/// ends at the file. What the panel reads is a snapshot, not a sensor, and a
+/// worker that stops writing leaves the last file it wrote on disk with every
+/// number in it intact. It stops writing more often than it looks: a thermal
+/// pause, the idle-hours window and the profit pause all return from the mining
+/// item before any stats are emitted, and a worker that hung or was killed
+/// without the panel noticing never writes again. Aging the snapshot at read
+/// time is the only place that can be caught.
+///
+/// The window is the one `fleet.rs` already calls a stale rig, so the panel has
+/// a single definition of a snapshot too old to quote.
+pub const STATS_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// A snapshot stamped further ahead than this came from a clock that disagrees
+/// with ours, not from the future. Its age cannot be measured, so it is not
+/// quoted either.
+const STATS_FUTURE_SKEW: Duration = Duration::from_secs(30);
+
+/// Whether the worker's snapshot is recent enough for the figures in it to be
+/// drawn as live measurements. A snapshot that never arrived (`updated_unix_ms`
+/// is 0, which is also what the panel resets to when a worker stops) is not.
+pub fn snapshot_is_live(stats: &MiningStatsSnapshot, now_ms: u64) -> bool {
+    let taken_at = stats.updated_unix_ms;
+    if taken_at == 0 || taken_at > now_ms.saturating_add(STATS_FUTURE_SKEW.as_millis() as u64) {
+        return false;
+    }
+    now_ms.saturating_sub(taken_at) <= STATS_STALE_AFTER.as_millis() as u64
+}
+
+/// The GPU temperature the panel is allowed to put in the gauge.
+///
+/// `None` means exactly what an absent reading has always meant here: no
+/// temperature to draw, so the ring is empty and says "not measured". It is
+/// never a zero and never the last number a dead worker happened to leave
+/// behind. The range check is the worker's own (`mining_stats::sensor_temperature`),
+/// applied again because what arrives here is a file rather than a sensor.
+pub fn live_gpu_temp_c(stats: &MiningStatsSnapshot, now_ms: u64) -> Option<f32> {
+    if !snapshot_is_live(stats, now_ms) {
+        return None;
+    }
+    stats
+        .gpu_temp_c
+        .filter(|c| c.is_finite() && *c > 0.0 && *c < 120.0)
+}
+
+/// The OOM clamp in force, or `None` when nothing was clamped.
+///
+/// `oom_allowed_work_groups` is a COUNT of what the OOM fallback allows, not a
+/// count of what was taken away, and on a rig that has never hit an
+/// out-of-memory batch it equals `configured_work_groups`. Testing it for `> 0`
+/// therefore reports an OOM clamp on every healthy GPU in the world, which is
+/// exactly what painted the Hardware ring red on a rig running all 48 of its 48
+/// work groups. A clamp exists only where the allowance falls BELOW what the
+/// panel configured.
+pub fn oom_clamp(stats: &MiningStatsSnapshot) -> Option<u32> {
+    let allowed = stats.oom_allowed_work_groups;
+    let configured = stats.configured_work_groups;
+    // With no configured count there is nothing to be below, so no clamp can be
+    // proven and none is claimed.
+    if allowed == 0 || configured == 0 || allowed >= configured {
+        return None;
+    }
+    Some(allowed)
+}
+
+/// The thermal cap in force, or `None` when the thermal guard has capped
+/// nothing. Zero here really does mean "no cap", but a cap at or above the
+/// configured count still took nothing away, so it is not reported as a clamp.
+pub fn thermal_clamp(stats: &MiningStatsSnapshot) -> Option<u32> {
+    let cap = stats.thermal_cap_work_groups;
+    let configured = stats.configured_work_groups;
+    if cap == 0 || (configured > 0 && cap >= configured) {
+        return None;
+    }
+    Some(cap)
+}
+
+/// Whether something is holding this rig below the work groups it was told to
+/// run. A stale snapshot proves nothing about now, so it reports nothing.
+pub fn work_groups_clamped(stats: &MiningStatsSnapshot, now_ms: u64) -> bool {
+    snapshot_is_live(stats, now_ms)
+        && (oom_clamp(stats).is_some() || thermal_clamp(stats).is_some())
+}
+
+/// How many times a crashed worker is restarted before the panel stops and says
+/// so. Public because the sidebar prints the retries spent out of this budget,
+/// and a hard-coded "3" there would quietly start lying the day this changes.
+pub const MAX_RESTART_ATTEMPTS: u8 = 3;
+
 impl MinerApp {
     pub(super) fn poll_stats(&mut self) {
+        // The Master Panel is drawn by `FleetState`, which the frame loop hands
+        // a `Ui` and a stats snapshot and no language. This runs once per frame
+        // before any screen is drawn, so it is where the chosen language is
+        // published for the parts of the UI that cannot be passed it.
+        crate::i18n::note_active_lang(self.lang);
         // Money first, and before every early return below: a miner must be able
         // to see what it is owed whether or not the worker is currently running.
         self.poll_pool_money();
@@ -37,30 +134,14 @@ impl MinerApp {
                 }
             }
         }
+        self.fold_into_history();
 
         self.poll_scheduled_restart();
         if !self.mining {
             return;
         }
 
-        let t = self.t();
-        if let Some(rx) = &self.log_rx {
-            while let Ok(line) = rx.try_recv() {
-                if !line.trim().is_empty() {
-                    self.last_worker_log = line.clone();
-                }
-                if line.contains("MINING SUCCESS") {
-                    self.status_msg = t.block_found.to_string();
-                } else if line.contains("cannot get block data") {
-                    self.status_msg = t.fullnode_not_ready.to_string();
-                } else if line.contains("OpenCL error")
-                    || line.contains("GPU batch failed")
-                    || line.contains("CL_OUT_OF")
-                {
-                    self.status_msg = format!("{} {line}", t.worker_error_prefix);
-                }
-            }
-        }
+        self.absorb_worker_lines();
 
         let exit = match self.child.as_mut().map(|child| child.try_wait()) {
             Some(Ok(Some(exit))) => Some(Ok(exit)),
@@ -89,6 +170,13 @@ impl MinerApp {
             return;
         };
 
+        // The worker has gone. Read its last words now, without waiting out the
+        // usual interval and before the drain above stops running: whatever it
+        // printed on the way out is exactly what belongs in the message about
+        // why it stopped.
+        crate::worker_log_tail::read_immediately();
+        self.absorb_worker_lines();
+
         self.mining = false;
         self.child = None;
         self.log_rx = None;
@@ -102,6 +190,7 @@ impl MinerApp {
             self.restart_attempts = 0;
         }
 
+        let t = self.t();
         let exit_text = match exit {
             Ok(status) => status.to_string(),
             Err(error) => error,
@@ -112,7 +201,7 @@ impl MinerApp {
             format!("{exit_text}: {}", self.last_worker_log)
         };
 
-        if self.restart_attempts < 3 {
+        if self.restart_attempts < MAX_RESTART_ATTEMPTS {
             self.restart_attempts += 1;
             let delay = Duration::from_secs(3 * self.restart_attempts as u64);
             let worker = match self.mining_kind {
@@ -121,18 +210,94 @@ impl MinerApp {
             };
             self.restart_worker = Some((worker, Instant::now() + delay));
             self.status_msg = format!(
-                "{}: {}. Automatic retry {}/3 in {}s.",
+                "{}: {}. Automatic retry {}/{} in {}s.",
                 t.miner_exited,
                 detail,
                 self.restart_attempts,
+                MAX_RESTART_ATTEMPTS,
                 delay.as_secs()
             );
         } else {
             self.restart_worker = None;
             self.status_msg = format!(
-                "{}: {}. Automatic recovery stopped after 3 attempts.",
+                "{}: {}. Automatic recovery stopped after {MAX_RESTART_ATTEMPTS} attempts.",
                 t.miner_exited, detail
             );
+        }
+    }
+
+    /// Keep the chart's history, which lives here rather than in the view.
+    ///
+    /// This runs every frame, on every screen. The dashboard is not the only
+    /// place the panel spends its time, and a history that only advanced while
+    /// that one tab was open would put an hour-long hole in the chart for every
+    /// hour spent in Setup. The freshness rules inside `Series::record` decide
+    /// what is actually kept, and they refuse a snapshot the worker has not
+    /// rewritten, so a frame that measured nothing records nothing.
+    ///
+    /// The file beside it is what makes the wider ranges mean anything after a
+    /// restart. It is read once, before the first live reading is taken, and
+    /// written back on its own slow interval.
+    fn fold_into_history(&self) {
+        let path = crate::history::path_beside_stats(&self.stats_path);
+        let now_ms = now_unix_ms();
+        let mut live = crate::dashboard::live();
+        crate::history::restore_once(&path, &mut live.series, now_ms);
+        live.observe(&self.stats);
+        crate::history::persist_if_due(&path, &live.series, now_ms);
+    }
+
+    /// Take every line the worker has printed since the last call and file it:
+    /// into the dashboard's event feed, into `last_worker_log`, and into the
+    /// status line when the worker said something the panel must repeat.
+    ///
+    /// The output reaches the panel one of two ways, and exactly one of them is
+    /// live per platform. Where a worker is piped, the channel carries its
+    /// lines. Where the worker owns its own console window instead (Windows) it
+    /// pipes nothing back and that channel was born disconnected, so the rolling
+    /// log file the worker writes beside its config is the only copy the panel
+    /// can read. Reading both on the platform where both work would show every
+    /// line twice, so each is read only where it is the real source.
+    fn absorb_worker_lines(&mut self) {
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(rx) = &self.log_rx {
+            while let Ok(line) = rx.try_recv() {
+                // The Logs screen reads one bounded ring. A piped line is not in
+                // it yet, so it is put there here; a tailed line already is.
+                crate::worker_log_tail::record_piped(&line);
+                lines.push(line);
+            }
+        }
+        #[cfg(windows)]
+        lines.extend(
+            crate::worker_log_tail::poll()
+                .into_iter()
+                .map(|line| line.text),
+        );
+        if lines.is_empty() {
+            return;
+        }
+
+        let t = self.t();
+        for line in lines {
+            // The dashboard's event feed has to see every line here. It is the
+            // only place they exist: `last_worker_log` keeps one, and a view
+            // sampling that between frames would miss whatever was overwritten
+            // in between.
+            crate::dashboard::record_worker_line(&line);
+            if !line.trim().is_empty() {
+                self.last_worker_log = line.clone();
+            }
+            if line.contains("MINING SUCCESS") {
+                self.status_msg = t.block_found.to_string();
+            } else if line.contains("cannot get block data") {
+                self.status_msg = t.fullnode_not_ready.to_string();
+            } else if line.contains("OpenCL error")
+                || line.contains("GPU batch failed")
+                || line.contains("CL_OUT_OF")
+            {
+                self.status_msg = format!("{} {line}", t.worker_error_prefix);
+            }
         }
     }
 
@@ -484,7 +649,10 @@ fn fetch_payout_view(query: &PoolQuery, has_terms: bool, was_pool: bool) -> Payo
         was_pool: was_pool || has_terms,
     };
     if !query.worker.is_empty() {
-        match http_get(&query.connect, &format!("/earnings?worker={}", query.worker)) {
+        match http_get(
+            &query.connect,
+            &format!("/earnings?worker={}", query.worker),
+        ) {
             Err(error) => return unreachable(error),
             Ok((200, body)) => match parse_earnings(&body, &query.worker) {
                 EarningsAnswer::Earnings(e) => return PayoutView::Earnings(e),
@@ -631,7 +799,11 @@ fn read_last_payout(v: &Value) -> Option<LastPayout> {
     let unix_ms = last
         .get("unix_ms")
         .and_then(Value::as_u64)
-        .or_else(|| last.get("unix_sec").and_then(Value::as_u64).map(|s| s * 1000))
+        .or_else(|| {
+            last.get("unix_sec")
+                .and_then(Value::as_u64)
+                .map(|s| s * 1000)
+        })
         .unwrap_or(0);
     if amount.is_none() && tx.is_empty() && unix_ms == 0 {
         return None;
@@ -853,9 +1025,10 @@ fn split_head(raw: &[u8]) -> Option<(&[u8], &[u8])> {
 fn content_length(head: &[u8]) -> Option<usize> {
     let head = std::str::from_utf8(head).ok()?;
     head.lines()
-        .find_map(|line| line.split_once(':').filter(|(k, _)| {
-            k.trim().eq_ignore_ascii_case("content-length")
-        }))
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        })
         .and_then(|(_, v)| v.trim().parse().ok())
 }
 
@@ -899,6 +1072,79 @@ pub fn format_age_secs(sec: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operator's live rig this minute: 48 configured, 48 allowed, no
+    /// thermal cap, snapshot fresh.
+    fn healthy_rig() -> MiningStatsSnapshot {
+        MiningStatsSnapshot {
+            configured_work_groups: 48,
+            oom_allowed_work_groups: 48,
+            thermal_cap_work_groups: 0,
+            effective_work_groups: 48,
+            updated_unix_ms: now_unix_ms(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_rig_running_every_work_group_it_was_given_is_not_clamped() {
+        // This is the whole defect: `oom_allowed_work_groups` is a COUNT, and
+        // reading it as "work groups lost to an OOM" turned the Hardware ring
+        // red on a perfectly healthy card mining mainnet.
+        let stats = healthy_rig();
+        assert_eq!(oom_clamp(&stats), None);
+        assert_eq!(thermal_clamp(&stats), None);
+        assert!(!work_groups_clamped(&stats, now_unix_ms()));
+    }
+
+    #[test]
+    fn a_clamp_is_reported_only_where_the_allowance_falls_short() {
+        let mut stats = healthy_rig();
+        stats.oom_allowed_work_groups = 24;
+        stats.effective_work_groups = 24;
+        assert_eq!(oom_clamp(&stats), Some(24));
+        assert!(work_groups_clamped(&stats, now_unix_ms()));
+
+        // A thermal cap at or above the configured count took nothing away.
+        let mut capped = healthy_rig();
+        capped.thermal_cap_work_groups = 48;
+        assert_eq!(thermal_clamp(&capped), None);
+        assert!(!work_groups_clamped(&capped, now_unix_ms()));
+        capped.thermal_cap_work_groups = 12;
+        assert_eq!(thermal_clamp(&capped), Some(12));
+        assert!(work_groups_clamped(&capped, now_unix_ms()));
+    }
+
+    #[test]
+    fn a_worker_that_reported_nothing_is_never_called_clamped() {
+        // No configured count and no allowance means nothing is known, and an
+        // unknown is not a fault. A stale snapshot proves nothing about now
+        // either, however alarming the numbers frozen in it.
+        let mut nothing = MiningStatsSnapshot {
+            updated_unix_ms: now_unix_ms(),
+            ..Default::default()
+        };
+        assert_eq!(oom_clamp(&nothing), None);
+        assert!(!work_groups_clamped(&nothing, now_unix_ms()));
+        nothing.configured_work_groups = 48;
+        assert_eq!(oom_clamp(&nothing), None, "0 allowed is unreported, not 0");
+
+        let stale = MiningStatsSnapshot {
+            configured_work_groups: 48,
+            oom_allowed_work_groups: 4,
+            updated_unix_ms: now_unix_ms() - (STATS_STALE_AFTER.as_millis() as u64 + 1_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            oom_clamp(&stale),
+            Some(4),
+            "the file still says what it says"
+        );
+        assert!(
+            !work_groups_clamped(&stale, now_unix_ms()),
+            "a stale snapshot must not turn the ring red"
+        );
+    }
 
     #[test]
     fn pool_units_are_tenths_of_a_hac_in_the_chains_own_amount() {
@@ -960,7 +1206,8 @@ mod tests {
 
     #[test]
     fn a_refusal_is_repeated_to_the_miner_instead_of_being_swallowed() {
-        let body = r#"{"ok":false,"err":"set pool_worker=<your HAC address> so the pool can pay you"}"#;
+        let body =
+            r#"{"ok":false,"err":"set pool_worker=<your HAC address> so the pool can pay you"}"#;
         let EarningsAnswer::Refused(message) = parse_earnings(body, "1abc") else {
             panic!("a refusal must reach the miner");
         };
@@ -1006,7 +1253,10 @@ mod tests {
 
     #[test]
     fn an_endpoint_without_terms_publishes_none() {
-        assert_eq!(parse_terms(r#"{"ok":false,"err":"no such endpoint"}"#), None);
+        assert_eq!(
+            parse_terms(r#"{"ok":false,"err":"no such endpoint"}"#),
+            None
+        );
         assert_eq!(parse_terms(r#"{"ret":0,"height":9}"#), None);
         assert_eq!(parse_terms("nonsense"), None);
     }
@@ -1050,6 +1300,74 @@ mod tests {
     fn a_body_wrapped_by_a_transfer_encoding_still_parses() {
         let chunked = "7\r\n{\"a\":1}\r\n0\r\n\r\n";
         assert!(json_value(chunked).is_some());
+    }
+
+    fn snapshot_at(taken_at_ms: u64, temp: Option<f32>) -> MiningStatsSnapshot {
+        MiningStatsSnapshot {
+            gpu_temp_c: temp,
+            updated_unix_ms: taken_at_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_temperature_the_worker_stopped_refreshing_is_not_drawn_as_current() {
+        // The failure this exists for: the worker pauses on temperature, returns
+        // from the mining item before writing any stats, and the file on disk
+        // keeps its last reading forever. Nothing about that file changes, so
+        // the age has to be taken here or not at all.
+        let now = 1_800_000_000_000u64;
+        let stale = STATS_STALE_AFTER.as_millis() as u64;
+
+        assert_eq!(
+            live_gpu_temp_c(&snapshot_at(now - 1_000, Some(71.5)), now),
+            Some(71.5),
+            "a snapshot written a second ago is a measurement"
+        );
+        assert_eq!(
+            live_gpu_temp_c(&snapshot_at(now - stale, Some(71.5)), now),
+            Some(71.5),
+            "the window itself is still inside the window"
+        );
+        assert_eq!(
+            live_gpu_temp_c(&snapshot_at(now - stale - 1, Some(71.5)), now),
+            None,
+            "past it there is no reading, not a frozen one"
+        );
+        assert_eq!(
+            live_gpu_temp_c(&snapshot_at(now - 3_600_000, Some(71.5)), now),
+            None,
+            "an hour-old file must not put a confident number on the gauge"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_impossible_temperature_stays_absent_and_never_becomes_zero() {
+        let now = 1_800_000_000_000u64;
+        assert_eq!(live_gpu_temp_c(&snapshot_at(now, None), now), None);
+        for impossible in [0.0, -12.0, 120.0, 5_000.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                live_gpu_temp_c(&snapshot_at(now, Some(impossible)), now),
+                None,
+                "{impossible} is not a GPU temperature"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_never_arrived_or_came_from_a_disagreeing_clock_is_not_live() {
+        let now = 1_800_000_000_000u64;
+        // What the panel holds before the first read, and what it resets to when
+        // a worker stops.
+        assert!(!snapshot_is_live(&MiningStatsSnapshot::default(), now));
+        assert!(!snapshot_is_live(&snapshot_at(0, Some(60.0)), now));
+        // A small skew is a clock, not a lie; a large one cannot be aged at all.
+        assert!(snapshot_is_live(&snapshot_at(now + 1_000, Some(60.0)), now));
+        assert!(!snapshot_is_live(
+            &snapshot_at(now + 10 * 60 * 1_000, Some(60.0)),
+            now
+        ));
+        assert!(snapshot_is_live(&snapshot_at(now - 1, Some(60.0)), now));
     }
 
     #[test]

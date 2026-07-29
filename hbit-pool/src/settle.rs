@@ -14,7 +14,17 @@ use protocol::action::HacToTrs;
 use protocol::transaction::TransactionType2;
 use sys::*;
 
-use hbit_pool::{balance, http_client, mine_and_submit_block, post_hex};
+use hbit_pool::{BalanceAnswer, balance, http_client, mine_and_submit_block, post_hex};
+
+/// Does this address hold anything at all? The spike pays FRACTIONAL amounts,
+/// most of them under 0.1 HAC, so it reads the node's own string rather than the
+/// 0.1-HAC valuation the payout path uses - that one floors 0.3 HAC to nothing.
+///
+/// A node that did not answer is NOT funded here. Reading silence as "paid"
+/// would let this spike report SUCCESS without a single balance having moved.
+fn is_funded(b: &BalanceAnswer) -> bool {
+    matches!(b, BalanceAnswer::Reported(s) if !s.starts_with("0:"))
+}
 
 fn main() {
     let base = env::args()
@@ -40,9 +50,18 @@ fn main() {
     // Deterministic accounts we control (public keys — testnet demo only).
     let sender = Account::create_by_secret_key_value([1u8; 32]).expect("sender account");
     let recipients: Vec<(Account, &str)> = vec![
-        (Account::create_by_secret_key_value([2u8; 32]).unwrap(), "2:247"), // 0.2 HAC
-        (Account::create_by_secret_key_value([3u8; 32]).unwrap(), "3:247"), // 0.3 HAC
-        (Account::create_by_secret_key_value([4u8; 32]).unwrap(), "1:247"), // 0.1 HAC
+        (
+            Account::create_by_secret_key_value([2u8; 32]).unwrap(),
+            "2:247",
+        ), // 0.2 HAC
+        (
+            Account::create_by_secret_key_value([3u8; 32]).unwrap(),
+            "3:247",
+        ), // 0.3 HAC
+        (
+            Account::create_by_secret_key_value([4u8; 32]).unwrap(),
+            "1:247",
+        ), // 0.1 HAC
     ];
 
     println!("== HBIT settlement spike ==");
@@ -51,7 +70,7 @@ fn main() {
     let sender_bal = balance(&client, &base, sender.readable());
     println!("sender balance = {sender_bal}");
 
-    if sender_bal.is_empty() || sender_bal.starts_with("0:") {
+    if !is_funded(&sender_bal) {
         println!(
             "\nSender is unfunded. Fund it by mining one block to it, then re-run:\n  \
              hbit-pool-spike {base} {}\n",
@@ -84,11 +103,19 @@ fn main() {
 
     println!("\nbefore:");
     for (rec, _) in &recipients {
-        println!("  {} = {}", rec.readable(), balance(&client, &base, rec.readable()));
+        println!(
+            "  {} = {}",
+            rec.readable(),
+            balance(&client, &base, rec.readable())
+        );
     }
 
     // (a) submit to the mempool — the pool's normal action.
-    let resp = post_hex(&client, &format!("{base}/submit/transaction?hexbody=true"), &body_hex);
+    let resp = post_hex(
+        &client,
+        &format!("{base}/submit/transaction?hexbody=true"),
+        &body_hex,
+    );
     println!("\n/submit/transaction -> {resp}");
 
     // (b) confirm it by mining a block that INCLUDES the transfer (this testnet
@@ -103,13 +130,13 @@ fn main() {
     println!("mined confirming block {h} (coinbase+transfer) -> {blkresp}");
 
     // Verify recipient balances after.
-    let mut after: Vec<String> = Vec::new();
+    let mut after: Vec<BalanceAnswer> = Vec::new();
     for _ in 0..12 {
         after = recipients
             .iter()
             .map(|(rec, _)| balance(&client, &base, rec.readable()))
             .collect();
-        if after.iter().all(|b| !b.is_empty() && !b.starts_with("0:")) {
+        if after.iter().all(is_funded) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(800));
@@ -118,7 +145,7 @@ fn main() {
     println!("\nafter:");
     let mut all_paid = true;
     for ((rec, want), got) in recipients.iter().zip(after.iter()) {
-        let ok = !got.is_empty() && !got.starts_with("0:");
+        let ok = is_funded(got);
         all_paid &= ok;
         println!(
             "  {} = {got}  (wanted {want}) {}",

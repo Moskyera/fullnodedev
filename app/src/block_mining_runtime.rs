@@ -13,12 +13,12 @@ use crate::efficiency::*;
 use crate::hash_util::{hash_left_zero_pad3, hash_more_power};
 // The panic firewall is shared with the diamond (HACD) worker, which has exactly
 // the same "one result thread owns every submission" shape.
-use crate::mining_guard::guard_mining_iteration;
 #[cfg(feature = "cuda")]
 use crate::mining_batch::CudaBlockBackend;
 #[cfg(feature = "ocl")]
 use crate::mining_batch::OpenclBlockBackend;
 use crate::mining_batch::{BatchCtx, BlockMinerBackend, CpuBlockBackend};
+use crate::mining_guard::guard_mining_iteration;
 
 use basis::difficulty::*;
 use basis::interface::*;
@@ -292,7 +292,7 @@ fn report_share_undersampling(dropped: u64) {
     {
         return;
     }
-    eprintln!(
+    wlogerr!(
         "\n[Mining] UNDERSAMPLING: the GPU share list filled up, so {dropped} payable nonces from this batch were never submitted ({total} so far this session). This is lost income, and it means the pool's share target is far too easy for this card: ask the operator to LOWER share_bits, which makes each share harder. Raising it makes shares easier and loses more. Nothing is wrong with the GPU. This line is rate limited to one per 30 seconds, so it undercounts how often this happens; the session figure is the number that matters."
     );
 }
@@ -363,7 +363,7 @@ fn send_mining_result(
             if result_meets_target(&res) {
                 return result_ch_tx.send(res).is_ok();
             }
-            eprintln!(
+            wlogerr!(
                 "[Mining] Result queue full, dropped a statistics-only batch at height {}.",
                 res.height
             );
@@ -582,7 +582,7 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                             // duplicate, busy, invalid): resending this exact
                             // submission cannot help, so stop attempting.
                             _ => {
-                                println!(
+                                wlogln!(
                                     "[submit] node rejected height {}: {}",
                                     success.height, err
                                 );
@@ -596,7 +596,7 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                         // node decision, so treat it as transient and retry: a
                         // winning block is not discarded on a front-end hiccup.
                         let snippet: String = body.chars().take(120).collect();
-                        println!(
+                        wlogln!(
                             "[submit] attempt {}/{} unrecognized response, retrying: {}",
                             attempt, MAX_SUBMIT_ATTEMPTS, snippet
                         );
@@ -608,7 +608,7 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
             }
             Err(e) => {
                 last = format!("transport error: {e}");
-                println!(
+                wlogln!(
                     "[submit] attempt {}/{} failed: {e}",
                     attempt, MAX_SUBMIT_ATTEMPTS
                 );
@@ -618,10 +618,10 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
             }
         }
     }
-    println!("{} {}", &urlapi_success, last);
+    wlogln!("{} {}", &urlapi_success, last);
     match verdict {
         SubmitVerdict::Accepted => {
-            println!(
+            wlogln!(
                 "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
                 success.height,
                 success.result_hash.to_hex()
@@ -632,28 +632,28 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
         // "check the node/connection" alarm for these would cry wolf on every
         // single share a pool miner earns.
         SubmitVerdict::ShareCredited => {
-            println!(
+            wlogln!(
                 "[submit] pool credited a share at height {} (hash {}).",
                 success.height,
                 success.result_hash.to_hex()
             );
         }
         SubmitVerdict::UpstreamBusy => {
-            println!(
+            wlogln!(
                 "[submit] pool is busy at height {}: pausing submits for it for {}s.",
                 success.height,
                 POOL_BUSY_COOLDOWN.as_secs()
             );
         }
         SubmitVerdict::DuplicateSubmission => {
-            println!(
+            wlogln!(
                 "[submit] height {} was already credited for this nonce (hash {}).",
                 success.height,
                 success.result_hash.to_hex()
             );
         }
         _ => {
-            println!(
+            wlogln!(
                 "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
                 success.height,
                 MAX_SUBMIT_ATTEMPTS,
@@ -661,7 +661,7 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
             );
         }
     }
-    println!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔");
+    wlogln!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔");
     verdict
 }
 
@@ -870,7 +870,7 @@ impl SubmitGate {
             // report: the submit path already printed its own outcome.
             if entry.suppressed > 0 {
                 if entry.state == TemplateSubmitState::Settled {
-                    println!(
+                    wlogln!(
                         "\n[Mining] height {} {}, suppressed {} redundant winners.",
                         key.0, entry.outcome, entry.suppressed
                     );
@@ -879,7 +879,7 @@ impl SubmitGate {
                     // held back while a submission was in flight or while the
                     // upstream asked for a pause. Say so instead of calling them
                     // redundant.
-                    println!(
+                    wlogln!(
                         "\n[Mining] height {} {}, held back {} further winners.",
                         key.0, entry.outcome, entry.suppressed
                     );
@@ -945,7 +945,7 @@ fn queue_block_mining_success(
     match submit_tx.try_send(win.clone()) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(win)) => {
-            eprintln!(
+            wlogerr!(
                 "[Mining] Submit queue full, submitting height {} inline.",
                 win.height
             );
@@ -1284,7 +1284,7 @@ fn build_gpu_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
             let cuda_resources =
                 super::initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize);
             if !cuda_resources.is_empty() {
-                println!(
+                wlogln!(
                     "\n[Start] Create CUDA block miner worker #{}.",
                     cuda_resources.len()
                 );
@@ -1295,7 +1295,7 @@ fn build_gpu_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            println!(
+            wlogln!(
                 "\n[Warn] use_cuda=true but app built without `cuda` feature, fallback to CPU miner."
             );
         }
@@ -1316,7 +1316,7 @@ fn build_gpu_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
                 false,
             );
             if !opencl_resources.is_empty() {
-                println!(
+                wlogln!(
                     "\n[Start] Create GPU block miner worker #{}.",
                     opencl_resources.len()
                 );
@@ -1351,7 +1351,7 @@ fn build_gpu_backends(cnf: &PoWorkConf) -> Vec<MinerBackend> {
 
         #[cfg(not(feature = "ocl"))]
         {
-            println!(
+            wlogln!(
                 "\n[Warn] use_opencl=true but app built without `ocl` feature, fallback to CPU miner."
             );
         }
@@ -1375,7 +1375,7 @@ fn build_miner_backends(
             break;
         }
         let wait = GPU_INIT_RETRY_DELAYS_SECS[attempt - 1];
-        println!(
+        wlogln!(
             "\n[Start] GPU not ready yet (attempt {attempt}/{attempts}). Waiting {wait}s and trying again - this is normal shortly after a boot, a resume, or a driver reset."
         );
         if sleep_unless_stopped(stop_flag, Duration::from_secs(wait)) {
@@ -1387,7 +1387,7 @@ fn build_miner_backends(
     // work running instead of taking the whole rig to zero.
     let assist_threads = cpu_assist_thread_count(cnf, backends.len());
     if assist_threads > 0 {
-        println!(
+        wlogln!(
             "\n[Start] Create #{} Ryzen CPU assist threads (hybrid GPU+CPU, active={}).",
             assist_threads,
             cnf.runtime.active_cpu_assist.load(Relaxed)
@@ -1401,13 +1401,13 @@ fn build_miner_backends(
 
     if backends.is_empty() {
         if gpu_requested {
-            eprintln!(
+            wlogerr!(
                 "[Fatal] a GPU miner was requested but no usable GPU backend initialized after {attempts} attempt(s); refusing silent CPU fallback (you would pay for GPU power while mining slowly on the CPU). If the GPU works in other software, wait a minute and press Start again; otherwise check the driver/CUDA runtime, or set the backend to CPU."
             );
             return backends;
         }
         let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene.max(1)) as usize;
-        println!(
+        wlogln!(
             "\n[Start] Create #{} CPU block miner worker thread.",
             thrnum
         );
@@ -1434,15 +1434,8 @@ fn backend_nonce_space(_cnf: &PoWorkConf, backend: &MinerBackend) -> u32 {
             // Match run_batch: the planned window must reflect the same effective
             // work-groups (OOM/error backoff) and thermal cap the batch will use,
             // otherwise the nonce accounting overstates what the GPU covered.
-            let thermal = _cnf
-                .runtime
-                .thermal_workgroups_cap()
-                .unwrap_or(u32::MAX);
-            let wg = res
-                .effective_wg()
-                .min(_cnf.workgroups)
-                .min(thermal)
-                .max(1);
+            let thermal = _cnf.runtime.thermal_workgroups_cap().unwrap_or(u32::MAX);
+            let wg = res.effective_wg().min(_cnf.workgroups).min(thermal).max(1);
             wg.saturating_mul(x16rs_cuda::DEFAULT_LOCAL_SIZE)
                 .saturating_mul(res.unit_size)
                 .max(1)
@@ -1487,7 +1480,7 @@ fn run_block_mining_item(
     let stuff = match MINING_BLOCK_STUFF.read() {
         Ok(stuff) => stuff.clone(),
         Err(e) => {
-            eprintln!("[Mining] Block state lock failed: {e}");
+            wlogerr!("[Mining] Block state lock failed: {e}");
             return;
         }
     };
@@ -1500,7 +1493,7 @@ fn run_block_mining_item(
 
     let mut coinbase_nonce = [0u8; HASH_WIDTH];
     if let Err(e) = getrandom::fill(&mut coinbase_nonce) {
-        eprintln!("[Mining] Secure random nonce failed: {e}");
+        wlogerr!("[Mining] Secure random nonce failed: {e}");
         return;
     }
     let coinbase_nonce = Hash::from(coinbase_nonce);
@@ -1705,7 +1698,7 @@ fn drain_winners_for_shutdown(
             && admit_for_submit(gate, &res)
         {
             if let Err(e) = submit_tx.try_send(res.clone()) {
-                eprintln!(
+                wlogerr!(
                     "[Mining] Shutdown could not queue a winning result at height {}: {e}",
                     res.height
                 );
@@ -1796,7 +1789,7 @@ fn deal_block_mining_results(
         *most_hash = most.result_hash.clone();
     }
     let Ok(tarhx) = most.target_hash.clone().try_into() else {
-        eprintln!("[Mining] Ignoring result with invalid target hash length.");
+        wlogerr!("[Mining] Ignoring result with invalid target hash length.");
         return;
     };
     let target_rates = hash_to_rates(&tarhx, TARGET_BLOCK_TIME);
@@ -1820,7 +1813,7 @@ fn deal_block_mining_results(
         .maybe_adjust_supervene(&cnf.efficiency, gpu_nonce_space, cpu_nonce_space);
     if should_pause_for_profit(&cnf.efficiency, hac1day, &cnf.gpu_profile, active_cpu) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
-        println!(
+        wlogln!(
             "\n[efficiency] Mining paused: estimated cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw."
         );
     } else {
@@ -1893,12 +1886,12 @@ pub(crate) fn may_print_turn_to_nex_block_mining(curr_hei: u64, most_hash: Optio
         *most_hash = vec![255u8; 32];
     }
     let Ok(stuff) = MINING_BLOCK_STUFF.read() else {
-        eprintln!("[Mining] Cannot read block state.");
+        wlogerr!("[Mining] Cannot read block state.");
         return;
     };
     let tarhx = hash_left_zero_pad3(&stuff.target_hash.as_bytes()).to_hex();
 
-    println!(
+    wlogln!(
         "\n[{}] req height {} target {} to mining ... ",
         &ctshow()[5..],
         mining_hei,

@@ -62,12 +62,12 @@ pub(crate) fn create_command_queue(
     let ooo = CommandQueueProperties::new().out_of_order();
     match Queue::new(context, device.clone(), Some(ooo)) {
         Ok(queue) => {
-            println!("[OpenCL] Out-of-order command queue enabled");
+            wlogln!("[OpenCL] Out-of-order command queue enabled");
             Ok((queue, true))
         }
         Err(ooo_error) => Queue::new(context, device.clone(), None)
             .map(|queue| {
-                println!("[OpenCL] In-order command queue (OOO not supported)");
+                wlogln!("[OpenCL] In-order command queue (OOO not supported)");
                 (queue, false)
             })
             .map_err(|e| format!("cannot create command queue: {e}; OOO attempt: {ooo_error}")),
@@ -125,9 +125,9 @@ pub struct OpenCLResources {
     buffer_share_found: Buffer<u32>,
     buffer_share_nonces: Buffer<u32>,
     buffer_share_hashes: Buffer<u8>,
-    /// Reused input buffer — avoids per-kernel GPU allocation.
+    /// Reused input buffer, avoids per-kernel GPU allocation.
     buffer_stuff: Buffer<u8>,
-    /// Cached OpenCL kernel — rebuilt only when `unit_size` changes.
+    /// Cached OpenCL kernel, rebuilt only when `unit_size` changes.
     kernel_slot: Mutex<KernelSlot>,
 }
 
@@ -631,7 +631,7 @@ pub(crate) fn build_opencl_resources(
         .build()
         .map_err(|e| format!("buffer_share_hashes: {}", e))?;
     if out_of_order {
-        println!("[OpenCL] Pinned host buffers enabled for stuff + readback");
+        wlogln!("[OpenCL] Pinned host buffers enabled for stuff + readback");
     }
     let resources = OpenCLResources {
         workgroups,
@@ -662,7 +662,7 @@ pub(crate) fn build_opencl_resources(
     };
     if arch_slug == "gfx1201" && !diamond {
         run_gfx1201_groestl_self_test(&resources)?;
-        println!("[OpenCL] gfx1201 Groestl integrity self-test passed");
+        wlogln!("[OpenCL] gfx1201 Groestl integrity self-test passed");
     }
     Ok(resources)
 }

@@ -1,0 +1,3 @@
+# Rendered configs and run logs. Run-Rig.ps1 wipes and recreates this on every
+# run, so nothing in it is worth keeping and none of it should be committed.
+run/

@@ -259,13 +259,17 @@ fn ensure_mainnet_node_section(content: &str) -> String {
     if has_node {
         return content.to_string();
     }
-    // fast_sync is deliberately FALSE. Measured 2026-07-27: a chain synced with
-    // it on stops dead at a block whose state it never wrote, with
-    //   [Block Sync Warning] insert N failed: diamond status HTAKES not found
-    // and nothing retries, so the node sits at that height forever while looking
-    // perfectly healthy. Turning the flag off afterwards does not repair it,
-    // because the state was never written. A clean sync with it OFF reached the
-    // tip in seven minutes with no errors at all.
+    // fast_sync is deliberately FALSE, and NOT for the reason first written here.
+    // This comment used to claim the flag corrupts the chain. It does not: a
+    // controlled test on 2026-07-28 synced from zero with fast_sync = true and
+    // reached the tip with no errors. What repaired the damaged chain seen the day
+    // before was the clean RESYNC, not the flag, and saying otherwise was reading
+    // causation out of a single sample with no control.
+    //
+    // The real reason is what it relaxes: fast_sync trusts a Type3 transaction's
+    // declared signers instead of verifying signatures, and runs a lighter action
+    // precheck. A panel user mining to their own wallet deserves the full checks;
+    // a faster first sync is not worth trading them for.
     let node = "[node]\nname = rust_node\nlisten = 3337\nboots = 54.193.49.59:3337, 182.92.163.225:3337, 54.219.80.127:3337\nnot_find_nodes = false\nfast_sync = false\n\n";
     format!("{node}{content}")
 }
@@ -533,7 +537,10 @@ mod tests {
         // them while the user can still read a message.
         assert_eq!(validate_bid_password(""), Err("empty".to_string()));
         assert_eq!(validate_bid_password("   "), Err("empty".to_string()));
-        assert_eq!(validate_bid_password("123456"), Err("well_known".to_string()));
+        assert_eq!(
+            validate_bid_password("123456"),
+            Err("well_known".to_string())
+        );
         assert_eq!(
             validate_bid_password("  123456  "),
             Err("well_known".to_string()),
@@ -567,7 +574,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "password '{bad}'");
-            assert!(!path.exists(), "a refused password must leave no config: '{bad}'");
+            assert!(
+                !path.exists(),
+                "a refused password must leave no config: '{bad}'"
+            );
         }
     }
 
@@ -612,7 +622,10 @@ mod tests {
         .unwrap();
         let hacd = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(hacd.contains("[node]"), "HACD config missing [node]:\n{hacd}");
+        assert!(
+            hacd.contains("[node]"),
+            "HACD config missing [node]:\n{hacd}"
+        );
         assert!(hacd.contains("not_find_nodes = false"), "{hacd}");
     }
 
@@ -630,7 +643,10 @@ mod tests {
         write_hac_miner_only(&path, "1NewWallet", Some(8080)).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(raw.contains("listen = 9999"), "custom [node] listen lost:\n{raw}");
+        assert!(
+            raw.contains("listen = 9999"),
+            "custom [node] listen lost:\n{raw}"
+        );
         assert_eq!(raw.matches("[node]").count(), 1, "duplicate [node]:\n{raw}");
     }
 

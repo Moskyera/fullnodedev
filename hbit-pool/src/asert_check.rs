@@ -57,7 +57,10 @@ fn main() {
 
     println!("== HBIT ASERT check ==");
     println!("node   = {node}");
-    println!("chain  = {chain} (ASERT anchor at height {})", params.asert_height);
+    println!(
+        "chain  = {chain} (ASERT anchor at height {})",
+        params.asert_height
+    );
     println!("tip    = {tip}");
 
     let anchor_time = find_u64(
@@ -80,7 +83,10 @@ fn main() {
             println!("h={h}  (missing block data, skipped)");
             continue;
         };
-        let pb = get_json(&client, &format!("{node}/query/block/intro?height={}", h - 1));
+        let pb = get_json(
+            &client,
+            &format!("{node}/query/block/intro?height={}", h - 1),
+        );
         let Some(prev_diff) = find_u64(&pb, "difficulty") else {
             println!("h={h}  (missing parent, skipped)");
             continue;
@@ -107,13 +113,18 @@ fn main() {
             }
             Some(_) => {
                 ok += 1;
-                println!("h={h}  OK        difficulty={stored}  target={}", hex::encode(target));
+                println!(
+                    "h={h}  OK        difficulty={stored}  target={}",
+                    hex::encode(target)
+                );
             }
             None => {
                 // Without the block's hash only half the check ran; do not report
                 // that as a pass.
                 bad += 1;
-                println!("h={h}  NO-HASH   could not read the block's own hash to verify the target");
+                println!(
+                    "h={h}  NO-HASH   could not read the block's own hash to verify the target"
+                );
             }
         }
     }

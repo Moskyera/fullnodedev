@@ -82,7 +82,7 @@ pub fn initialize_opencl(
     quiet: bool,
 ) -> Vec<OpenCLResources> {
     if *localsize != 256 {
-        eprintln!(
+        wlogerr!(
             "[Warn] OpenCL local_size={} is incompatible with kernel fixed local arrays(256), fallback to CPU miner.",
             localsize
         );
@@ -91,7 +91,7 @@ pub fn initialize_opencl(
 
     let opencl_path = Path::new(opencldir);
     if !opencl_path.is_dir() {
-        eprintln!("[OpenCL] Kernel directory not found: {opencldir}");
+        wlogerr!("[OpenCL] Kernel directory not found: {opencldir}");
         return Vec::new();
     }
     let kernel_path = opencl_kernel_path(opencl_path, diamond_mining);
@@ -114,7 +114,7 @@ pub fn initialize_opencl(
         }
     };
     for w in &scan.warnings {
-        eprintln!("[OpenCL] {}", w);
+        wlogerr!("[OpenCL] {}", w);
     }
 
     let mut cnf_devices = match parse_device_ids(deviceids) {
@@ -129,7 +129,7 @@ pub fn initialize_opencl(
             ids
         }
         Err(error) => {
-            eprintln!("[OpenCL] Invalid device_ids configuration: {error}");
+            wlogerr!("[OpenCL] Invalid device_ids configuration: {error}");
             return Vec::new();
         }
     };
@@ -138,7 +138,7 @@ pub fn initialize_opencl(
         crate::opencl_diag::resolve_opencl_selection(&scan.platforms, *platformid, primary_device);
     if !quiet {
         for n in &notes {
-            println!("{}", n);
+            wlogln!("{}", n);
         }
     }
     if !cnf_devices.is_empty() {
@@ -153,13 +153,13 @@ pub fn initialize_opencl(
     let platforms = crate::opencl_diag::platform_list();
     let Some(platform) = platforms.get(resolved_platform as usize).cloned() else {
         if platforms.is_empty() {
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] No OpenCL platform is available on this machine. Install the GPU \
                  driver's OpenCL runtime, then run ./list_opencl to confirm it. Mining \
                  continues on the CPU."
             );
         } else {
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] Platform {} is unavailable ({} platform(s) detected)",
                 resolved_platform,
                 platforms.len()
@@ -172,9 +172,9 @@ pub fn initialize_opencl(
     let vendor = platform.vendor().unwrap_or_else(|_| "unknown".into());
     let version: String = platform.version().unwrap_or_else(|_| "unknown".into());
     if !quiet {
-        println!("Platform name: {}", name);
-        println!("Manufacturer: {}", vendor);
-        println!("Version: {}", version);
+        wlogln!("Platform name: {}", name);
+        wlogln!("Manufacturer: {}", vendor);
+        wlogln!("Version: {}", version);
     }
 
     // Resolve exact device indices. `Device::by_idx_wrap` is intentionally not
@@ -182,7 +182,7 @@ pub fn initialize_opencl(
     let available_devices = match Device::list_all(&platform) {
         Ok(devices) => devices,
         Err(error) => {
-            eprintln!("[OpenCL] Cannot enumerate devices: {error}");
+            wlogerr!("[OpenCL] Cannot enumerate devices: {error}");
             return Vec::new();
         }
     };
@@ -191,7 +191,7 @@ pub fn initialize_opencl(
             .ok()
             .is_some_and(|index| index < available_devices.len());
         if !in_range {
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] Device {device_id} is unavailable ({} device(s) detected)",
                 available_devices.len()
             );
@@ -219,7 +219,7 @@ pub fn initialize_opencl(
         let arch_limits = ArchLimits::for_slug(&gpu_arch::arch_slug(&device_name));
         let mut wg = gpu_arch::tune_workgroups(*workgroups, compute_units, vendor, arch_limits);
         if !quiet && compute_units > 0 {
-            println!(
+            wlogln!(
                 "[OpenCL] CU={} tuned work_groups={} (config {})",
                 compute_units, wg, workgroups
             );
@@ -233,7 +233,7 @@ pub fn initialize_opencl(
                 arch_limits.panel_min_wg,
             );
             if clamped < wg {
-                println!(
+                wlogln!(
                     "[efficiency] VRAM clamp: work_groups {} -> {} ({} MB available)",
                     wg,
                     clamped,
@@ -247,9 +247,9 @@ pub fn initialize_opencl(
         let num_work_items = wg.saturating_mul(*localsize);
         let global_work_size = num_work_items;
 
-        println!("-----------------------------------------");
-        println!("Device {}: {}", device_id, device_name);
-        println!("-----------------------------------------");
+        wlogln!("-----------------------------------------");
+        wlogln!("Device {}: {}", device_id, device_name);
+        wlogln!("-----------------------------------------");
 
         // Create context
         let context = match Context::builder()
@@ -259,7 +259,7 @@ pub fn initialize_opencl(
         {
             Ok(context) => context,
             Err(e) => {
-                eprintln!("[OpenCL] Cannot create context for {device_name}: {e}");
+                wlogerr!("[OpenCL] Cannot create context for {device_name}: {e}");
                 continue;
             }
         };
@@ -268,7 +268,7 @@ pub fn initialize_opencl(
         let amd_plat_count = crate::opencl_diag::count_amd_platforms(&scan.platforms);
         let capped = arch_limits.workgroups_cap(wg, amd_plat_count);
         if capped < wg && !quiet {
-            println!(
+            wlogln!(
                 "[OpenCL] {}: work_groups {} -> {} ({} AMD platform(s))",
                 slug, wg, capped, amd_plat_count
             );
@@ -278,10 +278,10 @@ pub fn initialize_opencl(
         }
         let amd_fast = vendor == GpuVendor::Amd;
         if amd_fast {
-            println!("AMD fast-path: enabling OpenCL amd_bfe optimizations for this device");
+            wlogln!("AMD fast-path: enabling OpenCL amd_bfe optimizations for this device");
         }
         if vendor == GpuVendor::Nvidia {
-            println!("NVIDIA OpenCL path: arch={}", slug);
+            wlogln!("NVIDIA OpenCL path: arch={}", slug);
         }
         let safe_name = gpu_arch::safe_device_filename(&device_name);
         let diamond_tag = if diamond_mining { "_dia" } else { "" };
@@ -297,7 +297,7 @@ pub fn initialize_opencl(
             match opencl_cache_fingerprint(opencl_path, &kernel_path, &compile_identity) {
                 Ok(fingerprint) => fingerprint,
                 Err(error) => {
-                    eprintln!("[OpenCL] Invalid kernel source tree: {error}");
+                    wlogerr!("[OpenCL] Invalid kernel source tree: {error}");
                     continue;
                 }
             };
@@ -319,7 +319,7 @@ pub fn initialize_opencl(
         };
 
         let compile = || {
-            println!("Compiling...");
+            wlogln!("Compiling...");
             compile_program_from_source(
                 &context,
                 &device,
@@ -333,7 +333,7 @@ pub fn initialize_opencl(
         };
 
         let program = if !need_recompile {
-            println!("Loading OpenCL from the binary...");
+            wlogln!("Loading OpenCL from the binary...");
             let cached = read_cached_program_binary(&binary_path)
                 .ok()
                 .and_then(|binary_data| {
@@ -346,24 +346,24 @@ pub fn initialize_opencl(
                     .ok()
                 });
             if cached.is_none() {
-                eprintln!("[OpenCL] Cached binary is invalid; recompiling from source");
+                wlogerr!("[OpenCL] Cached binary is invalid; recompiling from source");
             }
             cached.or_else(|| compile())
         } else {
             compile()
         };
         let Some(program) = program else {
-            eprintln!("[OpenCL] Skipping {device_name}: program initialization failed");
+            wlogerr!("[OpenCL] Skipping {device_name}: program initialization failed");
             continue;
         };
         if let Err(error) = prune_opencl_cache(opencl_path, &binary_path) {
-            eprintln!("[OpenCL] Cannot prune stale cache binaries: {error}");
+            wlogerr!("[OpenCL] Cannot prune stale cache binaries: {error}");
         }
 
         let (queue, out_of_order) = match create_command_queue(&context, &device) {
             Ok(queue) => queue,
             Err(e) => {
-                eprintln!("[OpenCL] Skipping {device_name}: {e}");
+                wlogerr!("[OpenCL] Skipping {device_name}: {e}");
                 continue;
             }
         };
@@ -389,18 +389,18 @@ pub fn initialize_opencl(
                 opencl_resource_devices.push(res);
             }
             Err(e) => {
-                // A Groestl integrity self-test failure is deterministic — it is NOT
+                // A Groestl integrity self-test failure is deterministic; it is NOT
                 // a VRAM shortage, so shrinking work_groups just re-runs the same
                 // failing test and prints a misleading "insufficient VRAM". Report it
                 // as the integrity failure it is and skip the recovery loop.
                 if e.contains("integrity self-test") {
-                    eprintln!(
-                        "[efficiency] Skipping device {} — GPU hash integrity self-test failed (not a VRAM issue): {}",
+                    wlogerr!(
+                        "[efficiency] Skipping device {}: GPU hash integrity self-test failed (not a VRAM issue): {}",
                         device_id, e
                     );
                     continue;
                 }
-                eprintln!(
+                wlogerr!(
                     "[efficiency] OpenCL buffer init failed at work_groups={}: {}",
                     wg, e
                 );
@@ -423,7 +423,7 @@ pub fn initialize_opencl(
                         &slug,
                     ) {
                         if !quiet {
-                            println!("[efficiency] Recovered with work_groups={candidate}");
+                            wlogln!("[efficiency] Recovered with work_groups={candidate}");
                         }
                         res.platform_index = resolved_platform;
                         res.device_index = device_id;
@@ -434,8 +434,8 @@ pub fn initialize_opencl(
                     reduced = next_recovery_workgroups(candidate, wg_floor);
                 }
                 if !built {
-                    eprintln!(
-                        "[efficiency] Skipping device {} — insufficient VRAM",
+                    wlogerr!(
+                        "[efficiency] Skipping device {}: insufficient VRAM",
                         device_id
                     );
                 }

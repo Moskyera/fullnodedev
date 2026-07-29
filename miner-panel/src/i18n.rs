@@ -74,6 +74,16 @@ pub struct Strings {
     pub tab_settings: &'static str,
     pub tab_dashboard: &'static str,
     pub tab_help: &'static str,
+    /// Left sidebar. `nav_section_*` are group headings, drawn uppercase;
+    /// `status_*` label the live block at the bottom of the sidebar.
+    pub nav_section_mining: &'static str,
+    pub nav_section_control: &'static str,
+    pub nav_master_panel: &'static str,
+    pub status_worker: &'static str,
+    pub status_node: &'static str,
+    pub status_pool: &'static str,
+    pub status_recovery: &'static str,
+    pub status_ready: &'static str,
     pub ready_status: &'static str,
     pub saved_prefix: &'static str,
     pub save_error_prefix: &'static str,
@@ -87,6 +97,11 @@ pub struct Strings {
     pub sync_note: &'static str,
     pub sync_behind: &'static str,
     pub fullnode_starting: &'static str,
+    /// Shown between "the chain is caught up" and the worker actually
+    /// starting. The node refuses to hand out work for the first 30
+    /// seconds of its own life, so there is a real wait here that is
+    /// neither starting nor syncing, and it needs its own words.
+    pub node_warmup: &'static str,
     pub fullnode_not_ready: &'static str,
     pub fullnode_exe_not_found: &'static str,
     pub worker_error_prefix: &'static str,
@@ -100,7 +115,6 @@ pub struct Strings {
     pub mode_max: &'static str,
     pub label_power_cost: &'static str,
     pub label_hac_price: &'static str,
-    pub label_mining_type: &'static str,
     pub mining_hac: &'static str,
     pub mining_hacd: &'static str,
     pub label_bid_password: &'static str,
@@ -112,7 +126,6 @@ pub struct Strings {
     pub diaworker_not_found: &'static str,
     pub bid_password_required: &'static str,
     pub bid_password_insecure: &'static str,
-    pub label_connect_mode: &'static str,
     pub connect_solo: &'static str,
     pub connect_pool: &'static str,
     pub connect_pool_hint: &'static str,
@@ -229,6 +242,41 @@ pub struct Strings {
     /// no minimum and no address, because none of those is the panel's to
     /// promise.
     pub pool_dir_hbit_note: &'static str,
+    /// Setup screen: the four numbered steps, the two connection choices and
+    /// the reasons a choice can be unavailable. `connect_solo_*` deliberately
+    /// says "my own full node" and "no node, to a pool" rather than naming the
+    /// protocol: it is the first decision a new miner makes.
+    pub setup_page_title: &'static str,
+    pub setup_page_sub: &'static str,
+    pub step_mining_type_title: &'static str,
+    pub step_mining_type_hint: &'static str,
+    pub step_hardware_title: &'static str,
+    pub step_hardware_hint: &'static str,
+    pub step_profit_title: &'static str,
+    pub step_profit_hint: &'static str,
+    pub step_connection_title: &'static str,
+    pub step_connection_hint: &'static str,
+    pub step_bid_title: &'static str,
+    pub mining_hac_sub: &'static str,
+    pub mining_hacd_sub: &'static str,
+    pub connect_solo_title: &'static str,
+    pub connect_solo_sub: &'static str,
+    pub connect_pool_title: &'static str,
+    pub connect_pool_sub: &'static str,
+    pub connect_solo_unavailable: &'static str,
+    pub connect_solo_unavailable_hint: &'static str,
+    pub connect_hacd_local_title: &'static str,
+    pub connect_hacd_local_sub: &'static str,
+    pub connect_hacd_remote_title: &'static str,
+    pub connect_hacd_remote_sub: &'static str,
+    pub autotune_title: &'static str,
+    pub autotune_hint: &'static str,
+    pub btn_run_autotune: &'static str,
+    pub label_thermal_wg_cap: &'static str,
+    pub profit_fixed_note: &'static str,
+    pub label_reachability: &'static str,
+    pub btn_test_connection: &'static str,
+    pub label_pool_directory: &'static str,
 }
 
 fn apply_format_template(template: &str, args: &[String]) -> String {
@@ -242,28 +290,33 @@ fn apply_format_template(template: &str, args: &[String]) -> String {
 }
 
 impl Strings {
+    /// "effective / configured", and where a cap really bit, which one bit.
+    ///
+    /// `oom` and `thermal` are the clamps in force, not the raw fields from the
+    /// snapshot: `oom_allowed_work_groups` is a count that equals the configured
+    /// count on a healthy rig, so deciding here on `> 0` would name an OOM cap
+    /// on every GPU that never had one. The caller decides what was clamped
+    /// (`stats_poll::oom_clamp` / `thermal_clamp`) and this only says it.
     pub fn wg_breakdown_display(
         &self,
         effective: u32,
         configured: u32,
-        oom: u32,
-        thermal: u32,
+        oom: Option<u32>,
+        thermal: Option<u32>,
     ) -> String {
-        if oom > 0 || thermal > 0 {
+        if oom.is_some() || thermal.is_some() {
             apply_format_template(
                 self.dash_wg_breakdown_full,
                 &[
                     effective.to_string(),
                     configured.to_string(),
-                    if oom > 0 {
-                        oom.to_string()
-                    } else {
-                        self.dash_no_data.to_string()
+                    match oom {
+                        Some(oom) => oom.to_string(),
+                        None => self.dash_no_data.to_string(),
                     },
-                    if thermal > 0 {
-                        thermal.to_string()
-                    } else {
-                        self.dash_no_data.to_string()
+                    match thermal {
+                        Some(thermal) => thermal.to_string(),
+                        None => self.dash_no_data.to_string(),
                     },
                 ],
             )
@@ -278,7 +331,10 @@ impl Strings {
     /// "<amount>, paid <age> ago". The whole sentence is per language so each
     /// locale can put the time where its grammar wants it.
     pub fn pool_pay_last_display(&self, amount: &str, age: &str) -> String {
-        apply_format_template(self.pool_pay_last_line, &[amount.to_string(), age.to_string()])
+        apply_format_template(
+            self.pool_pay_last_line,
+            &[amount.to_string(), age.to_string()],
+        )
     }
 
     pub fn pool_pay_checked_display(&self, age: &str) -> String {
@@ -294,6 +350,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Settings",
             tab_dashboard: "Dashboard",
             tab_help: "Help",
+            nav_section_mining: "MINING",
+            nav_section_control: "CONTROL",
+            nav_master_panel: "Master Panel",
+            status_worker: "Worker",
+            status_node: "Node",
+            status_pool: "Pool",
+            status_recovery: "Auto-recovery",
+            status_ready: "Ready",
             ready_status: "Ready: pick CPU/GPU and press Start.",
             saved_prefix: "Saved:",
             save_error_prefix: "Save error:",
@@ -307,6 +371,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "Mining starts on its own when this finishes. Blocks found at an old height are rejected.",
             sync_behind: "blocks behind",
             fullnode_starting: "Starting fullnode (hacash.exe): wait up to 45s...",
+            node_warmup: "Node caught up: waiting for it to serve mining work...",
             fullnode_not_ready: "Fullnode not ready: start hacash.exe first, then press Start again:",
             fullnode_exe_not_found: "hacash.exe not found: build or copy next to miner-panel.exe:",
             worker_error_prefix: "Miner warning:",
@@ -320,7 +385,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Maximum hashrate",
             label_power_cost: "Power cost (/kWh):",
             label_hac_price: "HAC price USD (optional):",
-            label_mining_type: "Mining type:",
             mining_hac: "HAC blocks (poworker)",
             mining_hacd: "HACD diamonds + bids (diaworker)",
             label_bid_password: "Bid account password:",
@@ -332,7 +396,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "diaworker.exe not found: build first.\nSearched:",
             bid_password_required: "Enter bid account password for HACD mining.",
             bid_password_insecure: "The password 123456 is public: anyone can take those funds. Choose a different bid account password.",
-            label_connect_mode: "Connection:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "Host:port with miner RPC API (not CUDA-only pools like hacashdot).",
@@ -439,6 +502,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "This pool does not publish its terms. Ask the operator what it pays and what it keeps.",
             pool_terms_source: "Read from the pool itself, not from this panel.",
             pool_dir_hbit_note: "The pool this project builds and supports. It publishes its terms and each miner's earnings, so the panel reads the real scheme, fee, smallest payout and your own paid total live from the pool; for the other pools here it cannot. No address ships with the panel and none is verified: ask the operator for the host:port, or run the pool yourself.",
+            setup_page_title: "Set Up Mining",
+            setup_page_sub: "Hardware, connection, profitability and safety",
+            step_mining_type_title: "Mining Type",
+            step_mining_type_hint: "Choose GPU block mining or CPU diamond mining.",
+            step_hardware_title: "Hardware and Backend",
+            step_hardware_hint: "Detected hardware and safe tuning for it.",
+            step_profit_title: "Profit and Thermal Safety",
+            step_profit_hint: "Profit controls never override temperature protection.",
+            step_connection_title: "Connection and Rewards",
+            step_connection_hint: "Where the work comes from, and where the coins go.",
+            step_bid_title: "Diamond Bid Policy",
+            mining_hac_sub: "OpenCL / CUDA GPU",
+            mining_hacd_sub: "CPU and full node",
+            connect_solo_title: "With my own full node",
+            connect_solo_sub: "The panel runs a full node on this PC. Rewards go straight to your address.",
+            connect_pool_title: "No node, to a pool",
+            connect_pool_sub: "Send the work to a pool or to someone else's node.",
+            connect_solo_unavailable: "Not available in this package",
+            connect_solo_unavailable_hint: "This package ships no full node program. Copy hacash.exe next to the panel to mine with your own node, or pick a pool and point it at a node you already run.",
+            connect_hacd_local_title: "Full node on this PC",
+            connect_hacd_local_sub: "The panel starts the node and the diamond miner together.",
+            connect_hacd_remote_title: "Full node on another PC",
+            connect_hacd_remote_sub: "Point this miner at a node on your network.",
+            autotune_title: "Automatic GPU Tuning",
+            autotune_hint: "Benchmarks safe profiles, work groups and unit size.",
+            btn_run_autotune: "Run Auto Tune",
+            label_thermal_wg_cap: "Thermal work group cap",
+            profit_fixed_note: "OOM fallback, dynamic CPU assist and the always on schedule are built in and always active, so they are not settings.",
+            label_reachability: "Reachability",
+            btn_test_connection: "Test connection",
+            label_pool_directory: "Pool directory",
         },
         Lang::El => Strings {
             window_title: "HAC Miner Panel",
@@ -446,6 +540,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Ρυθμίσεις",
             tab_dashboard: "Dashboard",
             tab_help: "Βοήθεια",
+            nav_section_mining: "ΕΞΟΡΥΞΗ",
+            nav_section_control: "ΕΛΕΓΧΟΣ",
+            nav_master_panel: "Κεντρικός πίνακας",
+            status_worker: "Εργάτης",
+            status_node: "Κόμβος",
+            status_pool: "Pool",
+            status_recovery: "Αυτόματη ανάκτηση",
+            status_ready: "Έτοιμο",
             ready_status: "Έτοιμο: διάλεξε CPU/GPU και πάτα Έναρξη.",
             saved_prefix: "Αποθηκεύτηκε:",
             save_error_prefix: "Σφάλμα αποθήκευσης:",
@@ -459,6 +561,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "Η εξόρυξη ξεκινά μόνη της μόλις τελειώσει. Ό,τι βρεθεί σε παλιό ύψος απορρίπτεται.",
             sync_behind: "blocks πίσω",
             fullnode_starting: "Εκκίνηση fullnode (hacash.exe): περίμενε έως 45 δευτ....",
+            node_warmup: "Ο κόμβος είναι ενημερωμένος: αναμονή για εργασία εξόρυξης...",
             fullnode_not_ready: "Το fullnode δεν είναι έτοιμο: τρέξε πρώτα hacash.exe και πάτα Ξανά Έναρξη:",
             fullnode_exe_not_found: "Δεν βρέθηκε hacash.exe: build ή αντιγραφή δίπλα στο miner-panel.exe:",
             worker_error_prefix: "Προειδοποίηση miner:",
@@ -472,7 +575,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Μέγιστο hashrate",
             label_power_cost: "Κόστος ρεύματος (/kWh):",
             label_hac_price: "Τιμή HAC USD (προαιρετικό):",
-            label_mining_type: "Τύπος mining:",
             mining_hac: "HAC blocks (poworker)",
             mining_hacd: "HACD diamonds + bids (diaworker)",
             label_bid_password: "Κωδικός bid account:",
@@ -484,7 +586,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "Δεν βρέθηκε diaworker.exe: κάνε build πρώτα.\nΑναζήτηση:",
             bid_password_required: "Βάλε κωδικό bid account για HACD mining.",
             bid_password_insecure: "Ο κωδικός 123456 είναι δημόσιος: οποιοσδήποτε μπορεί να πάρει αυτά τα χρήματα. Βάλε άλλον κωδικό bid account.",
-            label_connect_mode: "Σύνδεση:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "Host:port με miner RPC API (όχι CUDA pools όπως hacashdot).",
@@ -591,6 +692,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "Αυτό το pool δεν δημοσιεύει τους όρους του. Ρώτα τον διαχειριστή τι πληρώνει και τι κρατά.",
             pool_terms_source: "Διαβάστηκε από το ίδιο το pool, όχι από αυτό το panel.",
             pool_dir_hbit_note: "Το pool που φτιάχνει και υποστηρίζει αυτό το πρόγραμμα. Δημοσιεύει τους όρους του και τα κέρδη κάθε miner, οπότε το panel διαβάζει ζωντανά από το pool τον πραγματικό τρόπο μοιρασιάς, την προμήθεια, τη μικρότερη πληρωμή και όσα σου έχουν πληρωθεί· για τα άλλα pools εδώ δεν μπορεί. Δεν έρχεται διεύθυνση μαζί με το panel και καμία δεν είναι επαληθευμένη: ζήτα το host:port από τον διαχειριστή ή τρέξε το pool μόνος σου.",
+            setup_page_title: "Ρύθμιση εξόρυξης",
+            setup_page_sub: "Υλικό, σύνδεση, κέρδος και ασφάλεια",
+            step_mining_type_title: "Τύπος εξόρυξης",
+            step_mining_type_hint: "Διάλεξε εξόρυξη block με GPU ή διαμαντιών με CPU.",
+            step_hardware_title: "Υλικό και backend",
+            step_hardware_hint: "Το υλικό που βρέθηκε και ασφαλής ρύθμιση γι' αυτό.",
+            step_profit_title: "Κέρδος και θερμική ασφάλεια",
+            step_profit_hint: "Οι ρυθμίσεις κέρδους δεν παρακάμπτουν ποτέ την προστασία θερμοκρασίας.",
+            step_connection_title: "Σύνδεση και ανταμοιβές",
+            step_connection_hint: "Από πού έρχεται η δουλειά και πού πάνε τα νομίσματα.",
+            step_bid_title: "Πολιτική προσφορών διαμαντιών",
+            mining_hac_sub: "OpenCL / CUDA GPU",
+            mining_hacd_sub: "CPU και full node",
+            connect_solo_title: "Με δικό μου full node",
+            connect_solo_sub: "Το panel τρέχει full node σε αυτό το PC. Οι ανταμοιβές πάνε κατευθείαν στη διεύθυνσή σου.",
+            connect_pool_title: "Χωρίς node, σε pool",
+            connect_pool_sub: "Στέλνει τη δουλειά σε pool ή στο node κάποιου άλλου.",
+            connect_solo_unavailable: "Μη διαθέσιμο σε αυτό το πακέτο",
+            connect_solo_unavailable_hint: "Αυτό το πακέτο δεν περιέχει πρόγραμμα full node. Αντίγραψε το hacash.exe δίπλα στο panel για εξόρυξη με δικό σου node, ή διάλεξε pool και δώσε τη διεύθυνση ενός node που ήδη τρέχεις.",
+            connect_hacd_local_title: "Full node σε αυτό το PC",
+            connect_hacd_local_sub: "Το panel ξεκινά μαζί το node και τον miner διαμαντιών.",
+            connect_hacd_remote_title: "Full node σε άλλο PC",
+            connect_hacd_remote_sub: "Στρέψε αυτόν τον miner σε node του δικτύου σου.",
+            autotune_title: "Αυτόματο tuning GPU",
+            autotune_hint: "Δοκιμάζει ασφαλή προφίλ, work groups και unit size.",
+            btn_run_autotune: "Εκτέλεση Auto Tune",
+            label_thermal_wg_cap: "Θερμικό όριο work groups",
+            profit_fixed_note: "Το OOM fallback, το δυναμικό CPU assist και η συνεχής λειτουργία είναι ενσωματωμένα και πάντα ενεργά, άρα δεν είναι ρυθμίσεις.",
+            label_reachability: "Προσβασιμότητα",
+            btn_test_connection: "Δοκιμή σύνδεσης",
+            label_pool_directory: "Κατάλογος pool",
         },
         Lang::Tr => Strings {
             window_title: "HAC Miner Panel",
@@ -598,6 +730,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Ayarlar",
             tab_dashboard: "Panel",
             tab_help: "Yardım",
+            nav_section_mining: "MADENCİLİK",
+            nav_section_control: "KONTROL",
+            nav_master_panel: "Ana panel",
+            status_worker: "İşçi",
+            status_node: "Düğüm",
+            status_pool: "Havuz",
+            status_recovery: "Otomatik kurtarma",
+            status_ready: "Hazır",
             ready_status: "Hazır: CPU/GPU seçin ve Başlat'a basın.",
             saved_prefix: "Kaydedildi:",
             save_error_prefix: "Kayıt hatası:",
@@ -611,6 +751,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "Bittiginde madencilik kendiliginden baslar. Eski yukseklikte bulunan bloklar reddedilir.",
             sync_behind: "blok geride",
             fullnode_starting: "Fullnode başlatılıyor (hacash.exe): 45 sn bekleyin...",
+            node_warmup: "Dugum guncel: madencilik isi vermesi bekleniyor...",
             fullnode_not_ready: "Fullnode hazır değil: önce hacash.exe çalıştırın, sonra Başlat:",
             fullnode_exe_not_found: "hacash.exe bulunamadı: miner-panel.exe yanına kopyalayın:",
             worker_error_prefix: "Miner uyarısı:",
@@ -624,7 +765,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Maksimum hashrate",
             label_power_cost: "Elektrik maliyeti (/kWh):",
             label_hac_price: "HAC fiyatı USD (isteğe bağlı):",
-            label_mining_type: "Madencilik türü:",
             mining_hac: "HAC blokları (poworker)",
             mining_hacd: "HACD elmas + teklifler (diaworker)",
             label_bid_password: "Teklif hesap şifresi:",
@@ -636,7 +776,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "diaworker.exe bulunamadı: önce derleyin.\nAranan:",
             bid_password_required: "HACD için teklif hesap şifresi girin.",
             bid_password_insecure: "123456 şifresi herkes tarafından bilinir: oradaki parayı herkes alabilir. Farklı bir teklif hesap şifresi girin.",
-            label_connect_mode: "Bağlantı:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "Miner RPC API host:port (hacashdot CUDA pool değil).",
@@ -743,6 +882,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "Bu havuz koşullarını yayınlamıyor. İşletmeciye ne ödediğini ve ne kestiğini sor.",
             pool_terms_source: "Bu panelden değil, havuzun kendisinden okundu.",
             pool_dir_hbit_note: "Bu projenin geliştirdiği ve desteklediği havuz. Koşullarını ve her madencinin kazancını yayınlar, bu yüzden panel gerçek dağıtım yöntemini, komisyonu, en küçük ödemeyi ve sana ödenen toplamı doğrudan havuzdan okur; buradaki diğer havuzlar için bunu yapamaz. Panelle birlikte bir adres gelmez ve hiçbiri doğrulanmış değildir: host:port bilgisini işletmeciden iste ya da havuzu kendin çalıştır.",
+            setup_page_title: "Madenciliği kur",
+            setup_page_sub: "Donanım, bağlantı, kârlılık ve güvenlik",
+            step_mining_type_title: "Madencilik türü",
+            step_mining_type_hint: "GPU ile blok veya CPU ile elmas madenciliği seçin.",
+            step_hardware_title: "Donanım ve backend",
+            step_hardware_hint: "Algılanan donanım ve ona uygun güvenli ayar.",
+            step_profit_title: "Kâr ve sıcaklık güvenliği",
+            step_profit_hint: "Kâr ayarları sıcaklık korumasını asla geçersiz kılmaz.",
+            step_connection_title: "Bağlantı ve ödüller",
+            step_connection_hint: "İşin nereden geldiği ve paranın nereye gittiği.",
+            step_bid_title: "Elmas teklif politikası",
+            mining_hac_sub: "OpenCL / CUDA GPU",
+            mining_hacd_sub: "CPU ve full node",
+            connect_solo_title: "Kendi full node'umla",
+            connect_solo_sub: "Panel bu bilgisayarda bir full node çalıştırır. Ödüller doğrudan adresinize gider.",
+            connect_pool_title: "Node yok, havuza",
+            connect_pool_sub: "İşi bir havuza ya da başkasının node'una gönderir.",
+            connect_solo_unavailable: "Bu pakette yok",
+            connect_solo_unavailable_hint: "Bu pakette full node programı yok. Kendi node'unuzla kazmak için hacash.exe dosyasını panelin yanına kopyalayın ya da havuzu seçip zaten çalıştırdığınız bir node adresini yazın.",
+            connect_hacd_local_title: "Bu bilgisayardaki full node",
+            connect_hacd_local_sub: "Panel node ile elmas madencisini birlikte başlatır.",
+            connect_hacd_remote_title: "Başka bilgisayardaki full node",
+            connect_hacd_remote_sub: "Bu madenciyi ağınızdaki bir node'a yönlendirin.",
+            autotune_title: "Otomatik GPU ayarı",
+            autotune_hint: "Güvenli profilleri, work group ve unit size değerlerini ölçer.",
+            btn_run_autotune: "Auto Tune çalıştır",
+            label_thermal_wg_cap: "Termal work group sınırı",
+            profit_fixed_note: "OOM yedeği, dinamik CPU desteği ve sürekli çalışma programı yerleşiktir ve hep açıktır, yani ayar değildir.",
+            label_reachability: "Erişilebilirlik",
+            btn_test_connection: "Bağlantıyı test et",
+            label_pool_directory: "Havuz listesi",
         },
         Lang::Zh => Strings {
             window_title: "HAC 挖矿面板",
@@ -750,6 +920,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "设置",
             tab_dashboard: "仪表盘",
             tab_help: "帮助",
+            nav_section_mining: "挖矿",
+            nav_section_control: "控制",
+            nav_master_panel: "主控面板",
+            status_worker: "矿工",
+            status_node: "节点",
+            status_pool: "矿池",
+            status_recovery: "自动恢复",
+            status_ready: "就绪",
             ready_status: "就绪: 选择 CPU/GPU 后点击开始。",
             saved_prefix: "已保存:",
             save_error_prefix: "保存错误:",
@@ -763,6 +941,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "完成后将自动开始挖矿。在旧高度找到的区块会被拒绝。",
             sync_behind: "个区块落后",
             fullnode_starting: "正在启动全节点 (hacash.exe): 请等待最多 45 秒...",
+            node_warmup: "节点已同步: 正在等待它提供挖矿任务...",
             fullnode_not_ready: "全节点未就绪: 请先运行 hacash.exe，再按开始:",
             fullnode_exe_not_found: "未找到 hacash.exe: 请放在 miner-panel.exe 旁边:",
             worker_error_prefix: "矿工警告:",
@@ -776,7 +955,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "最大算力",
             label_power_cost: "电费 (/kWh):",
             label_hac_price: "HAC 价格 USD (可选):",
-            label_mining_type: "挖矿类型:",
             mining_hac: "HAC 区块 (poworker)",
             mining_hacd: "HACD 钻石 + 竞价 (diaworker)",
             label_bid_password: "竞价账户密码:",
@@ -788,7 +966,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "未找到 diaworker.exe: 请先编译。\n搜索路径:",
             bid_password_required: "请输入 HACD 竞价账户密码。",
             bid_password_insecure: "密码 123456 是公开的，任何人都能取走其中的资金。请换一个竞价账户密码。",
-            label_connect_mode: "连接:",
             connect_solo: "Solo (全节点)",
             connect_pool: "矿池 (RPC)",
             connect_pool_hint: "支持 miner RPC 的 host:port（非 hacashdot CUDA 矿池）。",
@@ -895,6 +1072,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "这个矿池不公布条款。请询问运营者它支付什么、留下什么。",
             pool_terms_source: "读取自矿池本身，而不是本面板。",
             pool_dir_hbit_note: "本项目自己开发并维护的矿池。它公开自己的条件和每位矿工的收益，因此面板可以直接从矿池实时读取真实的分配方式、手续费、最小支付额以及已付给你的总额；对这里的其他矿池则做不到。面板不附带任何地址，也没有任何地址经过验证: 请向运营者索取 host:port，或者自己运行这个矿池。",
+            setup_page_title: "设置挖矿",
+            setup_page_sub: "硬件、连接、收益与安全",
+            step_mining_type_title: "挖矿类型",
+            step_mining_type_hint: "选择 GPU 区块挖矿或 CPU 钻石挖矿。",
+            step_hardware_title: "硬件与后端",
+            step_hardware_hint: "检测到的硬件及其安全调优。",
+            step_profit_title: "收益与温度安全",
+            step_profit_hint: "收益设置绝不会覆盖温度保护。",
+            step_connection_title: "连接与奖励",
+            step_connection_hint: "工作从哪里来，币又发到哪里。",
+            step_bid_title: "钻石竞价策略",
+            mining_hac_sub: "OpenCL / CUDA 显卡",
+            mining_hacd_sub: "CPU 加全节点",
+            connect_solo_title: "使用我自己的全节点",
+            connect_solo_sub: "面板在本机运行全节点，奖励直接进入你的地址。",
+            connect_pool_title: "没有节点，连接矿池",
+            connect_pool_sub: "把工作发送到矿池或别人的节点。",
+            connect_solo_unavailable: "此安装包不支持",
+            connect_solo_unavailable_hint: "此安装包不含全节点程序。若要用自己的节点挖矿，请把 hacash.exe 放在面板旁边；或选择矿池，并填写你已经运行的节点地址。",
+            connect_hacd_local_title: "本机全节点",
+            connect_hacd_local_sub: "面板会同时启动全节点和钻石矿工。",
+            connect_hacd_remote_title: "其他电脑上的全节点",
+            connect_hacd_remote_sub: "让此矿工连接局域网中的节点。",
+            autotune_title: "自动 GPU 调优",
+            autotune_hint: "测试安全配置、work groups 和 unit size。",
+            btn_run_autotune: "运行 Auto Tune",
+            label_thermal_wg_cap: "温度 work group 上限",
+            profit_fixed_note: "OOM 回退、动态 CPU 辅助和全天候运行是内置且始终启用的，不是可调选项。",
+            label_reachability: "可达性",
+            btn_test_connection: "测试连接",
+            label_pool_directory: "矿池目录",
         },
         Lang::Ja => Strings {
             window_title: "HAC マイナーパネル",
@@ -902,6 +1110,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "設定",
             tab_dashboard: "ダッシュボード",
             tab_help: "ヘルプ",
+            nav_section_mining: "マイニング",
+            nav_section_control: "コントロール",
+            nav_master_panel: "マスターパネル",
+            status_worker: "ワーカー",
+            status_node: "ノード",
+            status_pool: "プール",
+            status_recovery: "自動復旧",
+            status_ready: "準備完了",
             ready_status: "準備完了: CPU/GPU を選んで開始を押してください。",
             saved_prefix: "保存しました:",
             save_error_prefix: "保存エラー:",
@@ -915,6 +1131,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "完了すると自動的に採掘を開始します。古い高さで見つけたブロックは拒否されます。",
             sync_behind: "ブロック遅れ",
             fullnode_starting: "フルノード起動中 (hacash.exe): 最大45秒お待ちください...",
+            node_warmup: "ノードは同期済み: 採掘作業の提供を待っています...",
             fullnode_not_ready: "フルノード未準備: 先に hacash.exe を実行してから開始:",
             fullnode_exe_not_found: "hacash.exe が見つかりません: miner-panel.exe の横に配置:",
             worker_error_prefix: "マイナー警告:",
@@ -928,7 +1145,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "最大ハッシュレート",
             label_power_cost: "電気代 (/kWh):",
             label_hac_price: "HAC 価格 USD (任意):",
-            label_mining_type: "マイニング種類:",
             mining_hac: "HAC ブロック (poworker)",
             mining_hacd: "HACD ダイヤ + 入札 (diaworker)",
             label_bid_password: "入札アカウントパスワード:",
@@ -940,7 +1156,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "diaworker.exe が見つかりません: 先にビルド。\n検索:",
             bid_password_required: "HACD 用の入札パスワードを入力してください。",
             bid_password_insecure: "パスワード 123456 は公開されており、誰でもその資金を持ち出せます。別の入札パスワードを設定してください。",
-            label_connect_mode: "接続:",
             connect_solo: "Solo (フルノード)",
             connect_pool: "プール (RPC)",
             connect_pool_hint: "miner RPC API の host:port（hacashdot CUDA プール不可）。",
@@ -1047,6 +1262,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "このプールは条件を公開していません。何を支払い何を差し引くのか運営者に確認してください。",
             pool_terms_source: "このパネルではなく、プール自身から読み取っています。",
             pool_dir_hbit_note: "このプロジェクトが開発し、運用を支えているプールです。条件とマイナーごとの収益を公開しているため、パネルは実際の分配方式、手数料、最小支払い額、そしてあなたへの支払い合計をプールから直接読み取れます。ここにある他のプールではそれができません。アドレスはパネルに同梱されておらず、検証済みのものもありません。運営者に host:port を聞くか、自分でプールを動かしてください。",
+            setup_page_title: "マイニング設定",
+            setup_page_sub: "ハードウェア、接続、収益、安全",
+            step_mining_type_title: "マイニング種別",
+            step_mining_type_hint: "GPU のブロック採掘か CPU のダイヤ採掘を選びます。",
+            step_hardware_title: "ハードウェアとバックエンド",
+            step_hardware_hint: "検出したハードウェアと、それに合う安全な設定。",
+            step_profit_title: "収益と温度保護",
+            step_profit_hint: "収益設定が温度保護を上書きすることはありません。",
+            step_connection_title: "接続と報酬",
+            step_connection_hint: "仕事の出どころと、コインの宛先。",
+            step_bid_title: "ダイヤ入札ポリシー",
+            mining_hac_sub: "OpenCL / CUDA GPU",
+            mining_hacd_sub: "CPU とフルノード",
+            connect_solo_title: "自分のフルノードで",
+            connect_solo_sub: "パネルがこの PC でフルノードを動かし、報酬は直接あなたのアドレスへ。",
+            connect_pool_title: "ノードなし、プールへ",
+            connect_pool_sub: "仕事をプールか他人のノードへ送ります。",
+            connect_solo_unavailable: "このパッケージでは使えません",
+            connect_solo_unavailable_hint: "このパッケージにフルノードのプログラムは入っていません。自分のノードで採掘するには hacash.exe をパネルの隣に置くか、プールを選んですでに動かしているノードのアドレスを入れてください。",
+            connect_hacd_local_title: "この PC のフルノード",
+            connect_hacd_local_sub: "パネルがノードとダイヤ採掘を一緒に起動します。",
+            connect_hacd_remote_title: "別の PC のフルノード",
+            connect_hacd_remote_sub: "このマイナーをネットワーク上のノードに向けます。",
+            autotune_title: "GPU 自動チューニング",
+            autotune_hint: "安全なプロファイル、work groups、unit size を計測します。",
+            btn_run_autotune: "Auto Tune を実行",
+            label_thermal_wg_cap: "温度による work group 上限",
+            profit_fixed_note: "OOM フォールバック、動的 CPU アシスト、常時稼働は組み込みで常に有効なので、設定項目ではありません。",
+            label_reachability: "到達性",
+            btn_test_connection: "接続テスト",
+            label_pool_directory: "プール一覧",
         },
         Lang::Es => Strings {
             window_title: "Panel HAC Miner",
@@ -1054,6 +1300,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Ajustes",
             tab_dashboard: "Panel",
             tab_help: "Ayuda",
+            nav_section_mining: "MINERÍA",
+            nav_section_control: "CONTROL",
+            nav_master_panel: "Panel maestro",
+            status_worker: "Trabajador",
+            status_node: "Nodo",
+            status_pool: "Pool",
+            status_recovery: "Recuperación automática",
+            status_ready: "Listo",
             ready_status: "Listo: elige CPU/GPU y pulsa Iniciar.",
             saved_prefix: "Guardado:",
             save_error_prefix: "Error al guardar:",
@@ -1067,6 +1321,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "La mineria empieza sola cuando termine. Los bloques hallados en una altura antigua se rechazan.",
             sync_behind: "bloques por detras",
             fullnode_starting: "Iniciando fullnode (hacash.exe): espere hasta 45 s...",
+            node_warmup: "Nodo al dia: esperando a que sirva trabajo de mineria...",
             fullnode_not_ready: "Fullnode no listo: ejecute hacash.exe primero, luego Iniciar:",
             fullnode_exe_not_found: "hacash.exe no encontrado: colóquelo junto a miner-panel.exe:",
             worker_error_prefix: "Aviso del minero:",
@@ -1080,7 +1335,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Hashrate máximo",
             label_power_cost: "Coste electricidad (/kWh):",
             label_hac_price: "Precio HAC USD (opcional):",
-            label_mining_type: "Tipo de minería:",
             mining_hac: "Bloques HAC (poworker)",
             mining_hacd: "Diamantes HACD + pujas (diaworker)",
             label_bid_password: "Contraseña cuenta de puja:",
@@ -1092,7 +1346,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "No se encontró diaworker.exe: compila primero.\nBuscado:",
             bid_password_required: "Introduce la contraseña de puja para HACD.",
             bid_password_insecure: "La contraseña 123456 es pública: cualquiera puede llevarse esos fondos. Elige otra contraseña de puja.",
-            label_connect_mode: "Conexión:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "host:port con API miner RPC (no pools CUDA como hacashdot).",
@@ -1199,6 +1452,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "Este pool no publica sus condiciones. Pregunta al operador qué paga y qué se queda.",
             pool_terms_source: "Leído del propio pool, no de este panel.",
             pool_dir_hbit_note: "El pool que este proyecto construye y mantiene. Publica sus condiciones y las ganancias de cada minero, así que el panel lee en directo del pool el reparto real, la comisión, el pago más pequeño y el total que se te ha pagado; con los demás pools de esta lista no puede. El panel no trae ninguna dirección y ninguna está verificada: pide el host:port al operador o levanta tú el pool.",
+            setup_page_title: "Configurar la minería",
+            setup_page_sub: "Hardware, conexión, rentabilidad y seguridad",
+            step_mining_type_title: "Tipo de minería",
+            step_mining_type_hint: "Elige minar bloques con la GPU o diamantes con la CPU.",
+            step_hardware_title: "Hardware y backend",
+            step_hardware_hint: "Hardware detectado y ajuste seguro para él.",
+            step_profit_title: "Rentabilidad y seguridad térmica",
+            step_profit_hint: "Los ajustes de rentabilidad nunca anulan la protección de temperatura.",
+            step_connection_title: "Conexión y recompensas",
+            step_connection_hint: "De dónde viene el trabajo y a dónde van las monedas.",
+            step_bid_title: "Política de pujas de diamantes",
+            mining_hac_sub: "GPU OpenCL / CUDA",
+            mining_hacd_sub: "CPU y nodo completo",
+            connect_solo_title: "Con mi propio nodo completo",
+            connect_solo_sub: "El panel ejecuta un nodo completo en este PC. Las recompensas van directas a tu dirección.",
+            connect_pool_title: "Sin nodo, a un pool",
+            connect_pool_sub: "Envía el trabajo a un pool o al nodo de otra persona.",
+            connect_solo_unavailable: "No disponible en este paquete",
+            connect_solo_unavailable_hint: "Este paquete no incluye el programa del nodo completo. Copia hacash.exe junto al panel para minar con tu propio nodo, o elige un pool e indica la dirección de un nodo que ya tengas en marcha.",
+            connect_hacd_local_title: "Nodo completo en este PC",
+            connect_hacd_local_sub: "El panel arranca juntos el nodo y el minero de diamantes.",
+            connect_hacd_remote_title: "Nodo completo en otro PC",
+            connect_hacd_remote_sub: "Apunta este minero a un nodo de tu red.",
+            autotune_title: "Ajuste automático de GPU",
+            autotune_hint: "Mide perfiles seguros, work groups y unit size.",
+            btn_run_autotune: "Ejecutar Auto Tune",
+            label_thermal_wg_cap: "Límite térmico de work groups",
+            profit_fixed_note: "El respaldo por OOM, la ayuda dinámica de CPU y el horario continuo están integrados y siempre activos, así que no son ajustes.",
+            label_reachability: "Accesibilidad",
+            btn_test_connection: "Probar conexión",
+            label_pool_directory: "Directorio de pools",
         },
         Lang::Fr => Strings {
             window_title: "Panneau HAC Miner",
@@ -1206,6 +1490,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Réglages",
             tab_dashboard: "Tableau de bord",
             tab_help: "Aide",
+            nav_section_mining: "MINAGE",
+            nav_section_control: "CONTRÔLE",
+            nav_master_panel: "Panneau principal",
+            status_worker: "Worker",
+            status_node: "Nœud",
+            status_pool: "Pool",
+            status_recovery: "Reprise automatique",
+            status_ready: "Prêt",
             ready_status: "Prêt: choisissez CPU/GPU et appuyez sur Démarrer.",
             saved_prefix: "Enregistré :",
             save_error_prefix: "Erreur d'enregistrement :",
@@ -1219,6 +1511,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "Le minage demarre seul une fois termine. Les blocs trouves a une ancienne hauteur sont rejetes.",
             sync_behind: "blocs de retard",
             fullnode_starting: "Démarrage du fullnode (hacash.exe): attendez jusqu'à 45 s...",
+            node_warmup: "Noeud a jour: en attente du travail de minage...",
             fullnode_not_ready: "Fullnode pas prêt: lancez hacash.exe d'abord, puis Démarrer:",
             fullnode_exe_not_found: "hacash.exe introuvable: placez-le à côté de miner-panel.exe:",
             worker_error_prefix: "Avertissement mineur:",
@@ -1232,7 +1525,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Hashrate maximum",
             label_power_cost: "Coût électricité (/kWh) :",
             label_hac_price: "Prix HAC USD (optionnel) :",
-            label_mining_type: "Type de minage :",
             mining_hac: "Blocs HAC (poworker)",
             mining_hacd: "Diamants HACD + enchères (diaworker)",
             label_bid_password: "Mot de passe compte enchère :",
@@ -1244,7 +1536,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "diaworker.exe introuvable: compilez d'abord.\nRecherché :",
             bid_password_required: "Entrez le mot de passe d'enchère pour HACD.",
             bid_password_insecure: "Le mot de passe 123456 est public : n'importe qui peut prendre ces fonds. Choisissez un autre mot de passe d'enchère.",
-            label_connect_mode: "Connexion :",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "host:port avec API miner RPC (pas les pools CUDA hacashdot).",
@@ -1351,6 +1642,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "Ce pool ne publie pas ses conditions. Demandez à l'opérateur ce qu'il paie et ce qu'il garde.",
             pool_terms_source: "Lu directement depuis le pool, pas depuis ce panneau.",
             pool_dir_hbit_note: "Le pool que ce projet développe et maintient. Il publie ses conditions et les gains de chaque mineur, donc le panneau lit en direct depuis le pool le partage réel, la commission, le plus petit paiement et le total qui vous a été payé ; pour les autres pools de cette liste, il ne le peut pas. Aucune adresse n'est fournie avec le panneau et aucune n'est vérifiée : demandez le host:port à l'opérateur, ou faites tourner le pool vous-même.",
+            setup_page_title: "Configurer le minage",
+            setup_page_sub: "Matériel, connexion, rentabilité et sécurité",
+            step_mining_type_title: "Type de minage",
+            step_mining_type_hint: "Choisissez le minage de blocs sur GPU ou de diamants sur CPU.",
+            step_hardware_title: "Matériel et backend",
+            step_hardware_hint: "Matériel détecté et réglage sûr pour celui-ci.",
+            step_profit_title: "Rentabilité et sécurité thermique",
+            step_profit_hint: "Les réglages de rentabilité ne contournent jamais la protection thermique.",
+            step_connection_title: "Connexion et récompenses",
+            step_connection_hint: "D'où vient le travail, et où vont les pièces.",
+            step_bid_title: "Politique d'enchères de diamants",
+            mining_hac_sub: "GPU OpenCL / CUDA",
+            mining_hacd_sub: "CPU et nœud complet",
+            connect_solo_title: "Avec mon propre nœud complet",
+            connect_solo_sub: "Le panneau fait tourner un nœud complet sur ce PC. Les récompenses vont directement à votre adresse.",
+            connect_pool_title: "Sans nœud, vers un pool",
+            connect_pool_sub: "Envoie le travail à un pool ou au nœud de quelqu'un d'autre.",
+            connect_solo_unavailable: "Indisponible dans ce paquet",
+            connect_solo_unavailable_hint: "Ce paquet ne contient pas le programme du nœud complet. Copiez hacash.exe à côté du panneau pour miner avec votre propre nœud, ou choisissez un pool et indiquez l'adresse d'un nœud que vous faites déjà tourner.",
+            connect_hacd_local_title: "Nœud complet sur ce PC",
+            connect_hacd_local_sub: "Le panneau lance ensemble le nœud et le mineur de diamants.",
+            connect_hacd_remote_title: "Nœud complet sur un autre PC",
+            connect_hacd_remote_sub: "Pointez ce mineur vers un nœud de votre réseau.",
+            autotune_title: "Réglage automatique du GPU",
+            autotune_hint: "Mesure les profils sûrs, les work groups et l'unit size.",
+            btn_run_autotune: "Lancer Auto Tune",
+            label_thermal_wg_cap: "Plafond thermique des work groups",
+            profit_fixed_note: "Le repli OOM, l'assistance CPU dynamique et le fonctionnement continu sont intégrés et toujours actifs : ce ne sont pas des réglages.",
+            label_reachability: "Accessibilité",
+            btn_test_connection: "Tester la connexion",
+            label_pool_directory: "Annuaire des pools",
         },
         Lang::Th => Strings {
             window_title: "HAC Miner Panel",
@@ -1358,6 +1680,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "ตั้งค่า",
             tab_dashboard: "แดชบอร์ด",
             tab_help: "ช่วยเหลือ",
+            nav_section_mining: "การขุด",
+            nav_section_control: "การควบคุม",
+            nav_master_panel: "แผงควบคุมหลัก",
+            status_worker: "ตัวขุด",
+            status_node: "โหนด",
+            status_pool: "พูล",
+            status_recovery: "กู้คืนอัตโนมัติ",
+            status_ready: "พร้อม",
             ready_status: "พร้อม: เลือก CPU/GPU แล้วกดเริ่ม",
             saved_prefix: "บันทึกแล้ว:",
             save_error_prefix: "ข้อผิดพลาดการบันทึก:",
@@ -1371,6 +1701,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "การขุดจะเริ่มเองเมื่อเสร็จ บล็อกที่พบที่ความสูงเก่าจะถูกปฏิเสธ",
             sync_behind: "บล็อกล้าหลัง",
             fullnode_starting: "กำลังเริ่ม fullnode (hacash.exe): รอสูงสุด 45 วินาที...",
+            node_warmup: "โหนดซิงค์แล้ว: กำลังรอให้ส่งงานขุด...",
             fullnode_not_ready: "fullnode ยังไม่พร้อม: รัน hacash.exe ก่อน แล้วกดเริ่ม:",
             fullnode_exe_not_found: "ไม่พบ hacash.exe: วางไว้ข้าง miner-panel.exe:",
             worker_error_prefix: "คำเตือนไมเนอร์:",
@@ -1384,7 +1715,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "แฮชเรทสูงสุด",
             label_power_cost: "ค่าไฟ (/kWh):",
             label_hac_price: "ราคา HAC USD (ไม่บังคับ):",
-            label_mining_type: "ประเภทการขุด:",
             mining_hac: "บล็อก HAC (poworker)",
             mining_hacd: "HACD เพชร + ประมูล (diaworker)",
             label_bid_password: "รหัสบัญชีประมูล:",
@@ -1396,7 +1726,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "ไม่พบ diaworker.exe: กรุณา build ก่อน\nค้นหา:",
             bid_password_required: "กรอกรหัสบัญชีประมูลสำหรับ HACD",
             bid_password_insecure: "รหัส 123456 เป็นรหัสสาธารณะ ใครก็นำเงินในบัญชีนั้นไปได้ กรุณาใช้รหัสบัญชีประมูลอื่น",
-            label_connect_mode: "การเชื่อมต่อ:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Pool (RPC)",
             connect_pool_hint: "host:port ที่มี miner RPC API (ไม่ใช่ CUDA pool เช่น hacashdot)",
@@ -1503,6 +1832,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "พูลนี้ไม่เปิดเผยเงื่อนไข ควรถามผู้ดูแลว่าจ่ายอะไรและหักอะไร",
             pool_terms_source: "อ่านจากพูลโดยตรง ไม่ใช่จากแผงควบคุมนี้",
             pool_dir_hbit_note: "พูลที่โครงการนี้พัฒนาและดูแลเอง มันเปิดเผยเงื่อนไขและรายได้ของนักขุดแต่ละคน แผงควบคุมจึงอ่านวิธีแบ่งรางวัลจริง ค่าธรรมเนียม ยอดจ่ายขั้นต่ำ และยอดที่จ่ายให้คุณแล้ว จากพูลโดยตรง ส่วนพูลอื่นในรายการนี้ทำแบบนั้นไม่ได้ แผงควบคุมไม่ได้แถมที่อยู่มาให้ และยังไม่มีที่อยู่ใดผ่านการตรวจสอบ ขอ host:port จากผู้ดูแล หรือรันพูลนี้ด้วยตัวคุณเอง",
+            setup_page_title: "ตั้งค่าการขุด",
+            setup_page_sub: "ฮาร์ดแวร์ การเชื่อมต่อ กำไร และความปลอดภัย",
+            step_mining_type_title: "ประเภทการขุด",
+            step_mining_type_hint: "เลือกขุดบล็อกด้วย GPU หรือขุดเพชรด้วย CPU",
+            step_hardware_title: "ฮาร์ดแวร์และแบ็กเอนด์",
+            step_hardware_hint: "ฮาร์ดแวร์ที่ตรวจพบและการปรับค่าที่ปลอดภัย",
+            step_profit_title: "กำไรและความปลอดภัยด้านความร้อน",
+            step_profit_hint: "การตั้งค่ากำไรจะไม่ลบล้างการป้องกันอุณหภูมิ",
+            step_connection_title: "การเชื่อมต่อและรางวัล",
+            step_connection_hint: "งานมาจากไหน และเหรียญไปที่ใด",
+            step_bid_title: "นโยบายประมูลเพชร",
+            mining_hac_sub: "GPU แบบ OpenCL / CUDA",
+            mining_hacd_sub: "CPU และ full node",
+            connect_solo_title: "ใช้ full node ของฉันเอง",
+            connect_solo_sub: "แผงควบคุมจะรัน full node บนเครื่องนี้ รางวัลเข้าที่อยู่ของคุณโดยตรง",
+            connect_pool_title: "ไม่มี node ส่งเข้าพูล",
+            connect_pool_sub: "ส่งงานไปยังพูลหรือ node ของคนอื่น",
+            connect_solo_unavailable: "ไม่มีในแพ็กเกจนี้",
+            connect_solo_unavailable_hint: "แพ็กเกจนี้ไม่มีโปรแกรม full node หากต้องการขุดด้วย node ของคุณเอง ให้คัดลอก hacash.exe ไว้ข้างแผงควบคุม หรือเลือกพูลแล้วใส่ที่อยู่ node ที่คุณรันอยู่แล้ว",
+            connect_hacd_local_title: "full node บนเครื่องนี้",
+            connect_hacd_local_sub: "แผงควบคุมจะเริ่ม node และตัวขุดเพชรพร้อมกัน",
+            connect_hacd_remote_title: "full node บนเครื่องอื่น",
+            connect_hacd_remote_sub: "ชี้ตัวขุดนี้ไปที่ node ในเครือข่ายของคุณ",
+            autotune_title: "ปรับจูน GPU อัตโนมัติ",
+            autotune_hint: "ทดสอบโปรไฟล์ที่ปลอดภัย work groups และ unit size",
+            btn_run_autotune: "เริ่ม Auto Tune",
+            label_thermal_wg_cap: "เพดาน work group ตามความร้อน",
+            profit_fixed_note: "OOM fallback, CPU assist แบบไดนามิก และการทำงานตลอดเวลา ถูกฝังไว้และเปิดอยู่เสมอ จึงไม่ใช่ตัวเลือกที่ตั้งค่าได้",
+            label_reachability: "การเข้าถึง",
+            btn_test_connection: "ทดสอบการเชื่อมต่อ",
+            label_pool_directory: "รายชื่อพูล",
         },
         Lang::Ru => Strings {
             window_title: "Панель HAC Miner",
@@ -1510,6 +1870,14 @@ pub fn strings(lang: Lang) -> Strings {
             tab_settings: "Настройки",
             tab_dashboard: "Панель",
             tab_help: "Справка",
+            nav_section_mining: "МАЙНИНГ",
+            nav_section_control: "УПРАВЛЕНИЕ",
+            nav_master_panel: "Главная панель",
+            status_worker: "Воркер",
+            status_node: "Узел",
+            status_pool: "Пул",
+            status_recovery: "Автовосстановление",
+            status_ready: "Готово",
             ready_status: "Готово: выберите CPU/GPU и нажмите Старт.",
             saved_prefix: "Сохранено:",
             save_error_prefix: "Ошибка сохранения:",
@@ -1523,6 +1891,7 @@ pub fn strings(lang: Lang) -> Strings {
             sync_note: "Майнинг начнётся сам, когда это закончится. Блоки, найденные на старой высоте, отклоняются.",
             sync_behind: "блоков позади",
             fullnode_starting: "Запуск fullnode (hacash.exe): подождите до 45 с...",
+            node_warmup: "Узел синхронизирован: ждём выдачи задания для майнинга...",
             fullnode_not_ready: "Fullnode не готов: сначала запустите hacash.exe, затем Старт:",
             fullnode_exe_not_found: "hacash.exe не найден: положите рядом с miner-panel.exe:",
             worker_error_prefix: "Предупреждение майнера:",
@@ -1536,7 +1905,6 @@ pub fn strings(lang: Lang) -> Strings {
             mode_max: "Максимальный hashrate",
             label_power_cost: "Стоимость электричества (/kWh):",
             label_hac_price: "Цена HAC USD (необязательно):",
-            label_mining_type: "Тип майнинга:",
             mining_hac: "Блоки HAC (poworker)",
             mining_hacd: "HACD алмазы + ставки (diaworker)",
             label_bid_password: "Пароль bid-аккаунта:",
@@ -1548,7 +1916,6 @@ pub fn strings(lang: Lang) -> Strings {
             diaworker_not_found: "diaworker.exe не найден: сначала соберите.\nПоиск:",
             bid_password_required: "Введите пароль bid-аккаунта для HACD.",
             bid_password_insecure: "Пароль 123456 общеизвестен: любой может забрать эти средства. Выберите другой пароль bid-аккаунта.",
-            label_connect_mode: "Подключение:",
             connect_solo: "Solo (fullnode)",
             connect_pool: "Пул (RPC)",
             connect_pool_hint: "host:port с miner RPC API (не CUDA-пулы вроде hacashdot).",
@@ -1655,6 +2022,37 @@ pub fn strings(lang: Lang) -> Strings {
             pool_terms_unavailable: "Этот пул не публикует свои условия. Спросите оператора, что он платит и что удерживает.",
             pool_terms_source: "Прочитано из самого пула, а не из этой панели.",
             pool_dir_hbit_note: "Пул, который создаёт и поддерживает этот проект. Он публикует свои условия и заработок каждого майнера, поэтому панель читает прямо из пула реальную схему раздела, комиссию, минимальную выплату и выплаченную вам сумму; для остальных пулов в этом списке она так не может. Адрес с панелью не поставляется, и ни один адрес не проверен: спросите host:port у оператора или запустите пул сами.",
+            setup_page_title: "Настройка майнинга",
+            setup_page_sub: "Оборудование, подключение, доходность и безопасность",
+            step_mining_type_title: "Тип майнинга",
+            step_mining_type_hint: "Выберите добычу блоков на GPU или алмазов на CPU.",
+            step_hardware_title: "Оборудование и backend",
+            step_hardware_hint: "Найденное оборудование и безопасная настройка под него.",
+            step_profit_title: "Доходность и тепловая защита",
+            step_profit_hint: "Настройки доходности никогда не отменяют защиту по температуре.",
+            step_connection_title: "Подключение и вознаграждения",
+            step_connection_hint: "Откуда приходит работа и куда уходят монеты.",
+            step_bid_title: "Политика ставок за алмазы",
+            mining_hac_sub: "GPU OpenCL / CUDA",
+            mining_hacd_sub: "CPU и полный узел",
+            connect_solo_title: "Со своим полным узлом",
+            connect_solo_sub: "Панель запускает полный узел на этом ПК. Награды идут прямо на ваш адрес.",
+            connect_pool_title: "Без узла, в пул",
+            connect_pool_sub: "Отправляет работу в пул или на чужой узел.",
+            connect_solo_unavailable: "Недоступно в этой сборке",
+            connect_solo_unavailable_hint: "В этой сборке нет программы полного узла. Скопируйте hacash.exe рядом с панелью, чтобы майнить на своём узле, либо выберите пул и укажите адрес узла, который у вас уже работает.",
+            connect_hacd_local_title: "Полный узел на этом ПК",
+            connect_hacd_local_sub: "Панель запускает узел и алмазный майнер вместе.",
+            connect_hacd_remote_title: "Полный узел на другом ПК",
+            connect_hacd_remote_sub: "Направьте этот майнер на узел в вашей сети.",
+            autotune_title: "Автонастройка GPU",
+            autotune_hint: "Замеряет безопасные профили, work groups и unit size.",
+            btn_run_autotune: "Запустить Auto Tune",
+            label_thermal_wg_cap: "Тепловой предел work groups",
+            profit_fixed_note: "Откат при нехватке памяти, динамическая помощь CPU и круглосуточный режим встроены и всегда включены, это не настройки.",
+            label_reachability: "Доступность",
+            btn_test_connection: "Проверить связь",
+            label_pool_directory: "Каталог пулов",
         },
     }
 }
@@ -1694,7 +2092,8 @@ mod tests {
                 lang.code()
             );
             assert_ne!(
-                msg, s.bid_password_required,
+                msg,
+                s.bid_password_required,
                 "{} must not reuse the blank password message",
                 lang.code()
             );
@@ -1822,6 +2221,1842 @@ mod tests {
                 s.pool_pay_amount_note.contains("1:248") && s.pool_pay_amount_note.contains("HAC"),
                 "{} must explain the amount notation",
                 lang.code()
+            );
+        }
+    }
+
+    /// Every string the left sidebar draws. The sidebar is the only way to
+    /// reach three of the four screens, so a language that ships a blank here
+    /// ships an unnavigable panel.
+    fn sidebar_strings(s: &Strings) -> [&'static str; 11] {
+        [
+            s.nav_section_mining,
+            s.nav_section_control,
+            s.nav_master_panel,
+            s.tab_settings,
+            s.tab_dashboard,
+            s.tab_help,
+            s.status_worker,
+            s.status_node,
+            s.status_pool,
+            s.status_recovery,
+            s.status_ready,
+        ]
+    }
+
+    #[test]
+    fn every_language_labels_the_sidebar() {
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            for text in sidebar_strings(&s) {
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} left a sidebar string blank",
+                    lang.code()
+                );
+                assert!(
+                    !text.contains('\u{2014}'),
+                    "{} uses an em dash in a sidebar string: {text}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    /// Every string the Setup screen draws for itself. A blank here is a step
+    /// card with no title, or a choice with no explanation, in that language.
+    fn setup_strings(s: &Strings) -> [&'static str; 31] {
+        [
+            s.setup_page_title,
+            s.setup_page_sub,
+            s.step_mining_type_title,
+            s.step_mining_type_hint,
+            s.step_hardware_title,
+            s.step_hardware_hint,
+            s.step_profit_title,
+            s.step_profit_hint,
+            s.step_connection_title,
+            s.step_connection_hint,
+            s.step_bid_title,
+            s.mining_hac_sub,
+            s.mining_hacd_sub,
+            s.connect_solo_title,
+            s.connect_solo_sub,
+            s.connect_pool_title,
+            s.connect_pool_sub,
+            s.connect_solo_unavailable,
+            s.connect_solo_unavailable_hint,
+            s.connect_hacd_local_title,
+            s.connect_hacd_local_sub,
+            s.connect_hacd_remote_title,
+            s.connect_hacd_remote_sub,
+            s.autotune_title,
+            s.autotune_hint,
+            s.btn_run_autotune,
+            s.label_thermal_wg_cap,
+            s.profit_fixed_note,
+            s.label_reachability,
+            s.btn_test_connection,
+            s.label_pool_directory,
+        ]
+    }
+
+    #[test]
+    fn every_language_labels_the_setup_screen() {
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            for text in setup_strings(&s) {
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} left a setup string blank",
+                    lang.code()
+                );
+                assert!(
+                    !text.contains('\u{2014}'),
+                    "{} uses an em dash in a setup string: {text}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_language_keeps_the_two_connection_choices_apart() {
+        // Running your own node and sending the work to a pool are opposite
+        // decisions about who gets paid. A language that words them alike, or
+        // that leaves the "not in this package" reason equal to the normal
+        // explanation, hands the user a coin flip.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            let distinct = [
+                s.connect_solo_title,
+                s.connect_pool_title,
+                s.connect_hacd_local_title,
+                s.connect_hacd_remote_title,
+            ];
+            for i in 0..distinct.len() {
+                for j in (i + 1)..distinct.len() {
+                    assert_ne!(
+                        distinct[i],
+                        distinct[j],
+                        "{} gives two connection choices the same label",
+                        lang.code()
+                    );
+                }
+            }
+            assert_ne!(
+                s.connect_solo_sub,
+                s.connect_solo_unavailable,
+                "{} must say something different when the choice is unavailable",
+                lang.code()
+            );
+            assert!(
+                s.connect_solo_unavailable_hint.contains("hacash"),
+                "{} must name the missing program",
+                lang.code()
+            );
+        }
+    }
+
+    #[test]
+    fn every_language_keeps_the_four_screens_apart() {
+        // Two nav items with the same label is a panel where one screen cannot
+        // be reached, and the user has no way to tell which.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            let items = [
+                s.tab_dashboard,
+                s.tab_settings,
+                s.nav_master_panel,
+                s.tab_help,
+            ];
+            for i in 0..items.len() {
+                for j in (i + 1)..items.len() {
+                    assert_ne!(
+                        items[i],
+                        items[j],
+                        "{} gives two screens the same nav label",
+                        lang.code()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard labels.
+//
+// A second table rather than more fields on `Strings` on purpose: `Strings` is
+// nine literal blocks that every screen edits, and appending forty fields to it
+// means touching all nine in nine places at once. This table is one block per
+// language, added and reviewed as a unit, and it never collides with work on
+// the other screens.
+// ---------------------------------------------------------------------------
+
+/// Every word the Dashboard screen puts on the page that is not already in
+/// `Strings`.
+#[derive(Clone, Copy)]
+pub struct DashLabels {
+    pub overview_title: &'static str,
+    pub live_telemetry: &'static str,
+    pub perf_title: &'static str,
+    pub perf_sub: &'static str,
+    /// Shown wherever a figure needs history the panel has not gathered yet.
+    /// It is never a zero, because zero would be a claim.
+    pub collecting: &'static str,
+    pub stat_average: &'static str,
+    pub stat_peak: &'static str,
+    pub stat_gpu_errors: &'static str,
+    pub stat_uptime: &'static str,
+    pub hw_title: &'static str,
+    pub hw_sub: &'static str,
+    pub hw_unit_size: &'static str,
+    /// Caption under the ring when it is showing the work-group load. That is
+    /// what the ring falls back to on a machine whose GPU publishes no
+    /// temperature, so the caption always names what is actually being shown.
+    pub gauge_load: &'static str,
+    pub gauge_threads: &'static str,
+    /// Caption under the ring when the worker really did read a sensor.
+    pub gauge_temp: &'static str,
+    /// Said in words on the Hardware card when the ring stops being a
+    /// thermometer, because a changed caption alone leaves an operator reading
+    /// a work-group percentage as though it were a temperature.
+    pub temp_no_sensor: &'static str,
+    pub guard_thermal: &'static str,
+    pub guard_restart: &'static str,
+    pub guard_oom: &'static str,
+    pub guard_profit: &'static str,
+    pub limit_off: &'static str,
+    pub events_title: &'static str,
+    pub events_empty: &'static str,
+    pub control_title: &'static str,
+    pub control_sub: &'static str,
+    pub control_locked: &'static str,
+    pub btn_stop_safely: &'static str,
+    pub btn_auto_tune: &'static str,
+    pub btn_worker_log: &'static str,
+    pub btn_hide_log: &'static str,
+    pub btn_cancel: &'static str,
+    pub btn_busy: &'static str,
+    pub btn_restore: &'static str,
+    pub pool_title: &'static str,
+    pub pool_sub: &'static str,
+    pub pool_none: &'static str,
+    pub network_share: &'static str,
+    /// The honest filler for a slot the mockup fills with a number this build
+    /// has no source for.
+    pub not_measured: &'static str,
+    /// Names the one half of "net per day" that is still measured when no HAC
+    /// price is configured: the power bill.
+    pub net_cost_only: &'static str,
+    /// Why the net figure is a dash, and what makes it a number again. An
+    /// operator who sees a blank where money used to be needs the remedy, not
+    /// just the blank.
+    pub net_price_unset: &'static str,
+    pub node_not_probed: &'static str,
+    pub telemetry_never: &'static str,
+    /// "vs {} average", the window name goes in the placeholder.
+    pub vs_average: &'static str,
+    /// "worker telemetry {} old".
+    pub telemetry_age: &'static str,
+    /// "{} / {} retries".
+    pub retries: &'static str,
+    pub ev_success: &'static str,
+    pub ev_failure: &'static str,
+    pub ev_gpu: &'static str,
+    pub ev_paused: &'static str,
+    pub ev_resumed: &'static str,
+    pub ev_notice: &'static str,
+}
+
+impl DashLabels {
+    pub fn vs_average_display(&self, window: &str) -> String {
+        apply_format_template(self.vs_average, &[window.to_string()])
+    }
+
+    pub fn telemetry_age_display(&self, age: &str) -> String {
+        apply_format_template(self.telemetry_age, &[age.to_string()])
+    }
+
+    pub fn retries_display(&self, spent: u8, budget: u8) -> String {
+        apply_format_template(self.retries, &[spent.to_string(), budget.to_string()])
+    }
+}
+
+pub fn dash_labels(lang: Lang) -> DashLabels {
+    match lang {
+        Lang::En => DashLabels {
+            overview_title: "Mining Overview",
+            live_telemetry: "Live worker telemetry",
+            perf_title: "Mining Performance",
+            perf_sub: "Hash rate this panel has measured from the worker",
+            collecting: "Collecting samples",
+            stat_average: "Average",
+            stat_peak: "Peak",
+            stat_gpu_errors: "GPU errors",
+            stat_uptime: "Uptime",
+            hw_title: "Hardware & Safety",
+            hw_sub: "Device limits are enforced by the worker",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "CPU THREADS",
+            gauge_temp: "GPU TEMP",
+            temp_no_sensor: "No temperature sensor answered",
+            guard_thermal: "Thermal guard",
+            guard_restart: "Auto-restart",
+            guard_oom: "OOM fallback",
+            guard_profit: "Profit pause",
+            limit_off: "Off",
+            events_title: "Recent Worker Events",
+            events_empty: "The worker has printed nothing yet",
+            control_title: "Mining Control",
+            control_sub: "Safe start, stop and recovery controls",
+            control_locked: "Settings stay locked while the worker, the OpenCL check or Auto Tune is running.",
+            btn_stop_safely: "■ Stop Mining Safely",
+            btn_auto_tune: "Run Auto Tune",
+            btn_worker_log: "Worker log",
+            btn_hide_log: "Hide worker log",
+            btn_cancel: "Cancel",
+            btn_busy: "Working...",
+            btn_restore: "Retry settings restore",
+            pool_title: "Pool Earnings",
+            pool_sub: "Reported by the connected payout pool",
+            pool_none: "No payout pool is connected.",
+            network_share: "Network share",
+            not_measured: "Not measured by this panel",
+            net_cost_only: "Power cost",
+            net_price_unset: "Set the HAC price in Settings",
+            node_not_probed: "node height not probed",
+            telemetry_never: "no worker telemetry yet",
+            vs_average: "vs {} average",
+            telemetry_age: "worker telemetry {} old",
+            retries: "{} / {} retries",
+            ev_success: "Block accepted",
+            ev_failure: "Worker error",
+            ev_gpu: "GPU error",
+            ev_paused: "Mining paused",
+            ev_resumed: "Mining resumed",
+            ev_notice: "Worker notice",
+        },
+        Lang::El => DashLabels {
+            overview_title: "Επισκόπηση εξόρυξης",
+            live_telemetry: "Ζωντανή τηλεμετρία worker",
+            perf_title: "Απόδοση εξόρυξης",
+            perf_sub: "Hashrate που έχει μετρήσει αυτό το panel από τον worker",
+            collecting: "Συλλογή δειγμάτων",
+            stat_average: "Μέσος όρος",
+            stat_peak: "Μέγιστο",
+            stat_gpu_errors: "Σφάλματα GPU",
+            stat_uptime: "Χρόνος λειτουργίας",
+            hw_title: "Υλικό & ασφάλεια",
+            hw_sub: "Τα όρια της συσκευής τα επιβάλλει ο worker",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "ΝΗΜΑΤΑ CPU",
+            gauge_temp: "ΘΕΡΜ. GPU",
+            temp_no_sensor: "Κανένας αισθητήρας θερμοκρασίας δεν απάντησε",
+            guard_thermal: "Θερμική προστασία",
+            guard_restart: "Αυτόματη επανεκκίνηση",
+            guard_oom: "Εφεδρεία OOM",
+            guard_profit: "Παύση κέρδους",
+            limit_off: "Ανενεργό",
+            events_title: "Πρόσφατα συμβάντα worker",
+            events_empty: "Ο worker δεν έχει τυπώσει ακόμα τίποτα",
+            control_title: "Έλεγχος εξόρυξης",
+            control_sub: "Ασφαλής εκκίνηση, διακοπή και ανάκτηση",
+            control_locked: "Οι ρυθμίσεις μένουν κλειδωμένες όσο τρέχει ο worker, ο έλεγχος OpenCL ή το Auto Tune.",
+            btn_stop_safely: "■ Ασφαλής διακοπή",
+            btn_auto_tune: "Εκτέλεση Auto Tune",
+            btn_worker_log: "Καταγραφή worker",
+            btn_hide_log: "Απόκρυψη καταγραφής",
+            btn_cancel: "Ακύρωση",
+            btn_busy: "Σε εξέλιξη...",
+            btn_restore: "Επανάληψη επαναφοράς ρυθμίσεων",
+            pool_title: "Έσοδα από το pool",
+            pool_sub: "Όπως τα αναφέρει το συνδεδεμένο pool πληρωμών",
+            pool_none: "Δεν είναι συνδεδεμένο pool πληρωμών.",
+            network_share: "Μερίδιο δικτύου",
+            not_measured: "Δεν μετριέται από αυτό το panel",
+            net_cost_only: "Κόστος ρεύματος",
+            net_price_unset: "Ορίστε την τιμή HAC στις Ρυθμίσεις",
+            node_not_probed: "το ύψος κόμβου δεν ελέγχθηκε",
+            telemetry_never: "καμία τηλεμετρία worker ακόμα",
+            vs_average: "έναντι μέσου όρου {}",
+            telemetry_age: "τηλεμετρία worker πριν {}",
+            retries: "{} / {} προσπάθειες",
+            ev_success: "Το μπλοκ έγινε δεκτό",
+            ev_failure: "Σφάλμα worker",
+            ev_gpu: "Σφάλμα GPU",
+            ev_paused: "Παύση εξόρυξης",
+            ev_resumed: "Συνέχιση εξόρυξης",
+            ev_notice: "Ειδοποίηση worker",
+        },
+        Lang::Tr => DashLabels {
+            overview_title: "Madencilik Özeti",
+            live_telemetry: "Canlı worker telemetrisi",
+            perf_title: "Madencilik Performansı",
+            perf_sub: "Bu panelin worker'dan ölçtüğü hashrate",
+            collecting: "Örnekler toplanıyor",
+            stat_average: "Ortalama",
+            stat_peak: "Zirve",
+            stat_gpu_errors: "GPU hataları",
+            stat_uptime: "Çalışma süresi",
+            hw_title: "Donanım ve Güvenlik",
+            hw_sub: "Cihaz sınırlarını worker uygular",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "CPU İŞ PARÇACIKLARI",
+            gauge_temp: "GPU SICAKLIĞI",
+            temp_no_sensor: "Hiçbir sıcaklık sensörü yanıt vermedi",
+            guard_thermal: "Termal koruma",
+            guard_restart: "Otomatik yeniden başlatma",
+            guard_oom: "OOM yedeği",
+            guard_profit: "Kar duraklatma",
+            limit_off: "Kapalı",
+            events_title: "Son Worker Olayları",
+            events_empty: "Worker henüz hiçbir şey yazmadı",
+            control_title: "Madencilik Kontrolü",
+            control_sub: "Güvenli başlatma, durdurma ve kurtarma",
+            control_locked: "Worker, OpenCL kontrolü veya Auto Tune çalışırken ayarlar kilitli kalır.",
+            btn_stop_safely: "■ Güvenli Durdur",
+            btn_auto_tune: "Auto Tune Çalıştır",
+            btn_worker_log: "Worker günlüğü",
+            btn_hide_log: "Günlüğü gizle",
+            btn_cancel: "İptal",
+            btn_busy: "Çalışıyor...",
+            btn_restore: "Ayar geri yüklemeyi tekrar dene",
+            pool_title: "Havuz Kazançları",
+            pool_sub: "Bağlı ödeme havuzunun bildirdiği",
+            pool_none: "Bağlı bir ödeme havuzu yok.",
+            network_share: "Ağ payı",
+            not_measured: "Bu panel tarafından ölçülmüyor",
+            net_cost_only: "Elektrik maliyeti",
+            net_price_unset: "Ayarlar bölümünde HAC fiyatını girin",
+            node_not_probed: "düğüm yüksekliği sorulmadı",
+            telemetry_never: "henüz worker telemetrisi yok",
+            vs_average: "{} ortalamasına göre",
+            telemetry_age: "worker telemetrisi {} önce",
+            retries: "{} / {} deneme",
+            ev_success: "Blok kabul edildi",
+            ev_failure: "Worker hatası",
+            ev_gpu: "GPU hatası",
+            ev_paused: "Madencilik duraklatıldı",
+            ev_resumed: "Madencilik devam ediyor",
+            ev_notice: "Worker bildirimi",
+        },
+        Lang::Zh => DashLabels {
+            overview_title: "挖矿总览",
+            live_telemetry: "实时矿工遥测",
+            perf_title: "挖矿性能",
+            perf_sub: "本面板从矿工采样得到的算力",
+            collecting: "正在采集样本",
+            stat_average: "平均",
+            stat_peak: "峰值",
+            stat_gpu_errors: "GPU 错误",
+            stat_uptime: "运行时长",
+            hw_title: "硬件与安全",
+            hw_sub: "设备限制由矿工执行",
+            hw_unit_size: "单元大小",
+            gauge_load: "工作组",
+            gauge_threads: "CPU 线程",
+            gauge_temp: "GPU 温度",
+            temp_no_sensor: "没有温度传感器响应",
+            guard_thermal: "温度保护",
+            guard_restart: "自动重启",
+            guard_oom: "显存回退",
+            guard_profit: "亏损暂停",
+            limit_off: "关闭",
+            events_title: "最近矿工事件",
+            events_empty: "矿工尚未输出任何内容",
+            control_title: "挖矿控制",
+            control_sub: "安全启动、停止与恢复",
+            control_locked: "矿工、OpenCL 检测或自动调优运行时，设置保持锁定。",
+            btn_stop_safely: "■ 安全停止",
+            btn_auto_tune: "运行自动调优",
+            btn_worker_log: "矿工日志",
+            btn_hide_log: "隐藏日志",
+            btn_cancel: "取消",
+            btn_busy: "处理中...",
+            btn_restore: "重试恢复设置",
+            pool_title: "矿池收益",
+            pool_sub: "由已连接的支付矿池报告",
+            pool_none: "未连接支付矿池。",
+            network_share: "全网占比",
+            not_measured: "本面板不测量此项",
+            net_cost_only: "电费",
+            net_price_unset: "请在设置中填写 HAC 价格",
+            node_not_probed: "未查询节点高度",
+            telemetry_never: "尚无矿工遥测",
+            vs_average: "对比 {} 平均",
+            telemetry_age: "矿工遥测 {} 前",
+            retries: "{} / {} 次重试",
+            ev_success: "区块被接受",
+            ev_failure: "矿工错误",
+            ev_gpu: "GPU 错误",
+            ev_paused: "挖矿已暂停",
+            ev_resumed: "挖矿已恢复",
+            ev_notice: "矿工通知",
+        },
+        Lang::Ja => DashLabels {
+            overview_title: "マイニング概要",
+            live_telemetry: "ワーカーのライブ計測",
+            perf_title: "マイニング性能",
+            perf_sub: "このパネルがワーカーから測定したハッシュレート",
+            collecting: "サンプル収集中",
+            stat_average: "平均",
+            stat_peak: "ピーク",
+            stat_gpu_errors: "GPU エラー",
+            stat_uptime: "稼働時間",
+            hw_title: "ハードウェアと安全",
+            hw_sub: "デバイスの上限はワーカーが適用します",
+            hw_unit_size: "ユニットサイズ",
+            gauge_load: "ワークグループ",
+            gauge_threads: "CPU スレッド",
+            gauge_temp: "GPU 温度",
+            temp_no_sensor: "温度センサーの応答がありません",
+            guard_thermal: "温度保護",
+            guard_restart: "自動再起動",
+            guard_oom: "OOM フォールバック",
+            guard_profit: "採算停止",
+            limit_off: "オフ",
+            events_title: "最近のワーカーイベント",
+            events_empty: "ワーカーはまだ何も出力していません",
+            control_title: "マイニング制御",
+            control_sub: "安全な開始、停止、復旧",
+            control_locked: "ワーカー、OpenCL 確認、Auto Tune の実行中は設定がロックされます。",
+            btn_stop_safely: "■ 安全に停止",
+            btn_auto_tune: "Auto Tune を実行",
+            btn_worker_log: "ワーカーログ",
+            btn_hide_log: "ログを隠す",
+            btn_cancel: "キャンセル",
+            btn_busy: "処理中...",
+            btn_restore: "設定復元を再試行",
+            pool_title: "プール収益",
+            pool_sub: "接続中の支払いプールの報告",
+            pool_none: "支払いプールに接続していません。",
+            network_share: "ネットワーク占有率",
+            not_measured: "このパネルでは測定していません",
+            net_cost_only: "電気代",
+            net_price_unset: "設定で HAC 価格を入力してください",
+            node_not_probed: "ノード高さは未確認",
+            telemetry_never: "ワーカー計測はまだありません",
+            vs_average: "{} 平均との比較",
+            telemetry_age: "ワーカー計測 {} 前",
+            retries: "{} / {} 回の再試行",
+            ev_success: "ブロックが承認されました",
+            ev_failure: "ワーカーエラー",
+            ev_gpu: "GPU エラー",
+            ev_paused: "マイニング一時停止",
+            ev_resumed: "マイニング再開",
+            ev_notice: "ワーカー通知",
+        },
+        Lang::Es => DashLabels {
+            overview_title: "Resumen de minería",
+            live_telemetry: "Telemetría en vivo del worker",
+            perf_title: "Rendimiento de minería",
+            perf_sub: "Hashrate que este panel ha medido desde el worker",
+            collecting: "Recogiendo muestras",
+            stat_average: "Media",
+            stat_peak: "Pico",
+            stat_gpu_errors: "Errores de GPU",
+            stat_uptime: "Tiempo activo",
+            hw_title: "Hardware y seguridad",
+            hw_sub: "Los límites del dispositivo los aplica el worker",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "HILOS DE CPU",
+            gauge_temp: "TEMP. GPU",
+            temp_no_sensor: "Ningún sensor de temperatura respondió",
+            guard_thermal: "Protección térmica",
+            guard_restart: "Reinicio automático",
+            guard_oom: "Respaldo OOM",
+            guard_profit: "Pausa por rentabilidad",
+            limit_off: "Desactivado",
+            events_title: "Eventos recientes del worker",
+            events_empty: "El worker aún no ha impreso nada",
+            control_title: "Control de minería",
+            control_sub: "Inicio, parada y recuperación seguros",
+            control_locked: "Los ajustes quedan bloqueados mientras el worker, la comprobación OpenCL o Auto Tune están activos.",
+            btn_stop_safely: "■ Detener con seguridad",
+            btn_auto_tune: "Ejecutar Auto Tune",
+            btn_worker_log: "Registro del worker",
+            btn_hide_log: "Ocultar registro",
+            btn_cancel: "Cancelar",
+            btn_busy: "Trabajando...",
+            btn_restore: "Reintentar restauración de ajustes",
+            pool_title: "Ganancias del pool",
+            pool_sub: "Informado por el pool de pagos conectado",
+            pool_none: "No hay pool de pagos conectado.",
+            network_share: "Cuota de red",
+            not_measured: "Este panel no lo mide",
+            net_cost_only: "Coste eléctrico",
+            net_price_unset: "Fija el precio de HAC en Ajustes",
+            node_not_probed: "altura del nodo sin consultar",
+            telemetry_never: "aún no hay telemetría del worker",
+            vs_average: "frente a la media de {}",
+            telemetry_age: "telemetría del worker de hace {}",
+            retries: "{} / {} reintentos",
+            ev_success: "Bloque aceptado",
+            ev_failure: "Error del worker",
+            ev_gpu: "Error de GPU",
+            ev_paused: "Minería pausada",
+            ev_resumed: "Minería reanudada",
+            ev_notice: "Aviso del worker",
+        },
+        Lang::Fr => DashLabels {
+            overview_title: "Vue d'ensemble du minage",
+            live_telemetry: "Télémétrie en direct du worker",
+            perf_title: "Performance de minage",
+            perf_sub: "Hashrate mesuré par ce panneau depuis le worker",
+            collecting: "Collecte des échantillons",
+            stat_average: "Moyenne",
+            stat_peak: "Pic",
+            stat_gpu_errors: "Erreurs GPU",
+            stat_uptime: "Durée de fonctionnement",
+            hw_title: "Matériel et sécurité",
+            hw_sub: "Les limites de l'appareil sont appliquées par le worker",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "THREADS CPU",
+            gauge_temp: "TEMP. GPU",
+            temp_no_sensor: "Aucun capteur de température n'a répondu",
+            guard_thermal: "Protection thermique",
+            guard_restart: "Redémarrage automatique",
+            guard_oom: "Repli OOM",
+            guard_profit: "Pause rentabilité",
+            limit_off: "Désactivé",
+            events_title: "Événements récents du worker",
+            events_empty: "Le worker n'a encore rien affiché",
+            control_title: "Contrôle du minage",
+            control_sub: "Démarrage, arrêt et reprise sûrs",
+            control_locked: "Les réglages restent verrouillés pendant le worker, la vérification OpenCL ou Auto Tune.",
+            btn_stop_safely: "■ Arrêter en sécurité",
+            btn_auto_tune: "Lancer Auto Tune",
+            btn_worker_log: "Journal du worker",
+            btn_hide_log: "Masquer le journal",
+            btn_cancel: "Annuler",
+            btn_busy: "En cours...",
+            btn_restore: "Réessayer la restauration",
+            pool_title: "Gains du pool",
+            pool_sub: "Communiqué par le pool de paiement connecté",
+            pool_none: "Aucun pool de paiement connecté.",
+            network_share: "Part du réseau",
+            not_measured: "Non mesuré par ce panneau",
+            net_cost_only: "Coût électrique",
+            net_price_unset: "Renseignez le prix du HAC dans Réglages",
+            node_not_probed: "hauteur du noeud non vérifiée",
+            telemetry_never: "aucune télémétrie du worker",
+            vs_average: "vs moyenne {}",
+            telemetry_age: "télémétrie du worker il y a {}",
+            retries: "{} / {} tentatives",
+            ev_success: "Bloc accepté",
+            ev_failure: "Erreur du worker",
+            ev_gpu: "Erreur GPU",
+            ev_paused: "Minage en pause",
+            ev_resumed: "Minage repris",
+            ev_notice: "Avis du worker",
+        },
+        Lang::Th => DashLabels {
+            overview_title: "ภาพรวมการขุด",
+            live_telemetry: "ข้อมูลสดจากตัวขุด",
+            perf_title: "ประสิทธิภาพการขุด",
+            perf_sub: "แฮชเรทที่แผงนี้วัดได้จากตัวขุด",
+            collecting: "กำลังเก็บตัวอย่าง",
+            stat_average: "เฉลี่ย",
+            stat_peak: "สูงสุด",
+            stat_gpu_errors: "ข้อผิดพลาด GPU",
+            stat_uptime: "เวลาทำงาน",
+            hw_title: "ฮาร์ดแวร์และความปลอดภัย",
+            hw_sub: "ขีดจำกัดอุปกรณ์บังคับใช้โดยตัวขุด",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "เธรด CPU",
+            gauge_temp: "อุณหภูมิ GPU",
+            temp_no_sensor: "ไม่มีเซ็นเซอร์อุณหภูมิตอบสนอง",
+            guard_thermal: "ป้องกันความร้อน",
+            guard_restart: "รีสตาร์ทอัตโนมัติ",
+            guard_oom: "สำรอง OOM",
+            guard_profit: "หยุดเมื่อขาดทุน",
+            limit_off: "ปิด",
+            events_title: "เหตุการณ์ล่าสุดของตัวขุด",
+            events_empty: "ตัวขุดยังไม่ได้แสดงข้อความใด",
+            control_title: "ควบคุมการขุด",
+            control_sub: "เริ่ม หยุด และกู้คืนอย่างปลอดภัย",
+            control_locked: "การตั้งค่าจะถูกล็อกขณะตัวขุด การตรวจ OpenCL หรือ Auto Tune ทำงาน",
+            btn_stop_safely: "■ หยุดอย่างปลอดภัย",
+            btn_auto_tune: "เรียกใช้ Auto Tune",
+            btn_worker_log: "บันทึกตัวขุด",
+            btn_hide_log: "ซ่อนบันทึก",
+            btn_cancel: "ยกเลิก",
+            btn_busy: "กำลังทำงาน...",
+            btn_restore: "ลองกู้คืนการตั้งค่าอีกครั้ง",
+            pool_title: "รายได้จากพูล",
+            pool_sub: "รายงานโดยพูลจ่ายเงินที่เชื่อมต่ออยู่",
+            pool_none: "ไม่ได้เชื่อมต่อพูลจ่ายเงิน",
+            network_share: "ส่วนแบ่งเครือข่าย",
+            not_measured: "แผงนี้ไม่ได้วัดค่านี้",
+            net_cost_only: "ค่าไฟ",
+            net_price_unset: "ตั้งราคา HAC ในการตั้งค่า",
+            node_not_probed: "ยังไม่ได้ตรวจความสูงโหนด",
+            telemetry_never: "ยังไม่มีข้อมูลจากตัวขุด",
+            vs_average: "เทียบค่าเฉลี่ย {}",
+            telemetry_age: "ข้อมูลตัวขุดเมื่อ {} ที่แล้ว",
+            retries: "ลองใหม่ {} / {} ครั้ง",
+            ev_success: "บล็อกได้รับการยอมรับ",
+            ev_failure: "ข้อผิดพลาดตัวขุด",
+            ev_gpu: "ข้อผิดพลาด GPU",
+            ev_paused: "หยุดขุดชั่วคราว",
+            ev_resumed: "กลับมาขุดต่อ",
+            ev_notice: "ประกาศจากตัวขุด",
+        },
+        Lang::Ru => DashLabels {
+            overview_title: "Обзор майнинга",
+            live_telemetry: "Живая телеметрия воркера",
+            perf_title: "Производительность майнинга",
+            perf_sub: "Хешрейт, измеренный этой панелью по данным воркера",
+            collecting: "Сбор образцов",
+            stat_average: "Среднее",
+            stat_peak: "Пик",
+            stat_gpu_errors: "Ошибки GPU",
+            stat_uptime: "Время работы",
+            hw_title: "Оборудование и защита",
+            hw_sub: "Лимиты устройства применяет воркер",
+            hw_unit_size: "Unit size",
+            gauge_load: "WORK GROUPS",
+            gauge_threads: "ПОТОКИ CPU",
+            gauge_temp: "ТЕМП. GPU",
+            temp_no_sensor: "Ни один датчик температуры не ответил",
+            guard_thermal: "Тепловая защита",
+            guard_restart: "Автоперезапуск",
+            guard_oom: "Откат при OOM",
+            guard_profit: "Пауза по прибыли",
+            limit_off: "Выкл.",
+            events_title: "Последние события воркера",
+            events_empty: "Воркер пока ничего не вывел",
+            control_title: "Управление майнингом",
+            control_sub: "Безопасный запуск, остановка и восстановление",
+            control_locked: "Настройки заблокированы, пока работают воркер, проверка OpenCL или Auto Tune.",
+            btn_stop_safely: "■ Безопасная остановка",
+            btn_auto_tune: "Запустить Auto Tune",
+            btn_worker_log: "Журнал воркера",
+            btn_hide_log: "Скрыть журнал",
+            btn_cancel: "Отмена",
+            btn_busy: "Выполняется...",
+            btn_restore: "Повторить восстановление настроек",
+            pool_title: "Выплаты пула",
+            pool_sub: "По данным подключенного пула выплат",
+            pool_none: "Пул выплат не подключен.",
+            network_share: "Доля сети",
+            not_measured: "Эта панель этого не измеряет",
+            net_cost_only: "Стоимость электричества",
+            net_price_unset: "Укажите цену HAC в настройках",
+            node_not_probed: "высота узла не запрошена",
+            telemetry_never: "телеметрии воркера еще нет",
+            vs_average: "к среднему за {}",
+            telemetry_age: "телеметрия воркера {} назад",
+            retries: "{} / {} попыток",
+            ev_success: "Блок принят",
+            ev_failure: "Ошибка воркера",
+            ev_gpu: "Ошибка GPU",
+            ev_paused: "Майнинг приостановлен",
+            ev_resumed: "Майнинг возобновлен",
+            ev_notice: "Уведомление воркера",
+        },
+    }
+}
+
+#[cfg(test)]
+mod dash_label_tests {
+    use super::*;
+
+    /// Every label the Dashboard draws, in one list, so a language that ships a
+    /// blank cannot ship a blank card.
+    fn all(d: &DashLabels) -> [&'static str; 51] {
+        [
+            d.overview_title,
+            d.live_telemetry,
+            d.perf_title,
+            d.perf_sub,
+            d.collecting,
+            d.stat_average,
+            d.stat_peak,
+            d.stat_gpu_errors,
+            d.stat_uptime,
+            d.hw_title,
+            d.hw_sub,
+            d.hw_unit_size,
+            d.gauge_load,
+            d.gauge_threads,
+            d.gauge_temp,
+            d.temp_no_sensor,
+            d.guard_thermal,
+            d.guard_restart,
+            d.guard_oom,
+            d.guard_profit,
+            d.limit_off,
+            d.events_title,
+            d.events_empty,
+            d.control_title,
+            d.control_sub,
+            d.control_locked,
+            d.btn_stop_safely,
+            d.btn_auto_tune,
+            d.btn_worker_log,
+            d.btn_hide_log,
+            d.btn_cancel,
+            d.btn_busy,
+            d.btn_restore,
+            d.pool_title,
+            d.pool_sub,
+            d.pool_none,
+            d.network_share,
+            d.not_measured,
+            d.net_cost_only,
+            d.net_price_unset,
+            d.node_not_probed,
+            d.telemetry_never,
+            d.vs_average,
+            d.telemetry_age,
+            d.retries,
+            d.ev_success,
+            d.ev_failure,
+            d.ev_gpu,
+            d.ev_paused,
+            d.ev_resumed,
+            d.ev_notice,
+        ]
+    }
+
+    #[test]
+    fn the_dashboard_table_covers_exactly_the_languages_the_panel_ships() {
+        // Asserted rather than assumed: a language added to `Lang::ALL` without
+        // a block here would be a compile error in `dash_labels`, and this test
+        // is what makes the count itself visible if that list ever changes.
+        assert_eq!(Lang::ALL.len(), 9, "the panel ships nine languages");
+        for lang in Lang::ALL {
+            // Panics if a language has no arm; the match is exhaustive today.
+            let _ = dash_labels(lang);
+        }
+    }
+
+    #[test]
+    fn no_language_leaves_a_dashboard_label_blank() {
+        for lang in Lang::ALL {
+            let d = dash_labels(lang);
+            for text in all(&d) {
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} left a dashboard label blank",
+                    lang.code()
+                );
+                assert!(
+                    !text.contains('\u{2014}'),
+                    "{} uses an em dash in a dashboard label: {text}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_language_can_say_that_no_sensor_answered() {
+        // The Hardware card ring becomes a work-group gauge on a machine with
+        // no sensor. The sentence that says so is the only thing keeping that
+        // from reading as a temperature, so a language shipping it blank, or
+        // shipping the caption again by copy and paste, would ship the silence
+        // back. The count is asserted, not assumed: nine blocks, nine lines.
+        assert_eq!(Lang::ALL.len(), 9, "the panel ships nine languages");
+        let mut seen = 0;
+        for lang in Lang::ALL {
+            let d = dash_labels(lang);
+            let line = d.temp_no_sensor;
+            assert!(
+                !line.trim().is_empty(),
+                "{} says nothing when no sensor answered",
+                lang.code()
+            );
+            assert_ne!(
+                line,
+                d.gauge_temp,
+                "{} repeats the ring caption instead of saying it",
+                lang.code()
+            );
+            assert!(
+                !line.contains('\n'),
+                "{} needs more than the one line the card has room for",
+                lang.code()
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, Lang::ALL.len());
+    }
+
+    #[test]
+    fn every_language_can_say_why_the_net_figure_is_blank() {
+        // With no HAC price configured the Net per day card stops showing a
+        // number, because the number would be a loss the rig is not making. The
+        // blank is only honest if the card also says what fills it back in, so a
+        // language shipping that line empty ships back a card that looks broken.
+        // Nine blocks, nine lines, asserted rather than assumed.
+        assert_eq!(Lang::ALL.len(), 9, "the panel ships nine languages");
+        let mut seen = 0;
+        for lang in Lang::ALL {
+            let d = dash_labels(lang);
+            assert!(
+                !d.net_price_unset.trim().is_empty(),
+                "{} does not say how to make the money figures real",
+                lang.code()
+            );
+            assert!(
+                d.net_price_unset.contains("HAC"),
+                "{} must name the HAC price as the thing to set",
+                lang.code()
+            );
+            assert!(
+                !d.net_cost_only.trim().is_empty(),
+                "{} does not name the cost it still shows",
+                lang.code()
+            );
+            assert_ne!(
+                d.net_cost_only,
+                d.net_price_unset,
+                "{} uses one line for both facts",
+                lang.code()
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, Lang::ALL.len());
+    }
+
+    #[test]
+    fn a_work_group_breakdown_names_only_the_cap_that_actually_bit() {
+        // `oom_allowed_work_groups` is a count, not a loss: on a healthy rig it
+        // equals the configured count. The caller passes None for a cap that did
+        // not bite, and the row must then not name one.
+        for lang in Lang::ALL {
+            let t = strings(lang);
+            let healthy = t.wg_breakdown_display(48, 48, None, None);
+            assert!(
+                !healthy.contains("OOM"),
+                "{} claims an OOM cap on an unclamped rig: {healthy}",
+                lang.code()
+            );
+            assert!(healthy.contains("48"), "{}: {healthy}", lang.code());
+            let clamped = t.wg_breakdown_display(24, 48, Some(24), None);
+            assert!(
+                clamped.contains("24") && clamped.contains("48"),
+                "{}: {clamped}",
+                lang.code()
+            );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_sentences_keep_their_placeholders() {
+        for lang in Lang::ALL {
+            let d = dash_labels(lang);
+            assert_eq!(
+                d.vs_average.matches("{}").count(),
+                1,
+                "{} must place the window name",
+                lang.code()
+            );
+            assert_eq!(
+                d.telemetry_age.matches("{}").count(),
+                1,
+                "{} must place the age",
+                lang.code()
+            );
+            assert_eq!(
+                d.retries.matches("{}").count(),
+                2,
+                "{} must place both the attempts spent and the budget",
+                lang.code()
+            );
+            assert!(d.vs_average_display("1H").contains("1H"));
+            assert!(d.telemetry_age_display("4s").contains("4s"));
+            let retries = d.retries_display(1, 3);
+            assert!(retries.contains('1') && retries.contains('3'), "{retries}");
+        }
+    }
+
+    #[test]
+    fn the_six_worker_event_headings_stay_distinct_in_every_language() {
+        // Two event kinds sharing a heading is a feed where a GPU failure and a
+        // routine notice look the same.
+        for lang in Lang::ALL {
+            let d = dash_labels(lang);
+            let kinds = [
+                d.ev_success,
+                d.ev_failure,
+                d.ev_gpu,
+                d.ev_paused,
+                d.ev_resumed,
+                d.ev_notice,
+            ];
+            for i in 0..kinds.len() {
+                for j in (i + 1)..kinds.len() {
+                    assert_ne!(
+                        kinds[i],
+                        kinds[j],
+                        "{} gives two worker event kinds the same heading",
+                        lang.code()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Master Panel and Help.
+//
+// A separate table, appended rather than folded into `Strings`, for the same
+// reason `DashLabels` is: three screens are being rebuilt at once and a shared
+// struct is a shared edit. Nine languages, asserted below rather than assumed.
+// ---------------------------------------------------------------------------
+
+/// Which language the panel is drawing in this frame.
+///
+/// `FleetState::show_master` is called from the frame loop with a `Ui` and the
+/// local stats snapshot and nothing else, and its call site is in a file this
+/// change must not touch, so it cannot be handed a `Lang`. The frame loop
+/// records the language here before any screen is drawn; the fleet screen then
+/// reads exactly what the rest of the frame is using. Relaxed ordering is
+/// enough: one writer, one reader, same thread, and a one-frame-old language
+/// would only ever be the value the user just chose.
+static ACTIVE_LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn note_active_lang(lang: Lang) {
+    let index = Lang::ALL
+        .iter()
+        .position(|candidate| *candidate == lang)
+        .unwrap_or(0) as u8;
+    ACTIVE_LANG.store(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn active_lang() -> Lang {
+    let index = ACTIVE_LANG.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    Lang::ALL[index % Lang::ALL.len()]
+}
+
+#[derive(Clone, Copy)]
+pub struct PanelLabels {
+    // -- Master Panel --------------------------------------------------------
+    pub master_title: &'static str,
+    pub master_sub: &'static str,
+    /// Drawn uppercase in the page header. It is a promise about this screen:
+    /// the fleet endpoint can be read and never written.
+    pub read_only: &'static str,
+    pub polling: &'static str,
+    pub kpi_hashrate: &'static str,
+    pub kpi_workers: &'static str,
+    pub kpi_power: &'static str,
+    pub kpi_hac_day: &'static str,
+    pub col_worker: &'static str,
+    pub col_hashrate: &'static str,
+    pub col_hac_day: &'static str,
+    pub col_power: &'static str,
+    pub col_height: &'static str,
+    pub this_pc: &'static str,
+    pub state_offline: &'static str,
+    pub state_waiting: &'static str,
+    /// The local row when the worker is not running. Not "offline": the machine
+    /// is right here, it is simply not mining.
+    pub state_idle: &'static str,
+    pub lan_warning: &'static str,
+    pub manage_title: &'static str,
+    pub manage_sub: &'static str,
+    pub manage_hint: &'static str,
+    pub field_name: &'static str,
+    pub field_address: &'static str,
+    pub field_token: &'static str,
+    pub btn_add_miner: &'static str,
+    pub btn_remove: &'static str,
+    pub no_peers: &'static str,
+    pub share_title: &'static str,
+    pub share_sub: &'static str,
+    pub share_enable: &'static str,
+    pub share_port: &'static str,
+    pub share_token: &'static str,
+    pub btn_copy: &'static str,
+    pub btn_new_token: &'static str,
+    /// "{}" is the port this panel is listening on.
+    pub share_hint: &'static str,
+    pub share_warning: &'static str,
+    pub share_active: &'static str,
+    // -- Help ----------------------------------------------------------------
+    pub help_sub: &'static str,
+    pub help_paths_title: &'static str,
+    pub help_paths_sub: &'static str,
+    pub help_notes_title: &'static str,
+    pub help_notes_sub: &'static str,
+    pub help_hacd_cpu_note: &'static str,
+    pub help_reference_sub: &'static str,
+}
+
+impl PanelLabels {
+    pub fn share_hint_display(&self, port: u16) -> String {
+        apply_format_template(self.share_hint, &[port.to_string()])
+    }
+}
+
+pub fn panel_labels(lang: Lang) -> PanelLabels {
+    match lang {
+        Lang::En => PanelLabels {
+            master_title: "Master Panel",
+            master_sub: "Local + LAN / VPS miners",
+            read_only: "Read-only fleet",
+            polling: "Polling",
+            kpi_hashrate: "Total hashrate",
+            kpi_workers: "Workers online",
+            kpi_power: "Total power",
+            kpi_hac_day: "Est. HAC / day",
+            col_worker: "Worker",
+            col_hashrate: "Hashrate",
+            col_hac_day: "HAC/day",
+            col_power: "Power",
+            col_height: "Height",
+            this_pc: "This PC",
+            state_offline: "Offline",
+            state_waiting: "Waiting for the first reply",
+            state_idle: "Not mining",
+            lan_warning: "Fleet telemetry uses a token-protected, read-only LAN endpoint. The connection is not encrypted and must never be exposed to the public internet.",
+            manage_title: "Manage miners",
+            manage_sub: "Add or remove a remote worker",
+            manage_hint: "On every remote panel switch LAN sharing on, then enter its address and its token here.",
+            field_name: "Miner name",
+            field_address: "LAN address",
+            field_token: "Access token",
+            btn_add_miner: "Add miner",
+            btn_remove: "Remove",
+            no_peers: "Only this PC is reporting. Add a remote miner to see it in the table.",
+            share_title: "LAN sharing",
+            share_sub: "Let another panel read this miner",
+            share_enable: "Allow this miner to be monitored over LAN",
+            share_port: "Port",
+            share_token: "Access token",
+            btn_copy: "Copy",
+            btn_new_token: "New token",
+            share_hint: "Add this miner on the other panel as <this-PC-IP>:{} and paste the token.",
+            share_warning: "Trusted LAN only: the stats connection is not encrypted. Never expose this port to the internet.",
+            share_active: "Read-only LAN endpoint is active",
+            help_sub: "How to start, what every option does, and where the files live",
+            help_paths_title: "Files and folders",
+            help_paths_sub: "Where this panel keeps things",
+            help_notes_title: "Before you start",
+            help_notes_sub: "Three things worth reading once",
+            help_hacd_cpu_note: "HACD mines on the CPU only. OpenCL, CUDA and Auto Tune apply to HAC.",
+            help_reference_sub: "Every setting, and what it changes",
+        },
+        Lang::El => PanelLabels {
+            master_title: "Κεντρικός πίνακας",
+            master_sub: "Τοπικοί + LAN / VPS miners",
+            read_only: "Στόλος μόνο για ανάγνωση",
+            polling: "Έλεγχος",
+            kpi_hashrate: "Συνολικό hashrate",
+            kpi_workers: "Ενεργοί workers",
+            kpi_power: "Συνολική ισχύς",
+            kpi_hac_day: "Εκτ. HAC / ημέρα",
+            col_worker: "Worker",
+            col_hashrate: "Hashrate",
+            col_hac_day: "HAC/ημέρα",
+            col_power: "Ισχύς",
+            col_height: "Ύψος",
+            this_pc: "Αυτό το PC",
+            state_offline: "Εκτός σύνδεσης",
+            state_waiting: "Αναμονή πρώτης απάντησης",
+            state_idle: "Δεν εξορύσσει",
+            lan_warning: "Η τηλεμετρία του στόλου χρησιμοποιεί ένα σημείο LAN μόνο για ανάγνωση, προστατευμένο με token. Η σύνδεση δεν είναι κρυπτογραφημένη και δεν πρέπει ποτέ να εκτεθεί στο δημόσιο internet.",
+            manage_title: "Διαχείριση miners",
+            manage_sub: "Προσθήκη ή αφαίρεση απομακρυσμένου worker",
+            manage_hint: "Σε κάθε απομακρυσμένο panel ενεργοποιήστε τον διαμοιρασμό LAN και μετά δώστε εδώ τη διεύθυνση και το token του.",
+            field_name: "Όνομα miner",
+            field_address: "Διεύθυνση LAN",
+            field_token: "Token πρόσβασης",
+            btn_add_miner: "Προσθήκη miner",
+            btn_remove: "Αφαίρεση",
+            no_peers: "Μόνο αυτό το PC αναφέρει. Προσθέστε έναν απομακρυσμένο miner για να εμφανιστεί στον πίνακα.",
+            share_title: "Διαμοιρασμός LAN",
+            share_sub: "Επιτρέψτε σε άλλο panel να διαβάζει αυτόν τον miner",
+            share_enable: "Να επιτρέπεται η παρακολούθηση αυτού του miner μέσω LAN",
+            share_port: "Θύρα",
+            share_token: "Token πρόσβασης",
+            btn_copy: "Αντιγραφή",
+            btn_new_token: "Νέο token",
+            share_hint: "Προσθέστε αυτόν τον miner στο άλλο panel ως <IP-αυτού-του-PC>:{} και επικολλήστε το token.",
+            share_warning: "Μόνο σε έμπιστο LAN: η σύνδεση στατιστικών δεν είναι κρυπτογραφημένη. Μην εκθέσετε ποτέ αυτή τη θύρα στο internet.",
+            share_active: "Το σημείο LAN μόνο για ανάγνωση είναι ενεργό",
+            help_sub: "Πώς ξεκινάτε, τι κάνει κάθε επιλογή και πού βρίσκονται τα αρχεία",
+            help_paths_title: "Αρχεία και φάκελοι",
+            help_paths_sub: "Πού κρατάει τα πράγματα αυτό το panel",
+            help_notes_title: "Πριν ξεκινήσετε",
+            help_notes_sub: "Τρία πράγματα που αξίζει να διαβάσετε μία φορά",
+            help_hacd_cpu_note: "Το HACD εξορύσσει μόνο με CPU. Το OpenCL, το CUDA και το Auto Tune αφορούν το HAC.",
+            help_reference_sub: "Κάθε ρύθμιση και τι αλλάζει",
+        },
+        Lang::Tr => PanelLabels {
+            master_title: "Ana Panel",
+            master_sub: "Yerel + LAN / VPS madenciler",
+            read_only: "Salt okunur filo",
+            polling: "Sorgulanıyor",
+            kpi_hashrate: "Toplam hashrate",
+            kpi_workers: "Çevrimiçi worker",
+            kpi_power: "Toplam güç",
+            kpi_hac_day: "Tahmini HAC / gün",
+            col_worker: "Worker",
+            col_hashrate: "Hashrate",
+            col_hac_day: "HAC/gün",
+            col_power: "Güç",
+            col_height: "Yükseklik",
+            this_pc: "Bu bilgisayar",
+            state_offline: "Çevrimdışı",
+            state_waiting: "İlk yanıt bekleniyor",
+            state_idle: "Madencilik yapmıyor",
+            lan_warning: "Filo telemetrisi token ile korunan, salt okunur bir LAN uç noktası kullanır. Bağlantı şifreli değildir ve asla halka açık internete açılmamalıdır.",
+            manage_title: "Madencileri yönet",
+            manage_sub: "Uzak bir worker ekleyin veya kaldırın",
+            manage_hint: "Her uzak panelde LAN paylaşımını açın, sonra adresini ve token'ını buraya girin.",
+            field_name: "Madenci adı",
+            field_address: "LAN adresi",
+            field_token: "Erişim token'ı",
+            btn_add_miner: "Madenci ekle",
+            btn_remove: "Kaldır",
+            no_peers: "Yalnızca bu bilgisayar rapor veriyor. Tabloda görmek için uzak bir madenci ekleyin.",
+            share_title: "LAN paylaşımı",
+            share_sub: "Başka bir panelin bu madenciyi okumasına izin verin",
+            share_enable: "Bu madencinin LAN üzerinden izlenmesine izin ver",
+            share_port: "Port",
+            share_token: "Erişim token'ı",
+            btn_copy: "Kopyala",
+            btn_new_token: "Yeni token",
+            share_hint: "Bu madenciyi diğer panele <bu-PC-IP>:{} olarak ekleyin ve token'ı yapıştırın.",
+            share_warning: "Yalnızca güvenilir LAN: istatistik bağlantısı şifreli değildir. Bu portu asla internete açmayın.",
+            share_active: "Salt okunur LAN uç noktası etkin",
+            help_sub: "Nasıl başlanır, her seçenek ne yapar ve dosyalar nerede",
+            help_paths_title: "Dosyalar ve klasörler",
+            help_paths_sub: "Bu panel her şeyi nerede tutuyor",
+            help_notes_title: "Başlamadan önce",
+            help_notes_sub: "Bir kez okunmaya değer üç şey",
+            help_hacd_cpu_note: "HACD yalnızca CPU ile kazar. OpenCL, CUDA ve Auto Tune HAC içindir.",
+            help_reference_sub: "Her ayar ve neyi değiştirdiği",
+        },
+        Lang::Zh => PanelLabels {
+            master_title: "主控面板",
+            master_sub: "本机 + 局域网 / VPS 矿机",
+            read_only: "只读矿群",
+            polling: "轮询中",
+            kpi_hashrate: "总算力",
+            kpi_workers: "在线矿机",
+            kpi_power: "总功耗",
+            kpi_hac_day: "预计 HAC / 天",
+            col_worker: "矿机",
+            col_hashrate: "算力",
+            col_hac_day: "HAC/天",
+            col_power: "功耗",
+            col_height: "区块高度",
+            this_pc: "本机",
+            state_offline: "离线",
+            state_waiting: "等待首次响应",
+            state_idle: "未在挖矿",
+            lan_warning: "矿群遥测使用受令牌保护的只读局域网端点。该连接未加密，绝不可暴露到公网。",
+            manage_title: "管理矿机",
+            manage_sub: "添加或移除远程矿机",
+            manage_hint: "在每台远程面板上开启局域网共享，然后在此填入它的地址和令牌。",
+            field_name: "矿机名称",
+            field_address: "局域网地址",
+            field_token: "访问令牌",
+            btn_add_miner: "添加矿机",
+            btn_remove: "移除",
+            no_peers: "目前只有本机在上报。添加远程矿机后即可在表中看到。",
+            share_title: "局域网共享",
+            share_sub: "允许另一个面板读取本矿机",
+            share_enable: "允许通过局域网监控本矿机",
+            share_port: "端口",
+            share_token: "访问令牌",
+            btn_copy: "复制",
+            btn_new_token: "新令牌",
+            share_hint: "在另一个面板上以 <本机IP>:{} 添加本矿机，并粘贴令牌。",
+            share_warning: "仅限可信局域网：统计连接未加密。切勿将此端口暴露到互联网。",
+            share_active: "只读局域网端点已启用",
+            help_sub: "如何开始、每个选项的作用，以及文件的位置",
+            help_paths_title: "文件与目录",
+            help_paths_sub: "本面板把东西放在哪里",
+            help_notes_title: "开始之前",
+            help_notes_sub: "值得读一次的三件事",
+            help_hacd_cpu_note: "HACD 只用 CPU 挖矿。OpenCL、CUDA 和 Auto Tune 仅适用于 HAC。",
+            help_reference_sub: "每一项设置及其影响",
+        },
+        Lang::Ja => PanelLabels {
+            master_title: "マスターパネル",
+            master_sub: "ローカル + LAN / VPS マイナー",
+            read_only: "読み取り専用フリート",
+            polling: "問い合わせ中",
+            kpi_hashrate: "合計ハッシュレート",
+            kpi_workers: "稼働中ワーカー",
+            kpi_power: "合計電力",
+            kpi_hac_day: "推定 HAC / 日",
+            col_worker: "ワーカー",
+            col_hashrate: "ハッシュレート",
+            col_hac_day: "HAC/日",
+            col_power: "電力",
+            col_height: "ブロック高",
+            this_pc: "このPC",
+            state_offline: "オフライン",
+            state_waiting: "最初の応答を待機中",
+            state_idle: "採掘していません",
+            lan_warning: "フリートのテレメトリはトークンで保護された読み取り専用の LAN エンドポイントを使います。この接続は暗号化されておらず、公開インターネットに晒してはいけません。",
+            manage_title: "マイナーの管理",
+            manage_sub: "リモートワーカーの追加と削除",
+            manage_hint: "各リモートパネルで LAN 共有を有効にし、そのアドレスとトークンをここに入力します。",
+            field_name: "マイナー名",
+            field_address: "LAN アドレス",
+            field_token: "アクセストークン",
+            btn_add_miner: "マイナーを追加",
+            btn_remove: "削除",
+            no_peers: "報告しているのはこのPCだけです。リモートマイナーを追加すると表に並びます。",
+            share_title: "LAN 共有",
+            share_sub: "別のパネルからこのマイナーを読めるようにします",
+            share_enable: "このマイナーを LAN 経由で監視できるようにする",
+            share_port: "ポート",
+            share_token: "アクセストークン",
+            btn_copy: "コピー",
+            btn_new_token: "新しいトークン",
+            share_hint: "もう一方のパネルに <このPCのIP>:{} として追加し、トークンを貼り付けてください。",
+            share_warning: "信頼できる LAN 限定です。統計の接続は暗号化されていません。このポートをインターネットに公開しないでください。",
+            share_active: "読み取り専用 LAN エンドポイントは有効です",
+            help_sub: "始め方、各オプションの働き、ファイルの場所",
+            help_paths_title: "ファイルとフォルダ",
+            help_paths_sub: "このパネルの保存場所",
+            help_notes_title: "始める前に",
+            help_notes_sub: "一度は読んでおきたい三つのこと",
+            help_hacd_cpu_note: "HACD は CPU のみで採掘します。OpenCL、CUDA、Auto Tune は HAC 用です。",
+            help_reference_sub: "すべての設定と、その効果",
+        },
+        Lang::Es => PanelLabels {
+            master_title: "Panel maestro",
+            master_sub: "Mineros locales + LAN / VPS",
+            read_only: "Flota de solo lectura",
+            polling: "Consultando",
+            kpi_hashrate: "Hashrate total",
+            kpi_workers: "Workers en línea",
+            kpi_power: "Potencia total",
+            kpi_hac_day: "HAC / día est.",
+            col_worker: "Worker",
+            col_hashrate: "Hashrate",
+            col_hac_day: "HAC/día",
+            col_power: "Potencia",
+            col_height: "Altura",
+            this_pc: "Este PC",
+            state_offline: "Sin conexión",
+            state_waiting: "Esperando la primera respuesta",
+            state_idle: "No está minando",
+            lan_warning: "La telemetría de la flota usa un punto LAN de solo lectura protegido por token. La conexión no está cifrada y nunca debe exponerse a internet.",
+            manage_title: "Gestionar mineros",
+            manage_sub: "Añadir o quitar un worker remoto",
+            manage_hint: "En cada panel remoto activa el uso compartido por LAN y luego escribe aquí su dirección y su token.",
+            field_name: "Nombre del minero",
+            field_address: "Dirección LAN",
+            field_token: "Token de acceso",
+            btn_add_miner: "Añadir minero",
+            btn_remove: "Quitar",
+            no_peers: "Solo este PC está informando. Añade un minero remoto para verlo en la tabla.",
+            share_title: "Compartir por LAN",
+            share_sub: "Deja que otro panel lea este minero",
+            share_enable: "Permitir que este minero se supervise por LAN",
+            share_port: "Puerto",
+            share_token: "Token de acceso",
+            btn_copy: "Copiar",
+            btn_new_token: "Token nuevo",
+            share_hint: "Añade este minero en el otro panel como <IP-de-este-PC>:{} y pega el token.",
+            share_warning: "Solo en una LAN de confianza: la conexión de estadísticas no está cifrada. Nunca expongas este puerto a internet.",
+            share_active: "El punto LAN de solo lectura está activo",
+            help_sub: "Cómo empezar, qué hace cada opción y dónde están los archivos",
+            help_paths_title: "Archivos y carpetas",
+            help_paths_sub: "Dónde guarda las cosas este panel",
+            help_notes_title: "Antes de empezar",
+            help_notes_sub: "Tres cosas que conviene leer una vez",
+            help_hacd_cpu_note: "HACD mina solo con CPU. OpenCL, CUDA y Auto Tune son para HAC.",
+            help_reference_sub: "Cada ajuste y lo que cambia",
+        },
+        Lang::Fr => PanelLabels {
+            master_title: "Panneau principal",
+            master_sub: "Mineurs locaux + LAN / VPS",
+            read_only: "Parc en lecture seule",
+            polling: "Interrogation",
+            kpi_hashrate: "Hashrate total",
+            kpi_workers: "Workers en ligne",
+            kpi_power: "Puissance totale",
+            kpi_hac_day: "HAC / jour est.",
+            col_worker: "Worker",
+            col_hashrate: "Hashrate",
+            col_hac_day: "HAC/jour",
+            col_power: "Puissance",
+            col_height: "Hauteur",
+            this_pc: "Ce PC",
+            state_offline: "Hors ligne",
+            state_waiting: "En attente de la première réponse",
+            state_idle: "Ne mine pas",
+            lan_warning: "La télémétrie du parc passe par un point LAN en lecture seule protégé par jeton. La connexion n'est pas chiffrée et ne doit jamais être exposée à internet.",
+            manage_title: "Gérer les mineurs",
+            manage_sub: "Ajouter ou retirer un worker distant",
+            manage_hint: "Sur chaque panneau distant, activez le partage LAN, puis saisissez ici son adresse et son jeton.",
+            field_name: "Nom du mineur",
+            field_address: "Adresse LAN",
+            field_token: "Jeton d'accès",
+            btn_add_miner: "Ajouter un mineur",
+            btn_remove: "Retirer",
+            no_peers: "Seul ce PC remonte des données. Ajoutez un mineur distant pour le voir dans le tableau.",
+            share_title: "Partage LAN",
+            share_sub: "Laisser un autre panneau lire ce mineur",
+            share_enable: "Autoriser la surveillance de ce mineur via le LAN",
+            share_port: "Port",
+            share_token: "Jeton d'accès",
+            btn_copy: "Copier",
+            btn_new_token: "Nouveau jeton",
+            share_hint: "Ajoutez ce mineur sur l'autre panneau sous la forme <IP-de-ce-PC>:{} et collez le jeton.",
+            share_warning: "LAN de confiance uniquement : la connexion des statistiques n'est pas chiffrée. N'exposez jamais ce port à internet.",
+            share_active: "Le point LAN en lecture seule est actif",
+            help_sub: "Comment démarrer, ce que fait chaque option et où sont les fichiers",
+            help_paths_title: "Fichiers et dossiers",
+            help_paths_sub: "Où ce panneau range les choses",
+            help_notes_title: "Avant de commencer",
+            help_notes_sub: "Trois points à lire une fois",
+            help_hacd_cpu_note: "HACD mine uniquement sur le CPU. OpenCL, CUDA et Auto Tune concernent HAC.",
+            help_reference_sub: "Chaque réglage, et ce qu'il change",
+        },
+        Lang::Th => PanelLabels {
+            master_title: "แผงควบคุมหลัก",
+            master_sub: "เครื่องขุดในเครื่อง + LAN / VPS",
+            read_only: "ฟลีตแบบอ่านอย่างเดียว",
+            polling: "กำลังสอบถาม",
+            kpi_hashrate: "แฮชเรตรวม",
+            kpi_workers: "เครื่องที่ออนไลน์",
+            kpi_power: "กำลังไฟรวม",
+            kpi_hac_day: "ประมาณ HAC / วัน",
+            col_worker: "เครื่องขุด",
+            col_hashrate: "แฮชเรต",
+            col_hac_day: "HAC/วัน",
+            col_power: "กำลังไฟ",
+            col_height: "ความสูงบล็อก",
+            this_pc: "เครื่องนี้",
+            state_offline: "ออฟไลน์",
+            state_waiting: "รอการตอบกลับครั้งแรก",
+            state_idle: "ยังไม่ได้ขุด",
+            lan_warning: "ข้อมูลของฟลีตใช้จุดเชื่อมต่อ LAN แบบอ่านอย่างเดียวที่ป้องกันด้วยโทเคน การเชื่อมต่อนี้ไม่ได้เข้ารหัส และต้องไม่เปิดออกสู่อินเทอร์เน็ตสาธารณะ",
+            manage_title: "จัดการเครื่องขุด",
+            manage_sub: "เพิ่มหรือลบเครื่องขุดระยะไกล",
+            manage_hint: "เปิดการแชร์ผ่าน LAN บนแผงควบคุมของทุกเครื่อง แล้วกรอกที่อยู่และโทเคนของเครื่องนั้นที่นี่",
+            field_name: "ชื่อเครื่องขุด",
+            field_address: "ที่อยู่ LAN",
+            field_token: "โทเคนการเข้าถึง",
+            btn_add_miner: "เพิ่มเครื่องขุด",
+            btn_remove: "ลบ",
+            no_peers: "ตอนนี้มีเพียงเครื่องนี้ที่รายงานอยู่ เพิ่มเครื่องขุดระยะไกลเพื่อให้แสดงในตาราง",
+            share_title: "การแชร์ผ่าน LAN",
+            share_sub: "ให้แผงควบคุมอื่นอ่านเครื่องขุดนี้ได้",
+            share_enable: "อนุญาตให้ตรวจสอบเครื่องขุดนี้ผ่าน LAN",
+            share_port: "พอร์ต",
+            share_token: "โทเคนการเข้าถึง",
+            btn_copy: "คัดลอก",
+            btn_new_token: "โทเคนใหม่",
+            share_hint: "เพิ่มเครื่องขุดนี้ในแผงควบคุมอีกเครื่องเป็น <IP-ของเครื่องนี้>:{} แล้ววางโทเคน",
+            share_warning: "ใช้เฉพาะ LAN ที่ไว้ใจได้: การเชื่อมต่อสถิติไม่ได้เข้ารหัส อย่าเปิดพอร์ตนี้สู่อินเทอร์เน็ต",
+            share_active: "จุดเชื่อมต่อ LAN แบบอ่านอย่างเดียวทำงานอยู่",
+            help_sub: "เริ่มอย่างไร แต่ละตัวเลือกทำอะไร และไฟล์อยู่ที่ไหน",
+            help_paths_title: "ไฟล์และโฟลเดอร์",
+            help_paths_sub: "แผงควบคุมนี้เก็บของไว้ที่ไหน",
+            help_notes_title: "ก่อนเริ่ม",
+            help_notes_sub: "สามเรื่องที่ควรอ่านสักครั้ง",
+            help_hacd_cpu_note: "HACD ขุดด้วย CPU เท่านั้น OpenCL, CUDA และ Auto Tune ใช้กับ HAC",
+            help_reference_sub: "ทุกการตั้งค่า และสิ่งที่มันเปลี่ยน",
+        },
+        Lang::Ru => PanelLabels {
+            master_title: "Главная панель",
+            master_sub: "Локальные + LAN / VPS майнеры",
+            read_only: "Парк только для чтения",
+            polling: "Опрос",
+            kpi_hashrate: "Общий хешрейт",
+            kpi_workers: "Воркеров в сети",
+            kpi_power: "Общая мощность",
+            kpi_hac_day: "Оценка HAC / день",
+            col_worker: "Воркер",
+            col_hashrate: "Хешрейт",
+            col_hac_day: "HAC/день",
+            col_power: "Мощность",
+            col_height: "Высота",
+            this_pc: "Этот ПК",
+            state_offline: "Не в сети",
+            state_waiting: "Ожидание первого ответа",
+            state_idle: "Не майнит",
+            lan_warning: "Телеметрия парка использует защищённую токеном точку LAN только для чтения. Соединение не шифруется и не должно быть открыто в интернет.",
+            manage_title: "Управление майнерами",
+            manage_sub: "Добавить или убрать удалённый воркер",
+            manage_hint: "На каждой удалённой панели включите обмен по LAN, затем введите здесь её адрес и токен.",
+            field_name: "Имя майнера",
+            field_address: "Адрес в LAN",
+            field_token: "Токен доступа",
+            btn_add_miner: "Добавить майнер",
+            btn_remove: "Убрать",
+            no_peers: "Отчитывается только этот ПК. Добавьте удалённый майнер, чтобы он появился в таблице.",
+            share_title: "Обмен по LAN",
+            share_sub: "Разрешить другой панели читать этот майнер",
+            share_enable: "Разрешить наблюдать за этим майнером по LAN",
+            share_port: "Порт",
+            share_token: "Токен доступа",
+            btn_copy: "Копировать",
+            btn_new_token: "Новый токен",
+            share_hint: "Добавьте этот майнер на другой панели как <IP-этого-ПК>:{} и вставьте токен.",
+            share_warning: "Только доверенная LAN: соединение статистики не шифруется. Никогда не открывайте этот порт в интернет.",
+            share_active: "Точка LAN только для чтения активна",
+            help_sub: "С чего начать, что делает каждая настройка и где лежат файлы",
+            help_paths_title: "Файлы и папки",
+            help_paths_sub: "Где эта панель хранит данные",
+            help_notes_title: "Перед запуском",
+            help_notes_sub: "Три вещи, которые стоит прочитать один раз",
+            help_hacd_cpu_note: "HACD майнит только на CPU. OpenCL, CUDA и Auto Tune относятся к HAC.",
+            help_reference_sub: "Каждая настройка и что она меняет",
+        },
+    }
+}
+
+#[cfg(test)]
+mod panel_label_tests {
+    use super::*;
+
+    /// Nine, checked rather than trusted: a language added without a block here
+    /// would fall out of `panel_labels` as a compile error, and a language
+    /// removed would silently shrink every loop below.
+    #[test]
+    fn there_are_nine_languages() {
+        assert_eq!(Lang::ALL.len(), 9);
+    }
+
+    #[test]
+    fn every_language_fills_every_master_panel_label() {
+        for lang in Lang::ALL {
+            let l = panel_labels(lang);
+            let fields = [
+                ("master_title", l.master_title),
+                ("master_sub", l.master_sub),
+                ("read_only", l.read_only),
+                ("polling", l.polling),
+                ("kpi_hashrate", l.kpi_hashrate),
+                ("kpi_workers", l.kpi_workers),
+                ("kpi_power", l.kpi_power),
+                ("kpi_hac_day", l.kpi_hac_day),
+                ("col_worker", l.col_worker),
+                ("col_hashrate", l.col_hashrate),
+                ("col_hac_day", l.col_hac_day),
+                ("col_power", l.col_power),
+                ("col_height", l.col_height),
+                ("this_pc", l.this_pc),
+                ("state_offline", l.state_offline),
+                ("state_waiting", l.state_waiting),
+                ("state_idle", l.state_idle),
+                ("lan_warning", l.lan_warning),
+                ("manage_title", l.manage_title),
+                ("manage_sub", l.manage_sub),
+                ("manage_hint", l.manage_hint),
+                ("field_name", l.field_name),
+                ("field_address", l.field_address),
+                ("field_token", l.field_token),
+                ("btn_add_miner", l.btn_add_miner),
+                ("btn_remove", l.btn_remove),
+                ("no_peers", l.no_peers),
+                ("share_title", l.share_title),
+                ("share_sub", l.share_sub),
+                ("share_enable", l.share_enable),
+                ("share_port", l.share_port),
+                ("share_token", l.share_token),
+                ("btn_copy", l.btn_copy),
+                ("btn_new_token", l.btn_new_token),
+                ("share_hint", l.share_hint),
+                ("share_warning", l.share_warning),
+                ("share_active", l.share_active),
+                ("help_sub", l.help_sub),
+                ("help_paths_title", l.help_paths_title),
+                ("help_paths_sub", l.help_paths_sub),
+                ("help_notes_title", l.help_notes_title),
+                ("help_notes_sub", l.help_notes_sub),
+                ("help_hacd_cpu_note", l.help_hacd_cpu_note),
+                ("help_reference_sub", l.help_reference_sub),
+            ];
+            for (name, value) in fields {
+                assert!(
+                    !value.trim().is_empty(),
+                    "{} leaves {name} empty",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_five_table_headings_stay_distinct_in_every_language() {
+        // Two columns sharing a heading is a table nobody can read.
+        for lang in Lang::ALL {
+            let l = panel_labels(lang);
+            let headings = [
+                l.col_worker,
+                l.col_hashrate,
+                l.col_hac_day,
+                l.col_power,
+                l.col_height,
+            ];
+            for i in 0..headings.len() {
+                for j in (i + 1)..headings.len() {
+                    assert_ne!(
+                        headings[i],
+                        headings[j],
+                        "{} gives two fleet columns the same heading",
+                        lang.code()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_sharing_hint_places_the_port_exactly_once() {
+        for lang in Lang::ALL {
+            let l = panel_labels(lang);
+            assert_eq!(
+                l.share_hint.matches("{}").count(),
+                1,
+                "{} must place the port exactly once",
+                lang.code()
+            );
+            assert!(l.share_hint_display(19_120).contains("19120"));
+        }
+    }
+
+    #[test]
+    fn the_active_language_survives_a_round_trip() {
+        // The fleet screen reads its language from here, so a language that
+        // does not come back is a Master Panel stuck in English.
+        for lang in Lang::ALL {
+            note_active_lang(lang);
+            assert_eq!(active_lang().code(), lang.code());
+        }
+        note_active_lang(Lang::En);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Logs screen.
+//
+// A third table, for the same reason as the other two: `Strings` is nine literal
+// blocks that every screen edits at once, and a new screen must not force an
+// edit inside all nine of them. Nine blocks here, counted by a test rather than
+// assumed.
+// ---------------------------------------------------------------------------
+
+/// Every word the Logs screen puts on the page.
+#[derive(Clone, Copy)]
+pub struct LogLabels {
+    /// The sidebar entry. It leads to a screen that exists, which is the only
+    /// reason it is in the sidebar at all.
+    pub nav_logs: &'static str,
+    pub title: &'static str,
+    pub sub: &'static str,
+    pub file_label: &'static str,
+    pub file_unknown: &'static str,
+    /// "{} of {} lines kept": what is held, out of the ceiling that holds it.
+    pub kept: &'static str,
+    pub empty: &'static str,
+    pub empty_hint: &'static str,
+    /// Says plainly that this screen is a window on the log and not the whole
+    /// of it, so nobody reads an absent line as a line the worker never wrote.
+    pub full_history: &'static str,
+}
+
+impl LogLabels {
+    pub fn kept_display(&self, held: usize, ceiling: usize) -> String {
+        apply_format_template(self.kept, &[held.to_string(), ceiling.to_string()])
+    }
+}
+
+pub fn log_labels(lang: Lang) -> LogLabels {
+    match lang {
+        Lang::En => LogLabels {
+            nav_logs: "Logs",
+            title: "Worker Log",
+            sub: "Every line the worker printed, as it printed it",
+            file_label: "Log file",
+            file_unknown: "No worker has been started in this session yet.",
+            kept: "{} of {} lines kept",
+            empty: "The worker has printed nothing yet.",
+            empty_hint: "Start mining and the worker's output appears here as it arrives.",
+            full_history: "This screen holds the newest lines only. The whole run is in the file above, which the worker caps and rotates itself.",
+        },
+        Lang::El => LogLabels {
+            nav_logs: "Καταγραφές",
+            title: "Καταγραφή worker",
+            sub: "Κάθε γραμμή που τύπωσε ο worker, όπως την τύπωσε",
+            file_label: "Αρχείο καταγραφής",
+            file_unknown: "Δεν έχει ξεκινήσει worker σε αυτή τη συνεδρία.",
+            kept: "{} από {} γραμμές",
+            empty: "Ο worker δεν έχει τυπώσει τίποτα ακόμη.",
+            empty_hint: "Ξεκίνα την εξόρυξη και η έξοδος του worker θα εμφανίζεται εδώ καθώς έρχεται.",
+            full_history: "Αυτή η οθόνη κρατά μόνο τις πιο πρόσφατες γραμμές. Ολόκληρη η εκτέλεση βρίσκεται στο παραπάνω αρχείο, το οποίο ο worker περιορίζει και εναλλάσσει μόνος του.",
+        },
+        Lang::Tr => LogLabels {
+            nav_logs: "Günlükler",
+            title: "Worker günlüğü",
+            sub: "Worker'ın yazdığı her satır, yazdığı gibi",
+            file_label: "Günlük dosyası",
+            file_unknown: "Bu oturumda henüz worker başlatılmadı.",
+            kept: "{} / {} satır tutuluyor",
+            empty: "Worker henüz bir şey yazmadı.",
+            empty_hint: "Kazmayı başlatın; worker'ın çıktısı geldikçe burada görünür.",
+            full_history: "Bu ekran yalnızca en yeni satırları tutar. Çalışmanın tamamı yukarıdaki dosyadadır; worker onu kendisi sınırlar ve döndürür.",
+        },
+        Lang::Zh => LogLabels {
+            nav_logs: "日志",
+            title: "矿工日志",
+            sub: "worker 打印的每一行，原样显示",
+            file_label: "日志文件",
+            file_unknown: "本次会话尚未启动 worker。",
+            kept: "保留 {} / {} 行",
+            empty: "worker 还没有输出。",
+            empty_hint: "开始挖矿后，worker 的输出会实时显示在这里。",
+            full_history: "本页面只保留最新的若干行。完整记录在上面的文件中，由 worker 自行限制大小并轮换。",
+        },
+        Lang::Ja => LogLabels {
+            nav_logs: "ログ",
+            title: "ワーカーログ",
+            sub: "ワーカーが出力した各行を、そのまま表示します",
+            file_label: "ログファイル",
+            file_unknown: "このセッションではまだワーカーが起動していません。",
+            kept: "{} / {} 行を保持",
+            empty: "ワーカーはまだ何も出力していません。",
+            empty_hint: "マイニングを開始すると、ワーカーの出力がここに順次表示されます。",
+            full_history: "この画面には最新の行のみを保持します。実行全体は上のファイルにあり、サイズの上限と入れ替えはワーカーが行います。",
+        },
+        Lang::Es => LogLabels {
+            nav_logs: "Registros",
+            title: "Registro del worker",
+            sub: "Cada línea que imprimió el worker, tal como la imprimió",
+            file_label: "Archivo de registro",
+            file_unknown: "Todavía no se ha iniciado ningún worker en esta sesión.",
+            kept: "{} de {} líneas guardadas",
+            empty: "El worker todavía no ha impreso nada.",
+            empty_hint: "Inicia la minería y la salida del worker aparecerá aquí a medida que llegue.",
+            full_history: "Esta pantalla guarda solo las líneas más recientes. La ejecución completa está en el archivo de arriba, que el propio worker limita y rota.",
+        },
+        Lang::Fr => LogLabels {
+            nav_logs: "Journaux",
+            title: "Journal du worker",
+            sub: "Chaque ligne imprimée par le worker, telle qu'il l'a imprimée",
+            file_label: "Fichier journal",
+            file_unknown: "Aucun worker n'a encore été lancé dans cette session.",
+            kept: "{} lignes sur {} conservées",
+            empty: "Le worker n'a encore rien imprimé.",
+            empty_hint: "Lancez le minage et la sortie du worker apparaîtra ici au fil de son arrivée.",
+            full_history: "Cet écran ne garde que les lignes les plus récentes. L'exécution complète se trouve dans le fichier ci-dessus, que le worker limite et fait tourner lui-même.",
+        },
+        Lang::Th => LogLabels {
+            nav_logs: "บันทึก",
+            title: "บันทึกของ worker",
+            sub: "ทุกบรรทัดที่ worker พิมพ์ออกมา ตามที่พิมพ์จริง",
+            file_label: "ไฟล์บันทึก",
+            file_unknown: "ยังไม่ได้เริ่ม worker ในเซสชันนี้",
+            kept: "เก็บไว้ {} จาก {} บรรทัด",
+            empty: "worker ยังไม่ได้พิมพ์อะไรเลย",
+            empty_hint: "เริ่มขุดแล้วผลลัพธ์ของ worker จะปรากฏที่นี่ทันทีที่เข้ามา",
+            full_history: "หน้านี้เก็บเฉพาะบรรทัดล่าสุด บันทึกทั้งหมดอยู่ในไฟล์ด้านบน ซึ่ง worker จำกัดขนาดและหมุนไฟล์เอง",
+        },
+        Lang::Ru => LogLabels {
+            nav_logs: "Журналы",
+            title: "Журнал воркера",
+            sub: "Каждая строка, которую напечатал воркер, как есть",
+            file_label: "Файл журнала",
+            file_unknown: "В этой сессии воркер ещё не запускался.",
+            kept: "Сохранено {} из {} строк",
+            empty: "Воркер пока ничего не напечатал.",
+            empty_hint: "Запустите майнинг, и вывод воркера будет появляться здесь по мере поступления.",
+            full_history: "На этом экране хранятся только последние строки. Весь прогон лежит в файле выше; воркер сам ограничивает его размер и ротирует.",
+        },
+    }
+}
+
+#[cfg(test)]
+mod log_label_tests {
+    use super::*;
+
+    /// Nine, checked rather than trusted. A language added without a block here
+    /// is a compile error in `log_labels`; a language removed would silently
+    /// shrink every loop below, and this is what catches that.
+    #[test]
+    fn there_are_nine_languages() {
+        assert_eq!(Lang::ALL.len(), 9);
+    }
+
+    #[test]
+    fn every_language_fills_every_log_label() {
+        let mut checked = 0;
+        for lang in Lang::ALL {
+            let l = log_labels(lang);
+            let fields = [
+                ("nav_logs", l.nav_logs),
+                ("title", l.title),
+                ("sub", l.sub),
+                ("file_label", l.file_label),
+                ("file_unknown", l.file_unknown),
+                ("kept", l.kept),
+                ("empty", l.empty),
+                ("empty_hint", l.empty_hint),
+                ("full_history", l.full_history),
+            ];
+            for (name, value) in fields {
+                assert!(
+                    !value.trim().is_empty(),
+                    "{} leaves {name} empty",
+                    lang.code()
+                );
+                // The house rule the other three tables already enforce: the
+                // panel's fonts are loaded from the system and an em dash is
+                // the character most likely to arrive as a box.
+                assert!(
+                    !value.contains('\u{2014}'),
+                    "{} uses an em dash in {name}: {value}",
+                    lang.code()
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 9, "every one of the nine blocks must be visited");
+    }
+
+    #[test]
+    fn the_line_count_places_both_numbers_exactly_once() {
+        for lang in Lang::ALL {
+            let l = log_labels(lang);
+            assert_eq!(
+                l.kept.matches("{}").count(),
+                2,
+                "{} must place both numbers",
+                lang.code()
+            );
+            let text = l.kept_display(128, 500);
+            assert!(text.contains("128"), "{}: {text}", lang.code());
+            assert!(text.contains("500"), "{}: {text}", lang.code());
+        }
+    }
+
+    #[test]
+    fn the_sidebar_entry_is_short_enough_for_the_sidebar() {
+        // The nav column is 236px wide with an icon and padding in it. A label
+        // longer than this wraps and breaks the row height every item shares.
+        for lang in Lang::ALL {
+            let label = log_labels(lang).nav_logs;
+            assert!(
+                label.chars().count() <= 16,
+                "{} gives the Logs entry a {}-character label",
+                lang.code(),
+                label.chars().count()
             );
         }
     }

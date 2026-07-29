@@ -42,13 +42,14 @@ use sys::*;
 use hbit_pool::difficulty::ChainParams;
 use hbit_pool::pool_core::split_payout;
 use hbit_pool::{
-    Admission, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS,
-    WALLET_PASSWORD_ENV, acquire_settle_lock, balance, balance_units, chunk_tx_fee,
-    classify_payout_tx, confirm_payout, distributable_units, drop_payout, find_u64, get_json,
-    http_client, is_payout_address, load_immature_units, load_or_create_wallet, load_paid_ledger,
-    load_payout_records, load_pending_payout_txs, load_pplns_counts, mine_and_submit_block,
+    Admission, BlockFees, GoneAction, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState,
+    SETTLE_RESERVE_UNITS, SubmitVerdict, WALLET_PASSWORD_ENV, acquire_settle_lock, balance,
+    block_fees, chunk_tx_fee, classify_payout_tx, confirm_payout, deduct_owed, distributable_units,
+    drop_payout, find_u64, get_json, gone_action, http_client, is_payout_address,
+    load_immature_blocks, load_or_create_wallet, load_owed, load_paid_ledger, load_payout_records,
+    load_pending_payout_txs, load_pplns_credit, merge_payout_rows, mine_and_submit_block, owe_rows,
     payout_amount, pool_state_path, post_hex, save_settlement_ledger, settle_lock_path,
-    verify_admitted,
+    submit_verdict, take_owed, verify_admitted,
 };
 
 /// The default wallet path, used when the operator does not name one. Quoted by
@@ -135,9 +136,23 @@ fn take_legacy_ledger(wallet_file: &str) -> Vec<String> {
     hashes
 }
 
+/// Remember that the node itself reported holding this payout.
+///
+/// The one fact that separates "the node lost a transaction it had relayed" from
+/// "the node never took it", and therefore the one fact that stops the same
+/// window being signed a second time. See [`gone_action`].
+fn note_node_holds(records: &mut [PayoutRecord], hash: &str) {
+    if let Some(r) = records.iter_mut().find(|r| r.hash == hash) {
+        r.node_holds = true;
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    if a.iter().skip(1).any(|x| x == "-h" || x == "--help" || x == "/?") {
+    if a.iter()
+        .skip(1)
+        .any(|x| x == "-h" || x == "--help" || x == "/?")
+    {
         println!("{}", usage());
         return;
     }
@@ -214,7 +229,10 @@ fn main() {
     let dust_units = unit_arg(5, "dust_units", PAYOUT_DUST_UNITS);
 
     let client = http_client();
-    println!("== HBIT pool payout ({}) ==", if commit { "COMMIT" } else { "DRY-RUN" });
+    println!(
+        "== HBIT pool payout ({}) ==",
+        if commit { "COMMIT" } else { "DRY-RUN" }
+    );
     // Exclusive claim on this wallet's settlement, held for the whole run. A
     // running hbit-pool-server holds the same lock, so this can never become a second
     // settler paying the same PPLNS window out of the same confirmed balance.
@@ -235,11 +253,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // The node has to answer before anything is valued. An unreachable node
-    // returns no balance at all, which reads as an empty string and values as
-    // zero: the run would then report "balance = , nothing to pay" and an
-    // operator would believe the wallet was empty.
-    if find_u64(&get_json(&client, &format!("{node}/query/latest")), "height").is_none() {
+    // The node has to answer before anything is valued. The balance reader now
+    // refuses a missing answer on its own, so this check is here for the
+    // OPERATOR: it turns "cannot value the wallet" into "your fullnode is not
+    // running at this address", which is the sentence somebody can act on.
+    if find_u64(
+        &get_json(&client, &format!("{node}/query/latest")),
+        "height",
+    )
+    .is_none()
+    {
         eprintln!(
             "REFUSING to pay: no Hacash fullnode answered at {node}, so this tool cannot read the \
              wallet's balance or what is already in flight.\n\
@@ -254,10 +277,8 @@ fn main() {
     let bal = balance(&client, &node, &pool_addr);
     // A balance this tool cannot value is NOT a zero balance: settling on it
     // would sign transactions for a number the node never reported.
-    let Some(bal_units) = balance_units(&bal) else {
-        eprintln!(
-            "REFUSING to pay: the node reported a balance this tool cannot value ({bal:?})."
-        );
+    let Some(bal_units) = bal.units() else {
+        eprintln!("REFUSING to pay: this tool cannot value the pool wallet ({bal}).");
         std::process::exit(1);
     };
     println!("wallet  = {pool_addr}");
@@ -275,6 +296,11 @@ fn main() {
     // that buries while the server is stopped would otherwise vanish out of
     // "in flight" without ever becoming "paid".
     let mut records = load_payout_records(&state_file);
+    // What an earlier settlement (by this tool or by the pool server) planned for
+    // named miners and failed to deliver. It is paid FIRST below: leaving it to
+    // the proportional split would give that money to whoever is in the share
+    // window now, including miners whose own chunk went through.
+    let mut owed = load_owed(&state_file);
     let mut paid = load_paid_ledger(&state_file);
     if paid.since == 0 {
         paid.since = curtimes();
@@ -285,7 +311,10 @@ fn main() {
     // upgrade cannot lose track of a payout that is still in flight.
     for h in take_legacy_ledger(&wallet_file) {
         if !prior.contains(&h) {
-            println!("  adopting payout tx {} from the old private ledger", short(&h));
+            println!(
+                "  adopting payout tx {} from the old private ledger",
+                short(&h)
+            );
             prior.push(h);
         }
     }
@@ -308,20 +337,79 @@ fn main() {
                         );
                     }
                 }
-                PayoutTxState::Gone => {
-                    println!(
-                        "  prior payout tx {} is unknown to the node (rejected or dropped)",
-                        short(h)
-                    );
-                    // Nothing was paid, so nothing is credited: those units are
-                    // still owed and go back into the split below.
-                    drop_payout(&mut records, h);
-                }
+                // "I do not know that hash" is NOT "nothing was paid". The
+                // mempool is memory only, so a node restart empties it and a
+                // transaction the node validated, accepted AND RELAYED reads
+                // exactly like one it never took.
+                PayoutTxState::Gone => match gone_action(records.iter().find(|r| &r.hash == h)) {
+                    GoneAction::Forget => {
+                        println!(
+                            "  prior payout tx {} is unknown to the node, and there are neither \
+                             signed bytes for it nor any sighting of the node holding it: nothing \
+                             can have been relayed and nobody was paid",
+                            short(h)
+                        );
+                        // Nothing was paid, so nothing is credited. The rows name
+                        // the miners it was for, so they become a debt paid
+                        // before the fresh split, not money back in the pot.
+                        if let Some(rec) = drop_payout(&mut records, h) {
+                            owe_rows(&mut owed, &rec.rows);
+                        }
+                    }
+                    GoneAction::Rebroadcast => {
+                        // Never re-sign the window. A fresh transaction carries a
+                        // fresh timestamp and so a different hash, and replay
+                        // protection here is by hash alone: if any peer still
+                        // holds the first one, BOTH can be mined and these miners
+                        // are paid twice out of the operator's own wallet.
+                        let body = records
+                            .iter()
+                            .find(|r| &r.hash == h)
+                            .map(|r| r.body_hex.clone())
+                            .unwrap_or_default();
+                        let resp = post_hex(
+                            &client,
+                            &format!("{node}/submit/transaction?hexbody=true"),
+                            &body,
+                        );
+                        println!(
+                            "  prior payout tx {} is not in the node's mempool. These bytes were \
+                             put on the network, so it can still be mined and this tool will not \
+                             re-sign the window. Re-broadcast the identical signed bytes (same \
+                             hash) -> {resp}",
+                            short(h)
+                        );
+                        still.push(h.clone());
+                    }
+                    GoneAction::Stuck => {
+                        eprintln!(
+                            "  prior payout tx {} left the node's mempool. The node held it once, \
+                             so it was relayed and can still be mined, but there are no stored \
+                             bytes for it (it predates them) and this tool will NOT re-sign the \
+                             window: that pays those miners twice if the first one is ever \
+                             included.",
+                            short(h)
+                        );
+                        still.push(h.clone());
+                    }
+                },
+                // The node is telling us it holds this. Record it: `node_holds`
+                // is the pool's only memory that a transaction reached the
+                // network, and it was written in ONE place - right after a
+                // submit whose verification came back `Held`. A payout submitted
+                // through a timeout and only seen in the mempool later stayed
+                // marked "never held" for ever, so the day the node restarted
+                // and answered `Gone` it read as never relayed and its rows were
+                // re-issued into a second, differently-hashed transaction.
                 PayoutTxState::Confirming(d) => {
                     println!("  prior payout tx {} is only {d} block(s) deep", short(h));
+                    note_node_holds(&mut records, h);
                     still.push(h.clone());
                 }
-                PayoutTxState::Pending => still.push(h.clone()),
+                PayoutTxState::Pending => {
+                    note_node_holds(&mut records, h);
+                    still.push(h.clone());
+                }
                 PayoutTxState::Unknown => {
                     eprintln!("  cannot determine the state of payout tx {}", short(h));
                     still.push(h.clone());
@@ -329,7 +417,7 @@ fn main() {
             }
         }
         if !still.is_empty() {
-            if let Err(e) = save_settlement_ledger(&state_file, &still, &records, &paid) {
+            if let Err(e) = save_settlement_ledger(&state_file, &still, &records, &owed, &paid) {
                 eprintln!("could not update the pending ledger {state_file}: {e}");
             }
             eprintln!(
@@ -341,18 +429,24 @@ fn main() {
             std::process::exit(1);
         }
         println!("prior payout(s) all final; clearing the ledger.");
-        if let Err(e) = save_settlement_ledger(&state_file, &[], &records, &paid) {
+        if let Err(e) = save_settlement_ledger(&state_file, &[], &records, &owed, &paid) {
             eprintln!("REFUSING to pay: cannot clear the pending ledger {state_file}: {e}");
             std::process::exit(1);
         }
     }
 
-    // 1) PPLNS counts. Try the live pool server first, then fall back to the
+    // 1) PPLNS credit. Try the live pool server first, then fall back to the
     // accounting file it left behind - holding the settlement lock means the
     // server is stopped, so /stats normally cannot answer at all.
+    //
+    // `credit`, never the `workers` headcount printed beside it: a headcount read
+    // at the instant of a payout is a number one miner can own outright by
+    // sitting on its shares and dumping a whole window's worth in the second
+    // before the split. This tool signs the same transactions the server does, so
+    // it has to weigh work the same way or it becomes the way round the fix.
     let stats = get_json(&client, &format!("{pool_base}/stats"));
     let rows = stats
-        .get("workers")
+        .get("credit")
         .and_then(|w| w.as_array())
         .cloned()
         .unwrap_or_default();
@@ -364,12 +458,17 @@ fn main() {
         })
         .collect();
     if counts.is_empty() {
-        counts = load_pplns_counts(&state_file);
+        counts = load_pplns_credit(&state_file);
         if !counts.is_empty() {
-            println!("(pool server not answering; using the share window recorded in {state_file})");
+            println!(
+                "(pool server not answering; using the share window recorded in {state_file})"
+            );
         }
     }
-    if counts.is_empty() {
+    // An empty window is not enough to stop: a chunk that failed while those
+    // miners' shares were in the window is still owed to them long after the
+    // window has rolled past, and this file is where that debt lives.
+    if counts.is_empty() && owed.is_empty() {
         println!("no shares recorded yet - nothing to pay");
         return;
     }
@@ -384,14 +483,45 @@ fn main() {
     if skipped > 0 {
         println!("({skipped} worker(s) without an announced payout address are excluded)");
     }
-    if payable_counts.is_empty() {
+    if payable_counts.is_empty() && owed.is_empty() {
         println!("no payable workers (nobody announced a payout address) - nothing to pay");
         return;
     }
     // Apply the SAME maturity gate as the automatic settlement: the pool server
-    // records the coinbase of every block it found that is not yet buried, and
-    // that income must not be paid out while a reorg could still take it back.
-    let immature_units = load_immature_units(&state_file);
+    // records every block it found that is not yet buried, and that income must
+    // not be paid out while a reorg could still take it back.
+    //
+    // Including its TRANSACTION FEES. The chain credits a block's whole fee
+    // income to the coinbase address, which is this wallet, so a block the
+    // server recorded before it could count them is holding back the subsidy
+    // alone and the fees are sitting in the balance below, unaccounted for. This
+    // tool runs while the server is stopped, so nothing else is going to count
+    // them: it asks the node itself rather than pay them out at zero
+    // confirmations.
+    let mut immature_units = 0u64;
+    for blk in load_immature_blocks(&state_file) {
+        immature_units = immature_units.saturating_add(blk.units);
+        if blk.fees_counted {
+            continue;
+        }
+        match block_fees(&client, &node, blk.height, &blk.hash) {
+            BlockFees::Counted(fee) => immature_units = immature_units.saturating_add(fee),
+            // Never landed, or another block took that height: it credited
+            // nothing, so there are no fees of its to hold back.
+            BlockFees::NotOnChain => {}
+            BlockFees::Unknown(why) => {
+                eprintln!(
+                    "REFUSING to pay: the node could not say what the pool's block at height {} \
+                     paid in transaction fees ({why}). That income is already in this wallet, and \
+                     splitting a balance that still contains it would pay it out at zero \
+                     confirmations - money you would have to fund yourself if the block is \
+                     orphaned. Check the node and run this again.",
+                    blk.height
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     if immature_units > 0 {
         println!("({immature_units} unit(s) of block income are not yet final and are held back)");
     }
@@ -402,14 +532,32 @@ fn main() {
         );
         return;
     };
-    let split = split_payout(distributable, 0, dust_units, &payable_counts);
+    // Everything a failed chunk owes comes off the top, before a single unit is
+    // split. Splitting first would hand that money to the current window, which
+    // includes the miners whose own chunks went through: they would be paid twice
+    // for the same window, funded by the miners who were paid nothing.
+    let (mut split, left) = take_owed(&owed, distributable);
+    let owed_now: u64 = split.iter().map(|(_, u)| *u).sum();
+    if owed_now > 0 {
+        println!(
+            "\n{owed_now} unit(s) are OWED to {} miner(s) by an earlier settlement that did not \
+             reach the node. They are paid first, before anything is split.",
+            split.len()
+        );
+    }
+    split.extend(split_payout(left, 0, dust_units, &payable_counts));
+    // One action per miner: a miner that is owed AND has shares in the window is
+    // paid once, and every action counts against the node's 200-action limit.
+    merge_payout_rows(&mut split);
     if split.is_empty() {
         println!("split produced no payable rows (all below dust {dust_units}) - nothing to pay");
         return;
     }
     let n_tx = split.len().div_ceil(PAYOUT_CHUNK);
+    let plan_units: u64 = split.iter().map(|(_, u)| *u).sum();
     println!(
-        "\nplanned split of {distributable} units over {} payable miner(s) in {n_tx} tx(s):",
+        "\nplanned payment of {plan_units} units over {} miner(s) in {n_tx} tx(s) \
+         ({owed_now} of it owed by an earlier settlement, the rest split from this balance):",
         split.len()
     );
     for (w, u) in &split {
@@ -466,14 +614,23 @@ fn main() {
         // same write: a tracked hash with no rows behind it is a payout no miner
         // could ever be shown.
         let txhash = hex::encode(tx.hash().serialize());
+        // Serialized before the record is written, because the record carries it:
+        // these bytes are the only way to put this exact transaction back on the
+        // network if the node later loses it, and the only alternative is signing
+        // a second transaction for the same window that can also be mined.
+        let body_hex = hex::encode(tx.serialize());
         submitted.push(txhash.clone());
+        // What this chunk pays comes off the owed ledger in the same write. If
+        // the chunk then fails, the rows go back on it below.
+        deduct_owed(&mut owed, &rows);
         records.push(PayoutRecord {
             hash: txhash.clone(),
             at: curtimes(),
             node_holds: false,
+            body_hex: body_hex.clone(),
             rows,
         });
-        if let Err(e) = save_settlement_ledger(&state_file, &submitted, &records, &paid) {
+        if let Err(e) = save_settlement_ledger(&state_file, &submitted, &records, &owed, &paid) {
             eprintln!(
                 "  cannot record the payout tx in {state_file} ({e}); ABORTING before submit so \
                  nothing is paid untracked."
@@ -481,26 +638,43 @@ fn main() {
             std::process::exit(1);
         }
 
-        let body_hex = hex::encode(tx.serialize());
         let resp = post_hex(
             &client,
             &format!("{node}/submit/transaction?hexbody=true"),
             &body_hex,
         );
-        let accepted = serde_json::from_str::<serde_json::Value>(&resp)
-            .ok()
-            .and_then(|v| find_u64(&v, "ret"))
-            == Some(0);
-        if !accepted {
-            all_ok = false;
-            println!("  tx {} paying {pushed} miner(s): REJECTED -> {resp}", short(&txhash));
-            // Never submitted, so never relayed: drop it so a retry re-issues
-            // this chunk instead of waiting forever on a hash nothing holds.
-            // Nothing was paid, so the rows come out with it.
-            submitted.retain(|h| h != &txhash);
-            drop_payout(&mut records, &txhash);
-            let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
-            continue;
+        match submit_verdict(&resp) {
+            SubmitVerdict::Accepted => {}
+            SubmitVerdict::Rejected => {
+                all_ok = false;
+                println!(
+                    "  tx {} paying {pushed} miner(s): REJECTED -> {resp}",
+                    short(&txhash)
+                );
+                // The node's own validator refused it, so it never inserted it
+                // and never relayed it. Nothing was paid, so the rows come out
+                // with it - onto the owed ledger, which the next settlement pays
+                // before it splits anything.
+                submitted.retain(|h| h != &txhash);
+                if let Some(rec) = drop_payout(&mut records, &txhash) {
+                    owe_rows(&mut owed, &rec.rows);
+                }
+                let _ = save_settlement_ledger(&state_file, &submitted, &records, &owed, &paid);
+                continue;
+            }
+            SubmitVerdict::Unresolved => {
+                // A timeout or a dropped connection is NOT a refusal: the node
+                // may have taken these bytes, inserted them and relayed them
+                // before the answer was lost. Forgetting the hash here is how the
+                // same window gets signed a second time and paid twice.
+                all_ok = false;
+                println!(
+                    "  tx {} paying {pushed} miner(s): no usable answer -> {resp}\n\
+                     the node may hold it, so it stays in the pending ledger and is NOT re-issued",
+                    short(&txhash)
+                );
+                continue;
+            }
         }
         // ret=0 only means the API took the bytes. The node validates the
         // transaction synchronously and then inserts it into the mempool on a
@@ -508,23 +682,29 @@ fn main() {
         // no evidence at all. Ask the node what it actually holds.
         let held = match verify_admitted(&client, &node, &txhash) {
             Admission::Held => {
-                println!("  tx {} paying {pushed} miner(s): the node holds it", short(&txhash));
+                println!(
+                    "  tx {} paying {pushed} miner(s): the node holds it",
+                    short(&txhash)
+                );
                 if let Some(r) = records.iter_mut().find(|r| r.hash == txhash) {
                     r.node_holds = true;
                 }
-                let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
+                let _ = save_settlement_ledger(&state_file, &submitted, &records, &owed, &paid);
                 true
             }
             Admission::Missing => {
                 all_ok = false;
                 println!(
                     "  tx {} paying {pushed} miner(s): the API accepted it but the node does NOT \
-                     hold it - nothing was paid and nothing was relayed",
+                     hold it - nothing was paid and nothing was relayed. These rows are now OWED \
+                     and the next settlement pays them first.",
                     short(&txhash)
                 );
                 submitted.retain(|h| h != &txhash);
-                drop_payout(&mut records, &txhash);
-                let _ = save_settlement_ledger(&state_file, &submitted, &records, &paid);
+                if let Some(rec) = drop_payout(&mut records, &txhash) {
+                    owe_rows(&mut owed, &rec.rows);
+                }
+                let _ = save_settlement_ledger(&state_file, &submitted, &records, &owed, &paid);
                 false
             }
             Admission::Unresolved => {
@@ -560,8 +740,14 @@ fn main() {
         println!("server both refuse to double-pay.");
     } else {
         eprintln!("\nSome payout tx(s) never reached the node, failed to sign, or could not be");
-        eprintln!("verified - see above. Those miners are still owed. The ledger keeps every hash");
-        eprintln!("the node does hold, so a retry will not double-pay them.");
+        eprintln!("verified - see above. Those miners are still owed, and the exact rows are");
+        eprintln!("recorded in the owed ledger in the pool state file: the next settlement, by");
+        eprintln!("this tool or by the pool server, pays THEM first, before it splits anything");
+        eprintln!("fresh. The pending ledger keeps every hash the node might hold, so a retry");
+        eprintln!("cannot double-pay them either.");
     }
-    println!("pool wallet after = {}", balance(&client, &node, &pool_addr));
+    println!(
+        "pool wallet after = {}",
+        balance(&client, &node, &pool_addr)
+    );
 }

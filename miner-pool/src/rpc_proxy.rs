@@ -50,9 +50,7 @@ pub async fn serve(
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
     info!("HTTP miner RPC listening on http://{addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| e.to_string())
+    axum::serve(listener, app).await.map_err(|e| e.to_string())
 }
 
 /// Constant-time compare so a timing side-channel cannot leak the token byte by
@@ -235,10 +233,7 @@ async fn submit(
         .await
     {
         Ok(body) => (StatusCode::OK, Json(normalise_submit_body(&body))),
-        Err(e) => (
-            StatusCode::OK,
-            Json(json!({"err": e, "ret": 1})),
-        ),
+        Err(e) => (StatusCode::OK, Json(json!({"err": e, "ret": 1}))),
     }
 }
 
@@ -272,7 +267,11 @@ mod tests {
             "",
         ] {
             let v = normalise_submit_body(body);
-            assert_eq!(v["ret"].as_i64(), Some(1), "body {body:?} was not normalised");
+            assert_eq!(
+                v["ret"].as_i64(),
+                Some(1),
+                "body {body:?} was not normalised"
+            );
             assert!(v.get("msg").is_some(), "body {body:?} lost its detail");
         }
         // A non-numeric `ret` is not a verdict either: both consumers read it with

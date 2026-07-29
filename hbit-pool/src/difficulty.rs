@@ -176,7 +176,10 @@ mod tests {
         // Documented defaults and mainnet still parse.
         let d = ChainParams::parse("testnet").expect("bare testnet");
         assert_eq!((d.asert_height, d.target_time), (290, 10));
-        assert_eq!(ChainParams::parse("mainnet").expect("mainnet").asert_height, 738654);
+        assert_eq!(
+            ChainParams::parse("mainnet").expect("mainnet").asert_height,
+            738654
+        );
         // Anything we cannot mine is refused rather than silently guessed.
         assert!(ChainParams::parse("regtest").is_none());
         assert!(ChainParams::parse("testnet:8").is_none());
@@ -201,7 +204,10 @@ mod tests {
         let p = ChainParams::testnet(288, 10);
         let (num, hash) = next_difficulty(&p, 290, 9_999, LOWEST_DIFFICULTY, 0);
         assert_eq!(num, ASERT_START_TARGET_NUM);
-        assert_eq!(hash, DifficultyTarget::from_num(ASERT_START_TARGET_NUM).hash);
+        assert_eq!(
+            hash,
+            DifficultyTarget::from_num(ASERT_START_TARGET_NUM).hash
+        );
         // mainnet anchors at 738654
         let m = ChainParams::mainnet();
         assert_eq!(
@@ -232,11 +238,25 @@ mod tests {
         );
         // ahead of schedule (mined too fast) -> smaller target (harder)
         let fast = DifficultyTarget::from_num(
-            next_difficulty(&p, height, on_time - 600, ASERT_START_TARGET_NUM, anchor_time).0,
+            next_difficulty(
+                &p,
+                height,
+                on_time - 600,
+                ASERT_START_TARGET_NUM,
+                anchor_time,
+            )
+            .0,
         );
         // behind schedule -> larger target (easier), capped at 2x the parent
         let slow = DifficultyTarget::from_num(
-            next_difficulty(&p, height, on_time + 600, ASERT_START_TARGET_NUM, anchor_time).0,
+            next_difficulty(
+                &p,
+                height,
+                on_time + 600,
+                ASERT_START_TARGET_NUM,
+                anchor_time,
+            )
+            .0,
         );
         assert!(fast.big < base.big, "faster blocks must tighten the target");
         assert!(slow.big > base.big, "slower blocks must ease the target");

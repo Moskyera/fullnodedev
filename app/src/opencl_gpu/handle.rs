@@ -91,7 +91,7 @@ impl OpenclGpuHandle {
                 notify,
             } => {
                 if notify {
-                    eprintln!(
+                    wlogerr!(
                         "[OpenCL] GPU QUARANTINED (level {level}, {total_failures} failed batches): no GPU work for another {}, mining continues on capped CPU recovery. The card is re-probed automatically, no restart needed.",
                         format_backoff(retry_in)
                     );
@@ -103,7 +103,7 @@ impl OpenclGpuHandle {
                 total_failures,
             } => {
                 let wg = self.prepare_reprobe();
-                println!(
+                wlogln!(
                     "[OpenCL] GPU quarantine (level {level}, {total_failures} failed batches) expired: re-probing the device at work_groups={wg}."
                 );
                 false
@@ -157,7 +157,7 @@ impl OpenclGpuHandle {
                     }
                     return synced_wg;
                 }
-                Err(e) => eprintln!("[OpenCL] re-probe context rebuild failed: {}", e),
+                Err(e) => wlogerr!("[OpenCL] re-probe context rebuild failed: {}", e),
             }
         }
         floor
@@ -233,7 +233,7 @@ impl OpenclGpuHandle {
             soft_recover_opencl(&mut res);
             drop(res);
             runtime.report_gpu_workgroups(floor, runtime.thermal_workgroups_cap(), configured_wg);
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] ALERT GPU quarantined after {} consecutive failed batches ({} this session): no GPU work for {}, then the card is re-probed automatically. Mining continues on capped CPU recovery. Last error: {}. Check the driver, cooling, power and the PCIe riser.",
                 report.consecutive_failures,
                 report.total_failures,
@@ -275,12 +275,12 @@ impl OpenclGpuHandle {
                             oom.sync_effective(synced_wg);
                         }
                         self.consecutive_errors.store(0, Relaxed);
-                        eprintln!(
+                        wlogerr!(
                             "[OpenCL] Rebuilt GPU context (errors={}, work_groups={})",
                             n, rebuild_wg
                         );
                     }
-                    Err(e) => eprintln!("[OpenCL] Context rebuild failed: {}", e),
+                    Err(e) => wlogerr!("[OpenCL] Context rebuild failed: {}", e),
                 }
             }
             drop(res);
@@ -292,7 +292,7 @@ impl OpenclGpuHandle {
         use std::sync::atomic::Ordering::Relaxed;
         self.consecutive_errors.store(0, Relaxed);
         if self.quarantine.record_success() {
-            println!(
+            wlogln!(
                 "[OpenCL] GPU RECOVERED: the re-probe succeeded, quarantine cleared and GPU mining has resumed."
             );
         }
@@ -336,7 +336,7 @@ impl OpenclGpuHandle {
                 if let Ok(mut oom) = self.oom.lock() {
                     oom.sync_effective(synced_wg);
                 }
-                println!("[OpenCL] Restored GPU context at work_groups={}", synced_wg);
+                wlogln!("[OpenCL] Restored GPU context at work_groups={}", synced_wg);
             }
             Err(e) => {
                 // Clamp the OOM state back to what the live context can run, so a
@@ -346,7 +346,7 @@ impl OpenclGpuHandle {
                 if let Ok(mut oom) = self.oom.lock() {
                     oom.sync_effective(capped);
                 }
-                eprintln!(
+                wlogerr!(
                     "[OpenCL] work_groups ramp-up rebuild failed, staying at {}: {}",
                     capped, e
                 );

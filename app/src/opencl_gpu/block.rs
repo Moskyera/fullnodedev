@@ -260,17 +260,28 @@ mod gpu_tests {
             pool.share_hits, BATCH_NONCES as u64,
             "the counter must see every hit, not only the stored ones"
         );
-        assert_eq!(pool.shares.len(), SHARE_LIST_CAPACITY.min(BATCH_NONCES as usize));
+        assert_eq!(
+            pool.shares.len(),
+            SHARE_LIST_CAPACITY.min(BATCH_NONCES as usize)
+        );
         let mut seen: Vec<u32> = pool.shares.iter().map(|(nonce, _)| *nonce).collect();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), pool.shares.len(), "no nonce may be listed twice");
+        assert_eq!(
+            seen.len(),
+            pool.shares.len(),
+            "no nonce may be listed twice"
+        );
         for (nonce, hash) in &pool.shares {
             assert!(
                 (NONCE_START..NONCE_START + BATCH_NONCES).contains(nonce),
                 "share nonce {nonce} is outside the batch window"
             );
-            assert_eq!(*hash, cpu_hash(&intro, *nonce), "share hash must match the CPU");
+            assert_eq!(
+                *hash,
+                cpu_hash(&intro, *nonce),
+                "share hash must match the CPU"
+            );
         }
 
         // 3. POOL, a target only three nonces beat: exactly those three, and
@@ -297,6 +308,9 @@ mod gpu_tests {
         assert_eq!(strict.share_hits, 3);
         let mut got: Vec<u32> = strict.shares.iter().map(|(nonce, _)| *nonce).collect();
         got.sort_unstable();
-        assert_eq!(got, expected, "the kernel must list exactly the payable nonces");
+        assert_eq!(
+            got, expected,
+            "the kernel must list exactly the payable nonces"
+        );
     }
 }

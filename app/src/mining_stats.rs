@@ -24,8 +24,22 @@ pub struct MiningStatsSnapshot {
     pub gpu_profile: String,
     #[serde(default)]
     pub configured_work_groups: u32,
-    #[serde(default)]
-    pub oom_work_groups: u32,
+    /// The work-group count the OOM fallback currently ALLOWS, per GPU, taken at
+    /// its worst across the devices in this rig.
+    ///
+    /// It is a count, not a loss. On a card that has never hit an out-of-memory
+    /// batch this equals `configured_work_groups`, and a healthy rig therefore
+    /// publishes a large positive number here every second it mines. Anything
+    /// reading `> 0` as "an OOM clamp happened" is wrong about every rig it will
+    /// ever meet; the clamp is the gap, so the only true test is
+    /// `oom_allowed_work_groups < configured_work_groups`.
+    ///
+    /// Serialised under its old key as well, because a stats file written by an
+    /// already-installed worker has to keep loading.
+    #[serde(default, alias = "oom_work_groups")]
+    pub oom_allowed_work_groups: u32,
+    /// The thermal cap in force, or 0 when the thermal guard has capped nothing.
+    /// Unlike the field above, this one really is absent when it is zero.
     #[serde(default)]
     pub thermal_cap_work_groups: u32,
     #[serde(default)]
@@ -33,6 +47,15 @@ pub struct MiningStatsSnapshot {
     pub gpu_hashrate_hps: f64,
     pub cpu_hashrate_hps: f64,
     pub gpu_hashrate_display: String,
+    /// The GPU temperature in Celsius, as read from the sensor this build
+    /// already talks to (`thermal_file`, `nvidia-smi`, `rocm-smi`, `amd-smi`).
+    ///
+    /// `None` where no sensor answered, and that is the whole point of the
+    /// Option: a machine with no readable sensor must publish nothing here. A
+    /// gauge reading 0 degrees looks like a working sensor on a cold card, and
+    /// is the one thing this field must never cause.
+    #[serde(default)]
+    pub gpu_temp_c: Option<f32>,
     pub active_cpu_threads: u32,
     pub paused_unprofitable: bool,
     pub mining_kind: String,
@@ -63,7 +86,7 @@ pub fn emit_from_batch_aggregate(
     diamond_best: &str,
     stats_path: &str,
 ) {
-    let oom_wg = runtime.oom_work_groups();
+    let oom_wg = runtime.oom_allowed_work_groups();
     let thermal = runtime.thermal_workgroups_cap().unwrap_or(0);
     let effective = runtime.effective_work_groups();
     let stats = if mining_kind == "hacd" {
@@ -98,11 +121,13 @@ pub fn emit_from_batch_aggregate(
             effective,
             agg.gpu_hashrate,
             agg.cpu_hashrate,
+            runtime.gpu_temp_c(),
         )
     };
     write_mining_stats(stats_path, &stats);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_mining_stats(
     hashrate: f64,
     hac_per_day: f64,
@@ -113,11 +138,12 @@ pub fn build_mining_stats(
     height: u64,
     paused: bool,
     configured_work_groups: u32,
-    oom_work_groups: u32,
+    oom_allowed_work_groups: u32,
     thermal_cap_work_groups: u32,
     effective_work_groups: u32,
     gpu_hashrate_hps: f64,
     cpu_hashrate_hps: f64,
+    gpu_temp_c: Option<f32>,
 ) -> MiningStatsSnapshot {
     let gpu_w = eff.estimate_gpu_watts(profile);
     let watts = gpu_w + active_cpu as f64 * eff.cpu_watts_per_thread;
@@ -150,12 +176,13 @@ pub fn build_mining_stats(
         height,
         gpu_profile: profile.to_string(),
         configured_work_groups,
-        oom_work_groups,
+        oom_allowed_work_groups,
         thermal_cap_work_groups,
         effective_work_groups,
         gpu_hashrate_hps,
         cpu_hashrate_hps,
         gpu_hashrate_display: rates_to_show(gpu_hashrate_hps),
+        gpu_temp_c: sensor_temperature(gpu_temp_c),
         active_cpu_threads: active_cpu,
         paused_unprofitable: paused,
         mining_kind: "hac".to_string(),
@@ -174,7 +201,7 @@ pub fn build_diamond_mining_stats(
     diamond_best: &str,
     paused: bool,
     _configured_work_groups: u32,
-    _oom_work_groups: u32,
+    _oom_allowed_work_groups: u32,
     _thermal_cap_work_groups: u32,
     _effective_work_groups: u32,
     _gpu_hashrate_hps: f64,
@@ -210,12 +237,15 @@ pub fn build_diamond_mining_stats(
         height: diamond_number as u64,
         gpu_profile: String::new(),
         configured_work_groups: 0,
-        oom_work_groups: 0,
+        oom_allowed_work_groups: 0,
         thermal_cap_work_groups: 0,
         effective_work_groups: 0,
         gpu_hashrate_hps: 0.0,
         cpu_hashrate_hps,
         gpu_hashrate_display: rates_to_show(0.0),
+        // HACD mines on the CPU through the full node. There is no GPU under
+        // this snapshot, so there is no GPU temperature to report.
+        gpu_temp_c: None,
         active_cpu_threads: active_cpu,
         paused_unprofitable: paused,
         mining_kind: "hacd".to_string(),
@@ -223,6 +253,13 @@ pub fn build_diamond_mining_stats(
         diamond_best: diamond_best.to_string(),
         updated_unix_ms: unix_ms_now(),
     }
+}
+
+/// The last gate a temperature passes before it is published. Anything a GPU
+/// sensor cannot produce is dropped to `None` rather than written out, so a
+/// broken reading reaches the panel as "no sensor" instead of as a number.
+fn sensor_temperature(temp_c: Option<f32>) -> Option<f32> {
+    temp_c.filter(|c| c.is_finite() && *c > 0.0 && *c < 120.0)
 }
 
 pub fn write_mining_stats(path: &str, stats: &MiningStatsSnapshot) {
@@ -243,7 +280,7 @@ pub fn write_mining_stats(path: &str, stats: &MiningStatsSnapshot) {
         Ok(()) => WARNED.store(false, Relaxed),
         Err(e) => {
             if !WARNED.swap(true, Relaxed) {
-                eprintln!("[stats] cannot update stats file ({e}); suppressing until it recovers");
+                wlogerr!("[stats] cannot update stats file ({e}); suppressing until it recovers");
             }
         }
     }
@@ -310,6 +347,116 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn hac_stats(gpu_temp_c: Option<f32>) -> MiningStatsSnapshot {
+        build_mining_stats(
+            1_000_000.0,
+            0.5,
+            0.01,
+            &efficiency(),
+            "amd_profit",
+            2,
+            765_432,
+            false,
+            1_536,
+            0,
+            0,
+            1_536,
+            900_000.0,
+            100_000.0,
+            gpu_temp_c,
+        )
+    }
+
+    #[test]
+    fn a_machine_with_no_sensor_publishes_no_temperature_rather_than_zero() {
+        // A gauge reading 0C looks exactly like a working sensor on a cold
+        // card, so the absence has to survive all the way to the JSON.
+        let stats = hac_stats(None);
+        assert_eq!(stats.gpu_temp_c, None);
+        let json = serde_json::to_string(&stats).unwrap();
+        let read: MiningStatsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.gpu_temp_c, None);
+    }
+
+    #[test]
+    fn a_measured_temperature_is_published_and_survives_the_json() {
+        let stats = hac_stats(Some(67.5));
+        assert_eq!(stats.gpu_temp_c, Some(67.5));
+        let json = serde_json::to_string(&stats).unwrap();
+        let read: MiningStatsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.gpu_temp_c, Some(67.5));
+    }
+
+    #[test]
+    fn a_reading_no_gpu_sensor_could_produce_is_dropped_not_published() {
+        for impossible in [0.0, -40.0, 500.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                hac_stats(Some(impossible)).gpu_temp_c,
+                None,
+                "{impossible} is not a GPU temperature"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stats_file_written_before_the_sensor_existed_still_reads_back() {
+        // Older workers wrote no temperature field at all. That file must load
+        // as "no reading", not fail the whole snapshot and freeze the panel.
+        let legacy = r#"{"status":"mining","hashrate_hps":1.0,"hashrate_display":"1H/s",
+            "watts":10.0,"kh_per_j":0.1,"hac_per_day":0.0,"network_pct":0.0,
+            "daily_cost_eur":0.0,"daily_revenue_eur":0.0,"daily_net_eur":0.0,"height":7,
+            "gpu_profile":"amd_profit","gpu_hashrate_hps":1.0,"cpu_hashrate_hps":0.0,
+            "gpu_hashrate_display":"1H/s","active_cpu_threads":0,"paused_unprofitable":false,
+            "mining_kind":"hac","diamond_number":0,"diamond_best":"","updated_unix_ms":1}"#;
+        let read: MiningStatsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(read.gpu_temp_c, None);
+        assert_eq!(read.height, 7);
+    }
+
+    #[test]
+    fn a_healthy_rig_publishes_the_full_work_group_count_under_the_oom_field() {
+        // The operator's rig: 48 configured, 48 allowed, nothing clamped. This
+        // is the shape that made the panel draw a red ring, so it is written
+        // down here as the normal case it actually is.
+        let stats = build_mining_stats(
+            1_000_000.0,
+            0.5,
+            0.01,
+            &efficiency(),
+            "amd_profit",
+            2,
+            768_566,
+            false,
+            48,
+            48,
+            0,
+            48,
+            900_000.0,
+            100_000.0,
+            None,
+        );
+        assert_eq!(stats.oom_allowed_work_groups, stats.configured_work_groups);
+        assert_eq!(stats.thermal_cap_work_groups, 0);
+    }
+
+    #[test]
+    fn a_stats_file_written_under_the_old_oom_key_still_loads() {
+        // The field was renamed because its old name read as a loss. A worker
+        // already installed on disk still writes the old key, and its snapshot
+        // must not come back as zero work groups.
+        let legacy = r#"{"status":"mining","hashrate_hps":1.0,"hashrate_display":"1H/s",
+            "watts":10.0,"kh_per_j":0.1,"hac_per_day":0.0,"network_pct":0.0,
+            "daily_cost_eur":0.0,"daily_revenue_eur":0.0,"daily_net_eur":0.0,"height":7,
+            "gpu_profile":"amd_profit","configured_work_groups":48,"oom_work_groups":48,
+            "thermal_cap_work_groups":0,"effective_work_groups":48,
+            "gpu_hashrate_hps":1.0,"cpu_hashrate_hps":0.0,
+            "gpu_hashrate_display":"1H/s","active_cpu_threads":0,"paused_unprofitable":false,
+            "mining_kind":"hac","diamond_number":0,"diamond_best":"","updated_unix_ms":1}"#;
+        let read: MiningStatsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(read.oom_allowed_work_groups, 48);
+        assert_eq!(read.configured_work_groups, 48);
+    }
+
     #[test]
     fn hacd_snapshot_is_cpu_only_even_with_legacy_gpu_inputs() {
         let stats = build_diamond_mining_stats(
@@ -327,6 +474,7 @@ mod tests {
             900_000.0,
             1_000_000.0,
         );
+        assert!(stats.gpu_temp_c.is_none());
         assert_eq!(stats.watts, 32.0);
         assert!((stats.daily_cost_eur - 0.192).abs() < 0.000_001);
         assert_eq!(stats.gpu_hashrate_hps, 0.0);
@@ -338,7 +486,7 @@ mod tests {
     }
 }
 
-fn unix_ms_now() -> u64 {
+pub(crate) fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

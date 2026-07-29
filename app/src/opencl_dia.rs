@@ -54,7 +54,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
     // refuse the batch instead of mining garbage.
     debug_assert!(stuff_len == 61 || stuff_len == 93);
     if stuff_len != 61 && stuff_len != 93 {
-        eprintln!(
+        wlogerr!(
             "[OpenCL] diamond pre-image length {} is neither 61 nor 93; skipping batch",
             stuff_len
         );
@@ -65,7 +65,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
     let write_event = match write_stuff_to_gpu(opencl, &stuff, None) {
         Ok(ev) => ev,
         Err(e) => {
-            eprintln!("[OpenCL] stuff upload failed: {}", e);
+            wlogerr!("[OpenCL] stuff upload failed: {}", e);
             most.gpu_batch_ok = false;
             return most;
         }
@@ -83,7 +83,7 @@ pub(crate) fn do_diamond_group_mining_opencl(
     ) {
         Ok(ev) => ev,
         Err(e) => {
-            eprintln!("[OpenCL] diamond kernel failed: {}", e.display());
+            wlogerr!("[OpenCL] diamond kernel failed: {}", e.display());
             most.gpu_batch_ok = false;
             return most;
         }
@@ -152,11 +152,11 @@ pub(crate) fn do_diamond_group_mining_opencl(
         }
     }
 
-    // Always finish the queue when required — including the early success path —
+    // Always finish the queue when required, including the early success path,
     // so AMD RDNA/duplicate ICD does not leave work outstanding.
     if opencl.needs_queue_finish {
         if let Err(e) = opencl.queue.finish() {
-            eprintln!("[OpenCL] diamond queue finish: {}", e);
+            wlogerr!("[OpenCL] diamond queue finish: {}", e);
             // Report the driver failure, but NEVER discard `most.is_success`: that
             // DiamondMint was already verified on the CPU above (x16rs_hash
             // recompute, then check_diamond_hash_result + check_diamond_difficulty

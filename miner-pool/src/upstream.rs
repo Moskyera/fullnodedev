@@ -207,10 +207,7 @@ impl Upstream {
             };
             match fetched {
                 Ok(raw) => {
-                    let height = raw
-                        .get("height")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    let height = raw.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
                     let has_intro = raw.get("block_intro").and_then(|v| v.as_str()).is_some();
                     if height > 0 && has_intro {
                         if height != last_h {
@@ -234,7 +231,10 @@ impl Upstream {
             // can tell a wedged refresher from a quiet chain.
             let stale = self.hub.current_fresh(ttl).is_none() && self.hub.height() > 0;
             if stale && !stale_logged {
-                warn!("upstream job is stale (no refresh for >{}s); workers are being told to wait", ttl.as_secs());
+                warn!(
+                    "upstream job is stale (no refresh for >{}s); workers are being told to wait",
+                    ttl.as_secs()
+                );
                 stale_logged = true;
             } else if !stale && stale_logged {
                 info!("upstream job refresh recovered");
@@ -359,7 +359,8 @@ mod tests {
     async fn submit_does_not_re_hammer_a_genuine_rejection() {
         // ret:1 with HTTP 200 is the node's real verdict (e.g. stale height) and
         // must reach the miner verbatim after exactly one attempt.
-        let (addr, hits) = fake_upstream(vec![(200, "{\"ret\":1,\"err\":\"height passed\"}")]).await;
+        let (addr, hits) =
+            fake_upstream(vec![(200, "{\"ret\":1,\"err\":\"height passed\"}")]).await;
         let up = upstream_at(addr);
         let body = up.submit_success(100, "aabb", "00").await.unwrap();
         assert_eq!(body, "{\"ret\":1,\"err\":\"height passed\"}");
@@ -391,8 +392,11 @@ mod tests {
     #[tokio::test]
     async fn a_normal_verdict_is_returned_whole() {
         // The cap must not clip a real reply: the miner reads ret/err out of this.
-        let (addr, _hits) =
-            fake_upstream(vec![(200, "{\"ret\":0,\"height\":100,\"mining\":\"success\"}")]).await;
+        let (addr, _hits) = fake_upstream(vec![(
+            200,
+            "{\"ret\":0,\"height\":100,\"mining\":\"success\"}",
+        )])
+        .await;
         let up = upstream_at(addr);
         let body = up.submit_success(100, "aabb", "00").await.unwrap();
         assert_eq!(body, "{\"ret\":0,\"height\":100,\"mining\":\"success\"}");

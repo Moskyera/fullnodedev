@@ -16,7 +16,10 @@ fn dir_ver_key(name: &std::ffi::OsStr) -> (u32, u32) {
 /// The (major, minor) release of an nvcc, e.g. (12, 4). Used to gate arch flags
 /// that older toolkits do not understand.
 fn nvcc_version(nvcc: &Path) -> Option<(u32, u32)> {
-    let out = std::process::Command::new(nvcc).arg("--version").output().ok()?;
+    let out = std::process::Command::new(nvcc)
+        .arg("--version")
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let idx = text.find("release ")? + "release ".len();
     let ver: String = text[idx..]
