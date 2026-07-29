@@ -431,7 +431,7 @@ impl BlockMinerBackend for OpenclBlockBackend {
 
         match gpu_result {
             Err(e) => {
-                eprintln!("[efficiency] GPU batch failed: {}", e.display());
+                wlogerr!("[efficiency] GPU batch failed: {}", e.display());
                 self.gpu
                     .on_batch_error(e, self.oom_fallback, ctx.configured_wg, &self.runtime);
                 cpu_gpu_error_recovery(
@@ -469,7 +469,7 @@ impl BlockMinerBackend for OpenclBlockBackend {
                     Err(message) => {
                         let integrity_error =
                             GpuBatchError::Other(format!("GPU integrity error: {message}"));
-                        eprintln!("[OpenCL] {}", integrity_error.display());
+                        wlogerr!("[OpenCL] {}", integrity_error.display());
                         self.gpu.on_batch_error(
                             integrity_error,
                             false,
@@ -566,7 +566,7 @@ impl BlockMinerBackend for CudaBlockBackend {
             ctx.share_target.as_ref(),
         ) {
             Err(e) => {
-                eprintln!("[CUDA] batch failed: {e}");
+                wlogerr!("[CUDA] batch failed: {e}");
                 self.runtime.record_gpu_error_event();
                 let report = self.cuda.note_batch_failure();
                 let action = cuda_failure_action(e.is_sticky());
@@ -574,7 +574,7 @@ impl BlockMinerBackend for CudaBlockBackend {
                     // Back off the effective work-groups so the next batch tries a
                     // smaller, likely-runnable size instead of failing forever.
                     let reduced = self.cuda.record_error();
-                    eprintln!("[CUDA] reducing work_groups to {reduced} after error");
+                    wlogerr!("[CUDA] reducing work_groups to {reduced} after error");
                 }
                 self.cuda
                     .announce_quarantine(&report, &format!("Last error: {e}"));
@@ -617,7 +617,7 @@ impl BlockMinerBackend for CudaBlockBackend {
                 let shares = match verified {
                     Ok(shares) => shares,
                     Err(message) => {
-                        eprintln!("[CUDA] GPU integrity error: {message}");
+                        wlogerr!("[CUDA] GPU integrity error: {message}");
                         self.runtime.record_gpu_error_event();
                         // A card returning hashes the CPU cannot reproduce is as
                         // dead as one that fails to launch, so it shares the same

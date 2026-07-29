@@ -20,7 +20,7 @@ pub(crate) fn panic_reason(payload: &(dyn std::any::Any + Send)) -> &str {
 /// panic, log it, and let the loop keep running.
 pub(crate) fn guard_mining_iteration(label: &str, body: impl FnOnce()) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        eprintln!(
+        wlogerr!(
             "[Mining] {} panicked and was contained: {}",
             label,
             panic_reason(&*payload)

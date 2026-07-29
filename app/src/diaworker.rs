@@ -74,7 +74,7 @@ impl DiaWorkConf {
             )
         }) || ini_must_u64(sec, "workgroups", 0) > 0;
         if wants_gpu {
-            println!(
+            wlogln!(
                 "[diamond] NOTE: HACD (diamond) mining is CPU / full-node only; the GPU keys \
                  in this config (useopencl / usecuda / workgroups) are ignored."
             );
@@ -259,7 +259,7 @@ fn send_diamond_result(
             if res.is_success.is_some() {
                 return result_ch_tx.send(res).is_ok();
             }
-            eprintln!(
+            wlogerr!(
                 "[Mining] Diamond result queue full, dropped a statistics-only batch at number {}.",
                 res.number
             );
@@ -293,7 +293,7 @@ fn queue_diamond_mining_success(
     match submit_tx.try_send(success) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(success)) => {
-            eprintln!(
+            wlogerr!(
                 "[Mining] Diamond submit queue full, submitting number {} inline.",
                 *success.d.number
             );
@@ -360,7 +360,7 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
     };
     #[cfg(feature = "ocl")]
     if cnf.useopencl && opencl_resources.is_empty() {
-        eprintln!(
+        wlogerr!(
             "[Fatal] OpenCL was requested but no usable GPU backend initialized; stopping HACD worker."
         );
         return;
@@ -422,7 +422,7 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
         #[cfg(feature = "ocl")]
         {
             // Initialize OpenCL
-            println!(
+            wlogln!(
                 "\n[Start] Create GPU diamond miner worker #{}.",
                 opencl_resources.len()
             );
@@ -463,11 +463,11 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
         }
         #[cfg(not(feature = "ocl"))]
         {
-            println!(
+            wlogln!(
                 "[Warning] use_opencl=true but app built without feature 'ocl'; fallback to CPU mining."
             );
             let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene) as usize;
-            println!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
+            wlogln!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
             for thrid in 0..thrnum {
                 let cnf2 = cnf.clone();
                 let rstx = res_tx.clone();
@@ -495,7 +495,7 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
             #[cfg(feature = "ocl")]
             {
                 let thrnum = cnf.efficiency.spawn_supervene(cnf.supervene) as usize;
-                println!(
+                wlogln!(
                     "\n[Start] Create #{} Ryzen CPU assist threads for diamonds (hybrid).",
                     thrnum
                 );
@@ -524,7 +524,7 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
         }
     } else {
         let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene) as usize;
-        println!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
+        wlogln!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
         for thrid in 0..thrnum {
             let cnf2 = cnf.clone();
             let rstx = res_tx.clone();
@@ -626,7 +626,7 @@ fn deal_diamond_mining_results(
         .maybe_adjust_supervene(&cnf.efficiency, gpu_nonce_space, cpu_nonce_space);
     if should_pause_for_diamond_profit(&cnf.efficiency, &cnf.gpu_profile, active_cpu) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
-        println!(
+        wlogln!(
             "\n[efficiency] HACD mining paused: daily power cost exceeds configured revenue target (hac_price)."
         );
     } else {
@@ -685,7 +685,7 @@ fn may_print_turn_to_nex_diamond_mining(
         *most_dia_str = [b'W'; DIAMOND_HASH_LEN]; // reset
     }
 
-    println!(
+    wlogln!(
         "\n[{}] req next number {} to mining ... ",
         &ctshow()[5..],
         mining_number
@@ -722,7 +722,7 @@ fn run_diamond_worker_thread(
     // start mining
     let mut custom_nonce = [0u8; HASH_WIDTH];
     if let Err(e) = getrandom::fill(&mut custom_nonce) {
-        eprintln!("[Mining] Secure random nonce failed: {e}");
+        wlogerr!("[Mining] Secure random nonce failed: {e}");
         return;
     }
     let custom_nonce = Hash::from(custom_nonce);
@@ -742,7 +742,7 @@ fn run_diamond_worker_thread(
             return;
         }
         let ctn = Instant::now();
-        // println!("- nonce_start: {}", nonce_start);
+        // wlogln!("- nonce_start: {}", nonce_start);
         let mut result = do_diamond_group_mining(
             current_mining_number,
             &current_mining_block_hash,
@@ -751,7 +751,7 @@ fn run_diamond_worker_thread(
             nonce_start,
             nonce_space,
         );
-        // println!("do_diamond_group_mining: {:?}", &result);
+        // wlogln!("do_diamond_group_mining: {:?}", &result);
         let use_secs = Instant::now().duration_since(ctn).as_millis() as f64 / 1000.0;
         result.use_secs = use_secs;
         result.is_gpu = false;
@@ -798,7 +798,7 @@ fn run_diamond_worker_thread_opencl(
 
     let mut custom_nonce = [0u8; HASH_WIDTH];
     if let Err(e) = getrandom::fill(&mut custom_nonce) {
-        eprintln!("[Mining] Secure random nonce failed: {e}");
+        wlogerr!("[Mining] Secure random nonce failed: {e}");
         return;
     }
     let custom_nonce = Hash::from(custom_nonce);
@@ -1009,7 +1009,7 @@ fn load_init(cnf: &mut DiaWorkConf) {
             match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
                 Ok(t) => t,
                 Err(e) => {
-                    println!(
+                    wlogln!(
                         "Error: cannot init diamond miner from {}: {}",
                         &urlapi_pending, e
                     );
@@ -1017,26 +1017,26 @@ fn load_init(cnf: &mut DiaWorkConf) {
                 }
             };
         let Ok(res) = serde_json::from_str::<JV>(&body) else {
-            println!("Error: invalid JSON from {urlapi_pending}");
+            wlogln!("Error: invalid JSON from {urlapi_pending}");
             delay_continue!(30);
         };
         let jstr = |k| res[k].as_str().unwrap_or("");
         let err = jstr("err");
         if err.len() > 0 {
-            println!("{} Error: {}", &urlapi_pending, err);
+            wlogln!("{} Error: {}", &urlapi_pending, err);
             delay_continue!(30);
         }
         let adr1 = jstr("bid_address");
         let Ok(bid_addr) = Address::from_readable(&adr1) else {
-            println!("Error: bid_address '{}' format invalid", &adr1);
+            wlogln!("Error: bid_address '{}' format invalid", &adr1);
             delay_continue!(30);
         };
         let adr2 = jstr("reward_address");
         let Ok(rwd_addr) = Address::from_readable(&adr2) else {
-            println!("Error: reward_address '{}' format invalid", &adr2);
+            wlogln!("Error: reward_address '{}' format invalid", &adr2);
             delay_continue!(30);
         };
-        println!(
+        wlogln!(
             "[Config] query diamond miner bid address: {}, reward address: {}",
             &adr1, &adr2
         );
@@ -1053,24 +1053,24 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
 
     let urlapi_latest = format!("http://{}/query/latest", &cnf.rpcaddr);
     // get next number
-    // println!("urlapi_latest: {}", &urlapi_latest);
+    // wlogln!("urlapi_latest: {}", &urlapi_latest);
     let body = match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_latest, &cnf.api_token, None) {
         Ok(t) => t,
         Err(e) => {
-            println!("Error: cannot get latest from {}: {}", &urlapi_latest, e);
+            wlogln!("Error: cannot get latest from {}: {}", &urlapi_latest, e);
             delay_return!(30);
         }
     };
     let Ok(res) = serde_json::from_str::<JV>(&body) else {
-        println!("Error: invalid JSON from {urlapi_latest}");
+        wlogln!("Error: invalid JSON from {urlapi_latest}");
         delay_return!(30);
     };
-    // println!("get latest: {:?}", &res);
+    // wlogln!("get latest: {:?}", &res);
     let jnum = |k| res[k].as_u64().unwrap_or(0);
     let next_num = jnum("diamond") as u32 + 1;
-    // println!("mining next num: {} {}", &mining_num, &next_num);
+    // wlogln!("mining next num: {} {}", &mining_num, &next_num);
     if next_num == 1 {
-        // println!("get latest: next_num == 1");
+        // wlogln!("get latest: next_num == 1");
         install_diamond_job(next_num, genesis_block_hash());
         return; // first mining
     }
@@ -1080,7 +1080,7 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
         // Refresh prev_hash for the same number when the node reorged the tip.
         // Cheap GET; skip heavy work only when hash is unchanged.
     } else if next_num < mining_num {
-        println!(
+        wlogln!(
             "[HACD] diamond tip reorg: number {} -> {}, refreshing job",
             mining_num, next_num
         );
@@ -1091,23 +1091,23 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
         &cnf.rpcaddr,
         next_num - 1
     );
-    // println!("urlapi_diamond: {}", &urlapi_diamond);
+    // wlogln!("urlapi_diamond: {}", &urlapi_diamond);
     let body = match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_diamond, &cnf.api_token, None)
     {
         Ok(t) => t,
         Err(e) => {
-            println!("Error: cannot get diamond from {}: {}", &urlapi_diamond, e);
+            wlogln!("Error: cannot get diamond from {}: {}", &urlapi_diamond, e);
             delay_return!(30);
         }
     };
     let Ok(res) = serde_json::from_str::<JV>(&body) else {
-        println!("Error: invalid JSON from {urlapi_diamond}");
+        wlogln!("Error: invalid JSON from {urlapi_diamond}");
         delay_return!(30);
     };
-    // println!("query diamond: {:?}", &res);
+    // wlogln!("query diamond: {:?}", &res);
     let prev_hash = res["born"]["hash"].as_str().unwrap_or("");
     let Ok(hx) = hex::decode(&prev_hash) else {
-        println!(
+        wlogln!(
             "Error: cannot get born.hash from {}: {:?}",
             &urlapi_diamond, &res
         );
@@ -1153,7 +1153,7 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
                 last = body.chars().take(200).collect();
                 let Ok(res) = serde_json::from_str::<JV>(&body) else {
                     let snippet: String = body.chars().take(120).collect();
-                    println!(
+                    wlogln!(
                         "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} unrecognized response, retrying: {snippet}"
                     );
                     if attempt < MAX_SUBMIT_ATTEMPTS {
@@ -1166,7 +1166,7 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
                 let jstr = |k: &str| res[k].as_str().unwrap_or("");
                 let tx_err = jstr("err");
                 if !tx_err.is_empty() {
-                    println!(
+                    wlogln!(
                         "ㄨㄨㄨㄨ Failed submit tx diamond mint to mainnet\n     ERROR: {}\n",
                         tx_err
                     );
@@ -1174,7 +1174,7 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
                 }
                 let tx_hash = jstr("tx_hash");
                 if tx_hash.len() == 64 {
-                    println!(
+                    wlogln!(
                         "Success submit tx diamond mint {} ({}) to mainnet, \n        get tx hash: {}\n",
                         success.d.diamond.to_readable(),
                         *success.d.number,
@@ -1182,8 +1182,8 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
                     );
                     return;
                 }
-                // JSON but no usable tx_hash — treat as transient front-end noise.
-                println!(
+                // JSON but no usable tx_hash: treat as transient front-end noise.
+                wlogln!(
                     "[HACD submit] attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} missing tx_hash, retrying"
                 );
                 if attempt < MAX_SUBMIT_ATTEMPTS {
@@ -1192,7 +1192,7 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
             }
             Err(e) => {
                 last = format!("transport error: {e}");
-                println!(
+                wlogln!(
                     "Error: attempt {attempt}/{MAX_SUBMIT_ATTEMPTS} cannot submit diamond success to {urlapi_success}: {e}"
                 );
                 if attempt < MAX_SUBMIT_ATTEMPTS {
@@ -1201,7 +1201,7 @@ fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
             }
         }
     }
-    println!(
+    wlogln!(
         "ㄨㄨㄨㄨ Failed submit tx diamond mint after {MAX_SUBMIT_ATTEMPTS} attempts ({last}). Check the node/connection."
     );
 }
@@ -1443,16 +1443,16 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
     #[cfg(not(feature = "ocl"))]
     {
         let _ = (cnf, config_path);
-        println!("[benchmark] Rebuild diaworker with --features ocl");
+        wlogln!("[benchmark] Rebuild diaworker with --features ocl");
         return;
     }
     #[cfg(feature = "ocl")]
     {
         if !cnf.useopencl {
-            println!("[benchmark] HACD is CPU-only; Auto Tune applies to the HAC poworker.");
+            wlogln!("[benchmark] HACD is CPU-only; Auto Tune applies to the HAC poworker.");
             return;
         }
-        println!(
+        wlogln!(
             "[benchmark] HACD: GPU tuning uses same profiles as HAC; run poworker benchmark or share ini."
         );
         let scan = crate::opencl_diag::scan_opencl();
@@ -1488,7 +1488,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
             max_us,
         );
         if candidates.is_empty() {
-            println!("[benchmark] HACD: no safe tuning candidates");
+            wlogln!("[benchmark] HACD: no safe tuning candidates");
             return;
         }
         let per =
@@ -1540,7 +1540,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
                 EfficiencyMode::Max => hps,
                 _ => kh_per_j,
             };
-            println!(
+            wlogln!(
                 "[benchmark] HACD {}: {} ({:.1} kH/J, wg={}, unit_size={})",
                 pick.profile,
                 rates_to_show(hps),
@@ -1560,7 +1560,7 @@ fn run_diamond_mining_benchmark(cnf: &DiaWorkConf, config_path: &str) {
         if let Some((pick, _)) = best {
             let _ = apply_benchmark_pick(config_path, &pick);
         } else {
-            println!("[benchmark] HACD: all tuning points failed; config unchanged");
+            wlogln!("[benchmark] HACD: all tuning points failed; config unchanged");
         }
     }
 }

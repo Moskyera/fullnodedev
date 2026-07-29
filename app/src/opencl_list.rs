@@ -1,4 +1,4 @@
-//! List OpenCL platforms/devices — used by `list_opencl` / `diagnose_opencl` binaries.
+//! List OpenCL platforms/devices, used by `list_opencl` / `diagnose_opencl` binaries.
 
 #[cfg(feature = "ocl")]
 fn select_opencl_dir_hint(
@@ -32,20 +32,20 @@ fn opencl_dir_hint() -> (&'static str, &'static str) {
 pub fn list_opencl_devices() -> bool {
     let scan = crate::opencl_diag::scan_opencl();
     crate::opencl_diag::print_scan_report(&scan);
-    println!("\nConfig hints (HAC poworker.config.ini only; HACD is CPU-only):");
+    wlogln!("\nConfig hints (HAC poworker.config.ini only; HACD is CPU-only):");
     if let Some(rec) = &scan.recommended {
-        println!("  [gpu]");
-        println!("  use_opencl = true");
-        println!("  platform_id = {}", rec.platform_id);
-        println!("  device_ids = {}", rec.device_id);
+        wlogln!("  [gpu]");
+        wlogln!("  use_opencl = true");
+        wlogln!("  platform_id = {}", rec.platform_id);
+        wlogln!("  device_ids = {}", rec.device_id);
     } else {
-        println!("  [gpu]");
-        println!("  use_opencl = true");
-        println!("  platform_id = <platform number above>");
-        println!("  device_ids = <device number>");
+        wlogln!("  [gpu]");
+        wlogln!("  use_opencl = true");
+        wlogln!("  platform_id = <platform number above>");
+        wlogln!("  device_ids = <device number>");
     }
     let (opencl_dir, layout) = opencl_dir_hint();
-    println!("  opencl_dir = {opencl_dir}   {layout}");
+    wlogln!("  opencl_dir = {opencl_dir}   {layout}");
     scan.recommended.is_some()
 }
 

@@ -222,7 +222,7 @@ pub fn scan_opencl() -> OpenClScan {
         let limits = crate::gpu_arch::ArchLimits::for_slug(&sel.device_slug);
         if limits.is_experimental() && amd_platforms.len() > 1 {
             warnings.push(
-                "gfx1201 (RX 9070 XT): duplicate AMD OpenCL platforms — miner will cap work_groups to 64 on this architecture."
+                "gfx1201 (RX 9070 XT): duplicate AMD OpenCL platforms; miner will cap work_groups to 64 on this architecture."
                     .to_string(),
             );
         }
@@ -330,7 +330,7 @@ pub fn resolve_opencl_selection(
     let Some(plat) = platforms.iter().find(|p| p.index == configured_platform) else {
         if let Some(rec) = recommend_opencl_device(platforms) {
             notes.push(format!(
-                "[OpenCL] platform_id={} invalid — using recommended platform {} device {} ({})",
+                "[OpenCL] platform_id={} invalid, using recommended platform {} device {} ({})",
                 configured_platform, rec.platform_id, rec.device_id, rec.device_slug
             ));
             return (rec.platform_id, rec.device_id, notes);
@@ -341,7 +341,7 @@ pub fn resolve_opencl_selection(
     let Some(dev) = plat.devices.iter().find(|d| d.index == configured_device) else {
         if let Some(rec) = recommend_opencl_device(platforms) {
             notes.push(format!(
-                "[OpenCL] device_id={} not found on platform {} — using {} ({})",
+                "[OpenCL] device_id={} not found on platform {}, using {} ({})",
                 configured_device, configured_platform, rec.device_id, rec.device_slug
             ));
             return (rec.platform_id, rec.device_id, notes);
@@ -369,14 +369,14 @@ pub fn resolve_opencl_selection(
         }
         if best_plat != configured_platform {
             notes.push(format!(
-                "[OpenCL] Auto-selected platform {} (AMD-APP {}) for {} — config had platform {} (AMD-APP {})",
+                "[OpenCL] Auto-selected platform {} (AMD-APP {}) for {}, config had platform {} (AMD-APP {})",
                 best_plat, best_build, slug, configured_platform, plat.amd_app_build
             ));
         }
         if is_igpu_slug(&dev.slug, dev.compute_units, &dev.name) {
             if let Some(rec) = recommend_opencl_device(platforms) {
                 notes.push(format!(
-                    "[OpenCL] device {} looks like iGPU — switching to {} ({})",
+                    "[OpenCL] device {} looks like iGPU, switching to {} ({})",
                     dev.name, rec.device_name, rec.device_slug
                 ));
                 return (rec.platform_id, rec.device_id, notes);
@@ -387,7 +387,7 @@ pub fn resolve_opencl_selection(
 
     if let Some(rec) = recommend_opencl_device(platforms) {
         notes.push(format!(
-            "[OpenCL] Configured device is not discrete — using {} ({})",
+            "[OpenCL] Configured device is not discrete, using {} ({})",
             rec.device_name, rec.device_slug
         ));
         return (rec.platform_id, rec.device_id, notes);
@@ -397,9 +397,9 @@ pub fn resolve_opencl_selection(
 }
 
 pub fn print_scan_report(scan: &OpenClScan) {
-    println!("OpenCL diagnostic scan\n");
+    wlogln!("OpenCL diagnostic scan\n");
     for plat in &scan.platforms {
-        println!(
+        wlogln!(
             "Platform {}: {}  vendor={}  version={}  AMD-APP build={}",
             plat.index, plat.name, plat.vendor, plat.version, plat.amd_app_build
         );
@@ -411,7 +411,7 @@ pub fn print_scan_report(scan: &OpenClScan) {
             } else {
                 "other"
             };
-            println!(
+            wlogln!(
                 "  device {}: {} ({})  CU={}  VRAM={}MB  max_wg={}  [{}]",
                 dev.index,
                 dev.name,
@@ -422,18 +422,18 @@ pub fn print_scan_report(scan: &OpenClScan) {
                 kind
             );
         }
-        println!();
+        wlogln!();
     }
     if let Some(rec) = &scan.recommended {
-        println!(
+        wlogln!(
             "Recommended: platform_id={} device_id={}  {} ({})  AMD-APP {}",
             rec.platform_id, rec.device_id, rec.device_name, rec.device_slug, rec.amd_app_build
         );
     }
     if !scan.warnings.is_empty() {
-        println!("\nWarnings:");
+        wlogln!("\nWarnings:");
         for w in &scan.warnings {
-            println!("  ! {}", w);
+            wlogln!("  ! {}", w);
         }
     }
 }

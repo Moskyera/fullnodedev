@@ -25,10 +25,14 @@ pub fn configure_background_command(command: &mut Command) {
 /// looked identical, from the panel, to one that was ready.
 ///
 /// The trade is real and worth stating: a process with its own console is NOT
-/// piping its output back here, so the panel cannot quote its log in an error
-/// message. Status still works, because it comes from polling the node's RPC and
-/// from the child's exit code, neither of which needs the pipe. The detail lives
-/// in the window the user can now see.
+/// piping its output back here. Status still works, because it comes from
+/// polling the node's RPC and from the child's exit code, neither of which needs
+/// the pipe.
+///
+/// For the two miners the pipe is no longer the only copy either: they write
+/// every line they print to a rolling log beside their config, and the panel
+/// tails it (`app::worker_log` and `worker_log_tail`). For the node it still is,
+/// because the node's output comes from crates that cannot depend on `app`.
 pub fn configure_visible_command(command: &mut Command) {
     #[cfg(windows)]
     {

@@ -118,7 +118,7 @@ impl PoWorkConf {
             efficiency,
             runtime,
         };
-        println!(
+        wlogln!(
             "[efficiency] mode={} profile={} work_groups={} unit_size={} dynamic_supervene={}",
             cnf.efficiency.mode.label(),
             cnf.gpu_profile,
@@ -180,7 +180,7 @@ pub fn poworker_with_conf(cnf: PoWorkConf) {
 
 pub fn poworker_with_stop(cnf: PoWorkConf, stop_flag: Option<Arc<AtomicBool>>) {
     if !block_mining_runtime::start_block_mining_workers(&cnf, stop_flag.clone()) {
-        eprintln!("[Fatal] Mining worker startup failed.");
+        wlogerr!("[Fatal] Mining worker startup failed.");
         return;
     }
 
@@ -257,7 +257,7 @@ fn upstream_stale_reason(res: &JV) -> Option<&str> {
 /// continuing to hash it only burns power.
 fn enter_upstream_stale(reason: &str, source: &str) {
     if block_mining_runtime::set_upstream_stale(true) {
-        println!(
+        wlogln!(
             "\n[Mining] PAUSED: {source} reports stale work ({reason}). The template can no longer win anything, so hashing is idle until fresh work arrives. Check the pool or node this miner connects to."
         );
     }
@@ -266,7 +266,7 @@ fn enter_upstream_stale(reason: &str, source: &str) {
 /// Clear the stale-work pause once real work is available again.
 fn leave_upstream_stale() {
     if block_mining_runtime::set_upstream_stale(false) {
-        println!("\n[Mining] Fresh work received, mining resumes.");
+        wlogln!("\n[Mining] Fresh work received, mining resumes.");
     }
 }
 
@@ -293,7 +293,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
             Ok(t) => t,
             Err(e) => {
-                println!(
+                wlogln!(
                     "Error: cannot get block data at {}: {}\n",
                     &urlapi_pending, e
                 );
@@ -301,7 +301,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             }
         };
     let Ok(res) = serde_json::from_str::<JV>(&jsdata) else {
-        println!(
+        wlogln!(
             "Error: invalid block data json at {} (body len {})\n",
             &urlapi_pending,
             jsdata.len()
@@ -315,7 +315,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             enter_upstream_stale(reason, "pending work");
             delay_return!(STALE_UPSTREAM_BACKOFF_SECS);
         }
-        println!("Error: get block stuff error: {}", jstr("err"));
+        wlogln!("Error: get block stuff error: {}", jstr("err"));
         delay_return!(15);
     };
     let pending_height = jnum("height");
@@ -329,7 +329,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
     // job's identity (height + parent hash), which that re-serialization leaves
     // untouched. A same-height reorg still changes the parent and is still detected.
     if let Err(e) = block_mining_runtime::set_pending_block_stuff(pending_height, res) {
-        println!("Error: invalid block data from {urlapi_pending}: {e}");
+        wlogln!("Error: invalid block data from {urlapi_pending}: {e}");
         delay_return!(10);
     }
     // Real work was served and installed, so any stale-work pause lifts.
@@ -355,7 +355,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             return;
         }
         if let Err(e) = getrandom::fill(&mut rpid) {
-            println!("Error: cannot generate request id: {e}");
+            wlogln!("Error: cannot generate request id: {e}");
             delay_return!(1);
         }
         let urlapi_notice = format!(
@@ -365,7 +365,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             pending_height,
             &hex::encode(&rpid)
         );
-        // println!("\n-------- {} -------- {}\n", &ctshow(), &urlapi_notice);
+        // wlogln!("\n-------- {} -------- {}\n", &ctshow(), &urlapi_notice);
         let jsdata = match crate::rpc_http::get_text(
             &HTTP_CLIENT,
             &urlapi_notice,
@@ -374,7 +374,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
         ) {
             Ok(t) => t,
             Err(e) => {
-                println!(
+                wlogln!(
                     "Error: cannot get miner notice at {}: {}\n",
                     &urlapi_notice, e
                 );
@@ -382,7 +382,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             }
         };
         let Ok(res2) = serde_json::from_str::<JV>(&jsdata) else {
-            println!("Error: invalid miner notice JSON at {urlapi_notice}");
+            wlogln!("Error: invalid miner notice JSON at {urlapi_notice}");
             delay_return!(1);
         };
         // The notice body carries the LAST known height alongside the error, so it
@@ -449,7 +449,7 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
                             .as_ref()
                             .and_then(|j| j["err"].as_str())
                             .unwrap_or("");
-                        println!("[submit] node rejected height {}: {}", success.height, err);
+                        wlogln!("[submit] node rejected height {}: {}", success.height, err);
                         break;
                     }
                     None => {
@@ -458,7 +458,7 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
                         // decision, so treat it as transient and retry: a winning
                         // block is not discarded on a front-end hiccup.
                         let snippet: String = body.chars().take(120).collect();
-                        println!(
+                        wlogln!(
                             "[submit] attempt {}/{} unrecognized response, retrying: {}",
                             attempt, MAX_SUBMIT_ATTEMPTS, snippet
                         );
@@ -470,7 +470,7 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
             }
             Err(e) => {
                 last = format!("transport error: {e}");
-                println!(
+                wlogln!(
                     "[submit] attempt {}/{} failed: {e}",
                     attempt, MAX_SUBMIT_ATTEMPTS
                 );
@@ -480,22 +480,22 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
             }
         }
     }
-    println!("{} {}", &urlapi_success, last);
+    wlogln!("{} {}", &urlapi_success, last);
     if accepted {
-        println!(
+        wlogln!(
             "\n\n████████████████ [MINING SUCCESS] Find a block height {},\n██ hash {} to submit.",
             success.height,
             success.result_hash.to_hex()
         );
     } else {
-        println!(
+        wlogln!(
             "\n\n████████████████ [MINING SUBMIT FAILED] block height {} was NOT confirmed accepted\n██ after {} attempts (hash {}). Check the node/connection.",
             success.height,
             MAX_SUBMIT_ATTEMPTS,
             success.result_hash.to_hex()
         );
     }
-    println!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
+    wlogln!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
 }
 #[cfg(feature = "ocl")]
 const AUTOTUNE_WARMUP_BATCHES: u32 = 3;
@@ -773,19 +773,19 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
     #[cfg(not(feature = "ocl"))]
     {
         let _ = (cnf, config_path);
-        println!("[benchmark] Rebuild with --features ocl and use_opencl=true");
+        wlogln!("[benchmark] Rebuild with --features ocl and use_opencl=true");
         return;
     }
     #[cfg(feature = "ocl")]
     {
         if !cnf.useopencl {
-            println!("[benchmark] Set use_opencl=true in [gpu]");
+            wlogln!("[benchmark] Set use_opencl=true in [gpu]");
             return;
         }
-        println!(
+        wlogln!(
             "[benchmark] Power and kH/J figures are estimates derived from configured board power; they are not hardware telemetry."
         );
-        println!(
+        wlogln!(
             "[benchmark] NOTE: the MH/s below are raw X16RS repeat=1 tuning rates (relative comparison only). The live mainnet runs 16 rounds, so real block-hash throughput is roughly 1/11-1/16 of these numbers. For the honest mainnet figure run: set HACASH_REPEAT16_BENCH_SECONDS=30 and run poworker."
         );
         let total_secs = cnf.efficiency.benchmark_seconds.max(15) as u64;
@@ -816,11 +816,11 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             false,
         );
         if opencl_resources.is_empty() {
-            println!("[benchmark] No OpenCL devices");
+            wlogln!("[benchmark] No OpenCL devices");
             return;
         }
         if !autotune_device_count_is_supported(opencl_resources.len()) {
-            println!(
+            wlogln!(
                 "[benchmark] Auto Tune requires exactly one OpenCL device, but detected {}. The current config has one shared work_groups/unit_size pair, so multi-GPU tuning would be ambiguous. Set [gpu] device_ids to one device and tune each GPU separately; config unchanged.",
                 opencl_resources.len()
             );
@@ -845,14 +845,14 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                 max_us,
             );
             if candidates.is_empty() {
-                println!(
+                wlogln!(
                     "[benchmark] No safe tuning candidates for device #{}",
                     dev_i
                 );
                 continue;
             }
             let per = (profile_secs / candidates.len() as u64).max(4);
-            println!(
+            wlogln!(
                 "[benchmark] Device #{}: {}s x {} exact tuning points{}",
                 dev_i,
                 per,
@@ -864,7 +864,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             for pick in candidates {
                 match benchmark_candidate(opencl, cnf, pick.clone(), per, max_wg, max_us) {
                     Ok(result) => {
-                        println!(
+                        wlogln!(
                             "[benchmark] dev{} {}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples, wg={}, unit_size={})",
                             dev_i,
                             result.pick.profile,
@@ -878,7 +878,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                         bench_results.push(result);
                     }
                     Err(error) => {
-                        println!(
+                        wlogln!(
                             "[benchmark] dev{} {}: REJECTED ({error}, wg={}, unit_size={})",
                             dev_i, pick.profile, pick.workgroups, pick.unitsize
                         );
@@ -887,7 +887,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             }
 
             let Some(base) = pick_benchmark_result(&bench_results, cnf.efficiency.mode) else {
-                println!(
+                wlogln!(
                     "[benchmark] No successful tuning points; config unchanged (check OpenCL driver)."
                 );
                 continue;
@@ -906,7 +906,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                     max_wg,
                 );
                 let per_wg = (wg_sweep_secs / wg_candidates.len().max(1) as u64).max(3);
-                println!(
+                wlogln!(
                     "[benchmark] dev{} bounded wg sweep: {:?} x {}s",
                     dev_i, wg_candidates, per_wg
                 );
@@ -919,7 +919,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                     };
                     match benchmark_candidate(opencl, cnf, candidate, per_wg, max_wg, max_us) {
                         Ok(result) => {
-                            println!(
+                            wlogln!(
                                 "[benchmark] dev{} wg={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
                                 dev_i,
                                 wg_try,
@@ -931,7 +931,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                             wg_results.push(result);
                         }
                         Err(error) => {
-                            println!("[benchmark] dev{} wg={}: REJECTED ({error})", dev_i, wg_try);
+                            wlogln!("[benchmark] dev{} wg={}: REJECTED ({error})", dev_i, wg_try);
                         }
                     }
                 }
@@ -941,7 +941,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
 
                 let us_candidates = sweep_unitsize_candidates(selected.pick.unitsize, max_us);
                 let per_us = (us_sweep_secs / us_candidates.len().max(1) as u64).max(3);
-                println!(
+                wlogln!(
                     "[benchmark] dev{} bounded unit_size sweep: {:?} x {}s",
                     dev_i, us_candidates, per_us
                 );
@@ -954,7 +954,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                     };
                     match benchmark_candidate(opencl, cnf, candidate, per_us, max_wg, max_us) {
                         Ok(result) => {
-                            println!(
+                            wlogln!(
                                 "[benchmark] dev{} unit_size={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
                                 dev_i,
                                 us_try,
@@ -966,7 +966,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                             us_results.push(result);
                         }
                         Err(error) => {
-                            println!(
+                            wlogln!(
                                 "[benchmark] dev{} unit_size={}: REJECTED ({error})",
                                 dev_i, us_try
                             );
@@ -979,7 +979,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             }
 
             let verify_secs = verification_seconds(total_secs);
-            println!(
+            wlogln!(
                 "[benchmark] dev{} final verification soak: {}s at wg={} unit_size={}",
                 dev_i, verify_secs, selected.pick.workgroups, selected.pick.unitsize
             );
@@ -993,7 +993,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             ) {
                 Ok(result) => result,
                 Err(error) => {
-                    println!(
+                    wlogln!(
                         "[benchmark] dev{} final verification REJECTED ({error}) - config unchanged.",
                         dev_i
                     );
@@ -1001,7 +1001,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                 }
             };
             if !verification_is_stable(selected.hps, verified.hps) {
-                println!(
+                wlogln!(
                     "[benchmark] dev{} final verification REJECTED: {} is below {:.0}% of measured {} - config unchanged.",
                     dev_i,
                     rates_to_show(verified.hps),
@@ -1010,7 +1010,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
                 );
                 continue;
             }
-            println!(
+            wlogln!(
                 "[benchmark] dev{} verified: profile={} work_groups={} unit_size={} {} (estimated {:.1} kH/J @ {:.0}W, {} samples, mode={})",
                 dev_i,
                 verified.pick.profile,
@@ -1025,11 +1025,11 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             if dev_i == 0 {
                 match apply_benchmark_pick(config_path, &verified.pick) {
                     Ok(()) => {
-                        println!(
+                        wlogln!(
                             "[benchmark] Config updated only after successful final verification."
                         )
                     }
-                    Err(e) => println!("[benchmark] Could not patch ini: {}", e),
+                    Err(e) => wlogln!("[benchmark] Could not patch ini: {}", e),
                 }
             }
         }
@@ -1212,7 +1212,7 @@ mod tests {
                 .try_into()
                 .unwrap();
 
-        println!(
+        wlogln!(
             "nonce={result_nonce} pre_x16rs={} algorithm={} expected_x16rs={} bad_gpu={}",
             hex::encode(pre_x16rs),
             x16rs_algorithm_id(&pre_x16rs),

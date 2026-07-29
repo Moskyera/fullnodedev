@@ -657,7 +657,7 @@ pub fn apply_benchmark_pick(path: &str, pick: &BenchmarkPick) -> std::io::Result
         out.push('\n');
     }
     atomic_write_private(Path::new(path), out.as_bytes())?;
-    println!(
+    wlogln!(
         "[benchmark] Applied gpu_profile={} (work_groups={}, unit_size={}) to {}",
         pick.profile, pick.workgroups, pick.unitsize, path
     );
@@ -954,6 +954,11 @@ enum GpuTempSensorSource {
         args: Vec<String>,
         parser: GpuTempParser,
     },
+    /// The AMD display driver's own library, which is the only one of these
+    /// that exists on a consumer Windows install. Bound to one ADL adapter at
+    /// detection time, so every later read is the same physical card.
+    #[cfg(windows)]
+    AmdDriver { adapter_index: i32 },
 }
 
 /// A sensor source selected once for one exact GPU and reused by the monitor.
@@ -987,6 +992,10 @@ impl GpuTempSensorBackend {
                         text.trim().parse::<f32>().ok().and_then(valid_gpu_temp)
                     }
                 }
+            }
+            #[cfg(windows)]
+            GpuTempSensorSource::AmdDriver { adapter_index } => {
+                crate::gpu_temp_adl::temperature_c(*adapter_index).and_then(valid_gpu_temp)
             }
         }
     }
@@ -1086,6 +1095,31 @@ fn nvidia_sensor(gpu_index: u32) -> GpuTempSensorBackend {
     )
 }
 
+/// The AMD driver's own sensor, on Windows, where no `*-smi` tool exists.
+///
+/// Bound only when exactly one card answers. ADL numbers its adapters in its own
+/// order, which is not the OpenCL device order (measured: on a machine with an
+/// integrated Radeon and an RX 9070 XT, ADL adapter 0 is the integrated one
+/// while OpenCL device 0 is the 9070 XT), so with several cards answering there
+/// is no honest way to say which reading belongs to `gpu_index`, and a
+/// neighbouring card's temperature is a wrong number rather than a missing one.
+/// The card that is bound is named in the sensor label so the operator can see
+/// which one the gauge is showing.
+#[cfg(windows)]
+fn amd_driver_sensor(_gpu_index: u32) -> Option<(GpuTempSensorBackend, f32)> {
+    let reporting = crate::gpu_temp_adl::reporting_gpus();
+    let [gpu] = reporting.as_slice() else {
+        return None;
+    };
+    let sensor = GpuTempSensorBackend {
+        label: format!("AMD driver (ADL) {}", gpu.name),
+        source: GpuTempSensorSource::AmdDriver {
+            adapter_index: gpu.adapter_index,
+        },
+    };
+    Some((sensor, gpu.temp_c))
+}
+
 pub(crate) fn detect_gpu_temp_sensor(
     thermal_file: &str,
     gpu_index: u32,
@@ -1100,6 +1134,14 @@ pub(crate) fn detect_gpu_temp_sensor(
     }
 
     match vendor {
+        // The driver library is tried first on Windows: it is the only source
+        // that exists there, it answers in under a millisecond, and each
+        // `*-smi` candidate behind it costs a process spawn and up to two
+        // seconds of timeout before failing.
+        #[cfg(windows)]
+        crate::gpu_arch::GpuVendor::Amd => amd_driver_sensor(gpu_index)
+            .or_else(|| detect_first_sensor(amd_sensor_candidates(gpu_index))),
+        #[cfg(not(windows))]
         crate::gpu_arch::GpuVendor::Amd => detect_first_sensor(amd_sensor_candidates(gpu_index)),
         crate::gpu_arch::GpuVendor::Nvidia => {
             let sensor = nvidia_sensor(gpu_index);

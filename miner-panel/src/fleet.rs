@@ -15,6 +15,7 @@ use app::efficiency::MiningStatsSnapshot;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::PanelLabels;
 use crate::{hacash_config::atomic_write_private, theme};
 
 const DEFAULT_PORT: u16 = 19_120;
@@ -39,7 +40,9 @@ const MAX_DNS_RESOLVERS: usize = POLL_WORKERS;
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const PEER_WALL_TIMEOUT: Duration = Duration::from_millis(2_500);
 const PEER_CONNECT_SLICE: Duration = Duration::from_millis(600);
-const MAX_STATS_AGE: Duration = Duration::from_secs(30);
+/// A rig's snapshot is stale on exactly the terms the dashboard uses for the
+/// local worker's, so "too old to quote" means one thing in this panel.
+const MAX_STATS_AGE: Duration = crate::stats_poll::STATS_STALE_AFTER;
 const MAX_STATS_FUTURE_SKEW: Duration = Duration::from_secs(30);
 const MAX_STATS_STRING_BYTES: usize = 256;
 const MAX_HASHRATE_HPS: f64 = 1.0e18;
@@ -352,6 +355,15 @@ pub struct FleetState {
     address_input: String,
     token_input: String,
     add_error: String,
+    /// Whether the worker on THIS machine is currently writing its stats file.
+    ///
+    /// The sidebar badge and the Master Panel's "workers online" card are the
+    /// same arithmetic, and both count this machine, so both need the same
+    /// answer about it. The local snapshot is only handed to the screen, and the
+    /// badge is drawn before the screen, so the check lives in `poll` where both
+    /// can read it.
+    local_online: bool,
+    local_probe_at: Instant,
 }
 
 impl FleetState {
@@ -393,6 +405,8 @@ impl FleetState {
             address_input: String::new(),
             token_input: String::new(),
             add_error: String::new(),
+            local_online: false,
+            local_probe_at: Instant::now() - LOCAL_PROBE_INTERVAL,
         };
 
         match state.save() {
@@ -411,7 +425,26 @@ impl FleetState {
         state
     }
 
+    /// (answering, configured) counting this machine, the same arithmetic the
+    /// Master Panel table prints. Exposed so the sidebar badge cannot drift
+    /// away from the table it is a summary of.
+    ///
+    /// This machine counts as answering only when its worker is actually
+    /// writing telemetry. An idle PC in the "online" count would be the one
+    /// number on this screen that is decided by nothing.
+    pub fn workers_online(&self) -> (usize, usize) {
+        let answering = self.results.iter().filter(|r| r.stats.is_some()).count();
+        (
+            answering + usize::from(self.local_online),
+            self.config.peers.len() + 1,
+        )
+    }
+
     pub fn poll(&mut self) {
+        if self.local_probe_at.elapsed() >= LOCAL_PROBE_INTERVAL {
+            self.local_probe_at = Instant::now();
+            self.local_online = local_worker_reporting(&self.stats_path);
+        }
         while let Ok(batch) = self.poll_rx.try_recv() {
             if self.poll_running_generation == Some(batch.generation) {
                 self.poll_running_generation = None;
@@ -461,57 +494,297 @@ impl FleetState {
         self.last_poll = Instant::now() - Duration::from_secs(30);
     }
 
-    pub fn show_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section_card().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("MINER FLEET • LAN SHARING")
-                    .strong()
-                    .size(12.0)
-                    .color(theme::colors::ACCENT),
+    // -----------------------------------------------------------------------
+    // The Master Panel screen.
+    // -----------------------------------------------------------------------
+
+    /// Every worker reporting to this panel, in the order the table prints them:
+    /// this machine first, then each configured remote in the order it was
+    /// added.
+    ///
+    /// A worker that is not answering carries dashes and the reason it is not
+    /// answering. It never carries the last number it managed to send, because
+    /// a stale hashrate on a dead rig is the one mistake this screen exists to
+    /// prevent.
+    fn worker_rows(&self, local: &MiningStatsSnapshot, l: &PanelLabels) -> Vec<WorkerRow> {
+        let mut rows = Vec::with_capacity(self.config.peers.len() + 1);
+        rows.push(WorkerRow {
+            name: l.this_pc.to_string(),
+            detail: if self.local_online {
+                String::new()
+            } else {
+                l.state_idle.to_string()
+            },
+            state: if self.local_online {
+                RowState::Online
+            } else {
+                RowState::Offline
+            },
+            hashrate: local.hashrate_hps,
+            hac_day: local.hac_per_day,
+            watts: local.watts,
+            height: local.height,
+        });
+
+        for peer in &self.config.peers {
+            let result = self.results.iter().find(|r| r.peer.address == peer.address);
+            match result.and_then(|r| r.stats.as_ref()) {
+                Some(stats) => rows.push(WorkerRow {
+                    name: peer.name.clone(),
+                    detail: String::new(),
+                    state: RowState::Online,
+                    hashrate: stats.hashrate_hps,
+                    hac_day: stats.hac_per_day,
+                    watts: stats.watts,
+                    height: stats.height,
+                }),
+                None => {
+                    // The three reasons a row has no numbers are not the same
+                    // reason, so the row says which one it is.
+                    let (state, detail) = match result {
+                        Some(r) if !r.error.is_empty() => (RowState::Offline, r.error.clone()),
+                        Some(_) => (RowState::Offline, l.state_offline.to_string()),
+                        None => (RowState::Waiting, l.state_waiting.to_string()),
+                    };
+                    rows.push(WorkerRow {
+                        name: peer.name.clone(),
+                        detail,
+                        state,
+                        hashrate: 0.0,
+                        hac_day: 0.0,
+                        watts: 0.0,
+                        height: 0,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// The Master Panel, laid out from the commissioned mockup: four overview
+    /// cards, one table row per worker, the LAN warning under it, and the two
+    /// cards that change the fleet, folded away until they are wanted.
+    ///
+    /// The four totals count only workers that are answering right now. Adding
+    /// an unreachable rig's last known 4 GH/s into "total hashrate" would make
+    /// the headline number grow when the fleet shrank.
+    pub fn show_master(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
+        let l = crate::i18n::panel_labels(crate::i18n::active_lang());
+        let rows = self.worker_rows(local, &l);
+        let mut total_hashrate = 0.0;
+        let mut total_hac = 0.0;
+        let mut total_watts = 0.0;
+        for row in rows.iter().filter(|row| row.state == RowState::Online) {
+            total_hashrate += row.hashrate;
+            total_hac += row.hac_day;
+            total_watts += row.watts;
+        }
+        let (answering, configured) = self.workers_online();
+        let busy = self.poll_running_generation.is_some();
+
+        page_header(
+            ui,
+            l.master_title,
+            l.master_sub,
+            if busy { Some(l.polling) } else { None },
+            l.read_only,
+        );
+        ui.add_space(16.0);
+
+        let width = ui.available_width();
+        let card_w = ((width - CARD_GAP * 3.0) / 4.0).floor().max(60.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            overview_card(ui, card_w, l.kpi_hashrate, &format_hashrate(total_hashrate));
+            overview_card(
+                ui,
+                card_w,
+                l.kpi_workers,
+                &format!("{answering} / {configured}"),
             );
-            ui.label(
-                egui::RichText::new(
-                    "Share read-only statistics with another dashboard on your local network.",
-                )
-                .color(theme::colors::TEXT_MUTED)
-                .size(11.5),
-            );
+            overview_card(ui, card_w, l.kpi_power, &format!("{total_watts:.0} W"));
+            overview_card(ui, card_w, l.kpi_hac_day, &format!("{total_hac:.4}"));
+        });
+
+        ui.add_space(CARD_GAP);
+        worker_table(ui, &l, &rows);
+
+        ui.add_space(CARD_GAP);
+        warning_strip(ui, l.lan_warning);
+
+        ui.add_space(CARD_GAP);
+        self.manage_card(ui, &l);
+        ui.add_space(CARD_GAP);
+        self.share_card(ui, &l, "fleet_share_master");
+        ui.add_space(4.0);
+    }
+
+    /// Add and remove remote workers. Folded shut by default: the screen is a
+    /// dashboard first, and this is the thing you do to it once.
+    fn manage_card(&mut self, ui: &mut egui::Ui, l: &PanelLabels) {
+        collapsible_card(
+            ui,
+            "fleet_manage_miners",
+            l.manage_title,
+            l.manage_sub,
+            |ui| {
+                ui.label(
+                    egui::RichText::new(l.manage_hint)
+                        .size(11.5)
+                        .color(theme::colors::TEXT_MUTED),
+                );
+                ui.add_space(12.0);
+
+                let width = ui.available_width();
+                // Wide enough that "Add miner" stays on one line in the longest
+                // of the nine languages rather than wrapping into a two-line
+                // button beside single-line inputs.
+                let button_w = 186.0;
+                let col = ((width - CARD_GAP * 3.0 - button_w) / 3.0)
+                    .floor()
+                    .max(90.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = CARD_GAP;
+                    theme::field_col(ui, col, l.field_name, |ui, w| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.name_input)
+                                .hint_text("Rig 02")
+                                .desired_width(w),
+                        );
+                    });
+                    theme::field_col(ui, col, l.field_address, |ui, w| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.address_input)
+                                .hint_text("192.168.1.42:19120")
+                                .desired_width(w),
+                        );
+                    });
+                    theme::field_col(ui, col, l.field_token, |ui, w| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.token_input)
+                                .password(true)
+                                .desired_width(w),
+                        );
+                    });
+                    ui.vertical(|ui| {
+                        // Down onto the baseline of the three inputs, past the
+                        // captions above them.
+                        ui.add_space(18.0);
+                        if theme::btn_secondary(ui, l.btn_add_miner).clicked() {
+                            self.add_peer();
+                        }
+                    });
+                });
+
+                if !self.add_error.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(&self.add_error)
+                            .size(11.5)
+                            .color(theme::colors::RED),
+                    );
+                }
+
+                ui.add_space(12.0);
+                if self.config.peers.is_empty() {
+                    ui.label(
+                        egui::RichText::new(l.no_peers)
+                            .size(11.5)
+                            .color(theme::colors::TEXT_DIM),
+                    );
+                    return;
+                }
+
+                let mut remove = None;
+                for (idx, peer) in self.config.peers.iter().enumerate() {
+                    if idx > 0 {
+                        ui.add_space(9.0);
+                        hairline(ui);
+                        ui.add_space(9.0);
+                    }
+                    let result = self.results.iter().find(|r| r.peer.address == peer.address);
+                    let (state, note) = match result {
+                        Some(r) if r.stats.is_some() => (RowState::Online, String::new()),
+                        Some(r) if !r.error.is_empty() => (RowState::Offline, r.error.clone()),
+                        Some(_) => (RowState::Offline, l.state_offline.to_string()),
+                        None => (RowState::Waiting, l.state_waiting.to_string()),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let (dot, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.5, state.dot());
+                        ui.label(
+                            egui::RichText::new(&peer.name)
+                                .size(12.5)
+                                .strong()
+                                .color(theme::colors::TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new(&peer.address)
+                                .size(11.5)
+                                .color(theme::colors::TEXT_DIM),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(l.btn_remove).clicked() {
+                                remove = Some(idx);
+                            }
+                            if !note.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(elide(&note, 64))
+                                        .size(11.0)
+                                        .color(theme::colors::TEXT_DIM),
+                                );
+                            }
+                        });
+                    });
+                }
+                if let Some(idx) = remove {
+                    self.remove_peer(idx);
+                }
+            },
+        );
+    }
+
+    /// Whether other panels may read this miner, on which port, and with which
+    /// token. Drawn on the Master Panel and again on Setup, so the caller names
+    /// the fold state; two cards sharing one id would open and close together.
+    fn share_card(&mut self, ui: &mut egui::Ui, l: &PanelLabels, id: &str) {
+        collapsible_card(ui, id, l.share_title, l.share_sub, |ui| {
+            let mut restart = ui
+                .checkbox(&mut self.config.share_enabled, l.share_enable)
+                .changed();
             ui.add_space(10.0);
 
-            let enabled_changed = ui
-                .checkbox(
-                    &mut self.config.share_enabled,
-                    "Allow this miner to be monitored over LAN",
-                )
-                .changed();
-            let mut restart = enabled_changed;
-            ui.add_enabled_ui(self.config.share_enabled, |ui| {
-                egui::Grid::new("fleet_share_grid")
-                    .num_columns(2)
-                    .spacing([18.0, 8.0])
-                    .show(ui, |ui| {
-                        theme::field_label(ui, "Port:");
+            let enabled = self.config.share_enabled;
+            ui.add_enabled_ui(enabled, |ui| {
+                let width = ui.available_width();
+                let col = ((width - CARD_GAP) * 0.5).floor().max(120.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = CARD_GAP;
+                    theme::field_col(ui, col, l.share_port, |ui, _w| {
                         restart |= ui
                             .add(
                                 egui::DragValue::new(&mut self.config.share_port)
                                     .range(1024..=65535),
                             )
                             .changed();
-                        ui.end_row();
-
-                        theme::field_label(ui, "Access token:");
+                    });
+                    theme::field_col(ui, col, l.share_token, |ui, w| {
                         ui.horizontal(|ui| {
-                            let mut masked_token = self.config.share_token.clone();
+                            // Shown masked and disabled on purpose: this is a
+                            // secret to copy, never a field to retype.
+                            let mut masked = self.config.share_token.clone();
                             ui.add_enabled(
                                 false,
-                                egui::TextEdit::singleline(&mut masked_token)
+                                egui::TextEdit::singleline(&mut masked)
                                     .password(true)
-                                    .desired_width(240.0),
+                                    .desired_width((w - 170.0).max(70.0)),
                             );
-                            if ui.small_button("Copy").clicked() {
+                            if ui.small_button(l.btn_copy).clicked() {
                                 ui.ctx().copy_text(self.config.share_token.clone());
                             }
-                            if ui.small_button("New token").clicked() {
+                            if ui.small_button(l.btn_new_token).clicked() {
                                 match try_generate_token() {
                                     Ok(token) => {
                                         self.config.share_token = token;
@@ -522,381 +795,95 @@ impl FleetState {
                                 }
                             }
                         });
-                        ui.end_row();
                     });
+                });
+                ui.add_space(10.0);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "Add this miner on another panel as <this-PC-IP>:{} and copy the token.",
-                        self.config.share_port
-                    ))
-                    .color(theme::colors::TEXT_MUTED)
-                    .size(11.0),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Trusted LAN only: the stats connection is not encrypted. Never expose this port to the internet.",
-                    )
-                    .color(theme::colors::GOLD)
-                    .size(11.0),
+                    egui::RichText::new(l.share_hint_display(self.config.share_port))
+                        .size(11.0)
+                        .color(theme::colors::TEXT_MUTED),
                 );
             });
 
-            if restart {
-                let token_ready = if self.config.share_token.trim().is_empty() {
-                    match try_generate_token() {
-                        Ok(token) => {
-                            self.config.share_token = token;
-                            true
-                        }
-                        Err(error) => {
-                            self.server_error = error;
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
-                if token_ready {
-                    match self.save() {
-                        Ok(()) => self.sync_server(),
-                        Err(error) => {
-                            self.stop_server_only();
-                            self.server_error = error;
-                        }
-                    }
-                } else {
-                    self.stop_server_only();
-                }
-            }
+            ui.add_space(10.0);
+            warning_strip(ui, l.share_warning);
+
             if !self.server_error.is_empty() {
+                ui.add_space(9.0);
                 ui.label(
                     egui::RichText::new(&self.server_error)
-                        .color(theme::colors::RED)
-                        .size(11.5),
+                        .size(11.5)
+                        .color(theme::colors::RED),
                 );
             } else if self.config.share_enabled {
+                ui.add_space(9.0);
                 ui.label(
-                    egui::RichText::new("Read-only LAN endpoint is active")
-                        .color(theme::colors::ACCENT)
+                    egui::RichText::new(l.share_active)
+                        .size(11.5)
                         .strong()
-                        .size(11.5),
+                        .color(theme::colors::ACCENT),
                 );
+            }
+
+            if restart {
+                self.restart_sharing();
             }
         });
     }
 
-    /// Dedicated "Master Panel" tab: a table of every worker reporting to this panel —
-    /// the local miner plus each remote / VPS miner that enabled sharing and was added
-    /// as a peer. One row per worker: status, live hashrate, estimated HAC/day, power and
-    /// the synced block height (so you can see at a glance which rigs are up and on tip).
-    pub fn show_master(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
-        let online: Vec<&PeerResult> = self.results.iter().filter(|r| r.stats.is_some()).collect();
-        let mut total_hr = local.hashrate_hps;
-        let mut total_hac = local.hac_per_day;
-        let mut total_w = local.watts;
-        for r in &online {
-            if let Some(s) = &r.stats {
-                total_hr += s.hashrate_hps;
-                total_hac += s.hac_per_day;
-                total_w += s.watts;
+    /// Save the sharing settings, then bring the endpoint into line with them.
+    /// A save that fails takes the endpoint down: a running server whose
+    /// settings were not written would come back different after a restart.
+    fn restart_sharing(&mut self) {
+        if self.config.share_token.trim().is_empty() {
+            match try_generate_token() {
+                Ok(token) => self.config.share_token = token,
+                Err(error) => {
+                    self.server_error = error;
+                    self.stop_server_only();
+                    return;
+                }
             }
         }
-
-        theme::section_card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("MASTER PANEL • ALL WORKERS")
-                            .strong()
-                            .size(12.0)
-                            .color(theme::colors::ACCENT),
-                    );
-                    ui.label(
-                        egui::RichText::new("Local miner plus every remote / VPS miner reporting here")
-                            .color(theme::colors::TEXT_MUTED)
-                            .size(11.5),
-                    );
-                });
-                if self.poll_running_generation.is_some() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spinner();
-                    });
-                }
-            });
-            ui.add_space(10.0);
-            egui::Grid::new("master_totals")
-                .num_columns(4)
-                .spacing([12.0, 10.0])
-                .min_col_width(170.0)
-                .show(ui, |ui| {
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::ACCENT,
-                        "Total hashrate",
-                        &format_hashrate(total_hr),
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::GOLD,
-                        "Workers online",
-                        &format!("{} / {}", online.len() + 1, self.config.peers.len() + 1),
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::ACCENT,
-                        "Total power",
-                        &format!("{total_w:.0} W"),
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::GOLD,
-                        "Est. HAC / day",
-                        &format!("{total_hac:.4}"),
-                    );
-                    ui.end_row();
-                });
-
-            ui.add_space(12.0);
-            egui::Grid::new("master_workers")
-                .num_columns(6)
-                .striped(true)
-                .spacing([16.0, 8.0])
-                .min_col_width(90.0)
-                .show(ui, |ui| {
-                    for h in ["Status", "Worker", "Hashrate", "Est. HAC/day", "Power", "Height"] {
-                        ui.label(
-                            egui::RichText::new(h)
-                                .strong()
-                                .size(11.5)
-                                .color(theme::colors::TEXT_MUTED),
-                        );
-                    }
-                    ui.end_row();
-
-                    // Local miner row.
-                    ui.label(egui::RichText::new("\u{25cf}").color(theme::colors::ACCENT));
-                    ui.label("This PC (local)");
-                    ui.label(format_hashrate(local.hashrate_hps));
-                    ui.label(format!("{:.4}", local.hac_per_day));
-                    ui.label(format!("{:.0} W", local.watts));
-                    ui.label(if local.height > 0 {
-                        local.height.to_string()
-                    } else {
-                        "-".to_string()
-                    });
-                    ui.end_row();
-
-                    // One row per configured remote miner.
-                    for peer in &self.config.peers {
-                        let stats = self
-                            .results
-                            .iter()
-                            .find(|r| r.peer.address == peer.address)
-                            .and_then(|r| r.stats.as_ref());
-                        match stats {
-                            Some(s) => {
-                                ui.label(egui::RichText::new("\u{25cf}").color(theme::colors::ACCENT));
-                                ui.label(&peer.name);
-                                ui.label(format_hashrate(s.hashrate_hps));
-                                ui.label(format!("{:.4}", s.hac_per_day));
-                                ui.label(format!("{:.0} W", s.watts));
-                                ui.label(if s.height > 0 {
-                                    s.height.to_string()
-                                } else {
-                                    "-".to_string()
-                                });
-                            }
-                            None => {
-                                ui.label(
-                                    egui::RichText::new("\u{25cf}").color(theme::colors::TEXT_MUTED),
-                                );
-                                ui.label(&peer.name);
-                                ui.label(
-                                    egui::RichText::new("offline").color(theme::colors::TEXT_MUTED),
-                                );
-                                ui.label("-");
-                                ui.label("-");
-                                ui.label("-");
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-
-            if self.config.peers.is_empty() {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "No remote miners yet. On each VPS/remote panel enable LAN sharing, then add it under the Dashboard tab -> Manage miners (name + address + token).",
-                    )
-                    .color(theme::colors::TEXT_MUTED)
-                    .size(11.0),
-                );
+        match self.save() {
+            Ok(()) => self.sync_server(),
+            Err(error) => {
+                self.stop_server_only();
+                self.server_error = error;
             }
-        });
+        }
     }
 
-    pub fn show_dashboard(&mut self, ui: &mut egui::Ui, local: &MiningStatsSnapshot) {
-        let online: Vec<&PeerResult> = self
-            .results
-            .iter()
-            .filter(|result| result.stats.is_some())
-            .collect();
-        let mut total_hashrate = local.hashrate_hps;
-        let mut total_watts = local.watts;
-        let mut total_cost = local.daily_cost_eur;
-        for result in &online {
-            if let Some(stats) = &result.stats {
-                total_hashrate += stats.hashrate_hps;
-                total_watts += stats.watts;
-                total_cost += stats.daily_cost_eur;
+    /// The Setup screen's copy of the LAN sharing card.
+    pub fn show_settings(&mut self, ui: &mut egui::Ui) {
+        let l = crate::i18n::panel_labels(crate::i18n::active_lang());
+        self.share_card(ui, &l, "fleet_share_setup");
+    }
+
+    fn remove_peer(&mut self, idx: usize) {
+        if idx >= self.config.peers.len() {
+            return;
+        }
+        let removed = self.config.peers.remove(idx);
+        match self.save() {
+            Ok(()) => {
+                let kept: HashSet<String> = self
+                    .config
+                    .peers
+                    .iter()
+                    .map(|peer| peer.address.clone())
+                    .collect();
+                self.results
+                    .retain(|result| kept.contains(&result.peer.address));
+                self.invalidate_peer_set();
+            }
+            Err(error) => {
+                // The file is the truth. If it would not take the removal, the
+                // peer is still in the fleet and the table must keep saying so.
+                self.config.peers.insert(idx, removed);
+                self.add_error = error;
             }
         }
-        let total_hashrate_display = format_hashrate(total_hashrate);
-        let online_display = format!("{} / {}", online.len() + 1, self.config.peers.len() + 1);
-
-        theme::section_card().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("MINER FLEET • MULTI-MINER")
-                            .strong()
-                            .size(12.0)
-                            .color(theme::colors::ACCENT),
-                    );
-                    ui.label(
-                        egui::RichText::new("Local miner plus all reachable LAN miners")
-                            .color(theme::colors::TEXT_MUTED)
-                            .size(11.5),
-                    );
-                });
-                if self.poll_running_generation.is_some() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spinner();
-                    });
-                }
-            });
-            ui.add_space(10.0);
-            egui::Grid::new("fleet_totals")
-                .num_columns(4)
-                .spacing([12.0, 10.0])
-                .min_col_width(180.0)
-                .show(ui, |ui| {
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::ACCENT,
-                        "Total hashrate",
-                        &total_hashrate_display,
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::GOLD,
-                        "Online panels",
-                        &online_display,
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::ACCENT,
-                        "Total power",
-                        &format!("{total_watts:.0} W"),
-                    );
-                    theme::show_stat_card(
-                        ui,
-                        theme::colors::GOLD,
-                        "Fleet cost / day",
-                        &format!("€{total_cost:.2}"),
-                    );
-                    ui.end_row();
-                });
-
-            ui.add_space(8.0);
-            ui.collapsing("Manage miners", |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "On every remote panel enable LAN sharing, then enter its address and token here.",
-                    )
-                    .color(theme::colors::TEXT_MUTED)
-                    .size(11.0),
-                );
-                ui.add_space(6.0);
-                egui::Grid::new("fleet_add_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 7.0])
-                    .show(ui, |ui| {
-                        theme::field_label(ui, "Miner name:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.name_input)
-                                .hint_text("Rig 2")
-                                .desired_width(300.0),
-                        );
-                        ui.end_row();
-                        theme::field_label(ui, "LAN address:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.address_input)
-                                .hint_text("192.168.1.42:19120")
-                                .desired_width(300.0),
-                        );
-                        ui.end_row();
-                        theme::field_label(ui, "Access token:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.token_input)
-                                .password(true)
-                                .desired_width(300.0),
-                        );
-                        ui.end_row();
-                    });
-                if theme::btn_secondary(ui, "Add miner").clicked() {
-                    self.add_peer();
-                }
-                if !self.add_error.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&self.add_error)
-                            .color(theme::colors::RED)
-                            .size(11.5),
-                    );
-                }
-
-                let mut remove = None;
-                for (idx, peer) in self.config.peers.iter().enumerate() {
-                    let result = self.results.iter().find(|r| r.peer.address == peer.address);
-                    let (status, color) = match result {
-                        Some(r) if r.stats.is_some() => ("Online".to_string(), theme::colors::ACCENT),
-                        Some(r) if !r.error.is_empty() => (r.error.clone(), theme::colors::RED),
-                        _ => ("Waiting…".to_string(), theme::colors::TEXT_MUTED),
-                    };
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{} • {}", peer.name, peer.address))
-                                .color(theme::colors::TEXT)
-                                .strong(),
-                        );
-                        ui.label(egui::RichText::new(status).color(color).size(11.5));
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(idx);
-                        }
-                    });
-                }
-                if let Some(idx) = remove {
-                    let removed = self.config.peers.remove(idx);
-                    match self.save() {
-                        Ok(()) => {
-                            self.results.retain(|result| {
-                                self.config
-                                    .peers
-                                    .iter()
-                                    .any(|peer| peer.address == result.peer.address)
-                            });
-                            self.invalidate_peer_set();
-                        }
-                        Err(error) => {
-                            self.config.peers.insert(idx, removed);
-                            self.add_error = error;
-                        }
-                    }
-                }
-            });
-        });
     }
 
     fn add_peer(&mut self) {
@@ -975,6 +962,433 @@ impl Drop for FleetState {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Master Panel's own drawing.
+//
+// The sizes and colours below are measured off the commissioned mockup, not
+// picked: a 30px header band filled like a card, 34px rows sitting straight on
+// the page, and one hairline between them. That is what lets a fleet table be
+// read at a glance, and it is why the rows are not striped and why the only
+// amber on the screen is the status dot and the words at the top right.
+// ---------------------------------------------------------------------------
+
+const CARD_GAP: f32 = 12.0;
+const TABLE_ROUND: f32 = 12.0;
+const TABLE_HEAD_H: f32 = 30.0;
+const TABLE_ROW_H: f32 = 34.0;
+/// A row that has to explain itself is taller by one small line.
+const TABLE_ROW_DETAIL_H: f32 = 46.0;
+/// The left edge of the four value columns, as a fraction of the table's width.
+const TABLE_COLS: [f32; 4] = [0.303, 0.503, 0.683, 0.843];
+const TABLE_DOT_X: f32 = 13.0;
+const TABLE_NAME_X: f32 = 35.0;
+const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(24, 24, 24);
+/// The warning strip: a near-black amber wash, not a colour field. It has to be
+/// readable every time the screen is opened without shouting every time.
+const WARN_BG: egui::Color32 = egui::Color32::from_rgb(14, 11, 5);
+const WARN_BORDER: egui::Color32 = egui::Color32::from_rgb(41, 32, 16);
+const WARN_TEXT: egui::Color32 = egui::Color32::from_rgb(151, 139, 119);
+/// The cell of a worker that is not reporting. An en dash, written as an escape
+/// so the character itself never has to survive a copy and paste.
+const NO_VALUE: &str = "\u{2013}";
+const LOCAL_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    Online,
+    Waiting,
+    Offline,
+}
+
+impl RowState {
+    /// Amber for a worker that is answering, dim amber while the first poll is
+    /// still out, grey for one that is not there. Never green: this panel can
+    /// say a worker replied, not that it is healthy.
+    fn dot(self) -> egui::Color32 {
+        match self {
+            RowState::Online => theme::colors::ACCENT,
+            RowState::Waiting => theme::colors::GOLD_DIM,
+            RowState::Offline => theme::colors::TEXT_DIM,
+        }
+    }
+}
+
+struct WorkerRow {
+    name: String,
+    /// Second line under the name, drawn only when there is something to say:
+    /// why this worker has no numbers. Empty for a worker that is answering.
+    detail: String,
+    state: RowState,
+    hashrate: f64,
+    hac_day: f64,
+    watts: f64,
+    height: u64,
+}
+
+impl WorkerRow {
+    fn height_px(&self) -> f32 {
+        if self.detail.is_empty() {
+            TABLE_ROW_H
+        } else {
+            TABLE_ROW_DETAIL_H
+        }
+    }
+
+    fn cells(&self) -> [String; 4] {
+        if self.state != RowState::Online {
+            return [
+                NO_VALUE.to_string(),
+                NO_VALUE.to_string(),
+                NO_VALUE.to_string(),
+                NO_VALUE.to_string(),
+            ];
+        }
+        [
+            format_hashrate(self.hashrate),
+            format!("{:.4}", self.hac_day),
+            format!("{:.0} W", self.watts),
+            if self.height > 0 {
+                crate::dashboard::group_thousands(self.height)
+            } else {
+                NO_VALUE.to_string()
+            },
+        ]
+    }
+}
+
+/// True when the worker on this machine is currently writing its stats file.
+///
+/// The file is removed when mining stops, so its absence is a stop, and a file
+/// that stopped moving is a worker that stopped answering. This is the same
+/// staleness rule a peer's snapshot is held to, applied to the one worker that
+/// does not arrive over the network.
+fn local_worker_reporting(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= MAX_STATS_AGE,
+        // A file stamped in the future is a clock that moved, not a dead rig.
+        Err(_) => true,
+    }
+}
+
+fn prop(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Proportional)
+}
+
+/// Cut a string to a printable length. The table paints straight onto its own
+/// rectangle, so an over-long worker name would run across the next column
+/// rather than wrap.
+fn elide(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = chars[..max_chars.saturating_sub(1)].iter().collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The page heading: the screen's name, one quiet line about it, and the note
+/// at the far right that says what this screen is allowed to do.
+fn page_header(ui: &mut egui::Ui, title: &str, sub: &str, busy: Option<&str>, badge: &str) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(25.0)
+                    .strong()
+                    .color(theme::colors::TEXT),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(sub)
+                    .size(12.0)
+                    .color(theme::colors::TEXT_MUTED),
+            );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.label(
+                egui::RichText::new(badge.to_uppercase())
+                    .size(10.5)
+                    .color(theme::colors::ACCENT),
+            );
+            if let Some(busy) = busy {
+                ui.label(
+                    egui::RichText::new(busy)
+                        .size(10.5)
+                        .color(theme::colors::TEXT_DIM),
+                );
+            }
+        });
+    });
+}
+
+/// One of the four figures across the top of the Master Panel.
+fn overview_card(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
+    egui::Frame::none()
+        .fill(theme::colors::BG_INPUT)
+        .stroke(egui::Stroke::new(1.0, theme::colors::BORDER_SOFT))
+        .rounding(egui::Rounding::same(12.0))
+        .inner_margin(egui::Margin::symmetric(15.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width((width - 30.0).max(1.0));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(
+                    egui::RichText::new(label.to_uppercase())
+                        .size(10.5)
+                        .color(theme::colors::TEXT_DIM),
+                );
+                ui.label(
+                    egui::RichText::new(value)
+                        .size(19.0)
+                        .strong()
+                        .color(theme::colors::TEXT),
+                );
+            });
+        });
+}
+
+/// The worker table.
+///
+/// Painted directly rather than assembled from widgets: the mockup's table is a
+/// filled header band over unfilled rows with one hairline between them, and a
+/// grid of labels cannot produce that without a fill behind every cell.
+fn worker_table(ui: &mut egui::Ui, l: &PanelLabels, rows: &[WorkerRow]) {
+    let width = ui.available_width();
+    let height = TABLE_HEAD_H + rows.iter().map(WorkerRow::height_px).sum::<f32>();
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter();
+    let head = egui::Rect::from_min_size(rect.min, egui::Vec2::new(width, TABLE_HEAD_H));
+    painter.rect_filled(
+        head,
+        egui::Rounding {
+            nw: TABLE_ROUND,
+            ne: TABLE_ROUND,
+            sw: 0.0,
+            se: 0.0,
+        },
+        theme::colors::BG_CARD,
+    );
+
+    let headings = [
+        l.col_worker,
+        l.col_hashrate,
+        l.col_hac_day,
+        l.col_power,
+        l.col_height,
+    ];
+    painter.text(
+        egui::pos2(rect.left() + TABLE_NAME_X, head.center().y),
+        egui::Align2::LEFT_CENTER,
+        headings[0].to_uppercase(),
+        prop(10.5),
+        theme::colors::TEXT_DIM,
+    );
+    for (i, fraction) in TABLE_COLS.iter().enumerate() {
+        painter.text(
+            egui::pos2(rect.left() + width * fraction, head.center().y),
+            egui::Align2::LEFT_CENTER,
+            headings[i + 1].to_uppercase(),
+            prop(10.5),
+            theme::colors::TEXT_DIM,
+        );
+    }
+
+    // The name column runs to the first value column, less a gutter.
+    let name_budget = ((width * TABLE_COLS[0] - TABLE_NAME_X - 14.0) / 6.6).max(8.0) as usize;
+    let detail_budget = ((width - TABLE_NAME_X - 20.0) / 5.6).max(12.0) as usize;
+
+    let mut y = rect.top() + TABLE_HEAD_H;
+    for row in rows {
+        let row_h = row.height_px();
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(rect.left(), y), egui::Vec2::new(width, 1.0)),
+            egui::Rounding::ZERO,
+            HAIRLINE,
+        );
+        let line_y = if row.detail.is_empty() {
+            y + row_h * 0.5
+        } else {
+            y + 16.0
+        };
+        painter.circle_filled(
+            egui::pos2(rect.left() + TABLE_DOT_X, line_y),
+            3.5,
+            row.state.dot(),
+        );
+        painter.text(
+            egui::pos2(rect.left() + TABLE_NAME_X, line_y),
+            egui::Align2::LEFT_CENTER,
+            elide(&row.name, name_budget),
+            prop(12.5),
+            if row.state == RowState::Online {
+                theme::colors::TEXT
+            } else {
+                theme::colors::TEXT_MUTED
+            },
+        );
+        if !row.detail.is_empty() {
+            painter.text(
+                egui::pos2(rect.left() + TABLE_NAME_X, y + row_h - 14.0),
+                egui::Align2::LEFT_CENTER,
+                elide(&row.detail, detail_budget),
+                prop(10.5),
+                theme::colors::TEXT_DIM,
+            );
+        }
+        let cells = row.cells();
+        let cell_color = if row.state == RowState::Online {
+            theme::colors::TEXT_MUTED
+        } else {
+            theme::colors::TEXT_DIM
+        };
+        for (i, fraction) in TABLE_COLS.iter().enumerate() {
+            painter.text(
+                egui::pos2(rect.left() + width * fraction, line_y),
+                egui::Align2::LEFT_CENTER,
+                &cells[i],
+                prop(12.0),
+                cell_color,
+            );
+        }
+        y += row_h;
+    }
+
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::same(TABLE_ROUND),
+        egui::Stroke::new(1.0, theme::colors::BORDER_SOFT),
+    );
+}
+
+/// The one thing on this screen an operator must not skip.
+fn warning_strip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::none()
+        .fill(WARN_BG)
+        .stroke(egui::Stroke::new(1.0, WARN_BORDER))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(16.0, 11.0))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            ui.label(egui::RichText::new(text).size(11.5).color(WARN_TEXT));
+        });
+}
+
+fn hairline(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), 1.0),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::ZERO, HAIRLINE);
+}
+
+/// The open / closed marker, drawn rather than typed: the bundled font has no
+/// caret glyph, and a text arrow at this size reads as a punctuation mistake.
+fn chevron(painter: &egui::Painter, center: egui::Pos2, open: bool, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.4, color);
+    let (dx, dy) = (4.5_f32, 2.6_f32);
+    let (near, far) = if open { (dy, -dy) } else { (-dy, dy) };
+    painter.line_segment(
+        [
+            egui::pos2(center.x - dx, center.y + near),
+            egui::pos2(center.x, center.y + far),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y + far),
+            egui::pos2(center.x + dx, center.y + near),
+        ],
+        stroke,
+    );
+}
+
+/// A card whose body folds away: title, one quiet line beside it, a caret at
+/// the right, and the content under a hairline once it is open.
+///
+/// `id` names the fold state, so the same card drawn on two screens can be open
+/// on one and shut on the other.
+fn collapsible_card(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    sub: &str,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    let id = ui.make_persistent_id(id);
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    egui::Frame::none()
+        .fill(theme::colors::BG_CARD)
+        .stroke(egui::Stroke::new(1.0, theme::colors::BORDER_SOFT))
+        .rounding(egui::Rounding::same(14.0))
+        .inner_margin(egui::Margin::symmetric(18.0, 15.0))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            let (rect, response) =
+                ui.allocate_exact_size(egui::Vec2::new(width, 22.0), egui::Sense::click());
+            if ui.is_rect_visible(rect) {
+                let hovered = response.hovered();
+                let title_color = if hovered {
+                    theme::colors::ACCENT
+                } else {
+                    theme::colors::TEXT
+                };
+                let painter = ui.painter();
+                let galley = painter.layout_no_wrap(title.to_owned(), prop(14.5), title_color);
+                let title_w = galley.rect.width();
+                painter.galley(
+                    egui::pos2(rect.left(), rect.center().y - galley.rect.height() * 0.5),
+                    galley,
+                    title_color,
+                );
+                if !sub.is_empty() {
+                    painter.text(
+                        egui::pos2(rect.left() + title_w + 12.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        sub,
+                        prop(11.5),
+                        theme::colors::TEXT_DIM,
+                    );
+                }
+                chevron(
+                    painter,
+                    egui::pos2(rect.right() - 9.0, rect.center().y),
+                    open,
+                    if hovered {
+                        theme::colors::TEXT
+                    } else {
+                        theme::colors::TEXT_MUTED
+                    },
+                );
+            }
+            if response.clicked() {
+                open = !open;
+                ui.data_mut(|d| d.insert_temp(id, open));
+            }
+            if open {
+                ui.add_space(13.0);
+                hairline(ui);
+                ui.add_space(13.0);
+                content(ui);
+            }
+        });
 }
 
 fn format_hashrate(hashrate: f64) -> String {
@@ -1694,7 +2108,7 @@ fn validate_stats_snapshot(stats: &MiningStatsSnapshot) -> Result<(), String> {
     }
 
     if stats.configured_work_groups > 100_000_000
-        || stats.oom_work_groups > 100_000_000
+        || stats.oom_allowed_work_groups > 100_000_000
         || stats.thermal_cap_work_groups > 100_000_000
         || stats.effective_work_groups > 100_000_000
         || stats.active_cpu_threads > 1_000_000

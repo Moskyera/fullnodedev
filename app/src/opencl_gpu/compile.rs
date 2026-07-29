@@ -324,13 +324,13 @@ pub(crate) fn compile_program_from_source(
     amd_fast: bool,
 ) -> Option<Program> {
     if let Err(error) = newest_opencl_source_mtime(opencldir, kernel_path) {
-        eprintln!("[OpenCL] Unsafe or invalid kernel tree: {error}");
+        wlogerr!("[OpenCL] Unsafe or invalid kernel tree: {error}");
         return None;
     }
     let kernel_bytes = match read_bounded_regular_file(kernel_path, MAX_OPENCL_SOURCE_BYTES) {
         Ok(source) => source,
         Err(error) => {
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] Cannot read kernel {}: {error}",
                 kernel_path.display()
             );
@@ -340,7 +340,7 @@ pub(crate) fn compile_program_from_source(
     let kernel_src = match String::from_utf8(kernel_bytes) {
         Ok(source) => source,
         Err(error) => {
-            eprintln!(
+            wlogerr!(
                 "[OpenCL] Kernel {} is not valid UTF-8: {error}",
                 kernel_path.display()
             );
@@ -350,14 +350,14 @@ pub(crate) fn compile_program_from_source(
     let include_option = match compiler_include_option(opencldir) {
         Ok(option) => option,
         Err(error) => {
-            eprintln!("[OpenCL] Invalid kernel directory: {error}");
+            wlogerr!("[OpenCL] Invalid kernel directory: {error}");
             return None;
         }
     };
 
     let arch_defs = gpu_arch::compile_defines(vendor, arch_slug, amd_fast);
     // -cl-uniform-work-group-size is an optional OpenCL 2.0 optimization hint that
-    // NVIDIA's OpenCL compiler does not recognize — it rejects the whole build
+    // NVIDIA's OpenCL compiler does not recognize; it rejects the whole build
     // ("Don't understand command line argument ..."). Omit it on NVIDIA; AMD and
     // Intel keep it unchanged (their kernel build is byte-identical to before).
     let uniform_wg = if vendor == gpu_arch::GpuVendor::Nvidia {
@@ -368,7 +368,7 @@ pub(crate) fn compile_program_from_source(
     let compile_options = format!(
         "-cl-std=CL2.0 -cl-fast-relaxed-math -cl-mad-enable{uniform_wg} {include_option}{arch_defs}"
     );
-    println!("[OpenCL] compile opts:{arch_defs}");
+    wlogln!("[OpenCL] compile opts:{arch_defs}");
     let program = match Program::builder()
         .src(&kernel_src)
         .devices(device)
@@ -377,7 +377,7 @@ pub(crate) fn compile_program_from_source(
     {
         Ok(program) => program,
         Err(error) => {
-            eprintln!("OpenCL program compilation error: {error}");
+            wlogerr!("OpenCL program compilation error: {error}");
             return None;
         }
     };
@@ -386,14 +386,14 @@ pub(crate) fn compile_program_from_source(
     match program.info(ProgramInfo::Binaries) {
         Ok(ProgramInfoResult::Binaries(binaries)) => {
             if let Some(binary) = binaries.first() {
-                println!("Saving OpenCL program in binary file...");
+                wlogln!("Saving OpenCL program in binary file...");
                 if let Err(error) = write_cache_atomically(binary_path, binary) {
-                    eprintln!("[OpenCL] Cannot cache {}: {error}", binary_path.display());
+                    wlogerr!("[OpenCL] Cannot cache {}: {error}", binary_path.display());
                 }
             }
         }
-        Ok(_) => eprintln!("[OpenCL] Driver returned no program binaries; cache disabled"),
-        Err(error) => eprintln!("[OpenCL] Cannot read compiled binary for cache: {error}"),
+        Ok(_) => wlogerr!("[OpenCL] Driver returned no program binaries; cache disabled"),
+        Err(error) => wlogerr!("[OpenCL] Cannot read compiled binary for cache: {error}"),
     }
 
     Some(program)

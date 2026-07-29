@@ -17,7 +17,7 @@ pub const OOM_RECOVERY_BATCHES: u32 = 16;
 /// whole session after a single transient CL_OUT_OF_RESOURCES.
 pub const OOM_SLOW_RAMP_BATCHES: u32 = OOM_RECOVERY_BATCHES * 4;
 
-/// Per-device work_groups state — lives on [`crate::opencl_gpu::OpenclGpuHandle`].
+/// Per-device work_groups state, lives on [`crate::opencl_gpu::OpenclGpuHandle`].
 pub struct GpuOomState {
     base_workgroups: u32,
     effective_workgroups: AtomicU32,
@@ -83,7 +83,7 @@ impl GpuOomState {
         let floor = self.oom_floor_wg.max(1);
         let next = (cur / 2).max(floor);
         if next < cur {
-            eprintln!(
+            wlogerr!(
                 "[efficiency] OpenCL error - reducing work_groups {} -> {} (floor={})",
                 cur, next, floor
             );
@@ -134,7 +134,7 @@ impl GpuOomState {
                 self.effective_workgroups.store(base, Relaxed);
                 self.oom_reduced.store(false, Relaxed);
                 self.success_batches_since_oom.store(0, Relaxed);
-                println!("[efficiency] GPU stable - restored work_groups to {}", base);
+                wlogln!("[efficiency] GPU stable - restored work_groups to {}", base);
             }
             return;
         }
@@ -151,7 +151,7 @@ impl GpuOomState {
             if next >= base {
                 self.oom_reduced.store(false, Relaxed);
             }
-            println!(
+            wlogln!(
                 "[efficiency] GPU stable for {} batches - raising work_groups {} -> {}",
                 n, cur, next
             );

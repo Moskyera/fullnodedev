@@ -1,8 +1,18 @@
 include! {"version.rs"}
 
+// First, and `macro_use`, because `wlogln!` and `wlogerr!` replace `println!`
+// and `eprintln!` throughout this crate: they must be in scope for every module
+// declared below.
+#[macro_use]
+pub mod worker_log;
+
 pub mod efficiency;
 pub mod gpu_arch;
 pub mod gpu_oom;
+/// Windows only: the AMD driver's own library is the only GPU temperature
+/// source that exists on a consumer Windows install.
+#[cfg(windows)]
+pub mod gpu_temp_adl;
 pub mod hash_util;
 pub mod mining_batch;
 pub mod mining_guard;

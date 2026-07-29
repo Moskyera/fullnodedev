@@ -1,6 +1,6 @@
 // bench_mainnet_repeat16.rs
 //
-// ADDITIVE MODULE — does not replace or modify any existing file.
+// ADDITIVE MODULE: does not replace or modify any existing file.
 // Drop-in benchmark that measures GPU block-mining throughput at the SAME
 // X16RS round count the live Hacash mainnet uses (repeat = 16), and prints
 // every raw number a reviewer needs to reproduce/verify the figure:
@@ -197,7 +197,7 @@ pub fn measure_at_height(
         Ok(used)
     };
 
-    // Warm-up (JIT / clocks / caches) — not counted.
+    // Warm-up (JIT / clocks / caches), not counted.
     let mut nonce = 0u32;
     for w in 0..WARMUP_BATCHES {
         run_batch(nonce).map_err(|e| format!("warm-up batch {} failed: {e}", w + 1))?;
@@ -262,8 +262,8 @@ pub fn run_repeat_comparison(
     unitsize: &u32,
     seconds: u64,
 ) {
-    println!("[repeat16] Mainnet-representative benchmark (x16rs repeat=16).");
-    println!(
+    wlogln!("[repeat16] Mainnet-representative benchmark (x16rs repeat=16).");
+    wlogln!(
         "[repeat16] Every measured batch is CPU-verified with x16rs::block_hash before it counts."
     );
 
@@ -281,11 +281,11 @@ pub fn run_repeat_comparison(
         false,
     );
     if resources.is_empty() {
-        println!("[repeat16] No OpenCL devices.");
+        wlogln!("[repeat16] No OpenCL devices.");
         return;
     }
     if resources.len() != 1 {
-        println!(
+        wlogln!(
             "[repeat16] Detected {} devices. Run one device at a time (set [gpu] device_ids to a single id) so the number is unambiguous.",
             resources.len()
         );
@@ -311,34 +311,34 @@ pub fn run_repeat_comparison(
         seconds,
     );
 
-    println!("\n================ REPEAT-16 (MAINNET) ================");
+    wlogln!("\n================ REPEAT-16 (MAINNET) ================");
     match &r16 {
-        Ok(rep) => println!("{}", rep.render()),
-        Err(e) => println!("  REJECTED: {e}"),
+        Ok(rep) => wlogln!("{}", rep.render()),
+        Err(e) => wlogln!("  REJECTED: {e}"),
     }
-    println!("\n================ REPEAT-1  (auto-tune reference) ====");
+    wlogln!("\n================ REPEAT-1  (auto-tune reference) ====");
     match &r1 {
-        Ok(rep) => println!("{}", rep.render()),
-        Err(e) => println!("  REJECTED: {e}"),
+        Ok(rep) => wlogln!("{}", rep.render()),
+        Err(e) => wlogln!("  REJECTED: {e}"),
     }
 
     if let (Ok(a), Ok(b)) = (&r16, &r1) {
         if a.nonces_per_sec > 0.0 {
             let ratio = b.nonces_per_sec / a.nonces_per_sec;
-            println!("\n================ SUMMARY ============================");
-            println!(
+            wlogln!("\n================ SUMMARY ============================");
+            wlogln!(
                 "  repeat=1  : {}\n  repeat=16 : {}\n  ratio     : {:.2}x  (expected ~16x; the repeat=1 figure is NOT a mainnet rate)",
                 fmt_rate(b.nonces_per_sec),
                 fmt_rate(a.nonces_per_sec),
                 ratio
             );
-            println!(
+            wlogln!(
                 "  On the live 16-round mainnet, THIS rig produces {} of block hashes.",
                 fmt_rate(a.nonces_per_sec)
             );
         }
     }
-    println!("====================================================");
+    wlogln!("====================================================");
 }
 
 /// Optional zero-touch trigger: if HACASH_REPEAT16_BENCH_SECONDS is set to a

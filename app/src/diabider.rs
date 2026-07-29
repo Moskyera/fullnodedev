@@ -25,7 +25,7 @@ pub fn start_diamond_auto_bidding(mut worker: Worker, hnode: Arc<dyn HNoder>) {
 
     macro_rules! printerr {
         ( $f: expr, $( $v: expr ),+ ) => {
-            println!("\n\n{} {}\n\n",
+            wlogln!("\n\n{} {}\n\n",
                 "[Diamond Auto Bid Config Warning]",
                 format!($f, $( $v ),+)
             );
@@ -45,7 +45,7 @@ pub fn start_diamond_auto_bidding(mut worker: Worker, hnode: Arc<dyn HNoder>) {
         return;
     }
 
-    println!(
+    wlogln!(
         "[Diamond Auto Bidding] start with account {} min fee {} and max fee {}.",
         &cnf.dmer_bid_account.readable(),
         &bidmin,
@@ -99,7 +99,7 @@ fn check_bidding_step(
 
     macro_rules! printerr {
         ( $f: expr, $( $v: expr ),+ ) => {
-            println!("\n\n{} {}\n\n",
+            wlogln!("\n\n{} {}\n\n",
                 "[Diamond Auto Build Error]",
                 format!($f, $( $v ),+)
             );
