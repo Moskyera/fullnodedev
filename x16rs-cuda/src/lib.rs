@@ -373,7 +373,7 @@ mod driver {
 
     // Mirrors CUDA's `cudaFuncAttributes` (leading fields only; trailing reserved for
     // forward-compat with newer toolkits). Used to clamp the launch block size to the
-    // kernel's own `maxThreadsPerBlock` — a register-heavy kernel can have a per-kernel
+    // kernel's own `maxThreadsPerBlock`, a register-heavy kernel can have a per-kernel
     // limit below the device's 1024, and launching above it returns
     // cudaErrorInvalidConfiguration (9).
     #[repr(C)]
@@ -498,19 +498,62 @@ mod driver {
         );
     }
 
+    /// Text for a `cudaError_t`, without trusting the runtime to supply any.
+    ///
+    /// `cudaGetErrorString` is documented to return a string for every code, and
+    /// it does not. Measured on CUDA 13.3 with no NVIDIA driver present, the
+    /// very first call a miner makes - `cudaGetDeviceCount` - returns 35
+    /// (cudaErrorInsufficientDriver) and `cudaGetErrorString(35)` returns NULL,
+    /// because 35 is one of the codes CUDA 13 dropped from its table. The
+    /// previous `CStr::from_ptr(cudaGetErrorString(err))` then dereferenced NULL
+    /// and the process died with an access violation.
+    ///
+    /// That is not a corner case, it is the most common CUDA failure there is:
+    /// no driver, or a driver older than the runtime the binary was built
+    /// against. A Colab session whose GPU runtime is not attached hits it on the
+    /// first call. `panic = 'unwind'` cannot catch it either - an access
+    /// violation is not a Rust panic - so the miner did not fall back to CPU, it
+    /// died, and the operator got no message at all.
+    ///
+    /// So: a null pointer becomes text, and the codes that mean "there is no
+    /// usable GPU here" get an explanation an operator can act on rather than a
+    /// bare number.
+    fn error_text(err: CudaError_t) -> String {
+        let raw = unsafe { cudaGetErrorString(err) };
+        let from_runtime = if raw.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+        };
+        let hint = match err {
+            35 => Some(
+                "the installed NVIDIA driver is older than the CUDA runtime this binary was \
+                 built against, or there is no NVIDIA driver at all",
+            ),
+            100 => Some("no CUDA-capable device is present"),
+            101 => Some("the CUDA device index asked for does not exist"),
+            _ => None,
+        };
+        match (from_runtime, hint) {
+            (Some(text), Some(hint)) if !text.is_empty() => format!("{text} ({hint})"),
+            (Some(text), None) if !text.is_empty() => text,
+            (_, Some(hint)) => hint.to_string(),
+            (_, None) => format!(
+                "the CUDA runtime supplied no description for error {err}"
+            ),
+        }
+    }
+
     fn check(err: CudaError_t) -> CudaResult<()> {
         if err == CUDA_SUCCESS {
             Ok(())
         } else {
-            unsafe {
-                let cstr = CStr::from_ptr(cudaGetErrorString(err));
-                // Carry the raw code, not just the text, so sticky context faults can
-                // be told apart from per-launch failures (see CudaError::is_sticky).
-                Err(CudaError::Driver {
-                    code: err,
-                    message: cstr.to_string_lossy().into_owned(),
-                })
-            }
+            // Carry the raw code, not just the text, so sticky context faults can
+            // be told apart from per-launch failures (see CudaError::is_sticky).
+            Err(CudaError::Driver {
+                code: err,
+                message: error_text(err),
+            })
         }
     }
 
@@ -717,7 +760,7 @@ mod driver {
             y: u32,
             z: u32,
         }
-        // RUNTIME API cudaLaunchKernel — real signature:
+        // RUNTIME API cudaLaunchKernel, real signature:
         //   cudaError_t cudaLaunchKernel(const void*, dim3, dim3, void**, size_t, cudaStream_t)
         // dim3 is passed BY VALUE and `args` comes BEFORE sharedMem/stream. The previous
         // declaration used the DRIVER API cuLaunchKernel layout (grid/block as six u32s,
@@ -985,7 +1028,7 @@ mod driver {
         // Each workgroup's kernel reduction returns the lexicographically SMALLEST hash
         // it found (diff_big_hash keeps the smaller of each pair), because mining wants
         // the hash closest to zero (hash < target). So aggregate across workgroups by
-        // keeping the MINIMUM too — replace the running best when the candidate is
+        // keeping the MINIMUM too, replace the running best when the candidate is
         // smaller, i.e. when best > candidate.
         let mut best_nonce = 0u32;
         let mut best_hash = [0u8; HASH_BYTES];
@@ -1483,6 +1526,40 @@ mod tests {
                 hits.saturating_sub(stored as u64),
                 want_dropped,
                 "dropped count for {hits} hits"
+            );
+        }
+    }
+
+    /// The blake IV must not be written out in block_miner.cu.
+    ///
+    /// It was, and the cost was precise: `scripts/x16rs_gate_trees.py` builds
+    /// the fault trees that prove the equivalence gate can FAIL by rewriting
+    /// `x16rs/opencl/x16rs.cl`, and one of the three flips a bit of blake's IV.
+    /// With a second copy here, that tree compiled to PTX byte-identical to the
+    /// shipping kernel (measured: `diff` of the two .ptx files was empty), so
+    /// the CUDA gate would have returned PASS for a kernel that was broken on
+    /// purpose and the proof would have been hollow.
+    ///
+    /// A grep is a crude test. It is also the only one that fails at the moment
+    /// someone pastes the constant back in, which is when it is cheap to fix
+    /// rather than after a gate run on Colab has been believed.
+    #[test]
+    fn the_blake_iv_is_not_duplicated_into_the_cuda_source() {
+        let cu = include_str!("../cuda/block_miner.cu");
+        assert!(
+            cu.contains("X16RS_H_BLAKE_INIT"),
+            "block_miner.cu must take the blake IV from x16rs.cl's shared macro"
+        );
+        for word in [
+            "0x6A09E667F3BCC908",
+            "0xBB67AE8584CAA73B",
+            "0x5BE0CD19137E2179",
+        ] {
+            assert!(
+                !cu.contains(word),
+                "block_miner.cu spells out the blake IV word {word}. A fault injected into \
+                 x16rs.cl would then leave this backend untouched, and the CUDA gate would pass \
+                 a kernel that is wrong on purpose."
             );
         }
     }

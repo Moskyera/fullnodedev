@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
-# Phase 1: CUDA smoke for Google Colab FREE TIER (T4) or any Linux NVIDIA box.
+# CUDA crate smoke for Google Colab FREE TIER (T4) or any Linux NVIDIA box.
 #
-# FREE TIER MODE (default): only x16rs-cuda unit tests (proves GPU kernels).
+# THIS IS NOT THE EQUIVALENCE GATE. It runs the x16rs-cuda test suite: the
+# genesis vector, the differential tests over a few thousand inputs, and the pool
+# share list's bookkeeping (overflow, counter isolation, readback bounds). That
+# is real coverage and it is worth having, but the claim "every hash this card
+# computes equals x16rs::block_hash" comes from
+#
+#   bash scripts/mining-nvidia/colab_cuda_gate.sh
+#
+# which compares whole windows byte for byte and is itself proved able to fail.
+# Run the gate first; run this after it.
+#
+# FREE TIER MODE (default): tests only.
 #   Skips full poworker --release (that can run for hours with workspace LTO).
 #
 # Full mode (optional, Pro / long session):
@@ -39,7 +50,7 @@ SUMMARY="${LOG_DIR}/latest-summary.txt"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "=============================================="
-echo " Hacash CUDA smoke — ${MODE}"
+echo " Hacash CUDA smoke: ${MODE}"
 echo " time (UTC): ${STAMP}"
 echo " repo:       ${ROOT}"
 echo " log:        ${LOG}"
@@ -126,8 +137,17 @@ fi
 echo ""
 echo "=== [required] cargo test -p x16rs-cuda --features cuda ==="
 echo "    (debug build; NOT full miner; free-tier safe)"
-if run_with_heartbeat "x16rs-cuda-tests" \
-  cargo test -p x16rs-cuda --features cuda -- --nocapture; then
+
+# The guards below read the test output back. They must NOT read "$LOG": that
+# file is written by the `exec > >(tee ...)` at the top, whose tee is a separate
+# process, so a grep run microseconds after the test finishes can read a file
+# that is still short. Capture the test's own output to its own file and grep
+# that; the pipeline's status is cargo's because pipefail is set at the top.
+TEST_LOG="${LOG_DIR}/tests-${STAMP}.log"
+run_cuda_tests() {
+  cargo test -p x16rs-cuda --features cuda -- --nocapture 2>&1 | tee "$TEST_LOG"
+}
+if run_with_heartbeat "x16rs-cuda-tests" run_cuda_tests; then
   TEST_RC=0
   echo "    PASS: x16rs-cuda tests"
   pass=$((pass + 1))
@@ -136,13 +156,39 @@ else
   echo "    FAIL: x16rs-cuda tests (exit ${TEST_RC})"
   fail=$((fail + 1))
 fi
+[[ -f "$TEST_LOG" ]] || : > "$TEST_LOG"
 
-# Guard: if kernels were stubs, tests may "pass" by skipping — detect skip spam
-if grep -q "CUDA kernels not compiled" "$LOG"; then
-  echo "    FAIL: kernels not compiled (install/path issue)"
-  fail=$((fail + 1))
-  TEST_RC=1
-fi
+# Guard 1: a test that SKIPS still counts as a pass. Every wording the suite
+# uses to decline has to be caught, not just one of them.
+for excuse in "CUDA kernels not compiled" "no usable CUDA device" "skipping"; do
+  if grep -q "$excuse" "$TEST_LOG"; then
+    echo "    FAIL: a GPU test declined to run (\"${excuse}\"), so this green result"
+    echo "          covers nothing about the card."
+    fail=$((fail + 1))
+    TEST_RC=1
+    break
+  fi
+done
+
+# Guard 2: the worse case, where a test does not skip because it was never
+# compiled. gpu_share_list_tests is #[cfg(all(test, cuda_available))] and
+# cuda_available is set by build.rs ONLY when it found nvcc. Without nvcc the
+# module vanishes and cargo prints a tidy "ok" for what is left, with no excuse
+# to grep for. The only reliable check is that the test NAMES appear.
+for want in \
+  "cuda_matches_cpu_across_many_inputs" \
+  "cuda_batch_matches_cpu" \
+  "cuda_genesis_block_hash_when_available" \
+  "the_share_list_matches_the_cpu_and_leaves_the_best_result_untouched" \
+  "the_blake_iv_is_not_duplicated_into_the_cuda_source"; do
+  if ! grep -q "$want" "$TEST_LOG"; then
+    echo "    FAIL: ${want} never ran."
+    echo "          Look for the cargo warning \"Using CUDA Toolkit at ...\" above. If it says"
+    echo "          \"CUDA Toolkit not found\" instead, the GPU tests were never compiled."
+    fail=$((fail + 1))
+    TEST_RC=1
+  fi
+done
 
 # --- OPTIONAL full poworker (skip on free tier) ---
 if [[ "$COLAB_FULL" == "1" ]]; then
@@ -198,7 +244,7 @@ if [[ "$RESULT" == "PASS" ]]; then
   echo ""
   echo "OVERALL: PASS (CUDA kernels validated on this GPU)"
   echo "Download: scripts/mining-nvidia/colab-results/"
-  echo "No push required yet — keep the logs."
+  echo "No push required yet; keep the logs."
   exit 0
 fi
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the modified OpenCL kernel trees the x16rs gate is exercised with.
+"""Build the modified kernel trees the x16rs gate is exercised with.
 
 Every tree is a COPY of x16rs/opencl written somewhere else. The shipping tree is
 never touched, and `app/src/opencl_gpu/compile.rs` fingerprints the full contents
@@ -15,6 +15,23 @@ faults   three deliberate defects, used to prove the gate can fail:
            faults/A  shabal (algo 13) counter Wlow 1 -> 2      one algorithm, always wrong
            faults/B  the barrier at x16rs.cl:269 deleted        a race, not one algorithm
            faults/C  one bit flipped in blake's IV              a single-bit constant
+
+BOTH BACKENDS. These trees drive the CUDA gate as well as the OpenCL one, because
+x16rs-cuda/cuda/block_miner.cu #includes util.cl, sha3_256.cl and x16rs.cl out of
+the same directory. OpenCL takes the tree at runtime (`--opencl-dir`); CUDA
+compiles at build time, so it takes it through an environment variable and a
+rebuild:
+
+    X16RS_CUDA_KERNEL_DIR=<outdir>/faults/A \\
+      cargo build --release --features cuda --bin x16rs_gate
+    x16rs_gate equiv --backend cuda        # must exit 3
+
+For that to mean anything every constant the kernels use has to live in these
+.cl files and nowhere else. block_miner.cu used to carry its own copy of blake's
+IV, which made faults/C compile to byte-identical CUDA PTX - a broken tree the
+CUDA gate would have passed. `x16rs.cl` now exports X16RS_H_BLAKE_INIT and the
+.cu reads it; `x16rs-cuda`'s test suite fails if the duplicate returns. Add a
+fault that patches a constant, and check it actually changes both backends.
 
 forced   forced/algoNN, NN = 00..15: every round runs algorithm NN. Isolates one
          algorithm's cost, but the compiler drops the other fifteen branches, so

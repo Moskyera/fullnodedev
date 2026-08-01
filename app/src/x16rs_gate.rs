@@ -1,7 +1,7 @@
 //! x16rs equivalence gate and fixed-corpus baseline.
 //!
 //! ADDITIVE MODULE. Nothing in the mining path calls it; it exists so that any
-//! future change to the OpenCL kernel can be judged against two things that a
+//! future change to a GPU kernel can be judged against two things that a
 //! self-test cannot give you:
 //!
 //!   1. `equiv`, a byte-equivalence proof. A fixed corpus of block headers and
@@ -17,17 +17,30 @@
 //!      every time and reports the spread across repeated runs, which is the
 //!      noise floor any later "optimisation" has to beat to mean anything.
 //!
+//! ONE GATE, TWO BACKENDS. The corpus, the CPU oracle, the exhaustive-window
+//! reassembly, the threshold arithmetic, the comparison, the algorithm coverage
+//! counting and the blame attribution live once, in code that is not compiled
+//! per backend. OpenCL and CUDA each supply only three device operations
+//! ([`GateDevice`]) and a way to open a device at a given launch shape
+//! ([`GateBackend`]). A gate that had been forked per backend would drift, and
+//! the fork would be discovered by one of them passing something the other
+//! catches.
+//!
 //! How `equiv` gets every hash off the card. The mining kernel returns only the
 //! best hash per work group, which would prove one hash in a hundred thousand.
-//! The pool share list (`x16rs_main.cl`, `share_capacity != 0`) already emits
-//! (nonce, hash) for every nonce that beats a target. With target 0xff..ff every
-//! nonce qualifies, so a batch sized to exactly `SHARE_LIST_CAPACITY` nonces
-//! dumps its ENTIRE window. That is the exhaustive mode. The production launch
-//! shape (48 x 256 x 48 = 589 824 nonces) cannot fit in the list, so there the
-//! gate checks the 1024 sampled hashes byte for byte AND checks that the kernel
-//! counted the whole window.
+//! The pool share list (`x16rs_main.cl`, and the identical block in
+//! `x16rs-cuda/cuda/block_miner.cu`, both keyed on `share_capacity != 0`)
+//! already emits (nonce, hash) for every nonce that beats a target. With target
+//! 0xff..ff every nonce qualifies, so a batch sized to exactly the share list's
+//! capacity dumps its ENTIRE window. That is the exhaustive mode, and it is
+//! available on BOTH backends today: the CUDA port carries the same 1024-entry
+//! list, the same total-hit counter and the same append-before-reduce ordering.
+//! The production launch shape (48 x 256 x 48 = 589 824 nonces) cannot fit in
+//! the list, so there the gate checks the 1024 returned hashes byte for byte AND
+//! checks that the kernel counted the whole window against a set of rank
+//! thresholds.
 
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 use std::time::Instant;
 
 /// Height whose `block_hash_repeat` is the mainnet maximum, 16.
@@ -198,30 +211,172 @@ pub struct Mismatch {
 
 impl Mismatch {
     pub fn render(&self) -> String {
+        let named: Vec<String> = self
+            .algos
+            .iter()
+            .map(|a| format!("{}:{}", a, ALGO_NAMES[(*a & 0x0f) as usize]))
+            .collect();
         format!(
-            "  MISMATCH height={} repeat={} header={} nonce={}\n    gpu={}\n    cpu={}\n    cpu algo order={:?}",
+            "  MISMATCH height={} repeat={} header={} nonce={}\n    gpu={}\n    cpu={}\n    cpu algo chain={}",
             self.height,
             self.repeat,
             self.header_index,
             self.nonce,
             hex::encode(self.gpu),
             hex::encode(self.cpu),
-            self.algos,
+            named.join(" -> "),
         )
     }
 }
 
+/// Which of the sixteen algorithms the mismatches point at.
+///
+/// The reasoning is the only one the data actually supports, and it is worth
+/// stating because a plausible-looking alternative is wrong. Each nonce runs a
+/// chain of `repeat` algorithms chosen by its own hash. If exactly one algorithm
+/// is broken then, necessarily:
+///
+///   * EVERY mismatching nonce ran it, so it survives the intersection of all
+///     failing chains;
+///   * NO matching nonce ran it, because running it would have produced a wrong
+///     hash, so it appears in none of the sampled passing chains.
+///
+/// How much each half is worth, measured rather than assumed, by breaking each
+/// of the sixteen algorithms in turn on this corpus at repeat 16:
+///
+///   * past about eight failing chains the intersection alone is usually already
+///     a single algorithm, and a real failing run is nowhere near that margin -
+///     one broken algorithm at repeat 16 corrupts 1 - (15/16)^16 = 64% of every
+///     window, so a default `equiv` fails thousands of nonces, not eight;
+///   * between three and eight it is not. With three failing chains, breaking
+///     skein left {groestl, jh, keccak, skein, cubehash, fugue} in the
+///     intersection and breaking luffa left seven candidates; the passing-chain
+///     filter cut both to the one true culprit.
+///
+/// So the intersection carries a well-populated run and the passing filter
+/// carries the thin one. Both are one pass over data the gate already has, and
+/// dropping either would cost accuracy in exactly the case where the operator
+/// most needs a name.
+///
+/// A defect that is NOT one algorithm - a missing barrier, a bad shared-table
+/// fill, a wrong nonce write - leaves no algorithm in every failing chain, and
+/// this reports exactly that instead of inventing a culprit. That is the honest
+/// outcome for the one of the three injected OpenCL faults that could not be
+/// named.
+#[derive(Clone, Debug, Default)]
+pub struct AlgoAttribution {
+    /// Algorithms in every failing chain AND in no sampled passing chain.
+    pub named: Vec<u8>,
+    /// Algorithms in every failing chain, before the passing-chain filter.
+    pub in_every_failure: Vec<u8>,
+    /// Failing chains that ran each algorithm.
+    pub failing: [u64; 16],
+    /// Sampled passing chains that ran each algorithm.
+    pub passing: [u64; 16],
+    pub failing_chains: u64,
+    pub passing_chains: u64,
+}
+
+/// Failing chains below which the gate refuses to name anything.
+///
+/// An innocent algorithm survives the intersection of n failing chains with
+/// probability about 0.64^n at repeat 16, which is 3% at n = 8, and it then has
+/// to be absent from every passing chain as well before a wrong name is printed.
+/// Measured on this corpus: every case that reached eight failing chains named
+/// the true culprit alone, while at five chains shavite, hamsi and shabal were
+/// indistinguishable from each other and all three came back as a tie. So under
+/// 8 the gate prints candidates instead. A confident wrong name would send
+/// someone to read the wrong kernel file for an afternoon, and the list costs
+/// them nothing.
+pub const MIN_CHAINS_TO_NAME: u64 = 8;
+
+impl AlgoAttribution {
+    pub fn render(&self) -> String {
+        if self.failing_chains == 0 {
+            return String::new();
+        }
+        let mut text = String::new();
+        let names = |set: &[u8]| -> String {
+            set.iter()
+                .map(|a| format!("{} ({})", ALGO_NAMES[(*a & 0x0f) as usize], a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        text.push_str(&format!(
+            "  blame: {} failing chains, {} sampled passing chains\n",
+            self.failing_chains, self.passing_chains
+        ));
+        if self.failing_chains < MIN_CHAINS_TO_NAME {
+            text.push_str(&format!(
+                "    too few failing chains to name an algorithm (need {MIN_CHAINS_TO_NAME}); \
+                 present in all of them: {}\n",
+                names(&self.in_every_failure)
+            ));
+        } else if self.named.len() == 1 {
+            text.push_str(&format!(
+                "    ALGORITHM: {}. It ran in every one of the {} failing chains and in none \
+                 of the {} passing ones.\n",
+                names(&self.named),
+                self.failing_chains,
+                self.passing_chains
+            ));
+        } else if self.named.is_empty() {
+            text.push_str(
+                "    NO single algorithm is implicated: the failing nonces do not share one. \
+                 That is what a race, a barrier, a shared-table fill or the nonce write looks \
+                 like, not one algorithm function.\n",
+            );
+        } else {
+            text.push_str(&format!(
+                "    candidates (in every failure, in no passing chain): {}\n",
+                names(&self.named)
+            ));
+        }
+        text
+    }
+}
+
 /// Totals for one full `equiv` run.
+/// Marker that an error describes the KERNEL'S OUTPUT being wrong rather than a
+/// failure to run.
+///
+/// It is a tag, not a phrase to be matched by guesswork. The wrapper scripts
+/// used to map every error to "the gate could not open the device, nothing was
+/// compared", which is what an operator was told on a run where the gate had
+/// just caught the exact fault it exists to catch. The exhaustive shapes are
+/// small, so a defect that only appears at the production shape reaches the
+/// operator through one of these messages and nowhere else.
+pub const DETECTED: &str = "[detected] ";
+
 #[derive(Clone, Debug, Default)]
 pub struct EquivReport {
+    /// Which backend produced this. Free text so the report cannot be mistaken
+    /// for the other card's.
+    pub backend: String,
+    /// The device the backend actually opened.
+    pub device: String,
     pub compared: u64,
     pub mismatches: Vec<Mismatch>,
     /// How many times each of the 16 algorithms was actually executed by the
     /// compared corpus, according to the CPU. A zero here means the gate never
     /// tested that algorithm, which is a hole in the gate, not a pass.
     pub algo_counts: [u64; 16],
+    /// Sampled chains of nonces the card got RIGHT, per algorithm, counted once
+    /// per chain. The denominator of the attribution above.
+    pub passing_algo_chains: [u64; 16],
+    pub passing_chain_samples: u64,
     pub exhaustive_batches: u32,
     pub production_batches: u32,
+    /// What the caller ASKED for, so a pass can be checked against the work that
+    /// was requested rather than only against the work that happened.
+    ///
+    /// `--headers 0` and `--batches 0` each make the exhaustive loop body never
+    /// run. The device is still opened, the production pass still satisfies
+    /// `compared > 0` and every algorithm count, and the gate printed PASS with
+    /// zero bytes compared exhaustively. The byte-for-byte pass is the whole
+    /// reason this exists, so a flag must not be able to delete it quietly.
+    pub asked_exhaustive: bool,
+    pub asked_production: bool,
     pub production_nonces: u64,
     /// Launches whose full-window hit count was compared against the CPU's.
     pub production_count_checks: u32,
@@ -283,10 +438,102 @@ impl EquivReport {
         self.mismatches.is_empty()
             && self.compared > 0
             && self.algo_counts.iter().all(|count| *count > 0)
+            && self.ran_what_was_asked()
+    }
+
+    /// Every pass the caller requested actually executed at least once.
+    ///
+    /// Without this, `--headers 0` or `--batches 0` removes the exhaustive
+    /// byte-for-byte comparison and the gate still exits 0, because the
+    /// production pass alone satisfies every other condition. A green gate that
+    /// compared nothing is worse than a red one: it is believed.
+    pub fn ran_what_was_asked(&self) -> bool {
+        (!self.asked_exhaustive || self.exhaustive_batches > 0)
+            && (!self.asked_production || self.production_batches > 0)
+    }
+
+    /// Why `passed()` is false, in the operator's words rather than a bool.
+    pub fn failure_reason(&self) -> Option<String> {
+        if !self.mismatches.is_empty() {
+            return Some(format!("{} hashes differ from the CPU", self.mismatches.len()));
+        }
+        if self.compared == 0 {
+            return Some("nothing was compared".to_string());
+        }
+        if let Some(algo) = self.algo_counts.iter().position(|count| *count == 0) {
+            return Some(format!(
+                "algorithm {algo} was never exercised, so the gate did not test it"
+            ));
+        }
+        if self.asked_exhaustive && self.exhaustive_batches == 0 {
+            return Some(
+                "the exhaustive byte-for-byte pass was requested but ran zero batches; \
+                 check --headers and --batches"
+                    .to_string(),
+            );
+        }
+        if self.asked_production && self.production_batches == 0 {
+            return Some(
+                "the production-shape pass was requested but ran zero batches; \
+                 check --prod-batches"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Name the broken algorithm when the mismatches allow it. See
+    /// [`AlgoAttribution`] for why both halves of the test are needed.
+    pub fn attribute(&self) -> AlgoAttribution {
+        let mut out = AlgoAttribution {
+            passing: self.passing_algo_chains,
+            passing_chains: self.passing_chain_samples,
+            failing_chains: self.mismatches.len() as u64,
+            ..Default::default()
+        };
+        for mismatch in &self.mismatches {
+            // Once per chain, not once per round: a chain that runs shabal three
+            // times is still one failing nonce, and counting rounds would make a
+            // frequently repeated algorithm look guilty.
+            let mut seen = [false; 16];
+            for algo in &mismatch.algos {
+                seen[(*algo & 0x0f) as usize] = true;
+            }
+            for (index, hit) in seen.iter().enumerate() {
+                if *hit {
+                    out.failing[index] += 1;
+                }
+            }
+        }
+        if out.failing_chains == 0 {
+            return out;
+        }
+        for index in 0..16u8 {
+            if out.failing[index as usize] == out.failing_chains {
+                out.in_every_failure.push(index);
+                if out.passing[index as usize] == 0 {
+                    out.named.push(index);
+                }
+            }
+        }
+        out
     }
 
     pub fn render(&self) -> String {
         let mut text = String::new();
+        text.push_str(&format!(
+            "  backend / device : {} / {}\n",
+            if self.backend.is_empty() {
+                "?"
+            } else {
+                &self.backend
+            },
+            if self.device.is_empty() {
+                "?"
+            } else {
+                &self.device
+            },
+        ));
         text.push_str(&format!(
             "  hashes compared byte-for-byte : {}\n  \
              exhaustive batches (ENTIRE window dumped and compared) : {}\n  \
@@ -318,31 +565,38 @@ impl EquivReport {
                 if *count == 0 { "   <-- NEVER TESTED" } else { "" }
             ));
         }
+        text.push_str(&self.attribute().render());
         for mismatch in self.mismatches.iter().take(20) {
             text.push_str(&mismatch.render());
             text.push('\n');
         }
         if self.mismatches.len() > 20 {
             text.push_str(&format!(
-                "  ... and {} more mismatches\n",
-                self.mismatches.len() - 20
+                "  ... and {} more mismatches (only the first {} are stored)\n",
+                self.mismatches.len() - 20,
+                MAX_STORED_MISMATCHES
             ));
         }
         text
     }
 }
 
+/// Mismatches kept in full. Past this the run has failed many times over and the
+/// rest add nothing but memory; the blame attribution is already saturated.
+pub const MAX_STORED_MISMATCHES: usize = 4096;
+
 pub const ALGO_NAMES: [&str; 16] = [
     "blake", "bmw", "groestl", "jh", "keccak", "skein", "luffa", "cubehash", "shavite", "simd",
     "echo", "hamsi", "fugue", "shabal", "whirlpool", "sha512",
 ];
 
-// ---------------------------------------------------------------------------
-// Everything below needs a real device.
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ocl")]
-use crate::opencl_gpu::{OpenCLResources, SHARE_LIST_CAPACITY, block::do_group_block_mining_opencl_shares};
+/// Entries the pool share list holds, on both backends.
+///
+/// `app/src/opencl_gpu/resources.rs` and `x16rs-cuda/src/lib.rs` each define
+/// their own; this is the number the gate's exhaustive window is sized from, and
+/// `run_equivalence_on` refuses to start if a backend disagrees with it, so the
+/// two cannot drift apart silently.
+pub const SHARE_LIST_CAPACITY: u64 = 1024;
 
 /// Launch shapes used by the exhaustive pass. Each one hashes exactly
 /// `SHARE_LIST_CAPACITY` nonces so the share list returns the ENTIRE window,
@@ -350,9 +604,15 @@ use crate::opencl_gpu::{OpenCLResources, SHARE_LIST_CAPACITY, block::do_group_bl
 /// `X16RS_RUN_REPEAT_LOOP` is per work group over `local_size * unit_size`
 /// slots, so varying `unit_size` varies the ordering the kernel builds and the
 /// contention on the histogram. A single shape would leave that untested.
-#[cfg(feature = "ocl")]
+///
+/// All three hold `local_size` at 256. That is not a preference: the CUDA host
+/// fixes the block size at `x16rs_cuda::DEFAULT_LOCAL_SIZE` because
+/// `block_miner.cu` declares `__shared__ unsigned int local_nonces[256]` and
+/// reduces over a power-of-two tree, so 256 is the only block size that kernel
+/// is correct at. Since the OpenCL gate already used 256 throughout, the two
+/// backends run the identical three shapes and their reports are comparable.
 pub const EXHAUSTIVE_SHAPES: [(u32, u32, u32); 3] = [
-    // (work_groups, local_size, unit_size)  product must equal 1024
+    // (work_groups, local_size, unit_size)  product must equal SHARE_LIST_CAPACITY
     (1, 256, 4),
     (2, 256, 2),
     (4, 256, 1),
@@ -360,11 +620,6 @@ pub const EXHAUSTIVE_SHAPES: [(u32, u32, u32); 3] = [
 
 /// The launch shape the rig actually mines with. Configurable so the gate can
 /// be re-pointed when the tuning changes.
-///
-/// Available to `cfg(test)` as well as to the OpenCL build because the
-/// auto-tuner's corpus arithmetic is built on it and has to be testable on a
-/// machine with no GPU.
-#[cfg(any(feature = "ocl", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
     pub work_groups: u32,
@@ -372,11 +627,130 @@ pub struct Shape {
     pub unit_size: u32,
 }
 
-#[cfg(any(feature = "ocl", test))]
 impl Shape {
     pub fn nonces(&self) -> u64 {
         self.work_groups as u64 * self.local_size as u64 * self.unit_size as u64
     }
+}
+
+impl std::fmt::Display for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}x{}x{}",
+            self.work_groups, self.local_size, self.unit_size
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Everything below needs a real device.
+// ---------------------------------------------------------------------------
+
+/// One opened device, at one launch shape.
+///
+/// Three operations, and they are the only thing a backend has to supply. Every
+/// piece of judgement - what to hash, what to compare it with, what counts as a
+/// pass, which algorithm to blame - is above this line and is compiled once.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+pub trait GateDevice {
+    /// The shape this device was opened at.
+    fn shape(&self) -> Shape;
+
+    /// Launch at `shape()` from `nonce_start` with `share_target`, and return
+    /// (total hits the kernel counted, the entries that fit in the share list).
+    ///
+    /// The total is the KERNEL's own count, including hits it could not store.
+    /// That is what makes the production pass possible: it is a statement about
+    /// every hash in the window, not about the ones that fit down the pipe.
+    fn count_and_shares(
+        &self,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+        share_target: &[u8; 32],
+    ) -> Result<(u64, Vec<(u32, [u8; 32])>), String>;
+
+    /// The best-hash reduction: one nonce and hash for the whole window. This is
+    /// a different code path from the share list and it is the ONLY one solo
+    /// mining reads, so the gate proves it separately.
+    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String>;
+
+    /// Every hash the card produced for a window, in NONCE ORDER.
+    ///
+    /// Provided, not per backend: this is the trick the whole exhaustive mode
+    /// rests on (weakest possible target, so every nonce qualifies and the share
+    /// list becomes a full dump), and having it in one place is what stops the
+    /// two backends proving subtly different things. Errors rather than
+    /// truncates if the card did not return the whole window, because a partial
+    /// dump would silently shrink the gate to a sample.
+    fn dump_window(
+        &self,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+    ) -> Result<Vec<[u8; 32]>, String> {
+        let count = self.shape().nonces();
+        let (hits, shares) = self.count_and_shares(height, intro, nonce_start, &[0xffu8; 32])?;
+        if hits != count {
+            return Err(format!(
+                "{DETECTED}kernel counted {hits} hits for a {count}-nonce window; with target 0xff..ff every \
+                 nonce must qualify, so the kernel did not hash the window it was asked to"
+            ));
+        }
+        if shares.len() as u64 != count {
+            return Err(format!(
+                "{DETECTED}share list returned {} of {count} nonces",
+                shares.len()
+            ));
+        }
+        let mut window: Vec<Option<[u8; 32]>> = vec![None; count as usize];
+        for (nonce, hash) in shares {
+            let offset = nonce.wrapping_sub(nonce_start) as u64;
+            if offset >= count {
+                return Err(format!(
+                    "{DETECTED}kernel returned nonce {nonce}, outside the window [{nonce_start}, {})",
+                    nonce_start.wrapping_add(count as u32)
+                ));
+            }
+            if window[offset as usize].is_some() {
+                return Err(format!("{DETECTED}kernel returned nonce {nonce} twice"));
+            }
+            window[offset as usize] = Some(hash);
+        }
+        window
+            .into_iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                cell.ok_or_else(|| {
+                    format!("kernel never returned nonce {}", nonce_start as u64 + i as u64)
+                })
+            })
+            .collect()
+    }
+}
+
+/// A way to open devices. One per GPU API.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+pub trait GateBackend {
+    type Device: GateDevice;
+
+    /// What the report calls this backend.
+    fn name(&self) -> &'static str;
+
+    /// The device under test, named well enough to identify it in a log.
+    fn describe(&self) -> String;
+
+    /// Entries this backend's share list holds. Checked against
+    /// [`SHARE_LIST_CAPACITY`] before anything runs.
+    fn share_capacity(&self) -> u64;
+
+    /// Reject a shape this backend cannot launch, before a device is opened and
+    /// before the CPU spends minutes hashing an oracle for it.
+    fn check_shape(&self, shape: Shape) -> Result<(), String>;
+
+    /// Open a device with buffers sized for `shape`.
+    fn open(&self, shape: Shape) -> Result<Self::Device, String>;
 }
 
 /// Open one device with buffers sized for `unit_size`.
@@ -415,95 +789,309 @@ pub fn open_device(
     Ok(resources.remove(0))
 }
 
-/// Dump every hash the card produced for a window, using the pool share list
-/// with the weakest possible target so that every nonce qualifies.
-///
-/// Returns the window in NONCE ORDER. Errors if the card did not return the
-/// whole window, because a partial dump would silently shrink the gate.
+// ---------------------------------------------------------------------------
+// Backend: OpenCL
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "ocl")]
-fn gpu_dump_window(
-    opencl: &OpenCLResources,
-    height: u64,
-    intro: &[u8],
-    nonce_start: u32,
+use crate::opencl_gpu::{OpenCLResources, block::do_group_block_mining_opencl_shares};
+
+/// The OpenCL device under test, opened at one shape.
+#[cfg(feature = "ocl")]
+pub struct OclGateDevice {
+    resources: OpenCLResources,
     shape: Shape,
-) -> Result<Vec<[u8; 32]>, String> {
-    let count = shape.nonces();
-    if count as usize > SHARE_LIST_CAPACITY {
-        return Err(format!(
-            "shape hashes {count} nonces but the share list holds {SHARE_LIST_CAPACITY}; \
-             an exhaustive dump needs work_groups * local_size * unit_size <= {SHARE_LIST_CAPACITY}"
-        ));
-    }
-    let out = do_group_block_mining_opencl_shares(
-        opencl,
-        height,
-        intro.to_vec(),
-        nonce_start,
-        shape.work_groups,
-        shape.local_size,
-        shape.unit_size,
-        Some(&[0xffu8; 32]),
-    )
-    .map_err(|e| e.display())?;
-
-    if out.share_hits != count {
-        return Err(format!(
-            "kernel counted {} hits for a {count}-nonce window; with target 0xff..ff every nonce \
-             must qualify, so the kernel did not hash the window it was asked to",
-            out.share_hits
-        ));
-    }
-    if out.shares.len() as u64 != count {
-        return Err(format!(
-            "share list returned {} of {count} nonces",
-            out.shares.len()
-        ));
-    }
-
-    let mut window: Vec<Option<[u8; 32]>> = vec![None; count as usize];
-    for (nonce, hash) in out.shares {
-        let offset = nonce.wrapping_sub(nonce_start) as u64;
-        if offset >= count {
-            return Err(format!(
-                "kernel returned nonce {nonce}, outside the window [{nonce_start}, {})",
-                nonce_start.wrapping_add(count as u32)
-            ));
-        }
-        if window[offset as usize].is_some() {
-            return Err(format!("kernel returned nonce {nonce} twice"));
-        }
-        window[offset as usize] = Some(hash);
-    }
-    window
-        .into_iter()
-        .enumerate()
-        .map(|(i, cell)| {
-            cell.ok_or_else(|| format!("kernel never returned nonce {}", nonce_start as u64 + i as u64))
-        })
-        .collect()
 }
 
-/// Full byte-equivalence run.
+#[cfg(feature = "ocl")]
+impl GateDevice for OclGateDevice {
+    fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    fn count_and_shares(
+        &self,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+        share_target: &[u8; 32],
+    ) -> Result<(u64, Vec<(u32, [u8; 32])>), String> {
+        let out = do_group_block_mining_opencl_shares(
+            &self.resources,
+            height,
+            intro.to_vec(),
+            nonce_start,
+            self.shape.work_groups,
+            self.shape.local_size,
+            self.shape.unit_size,
+            Some(share_target),
+        )
+        .map_err(|e| e.display())?;
+        Ok((out.share_hits, out.shares))
+    }
+
+    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String> {
+        crate::opencl_gpu::block::do_group_block_mining_opencl(
+            &self.resources,
+            height,
+            intro.to_vec(),
+            nonce_start,
+            self.shape.work_groups,
+            self.shape.local_size,
+            self.shape.unit_size,
+        )
+        .map_err(|e| e.display())
+    }
+}
+
+/// Which OpenCL device to open, and from which kernel tree.
+///
+/// The kernel directory is part of the backend because OpenCL compiles at
+/// RUNTIME, which is what lets `scripts/x16rs_gate_trees.py` prove the gate can
+/// fail: point it at a tree with a deliberate defect and the same binary catches
+/// it. CUDA has no equivalent knob at this level; see [`CudaBackend`].
+#[cfg(feature = "ocl")]
+pub struct OclBackend {
+    pub opencl_dir: String,
+    pub platform: u32,
+    pub device: String,
+}
+
+#[cfg(feature = "ocl")]
+impl GateBackend for OclBackend {
+    type Device = OclGateDevice;
+
+    fn name(&self) -> &'static str {
+        "opencl"
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "platform {}, device_ids '{}', kernels from {}",
+            self.platform, self.device, self.opencl_dir
+        )
+    }
+
+    fn share_capacity(&self) -> u64 {
+        crate::opencl_gpu::SHARE_LIST_CAPACITY as u64
+    }
+
+    fn check_shape(&self, shape: Shape) -> Result<(), String> {
+        if shape.work_groups == 0 || shape.local_size == 0 || shape.unit_size == 0 {
+            return Err(format!("launch shape {shape} has a zero dimension"));
+        }
+        Ok(())
+    }
+
+    fn open(&self, shape: Shape) -> Result<Self::Device, String> {
+        Ok(OclGateDevice {
+            resources: open_device(&self.opencl_dir, self.platform, &self.device, shape)?,
+            shape,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend: CUDA
+// ---------------------------------------------------------------------------
+
+/// The CUDA device under test, opened at one shape.
+///
+/// `x16rs_cuda::CudaMiner` owns its device allocations and sizes them from
+/// (work_groups, 256, unit_size) at construction, exactly like the OpenCL
+/// resources, so the gate opens one per shape and drops it after.
+#[cfg(feature = "cuda")]
+pub struct CudaGateDevice {
+    miner: x16rs_cuda::CudaMiner,
+    shape: Shape,
+}
+
+#[cfg(feature = "cuda")]
+impl GateDevice for CudaGateDevice {
+    fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    fn count_and_shares(
+        &self,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+        share_target: &[u8; 32],
+    ) -> Result<(u64, Vec<(u32, [u8; 32])>), String> {
+        let out = self
+            .miner
+            .mine_block_batch_shares(
+                height,
+                intro,
+                nonce_start,
+                self.shape.work_groups,
+                Some(share_target),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((out.share_hits, out.shares))
+    }
+
+    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String> {
+        self.miner
+            .mine_block_batch(height, intro, nonce_start, self.shape.work_groups)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// True when this binary actually contains compiled CUDA kernels.
+///
+/// The `cuda` feature only adds the x16rs-cuda crate. Whether that crate holds
+/// kernels is decided by its build script finding nvcc, which sets
+/// `cfg(cuda_available)`; without it the crate still compiles and every device
+/// call returns `NotCompiled`. Callers must check this before claiming a CUDA
+/// run proved anything, and the gate binary exits non-zero when it is false.
+#[cfg(feature = "cuda")]
+pub fn cuda_kernels_available() -> bool {
+    x16rs_cuda::CudaMiner::is_available()
+}
+
+/// Which CUDA device to open.
+///
+/// There is no kernel-directory knob here and there cannot be one at runtime:
+/// `x16rs-cuda/build.rs` compiles `block_miner.cu` with nvcc into the static
+/// library at BUILD time, so a CUDA kernel change means a rebuild. Fault
+/// injection is still available, and against the very same defects the OpenCL
+/// gate was proved with, because `block_miner.cu` includes `util.cl`,
+/// `sha3_256.cl` and `x16rs.cl` straight out of `x16rs/opencl`: set
+/// `X16RS_CUDA_KERNEL_DIR` to a tree built by `scripts/x16rs_gate_trees.py` and
+/// rebuild, and this gate is running the broken algorithm on the card.
+#[cfg(feature = "cuda")]
+pub struct CudaBackend {
+    pub device_index: i32,
+}
+
+#[cfg(feature = "cuda")]
+impl GateBackend for CudaBackend {
+    type Device = CudaGateDevice;
+
+    fn name(&self) -> &'static str {
+        "cuda"
+    }
+
+    fn describe(&self) -> String {
+        match x16rs_cuda::CudaMiner::list_devices() {
+            Ok(devices) => match devices.iter().find(|d| d.index == self.device_index) {
+                Some(d) => format!(
+                    "device #{} {} (SM {}.{}, {} MPs)",
+                    d.index, d.name, d.compute_major, d.compute_minor, d.multiprocessor_count
+                ),
+                None => format!(
+                    "device #{} (not present; {} device(s) visible)",
+                    self.device_index,
+                    devices.len()
+                ),
+            },
+            Err(e) => format!("device #{} (enumeration failed: {e})", self.device_index),
+        }
+    }
+
+    fn share_capacity(&self) -> u64 {
+        x16rs_cuda::SHARE_LIST_CAPACITY as u64
+    }
+
+    fn check_shape(&self, shape: Shape) -> Result<(), String> {
+        if shape.work_groups == 0 || shape.local_size == 0 || shape.unit_size == 0 {
+            return Err(format!("launch shape {shape} has a zero dimension"));
+        }
+        // Not a limitation of the gate. `x16rs_cuda_main` declares
+        // `__shared__ unsigned int local_nonces[256]` and reduces over a
+        // power-of-two tree across the block, so any other block size either
+        // overruns that array or reduces the wrong pairs. The host fixes it at
+        // DEFAULT_LOCAL_SIZE for the same reason and refuses a device whose
+        // maxThreadsPerBlock is lower. Say so here rather than let the operator
+        // read a wrong-hash report caused by their own --local-size.
+        if shape.local_size != x16rs_cuda::DEFAULT_LOCAL_SIZE {
+            return Err(format!(
+                "CUDA runs at local_size = {} only ({shape} was asked for): block_miner.cu's \
+                 shared local_nonces[{}] and its power-of-two tree reduction are correct at that \
+                 block size and no other",
+                x16rs_cuda::DEFAULT_LOCAL_SIZE,
+                x16rs_cuda::DEFAULT_LOCAL_SIZE
+            ));
+        }
+        Ok(())
+    }
+
+    fn open(&self, shape: Shape) -> Result<Self::Device, String> {
+        self.check_shape(shape)?;
+        let miner =
+            x16rs_cuda::CudaMiner::new(self.device_index, shape.work_groups, shape.unit_size)
+                .map_err(|e| {
+                    format!(
+                        "opening CUDA device #{} at {shape}: {e}",
+                        self.device_index
+                    )
+                })?;
+        Ok(CudaGateDevice { miner, shape })
+    }
+}
+
+/// Everything `equiv` needs that is not the device.
+#[derive(Clone, Copy, Debug)]
+pub struct EquivParams {
+    /// Corpus headers to hash.
+    pub headers: u32,
+    /// Exhaustive windows per (shape, height, header).
+    pub batches: u32,
+    /// The shape the rig actually mines with, or a zero `prod_batches` to skip.
+    pub prod_shape: Shape,
+    pub prod_batches: u32,
+    /// Rank thresholds used by the production count check.
+    pub prod_thresholds: u32,
+    /// CPU threads for the oracle.
+    pub threads: usize,
+}
+
+/// Full byte-equivalence run, on whichever backend is handed in.
 ///
 /// `headers` corpus entries x `batches` exhaustive windows x every shape in
 /// `EXHAUSTIVE_SHAPES` x every repeat in `GATE_HEIGHTS`, plus `prod_batches`
 /// runs at the production shape.
-#[cfg(feature = "ocl")]
-#[allow(clippy::too_many_arguments)]
-pub fn run_equivalence(
-    opencl_dir: &str,
-    platform: u32,
-    device: &str,
-    headers: u32,
-    batches: u32,
-    prod_shape: Shape,
-    prod_batches: u32,
-    prod_thresholds: u32,
-    threads: usize,
+///
+/// This function is the gate. Both backends run this exact code over this exact
+/// corpus against this exact oracle, so a defect either card has is judged by
+/// one standard, and a change to the standard cannot reach one backend and miss
+/// the other.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+pub fn run_equivalence_on<B: GateBackend>(
+    backend: &B,
+    params: EquivParams,
 ) -> Result<EquivReport, String> {
+    let EquivParams {
+        headers,
+        batches,
+        prod_shape,
+        prod_batches,
+        prod_thresholds,
+        threads,
+    } = params;
     let started = Instant::now();
-    let mut report = EquivReport::default();
+    let mut report = EquivReport {
+        backend: backend.name().to_string(),
+        device: backend.describe(),
+        asked_exhaustive: headers > 0 && batches > 0,
+        asked_production: prod_batches > 0,
+        ..Default::default()
+    };
+
+    // The exhaustive mode is only exhaustive if the share list really is as big
+    // as this module thinks. A backend whose capacity moved would silently turn
+    // every "ENTIRE window" claim into a sample, so refuse before hashing
+    // anything.
+    let capacity = backend.share_capacity();
+    if capacity != SHARE_LIST_CAPACITY {
+        return Err(format!(
+            "{} reports a share list capacity of {capacity}, the gate is built for \
+             {SHARE_LIST_CAPACITY}; the exhaustive shapes would no longer dump whole windows",
+            backend.name()
+        ));
+    }
 
     // Exhaustive pass. One device open per shape, because the GPU buffers are
     // sized from unit_size at init.
@@ -513,7 +1101,15 @@ pub fn run_equivalence(
             local_size,
             unit_size,
         };
-        let opencl = open_device(opencl_dir, platform, device, shape)?;
+        if shape.nonces() != capacity {
+            return Err(format!(
+                "exhaustive shape {shape} hashes {} nonces but the share list holds {capacity}; \
+                 an exhaustive dump needs them equal",
+                shape.nonces()
+            ));
+        }
+        backend.check_shape(shape)?;
+        let device = backend.open(shape)?;
         let count = shape.nonces() as u32;
         for height in GATE_HEIGHTS {
             let repeat = x16rs::block_hash_repeat(height);
@@ -523,7 +1119,7 @@ pub fn run_equivalence(
                     // A distinct nonce base per (shape, height, header, batch)
                     // so the gate never re-tests the same hashes twice.
                     let nonce_start = nonce_base(unit_size, height, header_index, batch);
-                    let gpu = gpu_dump_window(&opencl, height, &intro, nonce_start, shape)?;
+                    let gpu = device.dump_window(height, &intro, nonce_start)?;
                     let cpu = cpu_hash_window(height, &intro, nonce_start, count, threads);
                     report.exhaustive_batches += 1;
                     compare_window(
@@ -539,7 +1135,7 @@ pub fn run_equivalence(
                 }
             }
         }
-        drop(opencl);
+        drop(device);
     }
 
     // Production-shape pass.
@@ -562,14 +1158,15 @@ pub fn run_equivalence(
     // whose threshold yields exactly SHARE_LIST_CAPACITY hits returns those
     // 1024 hashes in full, and every byte of them is compared.
     if prod_batches > 0 && prod_shape.nonces() > 0 {
-        let opencl = open_device(opencl_dir, platform, device, prod_shape)?;
+        backend.check_shape(prod_shape)?;
+        let device = backend.open(prod_shape)?;
         let height = REPEAT16_HEIGHT;
         let repeat = x16rs::block_hash_repeat(height);
         let window = prod_shape.nonces();
         if window > u32::MAX as u64 {
             return Err("production window exceeds the 32-bit nonce space".to_string());
         }
-        let ranks = threshold_ranks(window, SHARE_LIST_CAPACITY as u64, prod_thresholds);
+        let ranks = threshold_ranks(window, capacity, prod_thresholds);
         for batch in 0..prod_batches {
             let header_index = batch % headers.max(1);
             let intro = corpus_header(header_index);
@@ -585,29 +1182,19 @@ pub fn run_equivalence(
 
             for rank in ranks.iter().copied() {
                 let target = sorted[(rank - 1) as usize];
-                let out = do_group_block_mining_opencl_shares(
-                    &opencl,
-                    height,
-                    intro.clone(),
-                    nonce_start,
-                    prod_shape.work_groups,
-                    prod_shape.local_size,
-                    prod_shape.unit_size,
-                    Some(&target),
-                )
-                .map_err(|e| e.display())?;
+                let (share_hits, shares) =
+                    device.count_and_shares(height, &intro, nonce_start, &target)?;
                 report.production_count_checks += 1;
-                if out.share_hits != rank {
+                if share_hits != rank {
                     return Err(format!(
-                        "production shape, header {header_index}, nonce base {nonce_start}: \
-                         the CPU says exactly {rank} of the {window} hashes are <= {}, the kernel counted {}. \
+                        "{DETECTED}production shape, header {header_index}, nonce base {nonce_start}: \
+                         the CPU says exactly {rank} of the {window} hashes are <= {}, the kernel counted {share_hits}. \
                          The kernel's hashes differ from the CPU's somewhere in the window.",
                         hex::encode(target),
-                        out.share_hits
                     ));
                 }
                 // Whatever did come back must be byte-exact and in-window.
-                for (nonce, hash) in &out.shares {
+                for (nonce, hash) in &shares {
                     let offset = nonce.wrapping_sub(nonce_start) as u64;
                     if offset >= window {
                         return Err(format!(
@@ -630,19 +1217,10 @@ pub fn run_equivalence(
             // The best-hash reduction is a separate code path from the share
             // list, and it is the ONLY path solo mining reads. It must return
             // the true minimum of the window, which the sorted oracle knows.
-            let (best_nonce, best_hash) = crate::opencl_gpu::block::do_group_block_mining_opencl(
-                &opencl,
-                height,
-                intro.clone(),
-                nonce_start,
-                prod_shape.work_groups,
-                prod_shape.local_size,
-                prod_shape.unit_size,
-            )
-            .map_err(|e| e.display())?;
+            let (best_nonce, best_hash) = device.best(height, &intro, nonce_start)?;
             if best_hash != sorted[0] {
                 return Err(format!(
-                    "production shape best-hash reduction returned {} for nonce {best_nonce}; \
+                    "{DETECTED}production shape best-hash reduction returned {} for nonce {best_nonce}; \
                      the CPU minimum over the window is {}",
                     hex::encode(best_hash),
                     hex::encode(sorted[0])
@@ -656,15 +1234,59 @@ pub fn run_equivalence(
             }
             report.production_reduction_checks += 1;
         }
-        drop(opencl);
+        drop(device);
     }
 
     report.wall_seconds = started.elapsed().as_secs_f64();
     Ok(report)
 }
 
-/// Nonce base that keeps every (shape, height, header, batch) window disjoint.
+/// Byte-equivalence run on an OpenCL device.
 #[cfg(feature = "ocl")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_equivalence(
+    opencl_dir: &str,
+    platform: u32,
+    device: &str,
+    headers: u32,
+    batches: u32,
+    prod_shape: Shape,
+    prod_batches: u32,
+    prod_thresholds: u32,
+    threads: usize,
+) -> Result<EquivReport, String> {
+    run_equivalence_on(
+        &OclBackend {
+            opencl_dir: opencl_dir.to_string(),
+            platform,
+            device: device.to_string(),
+        },
+        EquivParams {
+            headers,
+            batches,
+            prod_shape,
+            prod_batches,
+            prod_thresholds,
+            threads,
+        },
+    )
+}
+
+/// Byte-equivalence run on a CUDA device.
+///
+/// Same corpus, same oracle, same comparison, same report as the OpenCL entry
+/// point above: the only difference between them is which three device calls
+/// [`run_equivalence_on`] ends up making.
+#[cfg(feature = "cuda")]
+pub fn run_equivalence_cuda(
+    device_index: i32,
+    params: EquivParams,
+) -> Result<EquivReport, String> {
+    run_equivalence_on(&CudaBackend { device_index }, params)
+}
+
+/// Nonce base that keeps every (shape, height, header, batch) window disjoint.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 fn nonce_base(unit_size: u32, height: u64, header_index: u32, batch: u32) -> u32 {
     let height_slot = GATE_HEIGHTS
         .iter()
@@ -677,7 +1299,7 @@ fn nonce_base(unit_size: u32, height: u64, header_index: u32, batch: u32) -> u32
         .wrapping_add(0x0000_0400u32.wrapping_mul(batch))
 }
 
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn compare_window(
     report: &mut EquivReport,
@@ -695,7 +1317,16 @@ fn compare_window(
     }
 }
 
-#[cfg(feature = "ocl")]
+/// How often a compared nonce's algorithm chain is derived.
+///
+/// Deriving it costs `repeat` extra CPU hashes, which at 1-in-1 would double the
+/// oracle. 1-in-64 still gives hundreds of samples of every algorithm on a
+/// default run, which is all the coverage count and the attribution's
+/// passing-chain half need.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+const ALGO_SAMPLE_EVERY: u64 = 64;
+
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn record(
     report: &mut EquivReport,
@@ -711,13 +1342,27 @@ fn record(
     // Algorithm coverage is sampled, not counted for every nonce: deriving the
     // per-round algorithm costs `repeat` extra CPU hashes, which would double
     // the oracle's cost for a number that converges in a few hundred samples.
-    if report.compared % 64 == 0 {
-        for algo in algo_sequence(height, intro, nonce) {
-            report.algo_counts[(algo & 0x0f) as usize] += 1;
+    if report.compared % ALGO_SAMPLE_EVERY == 0 {
+        let chain = algo_sequence(height, intro, nonce);
+        let mut ran = [false; 16];
+        for algo in &chain {
+            report.algo_counts[(*algo & 0x0f) as usize] += 1;
+            ran[(*algo & 0x0f) as usize] = true;
+        }
+        // The passing half of the blame test. Counted once per chain, and only
+        // for nonces the card got RIGHT: an algorithm that appears here cannot
+        // be the broken one, because running it produced a correct hash.
+        if gpu == cpu {
+            report.passing_chain_samples += 1;
+            for (index, hit) in ran.iter().enumerate() {
+                if *hit {
+                    report.passing_algo_chains[index] += 1;
+                }
+            }
         }
     }
     if gpu != cpu {
-        if report.mismatches.len() < 4096 {
+        if report.mismatches.len() < MAX_STORED_MISMATCHES {
             report.mismatches.push(Mismatch {
                 height,
                 repeat,
@@ -737,7 +1382,7 @@ fn record(
 
 /// Middle-80% spread of an ascending sample, as a percentage of `centre`.
 /// Robust to the one-in-a-dozen stalled run that peak-to-peak cannot survive.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 pub fn spread_p10_p90(sorted: &[f64], centre: f64) -> f64 {
     if sorted.is_empty() || centre <= 0.0 {
         return 0.0;
@@ -750,7 +1395,7 @@ pub fn spread_p10_p90(sorted: &[f64], centre: f64) -> f64 {
 }
 
 /// One timed run over the fixed corpus.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 #[derive(Clone, Debug)]
 pub struct BaselineRun {
     pub seconds: f64,
@@ -758,7 +1403,7 @@ pub struct BaselineRun {
     pub hashrate: f64,
 }
 
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 #[derive(Clone, Debug)]
 pub struct BaselineReport {
     pub shape: Shape,
@@ -772,7 +1417,7 @@ pub struct BaselineReport {
     pub cpu_spot_checks: u32,
 }
 
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 impl BaselineReport {
     fn sorted_rates(&self) -> Vec<f64> {
         let mut rates: Vec<f64> = self.runs.iter().map(|r| r.hashrate).collect();
@@ -844,8 +1489,11 @@ impl BaselineReport {
              WARNING          : the within-process figure is NOT the bar for comparing two builds.\n                     \
              This card settles into one of several clock/power states for the life of a\n                     \
              process, and separate invocations of THIS command on identical work have\n                     \
-             disagreed by ~2.6% on this rig. To compare two kernels, use `x16rs_gate ab`,\n                     \
-             which alternates them inside one process and resolves ~0.3%.\n",
+             disagreed by ~2.6% on this rig. To compare two OPENCL kernel trees, use\n                     \
+             `x16rs_gate ab`, which alternates them inside one process and resolves ~0.3%.\n                     \
+             CUDA kernels are compiled into the binary by nvcc, so no in-process A/B\n                     \
+             exists for them: two CUDA builds can only be compared across processes, and\n                     \
+             a difference under the ~2.6% between-process spread is not a result.\n",
             crate::bench_mainnet_repeat16::fmt_rate(self.median()),
             crate::bench_mainnet_repeat16::fmt_rate(self.min()),
             crate::bench_mainnet_repeat16::fmt_rate(self.max()),
@@ -863,12 +1511,9 @@ impl BaselineReport {
 /// every nonce, and the algorithms differ in cost by more than an order of
 /// magnitude, so a run-for-N-seconds benchmark compares different work each
 /// time and its variance is dominated by which hashes it happened to reach.
-#[cfg(feature = "ocl")]
-#[allow(clippy::too_many_arguments)]
-pub fn run_baseline(
-    opencl_dir: &str,
-    platform: u32,
-    device: &str,
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+pub fn run_baseline_on<B: GateBackend>(
+    backend: &B,
     shape: Shape,
     height: u64,
     batches_per_run: u32,
@@ -876,7 +1521,8 @@ pub fn run_baseline(
     warmup_batches: u32,
     headers: u32,
 ) -> Result<BaselineReport, String> {
-    let opencl = open_device(opencl_dir, platform, device, shape)?;
+    backend.check_shape(shape)?;
+    let device = backend.open(shape)?;
     let per_batch = shape.nonces();
     let nonce_start = 0x1000_0000u32;
     let headers = headers.max(1);
@@ -887,16 +1533,9 @@ pub fn run_baseline(
     // corpus, so the measured work is unchanged by how long the warm-up ran.
     for w in 0..warmup_batches {
         let start = 0xF000_0000u32.wrapping_add(w.wrapping_mul(per_batch as u32));
-        crate::opencl_gpu::block::do_group_block_mining_opencl(
-            &opencl,
-            height,
-            intros[0].clone(),
-            start,
-            shape.work_groups,
-            shape.local_size,
-            shape.unit_size,
-        )
-        .map_err(|e| format!("warm-up batch {}: {}", w + 1, e.display()))?;
+        device
+            .best(height, &intros[0], start)
+            .map_err(|e| format!("warm-up batch {}: {e}", w + 1))?;
     }
 
     let mut out_runs = Vec::with_capacity(runs as usize);
@@ -907,16 +1546,9 @@ pub fn run_baseline(
         for batch in 0..batches_per_run {
             let header_index = header_indices[batch as usize];
             let start = nonce_start.wrapping_add(batch.wrapping_mul(per_batch as u32));
-            let (nonce, hash) = crate::opencl_gpu::block::do_group_block_mining_opencl(
-                &opencl,
-                height,
-                intros[header_index as usize].clone(),
-                start,
-                shape.work_groups,
-                shape.local_size,
-                shape.unit_size,
-            )
-            .map_err(|e| format!("run {} batch {}: {}", run + 1, batch + 1, e.display()))?;
+            let (nonce, hash) = device
+                .best(height, &intros[header_index as usize], start)
+                .map_err(|e| format!("run {} batch {}: {e}", run + 1, batch + 1))?;
             results.push((nonce, hash, header_index));
         }
         let seconds = started.elapsed().as_secs_f64();
@@ -962,8 +1594,67 @@ pub fn run_baseline(
     })
 }
 
+/// Fixed-work baseline on an OpenCL device.
+#[cfg(feature = "ocl")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_baseline(
+    opencl_dir: &str,
+    platform: u32,
+    device: &str,
+    shape: Shape,
+    height: u64,
+    batches_per_run: u32,
+    runs: u32,
+    warmup_batches: u32,
+    headers: u32,
+) -> Result<BaselineReport, String> {
+    run_baseline_on(
+        &OclBackend {
+            opencl_dir: opencl_dir.to_string(),
+            platform,
+            device: device.to_string(),
+        },
+        shape,
+        height,
+        batches_per_run,
+        runs,
+        warmup_batches,
+        headers,
+    )
+}
+
+/// Fixed-work baseline on a CUDA device.
+#[cfg(feature = "cuda")]
+pub fn run_baseline_cuda(
+    device_index: i32,
+    shape: Shape,
+    height: u64,
+    batches_per_run: u32,
+    runs: u32,
+    warmup_batches: u32,
+    headers: u32,
+) -> Result<BaselineReport, String> {
+    run_baseline_on(
+        &CudaBackend { device_index },
+        shape,
+        height,
+        batches_per_run,
+        runs,
+        warmup_batches,
+        headers,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Paired A/B
+//
+// OpenCL only, and not by omission. `ab` alternates two KERNEL TREES inside one
+// process, which works because OpenCL compiles its kernels at runtime from a
+// directory the caller names. `x16rs-cuda/build.rs` compiles block_miner.cu with
+// nvcc into the static library, so a CUDA process contains exactly one kernel
+// build and cannot alternate. Comparing two CUDA kernels means two binaries, and
+// the paired-within-one-process trick that resolves 0.3% on this rig is simply
+// not available there; `baseline`'s ~2.6% between-process figure is.
 // ---------------------------------------------------------------------------
 
 /// One A-then-B pair, timed back to back on the same card in the same process.
@@ -1317,4 +2008,237 @@ mod tests {
         let many = cpu_hash_window(1, &intro, 900, 40, 8);
         assert_eq!(single, many);
     }
+
+    /// Every exhaustive shape must dump a whole window on BOTH backends.
+    ///
+    /// `run_equivalence_on` refuses at runtime if a backend's capacity has moved,
+    /// but that check only fires on a machine with a card. This one fires on any
+    /// machine, and it is the thing that keeps the CUDA gate as exhaustive as the
+    /// OpenCL one: if someone changes the share list to 512, the shapes stop
+    /// covering the window and the "ENTIRE window" line in the report becomes a
+    /// lie on both cards at once.
+    #[test]
+    fn every_exhaustive_shape_fills_the_share_list_exactly() {
+        for (work_groups, local_size, unit_size) in EXHAUSTIVE_SHAPES {
+            let shape = Shape {
+                work_groups,
+                local_size,
+                unit_size,
+            };
+            assert_eq!(
+                shape.nonces(),
+                SHARE_LIST_CAPACITY,
+                "{shape} does not dump exactly one full share list"
+            );
+            // CUDA fixes the block size at 256; a shape that broke that would be
+            // rejected at run time on NVIDIA and silently accepted on AMD, which
+            // is exactly the drift one gate with two backends is meant to stop.
+            assert_eq!(shape.local_size, 256, "{shape} is not launchable on CUDA");
+        }
+        // Three DIFFERENT unit_sizes, because unit_size is what varies the
+        // counting sort's ordering and the histogram contention inside a work
+        // group. Three copies of one shape would prove a third as much.
+        let mut units: Vec<u32> = EXHAUSTIVE_SHAPES.iter().map(|s| s.2).collect();
+        units.sort_unstable();
+        units.dedup();
+        assert_eq!(units.len(), EXHAUSTIVE_SHAPES.len());
+    }
+
+    /// A helper that builds a report as if the card had failed exactly the
+    /// nonces whose chain runs `broken`, which is what one broken algorithm
+    /// function does.
+    fn report_with_broken_algo(broken: u8, height: u64, nonces: u32) -> EquivReport {
+        let intro = corpus_header(2);
+        let mut report = EquivReport {
+            backend: "test".into(),
+            ..Default::default()
+        };
+        for nonce in 0..nonces {
+            let chain = algo_sequence(height, &intro, nonce);
+            let hit = chain.contains(&broken);
+            if hit {
+                report.mismatches.push(Mismatch {
+                    height,
+                    repeat: x16rs::block_hash_repeat(height),
+                    header_index: 2,
+                    nonce,
+                    gpu: [0u8; 32],
+                    cpu: [1u8; 32],
+                    algos: chain,
+                });
+            } else {
+                report.passing_chain_samples += 1;
+                let mut seen = [false; 16];
+                for algo in &chain {
+                    seen[(*algo & 0x0f) as usize] = true;
+                }
+                for (index, ran) in seen.iter().enumerate() {
+                    if *ran {
+                        report.passing_algo_chains[index] += 1;
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// The whole point of the attribution: one broken algorithm, named, at every
+    /// repeat the gate runs.
+    ///
+    /// Repeat 16 is the hard case. An innocent algorithm is in a random chain
+    /// with probability 1 - (15/16)^16 = 64%, so the "in every failure"
+    /// intersection alone leaves several suspects; only the "in no passing
+    /// chain" half removes them. If someone deletes that half, this test fails
+    /// at 16 and passes at 1, which is the diagnosis printed in the assertion.
+    #[test]
+    fn one_broken_algorithm_is_named_at_every_repeat() {
+        for height in GATE_HEIGHTS {
+            for broken in 0u8..16 {
+                let report = report_with_broken_algo(broken, height, 4_000);
+                let blame = report.attribute();
+                assert!(
+                    blame.failing_chains >= MIN_CHAINS_TO_NAME,
+                    "height {height} algo {broken}: only {} failing chains, the corpus is too \
+                     small to test the attribution",
+                    blame.failing_chains
+                );
+                assert_eq!(
+                    blame.named,
+                    vec![broken],
+                    "height {height} (repeat {}): broken algorithm {} ({}) was not named alone; \
+                     in every failure = {:?}, named = {:?}",
+                    x16rs::block_hash_repeat(height),
+                    broken,
+                    ALGO_NAMES[broken as usize],
+                    blame.in_every_failure,
+                    blame.named,
+                );
+                assert_eq!(
+                    blame.passing[broken as usize], 0,
+                    "a chain that ran the broken algorithm cannot have passed"
+                );
+                assert!(blame.render().contains(ALGO_NAMES[broken as usize]));
+            }
+        }
+    }
+
+    /// A defect that is not one algorithm must NOT be blamed on one.
+    ///
+    /// The barrier fault the OpenCL gate was proved with corrupts hashes without
+    /// regard to which algorithms they ran. Failing chains then share no
+    /// algorithm, and the honest report is "no single algorithm is implicated" -
+    /// which is also the true statement about a race.
+    #[test]
+    fn a_defect_that_is_not_one_algorithm_names_nothing() {
+        let intro = corpus_header(4);
+        let height = REPEAT16_HEIGHT;
+        let mut report = EquivReport::default();
+        // Every third nonce wrong, chosen with no reference to its chain.
+        for nonce in 0..900u32 {
+            let chain = algo_sequence(height, &intro, nonce);
+            if nonce % 3 == 0 {
+                report.mismatches.push(Mismatch {
+                    height,
+                    repeat: 16,
+                    header_index: 4,
+                    nonce,
+                    gpu: [0u8; 32],
+                    cpu: [1u8; 32],
+                    algos: chain,
+                });
+            } else {
+                report.passing_chain_samples += 1;
+                let mut seen = [false; 16];
+                for algo in &chain {
+                    seen[(*algo & 0x0f) as usize] = true;
+                }
+                for (index, ran) in seen.iter().enumerate() {
+                    if *ran {
+                        report.passing_algo_chains[index] += 1;
+                    }
+                }
+            }
+        }
+        let blame = report.attribute();
+        assert!(
+            blame.named.is_empty(),
+            "a race was blamed on {:?}",
+            blame.named
+        );
+        assert!(blame.render().contains("NO single algorithm"));
+    }
+
+    /// The passing-chain half of the attribution, pinned where it does the work.
+    ///
+    /// On a thin run the intersection of the failing chains is NOT one algorithm
+    /// - here it is six - and only "ran in no chain the card got right" cuts it
+    /// to the culprit. Delete that half and this test reports the six.
+    #[test]
+    fn the_passing_chain_filter_is_what_cuts_the_suspects_down() {
+        // 6 corpus nonces at repeat 16, skein (5) broken: three chains fail.
+        let report = report_with_broken_algo(5, REPEAT16_HEIGHT, 6);
+        let blame = report.attribute();
+        assert_eq!(blame.failing_chains, 3);
+        assert!(
+            blame.in_every_failure.len() > 1,
+            "the intersection alone was already unique, so this test proves nothing: {:?}",
+            blame.in_every_failure
+        );
+        assert!(blame.in_every_failure.contains(&5));
+        assert_eq!(
+            blame.named,
+            vec![5],
+            "the passing-chain filter should have cut {:?} to skein alone",
+            blame.in_every_failure
+        );
+    }
+
+    /// Too few failures must produce a candidate list, not a confident name.
+    #[test]
+    fn a_handful_of_mismatches_names_nothing() {
+        let report = report_with_broken_algo(9, REPEAT16_HEIGHT, 4);
+        let blame = report.attribute();
+        assert!(blame.failing_chains < MIN_CHAINS_TO_NAME);
+        assert!(blame.render().contains("too few failing chains"));
+    }
+
+    /// A clean run must not accuse anyone, and must print nothing about blame.
+    #[test]
+    fn a_passing_run_attributes_nothing() {
+        let mut report = EquivReport {
+            compared: 10_000,
+            passing_chain_samples: 150,
+            ..Default::default()
+        };
+        report.algo_counts = [40; 16];
+        report.passing_algo_chains = [90; 16];
+        assert!(report.passed());
+        let blame = report.attribute();
+        assert_eq!(blame.failing_chains, 0);
+        assert!(blame.named.is_empty());
+        assert_eq!(blame.render(), "");
+    }
+
+    /// A gate that compared nothing, or that never reached an algorithm, is not
+    /// a pass. This is the property that makes a CUDA run on a machine with no
+    /// device fail instead of printing an empty PASS.
+    #[test]
+    fn an_empty_or_incomplete_run_is_not_a_pass() {
+        assert!(!EquivReport::default().passed());
+        let mut compared_nothing = EquivReport {
+            compared: 0,
+            ..Default::default()
+        };
+        compared_nothing.algo_counts = [1; 16];
+        assert!(!compared_nothing.passed());
+        let mut missed_one = EquivReport {
+            compared: 5_000,
+            ..Default::default()
+        };
+        missed_one.algo_counts = [7; 16];
+        missed_one.algo_counts[11] = 0;
+        assert!(!missed_one.passed());
+        assert!(missed_one.render().contains("NEVER TESTED"));
+    }
 }
+

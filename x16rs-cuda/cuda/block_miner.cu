@@ -4,12 +4,12 @@
 #include "sha3_256.cl"
 #include "x16rs.cl"
 
-__constant__ sph_u64 x16rs_d_H_blake[8] = {
-    SPH_C64(0x6A09E667F3BCC908), SPH_C64(0xBB67AE8584CAA73B),
-    SPH_C64(0x3C6EF372FE94F82B), SPH_C64(0xA54FF53A5F1D36F1),
-    SPH_C64(0x510E527FADE682D1), SPH_C64(0x9B05688C2B3E6C1F),
-    SPH_C64(0x1F83D9ABFB41BD6B), SPH_C64(0x5BE0CD19137E2179),
-};
+// CUDA needs the blake IV as a file-scope __constant__ (X16RS_DECLARE_H_BLAKE
+// under __CUDA__ just points H_blake at it), but the VALUES must not be a second
+// copy: see the comment on X16RS_H_BLAKE_INIT in x16rs.cl. Spelling the eight
+// words out again here is what made the fault tree that flips a blake IV bit a
+// no-op for this backend.
+__constant__ sph_u64 x16rs_d_H_blake[8] = X16RS_H_BLAKE_INIT;
 
 inline __device__ int diff_big_hash_dev(const hash_32 *src, const hash_32 *tar)
 {

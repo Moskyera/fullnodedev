@@ -88,7 +88,7 @@ fn main() {
 
     let Some(cuda_root) = cuda_root else {
         println!(
-            "cargo:warning=CUDA Toolkit not found (set CUDA_PATH or install NVIDIA CUDA) — build without GPU kernels"
+            "cargo:warning=CUDA Toolkit not found (set CUDA_PATH or install NVIDIA CUDA), build without GPU kernels"
         );
         return;
     };
@@ -102,8 +102,49 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let opencl_dir = manifest_dir.join("../x16rs/opencl");
     let cuda_dir = manifest_dir.join("cuda");
+
+    // block_miner.cu #includes util.cl, sha3_256.cl and x16rs.cl straight out of
+    // x16rs/opencl: the two backends share the algorithm sources, and only the
+    // launch wrapper differs. X16RS_CUDA_KERNEL_DIR redirects that include to
+    // another tree.
+    //
+    // This is what gives CUDA the same fault-injection proof OpenCL has. The
+    // OpenCL gate is believed because it was shown to FAIL on three deliberate
+    // defects (`scripts/x16rs_gate_trees.py`), and it could be shown that
+    // cheaply because OpenCL compiles its kernels at runtime from a directory
+    // the caller names. nvcc compiles these at BUILD time, so without a knob
+    // here the only honest thing anyone could say about the CUDA gate is that it
+    // has never been seen to fail. With it:
+    //
+    //   python scripts/x16rs_gate_trees.py x16rs/opencl /tmp/trees faults
+    //   X16RS_CUDA_KERNEL_DIR=/tmp/trees/faults/A \
+    //     cargo build --release --features cuda --bin x16rs_gate
+    //   ./x16rs_gate equiv --backend cuda      # must exit 3, naming shabal
+    //
+    // NEVER point a miner at a build made this way; every tree under faults/
+    // produces wrong hashes on purpose.
+    let opencl_dir = match env::var("X16RS_CUDA_KERNEL_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => {
+            let dir = PathBuf::from(dir);
+            if !dir.join("x16rs.cl").is_file() {
+                panic!(
+                    "X16RS_CUDA_KERNEL_DIR={} has no x16rs.cl; refusing to build CUDA kernels \
+                     against a directory that is not a kernel tree (it would silently fall back \
+                     to the shipping one and the build would look like a fault injection that \
+                     changed nothing)",
+                    dir.display()
+                );
+            }
+            println!(
+                "cargo:warning=x16rs-cuda: kernels from X16RS_CUDA_KERNEL_DIR={} instead of \
+                 x16rs/opencl. This is a MEASURING build. Do not mine with it.",
+                dir.display()
+            );
+            dir
+        }
+        _ => manifest_dir.join("../x16rs/opencl"),
+    };
 
     // cc-rs defaults pass GCC flags (-ffunction-sections) that nvcc rejects.
     unsafe {
@@ -160,4 +201,9 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/block_miner.cu");
     println!("cargo:rerun-if-changed=cuda/ocl_compat.cuh");
     println!("cargo:rerun-if-changed=../x16rs/opencl");
+    // Without this, switching kernel trees would reuse the previous build's
+    // object file and a fault-injection run would silently measure the shipping
+    // kernel, i.e. report a PASS for a tree that is broken on purpose.
+    println!("cargo:rerun-if-env-changed=X16RS_CUDA_KERNEL_DIR");
+    println!("cargo:rerun-if-changed={}", opencl_dir.display());
 }

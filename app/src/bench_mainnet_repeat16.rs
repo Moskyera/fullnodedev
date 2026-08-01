@@ -31,20 +31,20 @@ use std::time::{Duration, Instant};
 
 /// A height whose block_hash_repeat is the mainnet maximum of 16.
 /// 800_000 / 50_000 + 1 = 17 -> clamped to 16 by x16rs::block_hash_repeat.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const MAINNET_REPEAT16_HEIGHT: u64 = 800_000;
 
 /// A height whose block_hash_repeat is 1 (matches the stock auto-tune).
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const REPEAT1_HEIGHT: u64 = 1;
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 const WARMUP_BATCHES: u32 = 3;
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 const MIN_VALID_SAMPLES: u32 = 5;
 
 /// Fully-instrumented result of one measurement run at a fixed height/repeat.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Debug)]
 pub struct RepeatBenchReport {
     pub height: u64,
@@ -61,7 +61,7 @@ pub struct RepeatBenchReport {
     pub nonces_per_sec: f64,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl RepeatBenchReport {
     /// Human-readable, copy-pasteable proof block for a community post.
     pub fn render(&self) -> String {
@@ -92,7 +92,7 @@ impl RepeatBenchReport {
 
 /// Format a nonces/sec figure as H/s, kH/s or MH/s (self-contained; does not
 /// depend on basis::difficulty so this module stays drop-in).
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn fmt_rate(hps: f64) -> String {
     if hps >= 1_000_000.0 {
         format!("{:.2} MH/s", hps / 1_000_000.0)
@@ -105,7 +105,7 @@ pub fn fmt_rate(hps: f64) -> String {
 
 /// Re-hash the GPU's returned best nonce on the CPU and byte-compare.
 /// Returns Ok(()) only when the GPU output is provably correct for `height`.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn cpu_verify_batch(
     height: u64,
     block_intro: &[u8],

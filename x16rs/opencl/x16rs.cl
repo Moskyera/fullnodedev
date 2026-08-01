@@ -138,17 +138,32 @@ typedef union ALIGN {
   unsigned char h1[16];
 } diamond_t;
 
-#ifdef __CUDA__
-#define X16RS_DECLARE_H_BLAKE() \
-    const sph_u64 * const H_blake = x16rs_d_H_blake
-#else
-#define X16RS_DECLARE_H_BLAKE() \
-    __constant sph_u64 ALIGN H_blake[8] = { \
+/* The blake IV, in ONE place.
+ *
+ * It used to be written out twice: here for OpenCL, and again in
+ * x16rs-cuda/cuda/block_miner.cu for CUDA, which needs a __constant__ at file
+ * scope rather than a declaration inside the kernel. Two copies of a consensus
+ * constant is a standing invitation for the backends to disagree, and it had one
+ * concrete cost already: scripts/x16rs_gate_trees.py builds its fault trees by
+ * rewriting THIS file, so the "one bit flipped in blake's IV" tree that proves
+ * the gate can fail changed the OpenCL kernel and left the CUDA one untouched.
+ * The CUDA gate would have passed a kernel that was broken on purpose, and the
+ * proof would have been worthless without anyone noticing.
+ *
+ * Both backends now read these eight words, and a fault tree reaches both. */
+#define X16RS_H_BLAKE_INIT { \
         SPH_C64(0x6A09E667F3BCC908), SPH_C64(0xBB67AE8584CAA73B), \
         SPH_C64(0x3C6EF372FE94F82B), SPH_C64(0xA54FF53A5F1D36F1), \
         SPH_C64(0x510E527FADE682D1), SPH_C64(0x9B05688C2B3E6C1F), \
         SPH_C64(0x1F83D9ABFB41BD6B), SPH_C64(0x5BE0CD19137E2179) \
     }
+
+#ifdef __CUDA__
+#define X16RS_DECLARE_H_BLAKE() \
+    const sph_u64 * const H_blake = x16rs_d_H_blake
+#else
+#define X16RS_DECLARE_H_BLAKE() \
+    __constant sph_u64 ALIGN H_blake[8] = X16RS_H_BLAKE_INIT
 #endif
 
 #ifdef AMD_GFX_GFX1201
