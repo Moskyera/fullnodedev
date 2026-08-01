@@ -283,17 +283,28 @@ mod tests {
         let path = log_path(&dir, "poworker");
         init_with_limit(&path, DEFAULT_MAX_BYTES).expect("open the log");
 
-        record("[Mining] first");
+        // `serial()` only orders the tests in THIS module. The log is one
+        // process-wide file and every other test in the crate that reaches a
+        // `wlogln!` writes into whichever log is open, so counting the lines in
+        // the file counted their output too and passed only on lucky ordering.
+        // The claim being made is about the lines this test wrote, so they are
+        // tagged and picked out; nothing else in the crate can carry the tag.
+        let tag = format!(
+            "log-write-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        record(&format!("[Mining] {tag} first"));
         // A multi-line print becomes one entry per line: the panel splits on
         // newlines and must never see a half entry.
-        record("[Mining] second\r\n[Mining] third");
+        record(&format!("[Mining] {tag} second\r\n[Mining] {tag} third"));
 
         let text = fs::read_to_string(&path).expect("read back");
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = text.lines().filter(|line| line.contains(&tag)).collect();
         assert_eq!(lines.len(), 3, "got {text:?}");
-        assert!(lines[0].ends_with(" [Mining] first"), "{}", lines[0]);
-        assert!(lines[1].ends_with(" [Mining] second"), "{}", lines[1]);
-        assert!(lines[2].ends_with(" [Mining] third"), "{}", lines[2]);
+        assert!(lines[0].ends_with(&format!(" [Mining] {tag} first")), "{}", lines[0]);
+        assert!(lines[1].ends_with(&format!(" [Mining] {tag} second")), "{}", lines[1]);
+        assert!(lines[2].ends_with(&format!(" [Mining] {tag} third")), "{}", lines[2]);
         // Every entry carries the time it was printed, so the panel shows a
         // measured timestamp instead of the moment it happened to read the file.
         assert_eq!(lines[0].chars().nth(4), Some('-'), "{}", lines[0]);

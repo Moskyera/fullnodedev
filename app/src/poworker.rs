@@ -8,16 +8,8 @@ use serde_json::Value as JV;
 
 use crate::efficiency::*;
 
-#[cfg(feature = "ocl")]
-use basis::difficulty::*;
-#[cfg(any(feature = "ocl", test))]
-use field::*;
-#[cfg(any(feature = "ocl", test))]
-use protocol::block::*;
 use sys::*;
 
-#[cfg(feature = "ocl")]
-use crate::opencl_gpu::block::do_group_block_mining_opencl;
 #[cfg(feature = "ocl")]
 use crate::opencl_gpu::initialize_opencl;
 #[cfg(feature = "cuda")]
@@ -497,279 +489,89 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
     }
     wlogln!("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
 }
+/// How many rank thresholds each candidate's equivalence proof uses.
+///
+/// Each threshold is one launch that reads every hash in the window, and the
+/// set of them catches ONE wrong hash anywhere in the window with probability
+/// 1 - p, where p is printed by the tuner. 31 keeps a candidate's proof under a
+/// second on this card while leaving a shape bug, which corrupts many hashes and
+/// not one, with no way through: the miss probabilities multiply.
 #[cfg(feature = "ocl")]
-const AUTOTUNE_WARMUP_BATCHES: u32 = 3;
-#[cfg(any(feature = "ocl", test))]
-const AUTOTUNE_MIN_VALID_SAMPLES: u32 = 5;
-#[cfg(any(feature = "ocl", test))]
-const AUTOTUNE_ECO_MIN_PERFORMANCE_RATIO: f64 = 0.70;
-#[cfg(any(feature = "ocl", test))]
-const AUTOTUNE_VERIFY_MIN_HPS_RATIO: f64 = 0.70;
+const AUTOTUNE_PROOF_THRESHOLDS: u32 = 31;
 
-#[cfg(any(feature = "ocl", test))]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct BenchmarkMeasurement {
-    hps: f64,
-    samples: u32,
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn finish_benchmark_measurement(
-    total_hashes: u64,
-    total_secs: f64,
-    samples: u32,
-) -> Result<BenchmarkMeasurement, String> {
-    if total_hashes == 0 {
-        return Err("zero hashes measured".to_string());
-    }
-    if samples < AUTOTUNE_MIN_VALID_SAMPLES {
-        return Err(format!(
-            "only {samples} valid samples (minimum {AUTOTUNE_MIN_VALID_SAMPLES})"
-        ));
-    }
-    if !total_secs.is_finite() || total_secs <= 0.0 {
-        return Err("invalid measured duration".to_string());
-    }
-    let hps = total_hashes as f64 / total_secs;
-    if !hps.is_finite() || hps <= 0.0 {
-        return Err("zero or invalid hashrate".to_string());
-    }
-    Ok(BenchmarkMeasurement { hps, samples })
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn x16rs_algorithm_id(hash: &[u8; 32]) -> u8 {
-    (u32::from_le_bytes([hash[28], hash[29], hash[30], hash[31]]) % 16) as u8
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn validate_benchmark_batch_result(
-    height: u64,
-    block_intro: &[u8],
-    nonce_start: u32,
-    batch: u32,
-    result_nonce: u32,
-    result_hash: &[u8; 32],
-) -> Result<(), String> {
-    if batch == 0 {
-        return Err("zero-size OpenCL batch".to_string());
-    }
-    if result_hash.iter().all(|byte| *byte == 0) {
-        return Err("OpenCL returned a zero hash result".to_string());
-    }
-    if *result_hash == [u8::MAX; 32] {
-        return Err("OpenCL returned no best hash".to_string());
-    }
-    if result_nonce.wrapping_sub(nonce_start) >= batch {
-        return Err(format!(
-            "OpenCL returned nonce {result_nonce} outside batch starting at {nonce_start}"
-        ));
-    }
-    if block_intro.len() < 83 {
-        return Err("benchmark block intro is too short".to_string());
-    }
-    let mut verify_intro = block_intro.to_vec();
-    verify_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
-    let expected_hash = x16rs::block_hash(height, &verify_intro);
-    if expected_hash != *result_hash {
-        let prehash = x16rs::calculate_hash(&verify_intro);
-        return Err(format!(
-            "OpenCL nonce/hash result failed CPU verification: nonce={result_nonce} algorithm={} gpu={} cpu={}",
-            x16rs_algorithm_id(&prehash),
-            hex::encode(result_hash),
-            hex::encode(expected_hash)
-        ));
-    }
-    Ok(())
-}
-
+/// Corpus headers. Four distinct block intros, so the tune cannot be an artefact
+/// of one header's algorithm chain.
 #[cfg(feature = "ocl")]
-fn execute_benchmark_batch(
-    opencl: &crate::opencl_gpu::OpenCLResources,
-    cnf: &PoWorkConf,
-    height: u64,
-    block_intro: &[u8],
-    nonce_start: u32,
-    batch: u32,
-    wg_eff: u32,
-    us: u32,
-) -> Result<f64, String> {
-    let started = Instant::now();
-    let (result_nonce, result_hash) = do_group_block_mining_opencl(
-        opencl,
-        height,
-        block_intro.to_vec(),
-        nonce_start,
-        wg_eff,
-        cnf.localsize,
-        us,
-    )
-    .map_err(|error| error.display())?;
-    let used = started.elapsed().as_secs_f64();
-    if !used.is_finite() || used <= 0.0 {
-        return Err("OpenCL batch returned an invalid duration".to_string());
-    }
-    validate_benchmark_batch_result(
-        height,
-        block_intro,
-        nonce_start,
-        batch,
-        result_nonce,
-        &result_hash,
-    )?;
-    Ok(used)
-}
+const AUTOTUNE_CORPUS_HEADERS: u32 = 4;
 
+/// What a hash is worth per day, read from the node the miner is configured to
+/// mine on, or `None` when that cannot be known honestly.
+///
+/// Only Profit mode needs it, and only to compare candidates. It is deliberately
+/// not attempted when a pool is configured: a pool serves a SHARE target, which
+/// is orders of magnitude weaker than the network target, so pricing a hash from
+/// it would overstate revenue enormously and make every extra watt look free.
 #[cfg(feature = "ocl")]
-fn bench_block_hps(
-    opencl: &crate::opencl_gpu::OpenCLResources,
-    cnf: &PoWorkConf,
-    wg_eff: u32,
-    us: u32,
-    seconds: u64,
-) -> Result<BenchmarkMeasurement, String> {
-    let height = 1u64;
-    let block_intro = BlockIntro::default().serialize();
-    let batch_u64 = (wg_eff as u64)
-        .saturating_mul(cnf.localsize as u64)
-        .saturating_mul(us as u64);
-    if batch_u64 == 0 || batch_u64 > u32::MAX as u64 {
-        return Err(format!(
-            "invalid launch size wg={wg_eff} local={} unit_size={us}",
-            cnf.localsize
-        ));
+fn network_hac_per_hps_day(cnf: &PoWorkConf) -> Option<f64> {
+    if !cnf.pool_worker.is_empty() {
+        wlogln!(
+            "[autotune] pool_worker is set, so the target this miner is served is a share target, \
+             not the network's. The value of a hash cannot be read from it."
+        );
+        return None;
     }
-    let batch = batch_u64 as u32;
-    let mut nonce = 0u32;
-    for warmup in 0..AUTOTUNE_WARMUP_BATCHES {
-        execute_benchmark_batch(opencl, cnf, height, &block_intro, nonce, batch, wg_eff, us)
-            .map_err(|error| format!("warm-up batch {} failed: {error}", warmup + 1))?;
-        nonce = nonce.wrapping_add(batch);
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(seconds.max(3));
-    let mut total_hashes = 0u64;
-    let mut total_secs = 0.0f64;
-    let mut success_batches = 0u32;
-    while Instant::now() < deadline {
-        let used =
-            execute_benchmark_batch(opencl, cnf, height, &block_intro, nonce, batch, wg_eff, us)
-                .map_err(|error| {
-                    format!("measured batch {} failed: {error}", success_batches + 1)
-                })?;
-        success_batches += 1;
-        total_hashes = total_hashes.saturating_add(batch as u64);
-        total_secs += used;
-        nonce = nonce.wrapping_add(batch);
-    }
-    finish_benchmark_measurement(total_hashes, total_secs, success_batches)
-}
-
-#[cfg(any(feature = "ocl", test))]
-#[derive(Clone, Debug)]
-struct ProfileBenchResult {
-    pick: BenchmarkPick,
-    hps: f64,
-    estimated_watts: f64,
-    estimated_kh_per_j: f64,
-    samples: u32,
-}
-
-#[cfg(any(feature = "ocl", test))]
-impl ProfileBenchResult {
-    fn new(pick: BenchmarkPick, hps: f64, estimated_watts: f64, samples: u32) -> Option<Self> {
-        if !hps.is_finite()
-            || hps <= 0.0
-            || !estimated_watts.is_finite()
-            || estimated_watts <= 0.0
-            || samples < AUTOTUNE_MIN_VALID_SAMPLES
-        {
-            return None;
-        }
-        Some(Self {
-            pick,
-            hps,
-            estimated_watts,
-            estimated_kh_per_j: hps / estimated_watts / 1000.0,
-            samples,
-        })
-    }
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn pick_benchmark_result(
-    results: &[ProfileBenchResult],
-    mode: EfficiencyMode,
-) -> Option<&ProfileBenchResult> {
-    let stable = || {
-        results.iter().filter(|result| {
-            result.hps.is_finite()
-                && result.hps > 0.0
-                && result.estimated_watts.is_finite()
-                && result.estimated_watts > 0.0
-                && result.estimated_kh_per_j.is_finite()
-                && result.estimated_kh_per_j > 0.0
-                && result.samples >= AUTOTUNE_MIN_VALID_SAMPLES
-        })
-    };
-    match mode {
-        EfficiencyMode::Max => stable().max_by(|a, b| a.hps.total_cmp(&b.hps)),
-        EfficiencyMode::Profit => {
-            stable().max_by(|a, b| a.estimated_kh_per_j.total_cmp(&b.estimated_kh_per_j))
-        }
-        EfficiencyMode::Eco => {
-            let max_hps = stable().map(|result| result.hps).fold(0.0f64, f64::max);
-            let minimum_hps = max_hps * AUTOTUNE_ECO_MIN_PERFORMANCE_RATIO;
-            stable()
-                .filter(|result| result.hps >= minimum_hps)
-                .min_by(|a, b| {
-                    a.estimated_watts
-                        .total_cmp(&b.estimated_watts)
-                        .then_with(|| b.hps.total_cmp(&a.hps))
-                })
-        }
-    }
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn verification_is_stable(expected_hps: f64, verified_hps: f64) -> bool {
-    expected_hps.is_finite()
-        && expected_hps > 0.0
-        && verified_hps.is_finite()
-        && verified_hps >= expected_hps * AUTOTUNE_VERIFY_MIN_HPS_RATIO
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn verification_seconds(total_secs: u64) -> u64 {
-    (total_secs / 4).clamp(5, 15)
-}
-
-#[cfg(any(feature = "ocl", test))]
-fn autotune_device_count_is_supported(device_count: usize) -> bool {
-    device_count == 1
-}
-#[cfg(feature = "ocl")]
-fn benchmark_candidate(
-    opencl: &crate::opencl_gpu::OpenCLResources,
-    cnf: &PoWorkConf,
-    pick: BenchmarkPick,
-    seconds: u64,
-    max_workgroups: u32,
-    max_unitsize: u32,
-) -> Result<ProfileBenchResult, String> {
-    let measurement = bench_block_hps(opencl, cnf, pick.workgroups, pick.unitsize, seconds)?;
-    let estimated_watts = cnf.efficiency.estimate_tuning_watts(
-        &pick.profile,
-        pick.workgroups,
-        pick.unitsize,
-        max_workgroups,
-        max_unitsize,
+    let url = format!(
+        "http://{}/query/miner/pending?stuff=true&t={}",
+        &cnf.rpcaddr,
+        sys::curtimes()
     );
-    ProfileBenchResult::new(pick, measurement.hps, estimated_watts, measurement.samples)
-        .ok_or_else(|| "candidate produced an invalid measurement".to_string())
+    let body = crate::rpc_http::get_text(&HTTP_CLIENT, &url, &cnf.api_token, None).ok()?;
+    let res: JV = serde_json::from_str(&body).ok()?;
+    let height = res["height"].as_u64()?;
+    let target = hex::decode(res["target_hash"].as_str()?).ok()?;
+    let value = block_mining_runtime::hac_per_day_per_hashrate(height, &target)?;
+    wlogln!(
+        "[autotune] value of a hash, from {} at height {}: {:.3e} HAC per H/s per day",
+        &cnf.rpcaddr,
+        height,
+        value
+    );
+    Some(value)
+}
+
+/// Auto Tune measures OpenCL launch shapes, and only those.
+///
+/// The tuner opens an OpenCL device, sweeps `work_groups` x `unit_size` over the
+/// grid that backend allows, and proves each shape against the CPU through the
+/// OpenCL kernel. None of that exists for CUDA, whose shape space is a different
+/// size entirely (the shipped CUDA config starts at 131072 x 256 x 8, above
+/// anything the OpenCL grid contains), so there is nothing here to translate.
+///
+/// It is said as its own sentence because the alternative is what shipped: a
+/// CUDA owner pressed Auto Tune, waited, and was told to enable a backend they
+/// had deliberately turned off, with CUDA never mentioned.
+fn cuda_backend_refusal(cnf: &PoWorkConf) -> bool {
+    if !cnf.usecuda {
+        return false;
+    }
+    wlogln!(
+        "[autotune] Auto Tune does not support the CUDA backend yet. This config has [gpu] \
+         use_cuda = true, so the miner runs on CUDA, while the tuner only measures OpenCL launch \
+         shapes and would write numbers the CUDA miner cannot use. Nothing was measured and the \
+         config is unchanged. To tune, set use_cuda = false and use_opencl = true and run it \
+         again; to keep mining on CUDA, set [efficiency] benchmark_seconds = 0 and tune \
+         work_groups / unit_size by hand."
+    );
+    true
 }
 
 fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
+    // Before the feature split, because the answer is the same in both builds
+    // and a CUDA operator must not be told to rebuild for OpenCL when the real
+    // reason is that their backend has no tuner.
+    if cuda_backend_refusal(cnf) {
+        return;
+    }
     #[cfg(not(feature = "ocl"))]
     {
         let _ = (cnf, config_path);
@@ -782,255 +584,111 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             wlogln!("[benchmark] Set use_opencl=true in [gpu]");
             return;
         }
-        wlogln!(
-            "[benchmark] Power and kH/J figures are estimates derived from configured board power; they are not hardware telemetry."
-        );
-        wlogln!(
-            "[benchmark] NOTE: the MH/s below are raw X16RS repeat=1 tuning rates (relative comparison only). The live mainnet runs 16 rounds, so real block-hash throughput is roughly 1/11-1/16 of these numbers. For the honest mainnet figure run: set HACASH_REPEAT16_BENCH_SECONDS=30 and run poworker."
-        );
-        let total_secs = cnf.efficiency.benchmark_seconds.max(15) as u64;
-        let fine = cnf.efficiency.wants_fine_sweep();
-        let profile_secs = if fine {
-            (total_secs * 70 / 100).max(20)
-        } else {
-            total_secs
-        };
-        let sweep_secs = if fine {
-            total_secs.saturating_sub(profile_secs).max(10)
-        } else {
-            0
-        };
-
-        // Allocate GPU buffers for the largest profile unit_size (amd_max uses 128).
-        let init_unitsize = cnf.unitsize.max(128);
         let scan = crate::opencl_diag::scan_opencl();
-        let opencl_resources = initialize_opencl(
+        // One probe open, purely to learn this device's hard limits. Everything
+        // measured afterwards happens inside the tuner, which opens the device
+        // itself at the shapes it needs.
+        let probe = initialize_opencl(
             false,
             &cnf.opencldir,
             &cnf.platformid,
             &cnf.deviceids,
             &cnf.workgroups,
             &cnf.localsize,
-            &init_unitsize,
+            &cnf.unitsize.max(32),
             Some(&scan),
             false,
         );
-        if opencl_resources.is_empty() {
-            wlogln!("[benchmark] No OpenCL devices");
+        if probe.is_empty() {
+            wlogln!("[autotune] No OpenCL devices");
             return;
         }
-        if !autotune_device_count_is_supported(opencl_resources.len()) {
+        if probe.len() != 1 {
             wlogln!(
-                "[benchmark] Auto Tune requires exactly one OpenCL device, but detected {}. The current config has one shared work_groups/unit_size pair, so multi-GPU tuning would be ambiguous. Set [gpu] device_ids to one device and tune each GPU separately; config unchanged.",
-                opencl_resources.len()
+                "[autotune] Auto Tune requires exactly one OpenCL device, but detected {}. The \
+                 config has one shared work_groups/unit_size pair, so multi-GPU tuning would be \
+                 ambiguous. Set [gpu] device_ids to one device and tune each GPU separately; \
+                 config unchanged.",
+                probe.len()
             );
             return;
         }
+        let limits = crate::gpu_arch::ArchLimits::for_slug(&probe[0].arch_slug);
+        let min_wg = limits.panel_min_wg.min(probe[0].workgroups);
+        let max_wg = probe[0].workgroups;
+        let max_us = limits.max_unit_size().max(32);
+        let vendor = probe[0].vendor;
+        drop(probe);
 
-        for (dev_i, opencl) in opencl_resources.iter().enumerate() {
-            let limits = crate::gpu_arch::ArchLimits::for_slug(&opencl.arch_slug);
-            let min_wg = limits.panel_min_wg.min(opencl.workgroups);
-            let max_wg = opencl.workgroups;
-            let max_us = limits
-                .max_unit_size()
-                .min(opencl.allocated_unitsize)
-                .max(32);
-            let max_tier = crate::gpu_arch::ArchLimits::panel_max_tier(&cnf.gpu_slug);
-            let candidates = benchmark_candidates_for_device(
-                opencl.vendor,
-                min_profile_tier_for_mode(cnf.efficiency.mode),
-                max_tier,
-                min_wg,
-                max_wg,
-                max_us,
-            );
-            if candidates.is_empty() {
-                wlogln!(
-                    "[benchmark] No safe tuning candidates for device #{}",
-                    dev_i
-                );
-                continue;
-            }
-            let per = (profile_secs / candidates.len() as u64).max(4);
-            wlogln!(
-                "[benchmark] Device #{}: {}s x {} exact tuning points{}",
-                dev_i,
-                per,
-                candidates.len(),
-                if fine { " + bounded fine sweep" } else { "" }
-            );
+        let economics = crate::autotune16::Economics {
+            power_cost_kwh: cnf.efficiency.power_cost_kwh,
+            hac_price: cnf.efficiency.hac_price,
+            hac_per_hps_day: if cnf.efficiency.mode == EfficiencyMode::Profit {
+                network_hac_per_hps_day(cnf)
+            } else {
+                None
+            },
+            cpu_watts: cnf.efficiency.initial_active_supervene(cnf.supervene) as f64
+                * cnf.efficiency.cpu_watts_per_thread,
+        };
+        let request = crate::autotune16::TuneRequest {
+            opencl_dir: cnf.opencldir.clone(),
+            platform: cnf.platformid,
+            device_ids: cnf.deviceids.clone(),
+            local_size: cnf.localsize,
+            min_work_groups: min_wg,
+            max_work_groups: max_wg,
+            max_unit_size: max_us,
+            vendor,
+            mode: cnf.efficiency.mode,
+            budget_seconds: cnf.efficiency.benchmark_seconds.max(30) as u64,
+            economics,
+            estimated_watts: cnf.efficiency.estimate_gpu_watts(&cnf.gpu_profile),
+            thermal_file: cnf.efficiency.thermal_file.clone(),
+            gpu_index: cnf.efficiency.thermal_gpu_index,
+            // The CPU oracle is what proves each shape, and it is the only part
+            // of a tune that competes with the rest of the machine. Two cores are
+            // left alone so that a node syncing beside the tuner keeps running.
+            oracle_threads: std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(4),
+            headers: AUTOTUNE_CORPUS_HEADERS,
+            proof_thresholds: AUTOTUNE_PROOF_THRESHOLDS,
+            max_temp_c: (cnf.efficiency.max_temp_c > 0)
+                .then_some(cnf.efficiency.max_temp_c as f32),
+        };
 
-            let mut bench_results = Vec::new();
-            for pick in candidates {
-                match benchmark_candidate(opencl, cnf, pick.clone(), per, max_wg, max_us) {
-                    Ok(result) => {
-                        wlogln!(
-                            "[benchmark] dev{} {}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples, wg={}, unit_size={})",
-                            dev_i,
-                            result.pick.profile,
-                            rates_to_show(result.hps),
-                            result.estimated_kh_per_j,
-                            result.estimated_watts,
-                            result.samples,
-                            result.pick.workgroups,
-                            result.pick.unitsize
-                        );
-                        bench_results.push(result);
-                    }
-                    Err(error) => {
-                        wlogln!(
-                            "[benchmark] dev{} {}: REJECTED ({error}, wg={}, unit_size={})",
-                            dev_i, pick.profile, pick.workgroups, pick.unitsize
-                        );
-                    }
-                }
-            }
-
-            let Some(base) = pick_benchmark_result(&bench_results, cnf.efficiency.mode) else {
-                wlogln!(
-                    "[benchmark] No successful tuning points; config unchanged (check OpenCL driver)."
-                );
-                continue;
-            };
-            let mut selected = base.clone();
-
-            if fine && sweep_secs > 0 {
-                let wg_sweep_secs = sweep_secs / 2;
-                let us_sweep_secs = sweep_secs.saturating_sub(wg_sweep_secs).max(6);
-                let wg_candidates = sweep_workgroup_candidates_bounded(
-                    selected.pick.workgroups,
-                    opencl.vram_bytes,
-                    cnf.localsize,
-                    selected.pick.unitsize,
-                    min_wg,
-                    max_wg,
-                );
-                let per_wg = (wg_sweep_secs / wg_candidates.len().max(1) as u64).max(3);
-                wlogln!(
-                    "[benchmark] dev{} bounded wg sweep: {:?} x {}s",
-                    dev_i, wg_candidates, per_wg
-                );
-                let mut wg_results = Vec::new();
-                for wg_try in wg_candidates {
-                    let candidate = BenchmarkPick {
-                        profile: selected.pick.profile.clone(),
-                        workgroups: wg_try,
-                        unitsize: selected.pick.unitsize,
-                    };
-                    match benchmark_candidate(opencl, cnf, candidate, per_wg, max_wg, max_us) {
-                        Ok(result) => {
-                            wlogln!(
-                                "[benchmark] dev{} wg={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
-                                dev_i,
-                                wg_try,
-                                rates_to_show(result.hps),
-                                result.estimated_kh_per_j,
-                                result.estimated_watts,
-                                result.samples
-                            );
-                            wg_results.push(result);
-                        }
-                        Err(error) => {
-                            wlogln!("[benchmark] dev{} wg={}: REJECTED ({error})", dev_i, wg_try);
-                        }
-                    }
-                }
-                if let Some(best) = pick_benchmark_result(&wg_results, cnf.efficiency.mode) {
-                    selected = best.clone();
-                }
-
-                let us_candidates = sweep_unitsize_candidates(selected.pick.unitsize, max_us);
-                let per_us = (us_sweep_secs / us_candidates.len().max(1) as u64).max(3);
-                wlogln!(
-                    "[benchmark] dev{} bounded unit_size sweep: {:?} x {}s",
-                    dev_i, us_candidates, per_us
-                );
-                let mut us_results = Vec::new();
-                for us_try in us_candidates {
-                    let candidate = BenchmarkPick {
-                        profile: selected.pick.profile.clone(),
-                        workgroups: selected.pick.workgroups,
-                        unitsize: us_try,
-                    };
-                    match benchmark_candidate(opencl, cnf, candidate, per_us, max_wg, max_us) {
-                        Ok(result) => {
-                            wlogln!(
-                                "[benchmark] dev{} unit_size={}: {} (estimated {:.1} kH/J @ {:.0}W, {} samples)",
-                                dev_i,
-                                us_try,
-                                rates_to_show(result.hps),
-                                result.estimated_kh_per_j,
-                                result.estimated_watts,
-                                result.samples
-                            );
-                            us_results.push(result);
-                        }
-                        Err(error) => {
-                            wlogln!(
-                                "[benchmark] dev{} unit_size={}: REJECTED ({error})",
-                                dev_i, us_try
-                            );
-                        }
-                    }
-                }
-                if let Some(best) = pick_benchmark_result(&us_results, cnf.efficiency.mode) {
-                    selected = best.clone();
-                }
-            }
-
-            let verify_secs = verification_seconds(total_secs);
-            wlogln!(
-                "[benchmark] dev{} final verification soak: {}s at wg={} unit_size={}",
-                dev_i, verify_secs, selected.pick.workgroups, selected.pick.unitsize
-            );
-            let verified = match benchmark_candidate(
-                opencl,
-                cnf,
-                selected.pick.clone(),
-                verify_secs,
-                max_wg,
-                max_us,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
+        match crate::autotune16::tune(&request) {
+            Ok(outcome) => {
+                wlogln!("\n================ AUTO TUNE (x16rs repeat = 16) ================");
+                wlogln!("{}", crate::autotune16::render(&outcome, &request));
+                if !outcome.settle.settled {
+                    // The soak has already said which of the two it was, and
+                    // they have different answers. A corpus that could not fit
+                    // the settling window is a planning failure, and
+                    // `plan_session` refuses those before the sweep, so reaching
+                    // here means the card really was still moving.
                     wlogln!(
-                        "[benchmark] dev{} final verification REJECTED ({error}) - config unchanged.",
-                        dev_i
+                        "[autotune] The card never settled, so this shape is not proven to \
+                         sustain. Config unchanged. The soak made {} passes over {:.0}s with the \
+                         hashrate still spanning {:.2}%; a larger benchmark_seconds buys a longer \
+                         soak (up to 900s) and is the thing to try.",
+                        outcome.soak.len(),
+                        outcome.soak_seconds,
+                        outcome.settle.rate_span_pct,
                     );
-                    continue;
+                    return;
                 }
-            };
-            if !verification_is_stable(selected.hps, verified.hps) {
-                wlogln!(
-                    "[benchmark] dev{} final verification REJECTED: {} is below {:.0}% of measured {} - config unchanged.",
-                    dev_i,
-                    rates_to_show(verified.hps),
-                    AUTOTUNE_VERIFY_MIN_HPS_RATIO * 100.0,
-                    rates_to_show(selected.hps)
-                );
-                continue;
+                match apply_benchmark_pick(config_path, &outcome.pick) {
+                    Ok(()) => wlogln!(
+                        "[autotune] Config updated only after a settled soak at the chosen shape."
+                    ),
+                    Err(error) => wlogln!("[autotune] Could not patch ini: {error}"),
+                }
             }
-            wlogln!(
-                "[benchmark] dev{} verified: profile={} work_groups={} unit_size={} {} (estimated {:.1} kH/J @ {:.0}W, {} samples, mode={})",
-                dev_i,
-                verified.pick.profile,
-                verified.pick.workgroups,
-                verified.pick.unitsize,
-                rates_to_show(verified.hps),
-                verified.estimated_kh_per_j,
-                verified.estimated_watts,
-                verified.samples,
-                cnf.efficiency.mode.label()
-            );
-            if dev_i == 0 {
-                match apply_benchmark_pick(config_path, &verified.pick) {
-                    Ok(()) => {
-                        wlogln!(
-                            "[benchmark] Config updated only after successful final verification."
-                        )
-                    }
-                    Err(e) => wlogln!("[benchmark] Could not patch ini: {}", e),
-                }
+            Err(error) => {
+                wlogln!("[autotune] REJECTED: {error}");
+                wlogln!("[autotune] Config unchanged.");
             }
         }
     }
@@ -1040,197 +698,153 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
 mod tests {
     use super::*;
 
-    fn bench_result(
-        profile: &str,
-        workgroups: u32,
-        unitsize: u32,
-        hps: f64,
-        estimated_watts: f64,
-    ) -> ProfileBenchResult {
-        ProfileBenchResult::new(
-            BenchmarkPick {
-                profile: profile.to_string(),
-                workgroups,
-                unitsize,
+    /// The exact `[gpu]` section `scripts/mining-nvidia/INSTALL-CUDA-CONFIG.bat`
+    /// installs, kept here verbatim so this test tracks what a real NVIDIA
+    /// operator runs rather than a config invented for a test.
+    const CUDA_INI: &str = "\
+connect = 127.0.0.1:8080
+supervene = 4
+nonce_max = 4294967295
+notice_wait = 45
+
+[efficiency]
+mode = profit
+power_cost_kwh = 0.15
+gpu_watts = 0
+benchmark_seconds = 90
+
+[gpu]
+use_cuda = true
+use_opencl = false
+cuda_device = 0
+cpu_assist = true
+work_groups = 131072
+local_size = 256
+unit_size = 8
+debug = 0
+";
+
+    fn temp_ini(tag: &str, body: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hacash-{tag}-{}-{}.config.ini",
+            std::process::id(),
+            id
+        ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Auto Tune on a CUDA-only rig does nothing at all, and says nothing about
+    /// CUDA.
+    ///
+    /// This is the config the NVIDIA install script writes. The tuner's only
+    /// backend gate is `use_opencl`, so with `use_cuda = true` and
+    /// `use_opencl = false` it returns before opening any device and before
+    /// touching the file. The operator's `benchmark_seconds` therefore stays at
+    /// 90, which is exactly what the panel reads back as "the benchmark did not
+    /// produce a valid profile".
+    #[test]
+    fn auto_tune_on_a_cuda_only_config_refuses_and_leaves_the_file_untouched() {
+        let path = temp_ini("cuda-autotune-noop", CUDA_INI);
+        let cnf = PoWorkConf::new(&sys::load_config_path(&path));
+        assert!(cnf.usecuda, "the shipped CUDA config selects CUDA");
+        assert!(!cnf.useopencl, "the shipped CUDA config leaves OpenCL off");
+        assert_eq!(cnf.efficiency.benchmark_seconds, 90);
+
+        // The refusal is CUDA's, and it is reached before any OpenCL question is
+        // asked, so a --features cuda build says "CUDA" instead of telling the
+        // operator to rebuild for a backend they turned off on purpose.
+        assert!(cuda_backend_refusal(&cnf));
+
+        run_block_mining_benchmark(&cnf, path.to_str().unwrap());
+
+        // Byte-identical: no tune ran, no profile was chosen, and nothing was
+        // patched. benchmark_seconds is still 90, so the panel's success test
+        // (`loaded.benchmark_seconds == Some(0)`) fails and it rolls back.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CUDA_INI);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The CUDA refusal fires on `use_cuda` and on nothing else.
+    ///
+    /// An OpenCL rig must reach the tuner exactly as before: this gate is a new
+    /// sentence for CUDA owners, not a new way for anyone else to be refused.
+    #[test]
+    fn the_cuda_refusal_is_about_cuda_and_not_about_opencl() {
+        let opencl_ini = CUDA_INI
+            .replace("use_cuda = true", "use_cuda = false")
+            .replace("use_opencl = false", "use_opencl = true");
+        let path = temp_ini("opencl-autotune-allowed", &opencl_ini);
+        let cnf = PoWorkConf::new(&sys::load_config_path(&path));
+        assert!(!cnf.usecuda);
+        assert!(cnf.useopencl);
+        assert!(
+            !cuda_backend_refusal(&cnf),
+            "an OpenCL config must not be refused for a backend it does not use"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // Both flags on: CUDA still wins, because `build_gpu_backends` prefers
+        // CUDA and the shape the tuner would write is the one the CUDA miner
+        // would then be built from.
+        let both = CUDA_INI.replace("use_opencl = false", "use_opencl = true");
+        let path = temp_ini("both-backends-autotune", &both);
+        let cnf = PoWorkConf::new(&sys::load_config_path(&path));
+        assert!(cnf.usecuda && cnf.useopencl);
+        assert!(cuda_backend_refusal(&cnf));
+        run_block_mining_benchmark(&cnf, path.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), both);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Why the CUDA refusal has to come before the OpenCL gate.
+    ///
+    /// `build_gpu_backends` prefers CUDA (`if cnf.usecuda { .. } else if
+    /// cnf.useopencl { .. }`) and hands `cnf.workgroups` / `cnf.unitsize` to
+    /// `initialize_cuda`, while `apply_benchmark_pick` writes exactly those two
+    /// numbers. So a tune that ran on OpenCL with `use_cuda = true` still in the
+    /// file would land its winner in the numbers the CUDA miner is built from.
+    ///
+    /// The magnitudes below are the point: the shipped CUDA starting shape is
+    /// 131072 x 256 x 8, and the OpenCL tuner's search space tops out at a few
+    /// thousand work groups with unit_size in {32, 64, 128, 192}. This is not a
+    /// translation between backends, it is an overwrite, and it is what
+    /// `cuda_backend_refusal` now prevents by refusing on `use_cuda` rather than
+    /// letting `use_opencl` alone decide.
+    #[test]
+    fn an_opencl_tune_result_lands_in_the_two_numbers_the_cuda_miner_is_built_from() {
+        let both = CUDA_INI.replace("use_opencl = false", "use_opencl = true");
+        let path = temp_ini("cuda-autotune-crossover", &both);
+
+        let before = PoWorkConf::new(&sys::load_config_path(&path));
+        assert!(before.usecuda && before.useopencl);
+        assert_eq!((before.workgroups, before.unitsize), (131072, 8));
+
+        // A plausible winner from an OpenCL sweep on an RTX 4070-class card.
+        apply_benchmark_pick(
+            path.to_str().unwrap(),
+            &BenchmarkPick {
+                profile: "nvidia_max".to_string(),
+                workgroups: 1536,
+                unitsize: 128,
             },
-            hps,
-            estimated_watts,
-            AUTOTUNE_MIN_VALID_SAMPLES,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn autotune_pick_preserves_the_exact_measured_values() {
-        let results = vec![
-            bench_result("amd_profit", 1024, 96, 100.0, 100.0),
-            bench_result("amd_performance", 1536, 64, 120.0, 150.0),
-        ];
-        assert_eq!(
-            pick_benchmark_result(&results, EfficiencyMode::Max)
-                .unwrap()
-                .pick,
-            results[1].pick
-        );
-        assert_eq!(
-            pick_benchmark_result(&results, EfficiencyMode::Profit)
-                .unwrap()
-                .pick,
-            results[0].pick
-        );
-    }
-
-    #[test]
-    fn autotune_selection_is_mode_aware() {
-        let results = vec![
-            bench_result("amd_eco", 32, 32, 60.0, 20.0),
-            bench_result("amd_balanced", 48, 48, 75.0, 40.0),
-            bench_result("amd_performance", 64, 64, 100.0, 80.0),
-        ];
-
-        assert_eq!(
-            pick_benchmark_result(&results, EfficiencyMode::Max)
-                .unwrap()
-                .pick
-                .profile,
-            "amd_performance"
-        );
-        assert_eq!(
-            pick_benchmark_result(&results, EfficiencyMode::Profit)
-                .unwrap()
-                .pick
-                .profile,
-            "amd_eco"
-        );
-        assert_eq!(
-            pick_benchmark_result(&results, EfficiencyMode::Eco)
-                .unwrap()
-                .pick
-                .profile,
-            "amd_balanced"
-        );
-    }
-
-    #[test]
-    fn autotune_rejects_zero_and_under_sampled_measurements() {
-        assert!(finish_benchmark_measurement(0, 1.0, 10).is_err());
-        assert!(
-            finish_benchmark_measurement(1_000, 1.0, AUTOTUNE_MIN_VALID_SAMPLES.saturating_sub(1))
-                .is_err()
-        );
-        let valid = finish_benchmark_measurement(1_000, 2.0, AUTOTUNE_MIN_VALID_SAMPLES).unwrap();
-        assert_eq!(valid.hps, 500.0);
-        assert_eq!(valid.samples, AUTOTUNE_MIN_VALID_SAMPLES);
-    }
-
-    #[test]
-    fn autotune_final_verification_requires_repeatable_hashrate() {
-        assert!(verification_is_stable(100.0, 70.0));
-        assert!(!verification_is_stable(100.0, 69.99));
-        assert!(!verification_is_stable(100.0, f64::NAN));
-        assert_eq!(verification_seconds(15), 5);
-        assert_eq!(verification_seconds(60), 15);
-        assert_eq!(verification_seconds(600), 15);
-    }
-
-    #[test]
-    fn autotune_rejects_ambiguous_multi_gpu_targets() {
-        assert!(!autotune_device_count_is_supported(0));
-        assert!(autotune_device_count_is_supported(1));
-        assert!(!autotune_device_count_is_supported(2));
-    }
-
-    #[test]
-    fn autotune_rejects_invalid_gpu_results_and_accepts_cpu_verified_result() {
-        let height = 1u64;
-        let block_intro = BlockIntro::default().serialize();
-        let nonce_start = 11u32;
-        let batch = 256u32;
-
-        assert!(
-            validate_benchmark_batch_result(
-                height,
-                &block_intro,
-                nonce_start,
-                batch,
-                nonce_start,
-                &[0u8; 32]
-            )
-            .is_err()
-        );
-        assert!(
-            validate_benchmark_batch_result(
-                height,
-                &block_intro,
-                nonce_start,
-                batch,
-                nonce_start,
-                &[u8::MAX; 32]
-            )
-            .is_err()
-        );
-
-        let result_nonce = nonce_start + 42;
-        let mut verified_intro = block_intro.clone();
-        verified_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
-        let result_hash = x16rs::block_hash(height, &verified_intro);
-        validate_benchmark_batch_result(
-            height,
-            &block_intro,
-            nonce_start,
-            batch,
-            result_nonce,
-            &result_hash,
         )
         .unwrap();
 
+        let after = PoWorkConf::new(&sys::load_config_path(&path));
         assert!(
-            validate_benchmark_batch_result(
-                height,
-                &block_intro,
-                nonce_start,
-                batch,
-                nonce_start + batch,
-                &result_hash
-            )
-            .is_err()
+            after.usecuda,
+            "the tune did not turn CUDA off; the next run still mines on CUDA"
         );
-    }
-
-    #[test]
-    fn gfx1201_groestl_failure_vector_is_cpu_rejected() {
-        let height = 1u64;
-        let block_intro = BlockIntro::default().serialize();
-        let result_nonce = 6_858_338u32;
-        let mut verified_intro = block_intro.clone();
-        verified_intro[79..83].copy_from_slice(&result_nonce.to_be_bytes());
-        let pre_x16rs = x16rs::calculate_hash(&verified_intro);
-        let expected = x16rs::block_hash(height, &verified_intro);
-        let bad_gpu_hash: [u8; 32] =
-            hex::decode("00004f8f9d0fd569407298186d7015bc19d70bd379a551190b7233135562cb33")
-                .unwrap()
-                .try_into()
-                .unwrap();
-
-        wlogln!(
-            "nonce={result_nonce} pre_x16rs={} algorithm={} expected_x16rs={} bad_gpu={}",
-            hex::encode(pre_x16rs),
-            x16rs_algorithm_id(&pre_x16rs),
-            hex::encode(expected),
-            hex::encode(bad_gpu_hash)
+        assert_eq!(
+            (after.workgroups, after.unitsize),
+            (1536, 128),
+            "the OpenCL winner is now what initialize_cuda(cnf.cudadevice, cnf.workgroups, cnf.unitsize) is given"
         );
-        assert_eq!(x16rs_algorithm_id(&pre_x16rs), 2);
-        assert!(
-            validate_benchmark_batch_result(
-                height,
-                &block_intro,
-                result_nonce,
-                1,
-                result_nonce,
-                &bad_gpu_hash
-            )
-            .is_err()
-        );
+        assert_eq!(after.efficiency.benchmark_seconds, 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1309,6 +923,9 @@ mod tests {
 
     #[test]
     fn cpu_group_mining_result_matches_manual_scan() {
+        use field::Serialize;
+        use protocol::block::BlockIntro;
+
         let height = 1u64;
         let block_intro = BlockIntro::default().serialize();
         let nonce_start = 11u32;

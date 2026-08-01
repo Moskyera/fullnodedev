@@ -164,10 +164,46 @@ impl EfficiencyConf {
         profile_watts * (0.45 + 0.55 * load.sqrt())
     }
 
+    /// What the GPUs are drawing, preferring the sensor over the guess.
+    ///
+    /// `measured_gpu_w` is the rig's real total board power where a card
+    /// reported one. Every decision that used to be made on `gpu_watts` from the
+    /// ini goes through here instead, so a measured rig and an unmeasured one
+    /// differ in the number, never in the code path.
+    pub fn gpu_watts_now(&self, profile: &str, measured_gpu_w: Option<f32>) -> f64 {
+        match crate::mining_stats::sensor_board_power_w(measured_gpu_w) {
+            Some(measured) => f64::from(measured),
+            None => self.estimate_gpu_watts(profile),
+        }
+    }
+
+    /// Whole-rig draw: the GPUs (measured where possible) plus the CPU threads
+    /// assisting them, whose draw is always the configured per-thread estimate.
+    pub fn total_watts_now(
+        &self,
+        profile: &str,
+        active_cpu_threads: u32,
+        measured_gpu_w: Option<f32>,
+    ) -> f64 {
+        self.gpu_watts_now(profile, measured_gpu_w)
+            + active_cpu_threads as f64 * self.cpu_watts_per_thread
+    }
+
+    /// Daily electricity cost, on the measurement where there is one.
+    pub fn daily_power_cost_eur_now(
+        &self,
+        profile: &str,
+        active_cpu_threads: u32,
+        measured_gpu_w: Option<f32>,
+    ) -> f64 {
+        self.total_watts_now(profile, active_cpu_threads, measured_gpu_w) * 24.0 / 1000.0
+            * self.power_cost_kwh
+    }
+
+    /// Daily electricity cost with nothing measured, which is what a caller that
+    /// has no sensor reading to offer is really asking for.
     pub fn daily_power_cost_eur(&self, profile: &str, active_cpu_threads: u32) -> f64 {
-        let gpu_w = self.estimate_gpu_watts(profile);
-        let cpu_w = active_cpu_threads as f64 * self.cpu_watts_per_thread;
-        (gpu_w + cpu_w) * 24.0 / 1000.0 * self.power_cost_kwh
+        self.daily_power_cost_eur_now(profile, active_cpu_threads, None)
     }
 
     pub fn hashes_per_joule(&self, hashrate: f64, profile: &str, active_cpu_threads: u32) -> f64 {
@@ -946,6 +982,48 @@ enum GpuTempParser {
     Scalar,
 }
 
+/// The widest window a graphics board's total draw can honestly fall in.
+///
+/// It has to be wide: a card really does read 46 W on an idle desktop and 256 W
+/// under the miner, and both are the same sensor telling the truth, so a window
+/// tight enough to exclude "30" would throw away real idle readings. What it
+/// excludes is the two ways this can be wrong rather than low. Zero is the value
+/// an unsupported slot holds, and a board that is drawing power never reads
+/// exactly zero, so zero is read as "no sensor" and not as "free electricity". A
+/// thousand is above every board ever built (the largest data centre parts are
+/// 750 W), so anything at or beyond it is a different sensor or a different
+/// unit, not a draw.
+///
+/// This is the one definition; the AMD driver path delegates to it, so a Windows
+/// ADL reading and an `nvidia-smi` reading are judged by exactly the same rule.
+pub fn plausible_board_power_w(value: f32) -> Option<f32> {
+    (value.is_finite() && value > 0.0 && value < 1000.0).then_some(value)
+}
+
+/// A second query on the same tool that answers the board's draw in watts.
+///
+/// Separate from the temperature query rather than folded into it because the
+/// temperature parsers accept any labelled number, and a query that returned
+/// both would let a watt figure be read as a temperature or the reverse. Two
+/// queries, each asking for exactly one quantity, cannot be confused.
+#[derive(Clone, Debug)]
+struct BoardPowerQuery {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+/// Watts from a tool invoked with a power-only, unit-less, header-less query.
+///
+/// `nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits` prints one
+/// bare number, and prints `[N/A]` on the cards and virtualised setups that do
+/// not expose the sensor. `[N/A]` does not parse, so it becomes `None` and the
+/// caller falls back to the configured estimate and says that it did: absent
+/// means absent, exactly as on the AMD path.
+fn parse_board_power_output(text: &str) -> Option<f32> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    plausible_board_power_w(first.parse::<f32>().ok()?)
+}
+
 #[derive(Clone, Debug)]
 enum GpuTempSensorSource {
     File(PathBuf),
@@ -953,6 +1031,11 @@ enum GpuTempSensorSource {
         program: &'static str,
         args: Vec<String>,
         parser: GpuTempParser,
+        /// The same tool's power query, where the tool has one. `None` for the
+        /// AMD `*-smi` sources, whose power reporting is not uniform across
+        /// rocm-smi and amd-smi versions, and inventing a watt figure from a
+        /// query we did not make would be a guess wearing a measurement's label.
+        power: Option<BoardPowerQuery>,
     },
     /// The AMD display driver's own library, which is the only one of these
     /// that exists on a consumer Windows install. Bound to one ADL adapter at
@@ -983,6 +1066,7 @@ impl GpuTempSensorBackend {
                 program,
                 args,
                 parser,
+                ..
             } => {
                 let output = command_stdout_with_timeout(program, args, SENSOR_COMMAND_TIMEOUT)?;
                 let text = String::from_utf8_lossy(&output);
@@ -999,6 +1083,34 @@ impl GpuTempSensorBackend {
             }
         }
     }
+
+    /// The total board power this GPU is drawing right now, in watts, or `None`
+    /// where nothing under this backend measures it.
+    ///
+    /// Two sources can answer: the AMD display driver on Windows, and any
+    /// command source that was built with a power query of its own, which today
+    /// means `nvidia-smi`. The rest cannot, and say so rather than guessing: a
+    /// `thermal_file` is a single hwmon temperature and holds no power at all,
+    /// and the AMD `*-smi` sources are invoked here with temperature-only
+    /// queries, so a watt figure taken from them would be a guess wearing a
+    /// measurement's label. A `None` here is what makes the caller fall back to
+    /// the configured estimate and say that it did.
+    pub(crate) fn read_board_power_w(&self) -> Option<f32> {
+        match &self.source {
+            GpuTempSensorSource::File(_) => None,
+            GpuTempSensorSource::Command { power, .. } => {
+                let query = power.as_ref()?;
+                let output =
+                    command_stdout_with_timeout(query.program, &query.args, SENSOR_COMMAND_TIMEOUT)?;
+                parse_board_power_output(&String::from_utf8_lossy(&output))
+            }
+            #[cfg(windows)]
+            GpuTempSensorSource::AmdDriver { adapter_index } => {
+                crate::gpu_temp_adl::board_power_w(*adapter_index).and_then(plausible_board_power_w)
+            }
+        }
+    }
+
 }
 
 fn command_sensor(
@@ -1013,7 +1125,18 @@ fn command_sensor(
             program,
             args,
             parser,
+            power: None,
         },
+    }
+}
+
+impl GpuTempSensorBackend {
+    /// Attach the same tool's board-power query to a command sensor.
+    fn with_power_query(mut self, program: &'static str, args: Vec<String>) -> GpuTempSensorBackend {
+        if let GpuTempSensorSource::Command { power, .. } = &mut self.source {
+            *power = Some(BoardPowerQuery { program, args });
+        }
+        self
     }
 }
 
@@ -1081,7 +1204,15 @@ fn amd_sensor_candidates(gpu_index: u32) -> Vec<GpuTempSensorBackend> {
     ]
 }
 
+/// NVIDIA's own tool, which ships with the driver on every platform NVIDIA
+/// supports, and which reports the board's draw as well as its temperature.
+///
+/// The power query is the reason Eco and Profit can mean anything on an NVIDIA
+/// card: without a per-candidate watt figure every shape is scored on one
+/// configured constant, which makes hashes-per-joule and net-EUR affine in the
+/// hashrate and ranks all three efficiency modes identically.
 fn nvidia_sensor(gpu_index: u32) -> GpuTempSensorBackend {
+    let index = gpu_index.to_string();
     command_sensor(
         "nvidia-smi",
         format!("nvidia-smi GPU {gpu_index}"),
@@ -1089,9 +1220,18 @@ fn nvidia_sensor(gpu_index: u32) -> GpuTempSensorBackend {
             "--query-gpu=temperature.gpu".into(),
             "--format=csv,noheader,nounits".into(),
             "-i".into(),
-            gpu_index.to_string(),
+            index.clone(),
         ],
         GpuTempParser::Scalar,
+    )
+    .with_power_query(
+        "nvidia-smi",
+        vec![
+            "--query-gpu=power.draw".into(),
+            "--format=csv,noheader,nounits".into(),
+            "-i".into(),
+            index,
+        ],
     )
 }
 
@@ -1160,6 +1300,39 @@ pub fn read_gpu_temp_nvidia_smi(gpu_index: u32) -> Option<f32> {
     detect_gpu_temp_sensor("", gpu_index, crate::gpu_arch::GpuVendor::Nvidia).map(|(_, temp)| temp)
 }
 
+/// This card's real board draw right now, or `None` where nothing on this
+/// machine measures it.
+///
+/// The vendor is required rather than guessed because the answer differs by it:
+/// AMD on Windows answers through the display driver, NVIDIA through
+/// `nvidia-smi`, and Intel through nothing at all. A caller that has to tell the
+/// operator whether a power-aware choice is even possible asks this, and a
+/// `None` is a fact about the machine, not a failure to try.
+pub fn read_board_power_w_with_gpu(
+    thermal_file: &str,
+    gpu_index: u32,
+    vendor: crate::gpu_arch::GpuVendor,
+) -> Option<f32> {
+    let (backend, _) = detect_gpu_temp_sensor(thermal_file, gpu_index, vendor)?;
+    backend.read_board_power_w()
+}
+
+/// Whether this machine really reports this card's draw.
+///
+/// A reading, not a capability: a source can have a way to ask and still get
+/// `[N/A]` back, and an AMD adapter can report a temperature from a driver whose
+/// board-power slot is unsupported on that model. Answering from the shape of
+/// the source rather than from an answer would tell an operator their Eco mode
+/// works on a rig where it cannot, which is the failure this whole question
+/// exists to prevent.
+pub fn board_power_is_measurable(
+    thermal_file: &str,
+    gpu_index: u32,
+    vendor: crate::gpu_arch::GpuVendor,
+) -> bool {
+    read_board_power_w_with_gpu(thermal_file, gpu_index, vendor).is_some()
+}
+
 pub fn read_thermal_c(thermal_file: &str) -> Option<f32> {
     read_thermal_c_with_gpu(thermal_file, 0)
 }
@@ -1183,19 +1356,23 @@ pub fn format_efficiency_line(
     eff: &EfficiencyConf,
     profile: &str,
     active_cpu: u32,
+    measured_gpu_w: Option<f32>,
 ) -> String {
-    let gpu_w = eff.estimate_gpu_watts(profile);
-    let cpu_w = active_cpu as f64 * eff.cpu_watts_per_thread;
-    let watts = gpu_w + cpu_w;
+    let measured = crate::mining_stats::sensor_board_power_w(measured_gpu_w).is_some();
+    let watts = eff.total_watts_now(profile, active_cpu, measured_gpu_w);
     let hpj = if watts > 0.0 {
         hashrate / watts / 1000.0
     } else {
         0.0
     };
-    let daily_cost = eff.daily_power_cost_eur(profile, active_cpu);
+    let daily_cost = eff.daily_power_cost_eur_now(profile, active_cpu, measured_gpu_w);
+    // The console line has to carry the same distinction the panel does, or an
+    // operator reading the terminal cannot tell a measured 256 W from a
+    // configured 350 W. `~` is the estimate; a bare number is the card's own.
     let mut line = format!(
-        "{} | {:.0}W | {:.1}kH/J | {:.4}HAC/d {:.4}%",
+        "{} | {}{:.0}W | {:.1}kH/J | {:.4}HAC/d {:.4}%",
         rates_to_show(hashrate),
+        if measured { "" } else { "~" },
         watts,
         hpj,
         hac_per_day,
@@ -1228,6 +1405,32 @@ mod tests {
         let eff = EfficiencyConf::from_ini(&ini);
         assert_eq!(eff.initial_active_supervene(0), 0);
         assert_eq!(eff.spawn_supervene(0), 0);
+    }
+
+    /// A configuration with every knob at a stated value, so a test that changes
+    /// one of them is changing exactly one thing.
+    fn base_conf() -> EfficiencyConf {
+        EfficiencyConf {
+            mode: EfficiencyMode::Profit,
+            power_cost_kwh: 0.25,
+            gpu_watts: 0.0,
+            cpu_watts_per_thread: 8.0,
+            hac_price: 0.0,
+            dynamic_supervene: false,
+            supervene_min: 0,
+            supervene_max: 0,
+            oom_fallback: true,
+            max_temp_c: 0,
+            throttle_workgroups: 0,
+            thermal_file: String::new(),
+            idle_start_hour: 255,
+            idle_end_hour: 255,
+            pause_if_unprofitable: false,
+            benchmark_seconds: 0,
+            benchmark_fine_sweep: false,
+            thermal_gpu_index: 0,
+            stats_file: String::new(),
+        }
     }
 
     #[test]
@@ -1450,6 +1653,209 @@ mod tests {
     }
 
     #[test]
+    fn a_measured_draw_beats_the_configured_estimate_in_every_decision() {
+        let mut eff = base_conf();
+        eff.gpu_watts = 350.0;
+        eff.cpu_watts_per_thread = 8.0;
+        eff.power_cost_kwh = 0.30;
+
+        let estimated = eff.estimate_gpu_watts("amd_max");
+        assert_eq!(eff.gpu_watts_now("amd_max", None), estimated);
+        assert_eq!(eff.gpu_watts_now("amd_max", Some(256.0)), 256.0);
+        assert_eq!(eff.total_watts_now("amd_max", 2, Some(256.0)), 256.0 + 16.0);
+        assert!(
+            (eff.daily_power_cost_eur_now("amd_max", 2, Some(256.0))
+                - (256.0 + 16.0) * 24.0 / 1000.0 * 0.30)
+                .abs()
+                < 1e-9
+        );
+        // An impossible reading is not a measurement, so it falls back to the
+        // estimate rather than to zero watts and a free rig.
+        assert_eq!(eff.gpu_watts_now("amd_max", Some(0.0)), estimated);
+        assert_eq!(eff.gpu_watts_now("amd_max", Some(f32::NAN)), estimated);
+        // With nothing measured, the new path has to agree exactly with the old
+        // one, or this change silently moved every unmeasured rig's numbers.
+        assert_eq!(
+            eff.daily_power_cost_eur_now("amd_max", 3, None),
+            eff.daily_power_cost_eur("amd_max", 3)
+        );
+    }
+
+    #[test]
+    fn the_profit_pause_acts_on_the_measurement_not_on_the_ini() {
+        // A rig configured at 350 W but really drawing 150 W, earning revenue
+        // that sits between the two. On the guess it gets paused; on the truth
+        // it keeps mining, and the difference is the operator's income.
+        let mut eff = base_conf();
+        eff.pause_if_unprofitable = true;
+        eff.gpu_watts = 350.0;
+        eff.cpu_watts_per_thread = 0.0;
+        eff.power_cost_kwh = 1.0;
+        eff.hac_price = 1.0;
+
+        let estimated_cost = eff.daily_power_cost_eur_now("amd_max", 0, None);
+        let measured_cost = eff.daily_power_cost_eur_now("amd_max", 0, Some(150.0));
+        assert!(measured_cost < estimated_cost);
+        // Revenue between the two costs, expressed in HAC at a price of 1.
+        let hac_per_day = (measured_cost + estimated_cost) / 2.0;
+
+        assert!(should_pause_for_profit(
+            &eff,
+            hac_per_day,
+            "amd_max",
+            0,
+            None
+        ));
+        assert!(!should_pause_for_profit(
+            &eff,
+            hac_per_day,
+            "amd_max",
+            0,
+            Some(150.0)
+        ));
+    }
+
+    #[test]
+    fn the_console_line_marks_an_estimate_and_leaves_a_measurement_bare() {
+        let mut eff = base_conf();
+        eff.gpu_watts = 350.0;
+        eff.cpu_watts_per_thread = 0.0;
+        let guessed = format_efficiency_line(1e6, 0.5, 1.0, &eff, "amd_max", 0, None);
+        let measured = format_efficiency_line(1e6, 0.5, 1.0, &eff, "amd_max", 0, Some(256.0));
+        assert!(guessed.contains("~350W"), "{guessed}");
+        assert!(measured.contains("| 256W"), "{measured}");
+        assert!(!measured.contains('~'), "{measured}");
+    }
+
+    /// The NVIDIA sensor asks the driver for watts, and the AMD `*-smi` ones
+    /// deliberately do not.
+    ///
+    /// This is the whole of defect 1 on the detection side: `Sampler::start`
+    /// decides `measures_power` from `read_board_power_w`, which returned `None`
+    /// for every command source, so every NVIDIA card scored every candidate on
+    /// one configured constant and Eco, Profit and Max ranked identically.
+    #[test]
+    fn only_the_nvidia_command_sensor_carries_a_power_query() {
+        for index in [0, 3] {
+            assert!(
+                matches!(
+                    nvidia_sensor(index).source,
+                    GpuTempSensorSource::Command { power: Some(_), .. }
+                ),
+                "nvidia-smi reports power.draw and ships with the driver"
+            );
+        }
+        // The AMD `*-smi` sources are invoked with temperature-only queries, so
+        // they answer `None` without spawning anything rather than guessing a
+        // watt figure out of a query nobody made.
+        for sensor in amd_sensor_candidates(0) {
+            assert!(
+                matches!(
+                    sensor.source,
+                    GpuTempSensorSource::Command { power: None, .. }
+                ),
+                "{} was not asked for power, so it must not answer with any",
+                sensor.label()
+            );
+            assert_eq!(sensor.read_board_power_w(), None);
+        }
+        let file = GpuTempSensorBackend {
+            label: "thermal file".to_string(),
+            source: GpuTempSensorSource::File(PathBuf::from("/sys/class/hwmon/hwmon0/temp1_input")),
+        };
+        assert_eq!(
+            file.read_board_power_w(),
+            None,
+            "a hwmon temperature file holds no power at all"
+        );
+    }
+
+    /// The power query names the GPU it is asking about, and asks only for power.
+    ///
+    /// A query that dropped `-i <index>` would report the first card on a
+    /// multi-GPU rig whatever `thermal_gpu_index` said, which is a wrong number
+    /// rather than a missing one.
+    #[test]
+    fn the_nvidia_power_query_is_power_only_and_names_its_gpu() {
+        let GpuTempSensorSource::Command {
+            power: Some(power), ..
+        } = nvidia_sensor(2).source
+        else {
+            panic!("the nvidia sensor must carry a power query");
+        };
+        assert_eq!(power.program, "nvidia-smi");
+        assert!(power.args.iter().any(|a| a == "--query-gpu=power.draw"));
+        assert!(power.args.iter().any(|a| a == "--format=csv,noheader,nounits"));
+        assert_eq!(
+            power.args.windows(2).find(|w| w[0] == "-i").map(|w| &w[1]),
+            Some(&"2".to_string())
+        );
+        assert!(
+            !power.args.iter().any(|a| a.contains("temperature")),
+            "one query, one quantity: {:?}",
+            power.args
+        );
+    }
+
+    /// Absent means absent on the NVIDIA path too.
+    ///
+    /// `nvidia-smi` prints `[N/A]` for power on the parts and virtualised setups
+    /// that do not expose the sensor. That must become the configured estimate
+    /// labelled as an estimate, never a zero-watt card mining for free.
+    #[test]
+    fn nvidia_power_output_is_a_measurement_or_nothing() {
+        assert_eq!(parse_board_power_output("142.31\n"), Some(142.31));
+        assert_eq!(parse_board_power_output("  46.05  "), Some(46.05));
+        assert_eq!(parse_board_power_output("\n\n311\n"), Some(311.0));
+        // Every way it can be absent rather than low.
+        assert_eq!(parse_board_power_output("[N/A]\n"), None);
+        assert_eq!(parse_board_power_output("[Not Supported]"), None);
+        assert_eq!(parse_board_power_output(""), None);
+        assert_eq!(parse_board_power_output("0.00\n"), None);
+        assert_eq!(parse_board_power_output("-3.5"), None);
+        assert_eq!(parse_board_power_output("1000.0"), None);
+        assert_eq!(parse_board_power_output("nan"), None);
+        // And it must not fall through to the temperature parser's habits: a
+        // labelled line is not a bare number and is refused.
+        assert_eq!(parse_board_power_output("power.draw [W] : 142.31"), None);
+    }
+
+    /// The ADL validator and the nvidia-smi validator are the same rule.
+    #[test]
+    fn one_plausibility_window_judges_every_power_source() {
+        assert_eq!(plausible_board_power_w(46.0), Some(46.0));
+        assert_eq!(plausible_board_power_w(256.0), Some(256.0));
+        assert_eq!(plausible_board_power_w(0.0), None);
+        assert_eq!(plausible_board_power_w(-1.0), None);
+        assert_eq!(plausible_board_power_w(1000.0), None);
+        assert_eq!(plausible_board_power_w(f32::NAN), None);
+        assert_eq!(plausible_board_power_w(f32::INFINITY), None);
+        #[cfg(windows)]
+        for value in [46.0f32, 0.0, 1000.0, f32::NAN, 749.0] {
+            assert_eq!(
+                crate::gpu_temp_adl::plausible_board_power_w(value),
+                plausible_board_power_w(value),
+                "the two power paths must not drift apart at {value}"
+            );
+        }
+    }
+
+    /// Intel measures nothing, and the code says so instead of pretending.
+    #[test]
+    fn intel_has_neither_a_temperature_nor_a_power_source() {
+        assert!(detect_gpu_temp_sensor("", 0, crate::gpu_arch::GpuVendor::Intel).is_none());
+        assert!(!board_power_is_measurable(
+            "",
+            0,
+            crate::gpu_arch::GpuVendor::Intel
+        ));
+        assert_eq!(
+            read_board_power_w_with_gpu("", 0, crate::gpu_arch::GpuVendor::Intel),
+            None
+        );
+    }
+
+    #[test]
     fn max_mode_requires_at_least_profit_tier() {
         assert_eq!(min_profile_tier_for_mode(EfficiencyMode::Max), 2);
         assert!(profile_tier("amd_profit") >= min_profile_tier_for_mode(EfficiencyMode::Max));
@@ -1461,17 +1867,24 @@ pub use crate::mining_stats::{
     MiningStatsSnapshot, build_diamond_mining_stats, build_mining_stats, write_mining_stats,
 };
 
+/// Whether electricity is costing more than the block reward is worth.
+///
+/// `measured_gpu_w` is the rig's real board draw where a card reported one. It
+/// is the reason this takes an argument at all: pausing a profitable rig, or
+/// running an unprofitable one, on the strength of a `gpu_watts` line an
+/// operator typed once is the single most expensive thing a guess can do here.
 pub fn should_pause_for_profit(
     eff: &EfficiencyConf,
     hac_per_day: f64,
     profile: &str,
     active_cpu: u32,
+    measured_gpu_w: Option<f32>,
 ) -> bool {
     if !eff.pause_if_unprofitable || eff.hac_price <= 0.0 {
         return false;
     }
     let revenue = hac_per_day * eff.hac_price;
-    revenue < eff.daily_power_cost_eur(profile, active_cpu)
+    revenue < eff.daily_power_cost_eur_now(profile, active_cpu, measured_gpu_w)
 }
 
 /// HACD profit pause: when `hac_price` is set, treat it as minimum daily EUR revenue

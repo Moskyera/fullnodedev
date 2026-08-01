@@ -438,11 +438,23 @@ stats_file = {stats_file}
     )
 }
 
+/// Is CUDA the backend a config for this selection would really run on?
+///
+/// CUDA is only a valid backend for NVIDIA GPUs, so a stale checkbox must never
+/// count as CUDA for an AMD or Intel selection, or for no GPU at all.
+///
+/// One function rather than one condition in `write_poworker_config` and another
+/// in the panel, because the two now have to agree about something the operator
+/// can see: Auto Tune is refused exactly when the file that would be written
+/// says `use_cuda = true`. A predicate that drifted would either grey out a
+/// button that would have worked or offer one that cannot.
+pub fn cuda_backend_selected(use_cuda: bool, gpu_slug: &str, gpu_profile: &str) -> bool {
+    use_cuda && gpu_slug != "none" && profile_vendor(gpu_profile) == GpuVendor::Nvidia
+}
+
 pub fn write_poworker_config(path: &Path, s: &PanelSettings) -> std::io::Result<()> {
     let cpu_only = s.gpu.slug == "none";
-    // CUDA is only a valid backend for NVIDIA GPUs; gate here so a stale checkbox never
-    // writes use_cuda=true for an AMD/Intel selection.
-    let cuda_on = s.use_cuda && !cpu_only && profile_vendor(s.gpu.profile) == GpuVendor::Nvidia;
+    let cuda_on = cuda_backend_selected(s.use_cuda, s.gpu.slug, s.gpu.profile);
     let cpu_assist = !cpu_only && s.cpu.supervene > 0;
     let (wg, us, profile) = resolve_ini_tuning(s);
     let body = format!(
@@ -607,8 +619,11 @@ mod write_tuning_tests {
             .unwrap();
         let s = panel_with_wg(&gpu, 2048, 128);
         let (wg, us, _) = resolve_ini_tuning(&s);
+        // A benchmark that asked for 2048 x 128 is still held to this card's
+        // shape. Work groups stay capped at 64; the unit_size the Profit tier
+        // resolves to is 128, which is what the request happened to name.
         assert_eq!(wg, 64);
-        assert_eq!(us, 64);
+        assert_eq!(us, 128);
     }
 
     #[test]
@@ -712,6 +727,85 @@ mod write_tuning_tests {
         let loaded = load_panel_ini(&tmp);
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(loaded.use_cuda, Some(true));
+    }
+
+    /// Auto Tune hands the worker a config the tuner will refuse.
+    ///
+    /// The panel makes the two backends mutually exclusive, so pressing Run Auto
+    /// Tune with CUDA selected writes `use_cuda = true` / `use_opencl = false`
+    /// plus `benchmark_seconds = 90`. `run_block_mining_benchmark` gates only on
+    /// `use_opencl`, so poworker returns immediately and never patches
+    /// benchmark_seconds back to 0 - which is precisely the condition the panel
+    /// reports as "OpenCL benchmark failed" before rolling the settings back.
+    ///
+    /// The upside of the same fact: an OpenCL tune result can never be written
+    /// into a CUDA config through the panel, because the panel never produces a
+    /// config with both backends on.
+    #[test]
+    fn the_auto_tune_config_for_a_cuda_operator_asks_for_a_backend_it_turned_off() {
+        let gpu = gpu_presets()
+            .into_iter()
+            .find(|g| g.slug == "rtx4090")
+            .unwrap();
+        let mut s = panel_with_wg(&gpu, 1024, 128);
+        s.use_cuda = true;
+        let path = std::env::temp_dir().join(format!(
+            "hacash-panel-cuda-autotune-{}.ini",
+            std::process::id()
+        ));
+        write_poworker_benchmark_config(&path, &s, 90).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(raw.contains("benchmark_seconds = 90"), "{raw}");
+        assert!(raw.contains("use_cuda = true"), "{raw}");
+        assert!(
+            raw.contains("use_opencl = false"),
+            "an Auto Tune config with both backends on would let an OpenCL tune \
+             overwrite a CUDA shape: {raw}"
+        );
+    }
+
+    /// The predicate the Auto Tune button is greyed out by is the predicate the
+    /// config file is written from.
+    ///
+    /// Auto Tune measures OpenCL launch shapes only, so the button has to be
+    /// refused exactly when the file would say `use_cuda = true`. Checked
+    /// against the file itself for every preset the panel offers, so a new GPU
+    /// preset cannot quietly separate the two.
+    #[test]
+    fn the_button_is_refused_exactly_when_the_file_says_cuda() {
+        let path = std::env::temp_dir().join(format!(
+            "hacash-panel-cuda-predicate-{}.ini",
+            std::process::id()
+        ));
+        for gpu in gpu_presets() {
+            for use_cuda in [false, true] {
+                let mut s = panel_with_wg(&gpu, 1024, 128);
+                s.use_cuda = use_cuda;
+                let predicted = cuda_backend_selected(s.use_cuda, s.gpu.slug, s.gpu.profile);
+                write_poworker_config(&path, &s).unwrap();
+                let raw = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(
+                    predicted,
+                    raw.contains("use_cuda = true"),
+                    "{} with use_cuda={use_cuda}: the button and the file disagree",
+                    gpu.slug
+                );
+                // And CUDA on means OpenCL off, which is why the tuner never
+                // runs on a CUDA config in the first place.
+                if predicted {
+                    assert!(raw.contains("use_opencl = false"), "{raw}");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // No GPU at all is not CUDA, whatever the checkbox remembers.
+        assert!(!cuda_backend_selected(true, "none", "nvidia_max"));
+        assert!(!cuda_backend_selected(true, "rx9070xt", "amd_max"));
+        assert!(cuda_backend_selected(true, "rtx4090", "nvidia_max"));
+        assert!(!cuda_backend_selected(false, "rtx4090", "nvidia_max"));
     }
 
     #[test]

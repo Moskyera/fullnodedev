@@ -24,6 +24,12 @@ pub mod rpc_http;
 mod mining_util;
 
 pub mod bench_mainnet_repeat16;
+/// Byte-equivalence gate + fixed-work baseline for the OpenCL x16rs kernel.
+/// Never called by the mining path; it is the measuring instrument.
+pub mod x16rs_gate;
+/// Auto-tune measured at the mainnet x16rs repeat, on a corpus frozen for the
+/// whole session, scored on the watts the card reports.
+pub mod autotune16;
 pub mod diaworker;
 pub mod opencl_diag;
 #[cfg(feature = "ocl")]

@@ -113,6 +113,15 @@ pub struct Strings {
     pub mode_eco: &'static str,
     pub mode_profit: &'static str,
     pub mode_max: &'static str,
+    /// Said next to the mode picker when this machine reports no power draw for
+    /// the selected GPU.
+    ///
+    /// Without a per-candidate watt figure the tuner divides every shape by one
+    /// configured constant, so hashes-per-joule and net-EUR are affine in the
+    /// hashrate and Eco, Profit balance and Maximum hashrate rank identically.
+    /// An operator who chose Eco is given Max. A mode that cannot differ must
+    /// not silently pretend to, and this is where the choice is made.
+    pub mode_no_power_sensor: &'static str,
     pub label_power_cost: &'static str,
     pub label_hac_price: &'static str,
     pub mining_hac: &'static str,
@@ -146,7 +155,17 @@ pub struct Strings {
     pub paused_unprofitable: &'static str,
     pub stat_hashrate: &'static str,
     pub stat_hac_day: &'static str,
+    /// The power label for a figure the panel had to estimate from the
+    /// configured `gpu_watts`. Every translation of it must keep the word
+    /// "estimate": it is the only thing separating a guess from the reading
+    /// below, and an operator's electricity cost is built on the difference.
     pub stat_power: &'static str,
+    /// The power label for a figure the card's own sensor produced. Never used
+    /// for a mixed total; see `stats_poll::watts_are_measured`.
+    pub stat_power_measured: &'static str,
+    /// Detail row naming the measured GPU board draw on its own, so a rig whose
+    /// TOTAL is part estimate still shows the operator the part that is real.
+    pub stat_gpu_board_power: &'static str,
     pub stat_cost_day: &'static str,
     pub stat_efficiency: &'static str,
     pub stat_block_height: &'static str,
@@ -272,6 +291,10 @@ pub struct Strings {
     pub autotune_title: &'static str,
     pub autotune_hint: &'static str,
     pub btn_run_autotune: &'static str,
+    /// Said at the Auto Tune button when CUDA is the selected backend. The
+    /// tuner measures OpenCL launch shapes only, so on CUDA the button does
+    /// nothing and used to say so in OpenCL's words, never naming CUDA.
+    pub autotune_cuda_unsupported: &'static str,
     pub label_thermal_wg_cap: &'static str,
     pub profit_fixed_note: &'static str,
     pub label_reachability: &'static str,
@@ -383,6 +406,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Eco (less power)",
             mode_profit: "Profit balance (recommended)",
             mode_max: "Maximum hashrate",
+            mode_no_power_sensor: "This GPU does not report its power draw on this machine, so the three modes cannot be told apart: Eco and Profit balance choose exactly what Maximum hashrate chooses.",
             label_power_cost: "Power cost (/kWh):",
             label_hac_price: "HAC price USD (optional):",
             mining_hac: "HAC blocks (poworker)",
@@ -417,6 +441,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Hashrate",
             stat_hac_day: "HAC / day",
             stat_power: "Power (estimate)",
+            stat_power_measured: "Power (measured)",
+            stat_gpu_board_power: "GPU board",
             stat_cost_day: "Cost / day",
             stat_efficiency: "Efficiency",
             stat_block_height: "Block height",
@@ -528,6 +554,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Automatic GPU Tuning",
             autotune_hint: "Benchmarks safe profiles, work groups and unit size.",
             btn_run_autotune: "Run Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune does not support the CUDA backend yet. It measures OpenCL launch shapes only. Switch Backend to OpenCL to tune, or set work groups and unit size by hand.",
             label_thermal_wg_cap: "Thermal work group cap",
             profit_fixed_note: "OOM fallback, dynamic CPU assist and the always on schedule are built in and always active, so they are not settings.",
             label_reachability: "Reachability",
@@ -573,6 +600,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Οικονομικό (λιγότερο ρεύμα)",
             mode_profit: "Ισορροπία κέρδους (προτείνεται)",
             mode_max: "Μέγιστο hashrate",
+            mode_no_power_sensor: "Αυτή η GPU δεν αναφέρει την κατανάλωσή της σε αυτό το μηχάνημα, οπότε οι τρεις λειτουργίες δεν ξεχωρίζουν: το Οικονομικό και η Ισορροπία κέρδους επιλέγουν ακριβώς ό,τι και το Μέγιστο hashrate.",
             label_power_cost: "Κόστος ρεύματος (/kWh):",
             label_hac_price: "Τιμή HAC USD (προαιρετικό):",
             mining_hac: "HAC blocks (poworker)",
@@ -607,6 +635,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Hashrate",
             stat_hac_day: "HAC / μέρα",
             stat_power: "Ρεύμα (εκτίμηση)",
+            stat_power_measured: "Ρεύμα (μετρημένο)",
+            stat_gpu_board_power: "Κάρτα GPU",
             stat_cost_day: "Κόστος / μέρα",
             stat_efficiency: "Απόδοση",
             stat_block_height: "Ύψος block",
@@ -718,6 +748,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Αυτόματο tuning GPU",
             autotune_hint: "Δοκιμάζει ασφαλή προφίλ, work groups και unit size.",
             btn_run_autotune: "Εκτέλεση Auto Tune",
+            autotune_cuda_unsupported: "Το Auto Tune δεν υποστηρίζει ακόμη το backend CUDA. Μετράει μόνο σχήματα εκτέλεσης OpenCL. Αλλάξτε το Backend σε OpenCL για tuning, ή ορίστε work groups και unit size με το χέρι.",
             label_thermal_wg_cap: "Θερμικό όριο work groups",
             profit_fixed_note: "Το OOM fallback, το δυναμικό CPU assist και η συνεχής λειτουργία είναι ενσωματωμένα και πάντα ενεργά, άρα δεν είναι ρυθμίσεις.",
             label_reachability: "Προσβασιμότητα",
@@ -763,6 +794,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Ekonomik (daha az güç)",
             mode_profit: "Kâr dengesi (önerilen)",
             mode_max: "Maksimum hashrate",
+            mode_no_power_sensor: "Bu GPU bu makinede güç tüketimini bildirmiyor, bu yüzden üç mod birbirinden ayrılamaz: Ekonomik ve Kâr dengesi tam olarak Maksimum hashrate'in seçtiğini seçer.",
             label_power_cost: "Elektrik maliyeti (/kWh):",
             label_hac_price: "HAC fiyatı USD (isteğe bağlı):",
             mining_hac: "HAC blokları (poworker)",
@@ -797,6 +829,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Hashrate",
             stat_hac_day: "HAC / gün",
             stat_power: "Güç (tahmini)",
+            stat_power_measured: "Güç (ölçülen)",
+            stat_gpu_board_power: "GPU kartı",
             stat_cost_day: "Maliyet / gün",
             stat_efficiency: "Verimlilik",
             stat_block_height: "Blok yüksekliği",
@@ -908,6 +942,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Otomatik GPU ayarı",
             autotune_hint: "Güvenli profilleri, work group ve unit size değerlerini ölçer.",
             btn_run_autotune: "Auto Tune çalıştır",
+            autotune_cuda_unsupported: "Auto Tune henüz CUDA backend'ini desteklemiyor. Yalnızca OpenCL çalıştırma şekillerini ölçer. Ayarlamak için Backend'i OpenCL yapın veya work groups ve unit size değerlerini elle girin.",
             label_thermal_wg_cap: "Termal work group sınırı",
             profit_fixed_note: "OOM yedeği, dinamik CPU desteği ve sürekli çalışma programı yerleşiktir ve hep açıktır, yani ayar değildir.",
             label_reachability: "Erişilebilirlik",
@@ -953,6 +988,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "节能（低功耗）",
             mode_profit: "利润平衡（推荐）",
             mode_max: "最大算力",
+            mode_no_power_sensor: "本机无法读取该 GPU 的功耗，因此三种模式无法区分：节能和利润平衡的选择与最大算力完全相同。",
             label_power_cost: "电费 (/kWh):",
             label_hac_price: "HAC 价格 USD (可选):",
             mining_hac: "HAC 区块 (poworker)",
@@ -987,6 +1023,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "算力",
             stat_hac_day: "HAC / 天",
             stat_power: "功耗（估算）",
+            stat_power_measured: "功耗（实测）",
+            stat_gpu_board_power: "显卡整卡",
             stat_cost_day: "费用 / 天",
             stat_efficiency: "效率",
             stat_block_height: "区块高度",
@@ -1098,6 +1136,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "自动 GPU 调优",
             autotune_hint: "测试安全配置、work groups 和 unit size。",
             btn_run_autotune: "运行 Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune 尚不支持 CUDA 后端，它只测量 OpenCL 的启动形状。请将后端切换为 OpenCL 后再调优，或手动设置 work groups 和 unit size。",
             label_thermal_wg_cap: "温度 work group 上限",
             profit_fixed_note: "OOM 回退、动态 CPU 辅助和全天候运行是内置且始终启用的，不是可调选项。",
             label_reachability: "可达性",
@@ -1143,6 +1182,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "エコ（低消費電力）",
             mode_profit: "利益バランス（推奨）",
             mode_max: "最大ハッシュレート",
+            mode_no_power_sensor: "このマシンではこの GPU の消費電力を読み取れないため、3 つのモードは区別できません。エコと利益バランスは最大ハッシュレートとまったく同じ設定を選びます。",
             label_power_cost: "電気代 (/kWh):",
             label_hac_price: "HAC 価格 USD (任意):",
             mining_hac: "HAC ブロック (poworker)",
@@ -1177,6 +1217,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "ハッシュレート",
             stat_hac_day: "HAC / 日",
             stat_power: "消費電力（推定）",
+            stat_power_measured: "消費電力（実測）",
+            stat_gpu_board_power: "GPUボード",
             stat_cost_day: "コスト / 日",
             stat_efficiency: "効率",
             stat_block_height: "ブロック高",
@@ -1288,6 +1330,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "GPU 自動チューニング",
             autotune_hint: "安全なプロファイル、work groups、unit size を計測します。",
             btn_run_autotune: "Auto Tune を実行",
+            autotune_cuda_unsupported: "Auto Tune はまだ CUDA バックエンドに対応していません。測定できるのは OpenCL の起動形状だけです。調整するにはバックエンドを OpenCL に切り替えるか、work groups と unit size を手動で設定してください。",
             label_thermal_wg_cap: "温度による work group 上限",
             profit_fixed_note: "OOM フォールバック、動的 CPU アシスト、常時稼働は組み込みで常に有効なので、設定項目ではありません。",
             label_reachability: "到達性",
@@ -1333,6 +1376,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Eco (menos consumo)",
             mode_profit: "Equilibrio de beneficio (recomendado)",
             mode_max: "Hashrate máximo",
+            mode_no_power_sensor: "Esta GPU no informa su consumo en este equipo, así que los tres modos no se distinguen: Eco y Equilibrio de beneficio eligen exactamente lo mismo que Hashrate máximo.",
             label_power_cost: "Coste electricidad (/kWh):",
             label_hac_price: "Precio HAC USD (opcional):",
             mining_hac: "Bloques HAC (poworker)",
@@ -1367,6 +1411,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Hashrate",
             stat_hac_day: "HAC / día",
             stat_power: "Consumo (estimado)",
+            stat_power_measured: "Consumo (medido)",
+            stat_gpu_board_power: "Placa GPU",
             stat_cost_day: "Coste / día",
             stat_efficiency: "Eficiencia",
             stat_block_height: "Altura de bloque",
@@ -1478,6 +1524,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Ajuste automático de GPU",
             autotune_hint: "Mide perfiles seguros, work groups y unit size.",
             btn_run_autotune: "Ejecutar Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune todavía no admite el backend CUDA. Solo mide formas de lanzamiento OpenCL. Cambia el Backend a OpenCL para ajustar, o define work groups y unit size a mano.",
             label_thermal_wg_cap: "Límite térmico de work groups",
             profit_fixed_note: "El respaldo por OOM, la ayuda dinámica de CPU y el horario continuo están integrados y siempre activos, así que no son ajustes.",
             label_reachability: "Accesibilidad",
@@ -1523,6 +1570,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Éco (moins de consommation)",
             mode_profit: "Équilibre profit (recommandé)",
             mode_max: "Hashrate maximum",
+            mode_no_power_sensor: "Ce GPU n'indique pas sa consommation sur cette machine, donc les trois modes ne se distinguent pas : Éco et Équilibre profit choisissent exactement ce que choisit Hashrate maximum.",
             label_power_cost: "Coût électricité (/kWh) :",
             label_hac_price: "Prix HAC USD (optionnel) :",
             mining_hac: "Blocs HAC (poworker)",
@@ -1557,6 +1605,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Hashrate",
             stat_hac_day: "HAC / jour",
             stat_power: "Puissance (estimation)",
+            stat_power_measured: "Puissance (mesurée)",
+            stat_gpu_board_power: "Carte GPU",
             stat_cost_day: "Coût / jour",
             stat_efficiency: "Efficacité",
             stat_block_height: "Hauteur de bloc",
@@ -1668,6 +1718,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Réglage automatique du GPU",
             autotune_hint: "Mesure les profils sûrs, les work groups et l'unit size.",
             btn_run_autotune: "Lancer Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune ne prend pas encore en charge le backend CUDA. Il ne mesure que les formes de lancement OpenCL. Passez le Backend à OpenCL pour régler, ou définissez work groups et unit size à la main.",
             label_thermal_wg_cap: "Plafond thermique des work groups",
             profit_fixed_note: "Le repli OOM, l'assistance CPU dynamique et le fonctionnement continu sont intégrés et toujours actifs : ce ne sont pas des réglages.",
             label_reachability: "Accessibilité",
@@ -1713,6 +1764,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "ประหยัด (ใช้ไฟน้อย)",
             mode_profit: "สมดุลกำไร (แนะนำ)",
             mode_max: "แฮชเรทสูงสุด",
+            mode_no_power_sensor: "GPU นี้ไม่รายงานกำลังไฟที่ใช้บนเครื่องนี้ ทั้งสามโหมดจึงแยกจากกันไม่ได้ โหมดประหยัดและสมดุลกำไรจะเลือกค่าเดียวกับแฮชเรทสูงสุดทุกประการ",
             label_power_cost: "ค่าไฟ (/kWh):",
             label_hac_price: "ราคา HAC USD (ไม่บังคับ):",
             mining_hac: "บล็อก HAC (poworker)",
@@ -1747,6 +1799,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "แฮชเรท",
             stat_hac_day: "HAC / วัน",
             stat_power: "กำลังไฟ (ประมาณ)",
+            stat_power_measured: "กำลังไฟ (วัดจริง)",
+            stat_gpu_board_power: "บอร์ด GPU",
             stat_cost_day: "ค่าใช้จ่าย / วัน",
             stat_efficiency: "ประสิทธิภาพ",
             stat_block_height: "ความสูงบล็อก",
@@ -1858,6 +1912,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "ปรับจูน GPU อัตโนมัติ",
             autotune_hint: "ทดสอบโปรไฟล์ที่ปลอดภัย work groups และ unit size",
             btn_run_autotune: "เริ่ม Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune ยังไม่รองรับแบ็กเอนด์ CUDA และวัดได้เฉพาะรูปแบบการรัน OpenCL เท่านั้น เปลี่ยน Backend เป็น OpenCL เพื่อปรับจูน หรือกำหนด work groups และ unit size ด้วยตนเอง",
             label_thermal_wg_cap: "เพดาน work group ตามความร้อน",
             profit_fixed_note: "OOM fallback, CPU assist แบบไดนามิก และการทำงานตลอดเวลา ถูกฝังไว้และเปิดอยู่เสมอ จึงไม่ใช่ตัวเลือกที่ตั้งค่าได้",
             label_reachability: "การเข้าถึง",
@@ -1903,6 +1958,7 @@ pub fn strings(lang: Lang) -> Strings {
             mode_eco: "Эко (меньше энергии)",
             mode_profit: "Баланс прибыли (рекомендуется)",
             mode_max: "Максимальный hashrate",
+            mode_no_power_sensor: "Эта видеокарта не сообщает своё энергопотребление на этой машине, поэтому три режима неразличимы: Эко и Баланс прибыли выбирают ровно то же, что и Максимальный hashrate.",
             label_power_cost: "Стоимость электричества (/kWh):",
             label_hac_price: "Цена HAC USD (необязательно):",
             mining_hac: "Блоки HAC (poworker)",
@@ -1937,6 +1993,8 @@ pub fn strings(lang: Lang) -> Strings {
             stat_hashrate: "Хешрейт",
             stat_hac_day: "HAC / день",
             stat_power: "Мощность (оценка)",
+            stat_power_measured: "Мощность (измерено)",
+            stat_gpu_board_power: "Плата GPU",
             stat_cost_day: "Расход / день",
             stat_efficiency: "Эффективность",
             stat_block_height: "Высота блока",
@@ -2048,6 +2106,7 @@ pub fn strings(lang: Lang) -> Strings {
             autotune_title: "Автонастройка GPU",
             autotune_hint: "Замеряет безопасные профили, work groups и unit size.",
             btn_run_autotune: "Запустить Auto Tune",
+            autotune_cuda_unsupported: "Auto Tune пока не поддерживает бэкенд CUDA: он измеряет только формы запуска OpenCL. Переключите Backend на OpenCL для настройки или задайте work groups и unit size вручную.",
             label_thermal_wg_cap: "Тепловой предел work groups",
             profit_fixed_note: "Откат при нехватке памяти, динамическая помощь CPU и круглосуточный режим встроены и всегда включены, это не настройки.",
             label_reachability: "Доступность",
@@ -2095,6 +2154,30 @@ mod tests {
                 msg,
                 s.bid_password_required,
                 "{} must not reuse the blank password message",
+                lang.code()
+            );
+        }
+    }
+
+    #[test]
+    fn every_language_can_tell_a_measured_draw_from_an_estimated_one() {
+        // The two labels sit on the same row in the same place; if a language
+        // ever shipped them identical, an operator in that language could not
+        // tell the card's own 256 W from a 350 W line someone typed into an ini,
+        // and the whole point of reading the sensor would be lost for them.
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            for label in [s.stat_power, s.stat_power_measured, s.stat_gpu_board_power] {
+                assert!(
+                    !label.trim().is_empty(),
+                    "{} is missing a power label",
+                    lang.code()
+                );
+            }
+            assert_ne!(
+                s.stat_power,
+                s.stat_power_measured,
+                "{} cannot distinguish an estimate from a measurement",
                 lang.code()
             );
         }
@@ -2265,7 +2348,7 @@ mod tests {
 
     /// Every string the Setup screen draws for itself. A blank here is a step
     /// card with no title, or a choice with no explanation, in that language.
-    fn setup_strings(s: &Strings) -> [&'static str; 31] {
+    fn setup_strings(s: &Strings) -> [&'static str; 33] {
         [
             s.setup_page_title,
             s.setup_page_sub,
@@ -2293,6 +2376,8 @@ mod tests {
             s.autotune_title,
             s.autotune_hint,
             s.btn_run_autotune,
+            s.autotune_cuda_unsupported,
+            s.mode_no_power_sensor,
             s.label_thermal_wg_cap,
             s.profit_fixed_note,
             s.label_reachability,
@@ -2318,6 +2403,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two sentences that stop a silent no-op exist in all nine languages,
+    /// say the thing that matters, and are not each other.
+    ///
+    /// Both replace a mode or a button that did nothing and said nothing about
+    /// it, so a language that shipped a blank here would put the defect back for
+    /// its speakers while the test suite stayed green.
+    #[test]
+    fn every_language_says_when_a_choice_cannot_do_anything() {
+        assert_eq!(Lang::ALL.len(), 9, "the panel ships nine languages");
+        let mut power_seen = std::collections::BTreeSet::new();
+        let mut cuda_seen = std::collections::BTreeSet::new();
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            for text in [s.mode_no_power_sensor, s.autotune_cuda_unsupported] {
+                assert!(
+                    !text.trim().is_empty(),
+                    "{} left a no-op explanation blank",
+                    lang.code()
+                );
+                assert!(
+                    !text.contains('\u{2014}'),
+                    "{} uses an em dash: {text}",
+                    lang.code()
+                );
+            }
+            // The CUDA sentence has to name CUDA. That is the whole complaint:
+            // the old message talked about OpenCL and never said the word.
+            assert!(
+                s.autotune_cuda_unsupported.contains("CUDA"),
+                "{} must name the backend that is unsupported: {}",
+                lang.code(),
+                s.autotune_cuda_unsupported
+            );
+            assert!(
+                s.autotune_cuda_unsupported.contains("OpenCL"),
+                "{} must name the backend that does work: {}",
+                lang.code(),
+                s.autotune_cuda_unsupported
+            );
+            assert_ne!(
+                s.mode_no_power_sensor, s.autotune_cuda_unsupported,
+                "{} gives two different problems the same words",
+                lang.code()
+            );
+            // Untranslated copies are the other way this goes quietly wrong.
+            if lang != Lang::En {
+                let en = strings(Lang::En);
+                assert_ne!(
+                    s.mode_no_power_sensor,
+                    en.mode_no_power_sensor,
+                    "{} did not translate the power-sensor note",
+                    lang.code()
+                );
+                assert_ne!(
+                    s.autotune_cuda_unsupported,
+                    en.autotune_cuda_unsupported,
+                    "{} did not translate the CUDA note",
+                    lang.code()
+                );
+            }
+            power_seen.insert(s.mode_no_power_sensor);
+            cuda_seen.insert(s.autotune_cuda_unsupported);
+        }
+        assert_eq!(power_seen.len(), Lang::ALL.len());
+        assert_eq!(cuda_seen.len(), Lang::ALL.len());
     }
 
     #[test]

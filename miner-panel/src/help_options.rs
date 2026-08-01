@@ -60,7 +60,7 @@ static EN: &[HelpSection] = &[
         lines: &[
             "mode: max | profit | eco (also amd_profit / amd_eco aliases).",
             "power_cost_kwh: electricity price for profit estimates.",
-            "gpu_watts: override GPU power (0 = estimate from profile).",
+            "gpu_watts: estimated GPU power, used only where the card reports none.",
             "cpu_watts_per_thread: watts per CPU assist thread (default 8).",
             "hac_price: HAC/USD for profit pause (0 = disable revenue side).",
             "dynamic_supervene: auto adjust CPU assist from GPU/CPU ratio.",
@@ -155,7 +155,7 @@ static EL: &[HelpSection] = &[
         lines: &[
             "mode: max | profit | eco.",
             "power_cost_kwh: τιμή ρεύματος για εκτίμηση κέρδους.",
-            "gpu_watts: override ισχύος GPU (0 = εκτίμηση από profile).",
+            "gpu_watts: εκτίμηση ισχύος GPU, μόνο όταν η κάρτα δεν τη μετρά.",
             "cpu_watts_per_thread: watt ανά CPU thread (default 8).",
             "hac_price: HAC/USD για profit pause (0 = χωρίς έσοδα).",
             "dynamic_supervene: αυτόματη ρύθμιση CPU assist από αναλογία GPU/CPU.",

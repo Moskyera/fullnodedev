@@ -327,17 +327,35 @@ mod tests {
             .unwrap_or_else(|| panic!("unknown slug {slug}"))
     }
 
+    /// Max on this card is the measured optimum, not a conservative guess.
+    ///
+    /// 64 x 256 x 192 measured 28.80 MH/s at repeat 16 against 19.13 for the
+    /// 48 x 256 x 48 this used to resolve to, on a 0.5% noise floor, and was
+    /// proven byte identical to it against the CPU oracle first. The work-group
+    /// count is unchanged and was never the limit; the unit_size ceiling was.
     #[test]
-    fn rx9070xt_max_wg_capped() {
+    fn rx9070xt_max_is_the_measured_optimum() {
         let t = resolve_panel_tuning(&gpu("rx9070xt"), EfficiencyMode::Max);
-        assert_eq!(t.work_groups, 64);
-        assert_eq!(t.unit_size, 64);
+        assert_eq!((t.work_groups, t.unit_size), (64, 192));
     }
 
     #[test]
     fn rx7900xtx_max_wg_high() {
         let t = resolve_panel_tuning(&gpu("rx7900xtx"), EfficiencyMode::Max);
         assert!(t.work_groups >= 1024);
+    }
+
+    /// The tuning crate drives its limit and auto-tune tests over
+    /// `gpu_arch::PANEL_GPU_PRESETS`. If this list and that one drift, a card
+    /// added here ships with a search space nobody ever checked.
+    #[test]
+    fn the_preset_list_matches_the_one_the_tuning_tests_are_driven_over() {
+        let here: Vec<(&str, &str, u8)> = gpu_presets()
+            .into_iter()
+            .filter(|g| g.slug != "none")
+            .map(|g| (g.slug, g.profile, g.vram_gb))
+            .collect();
+        assert_eq!(here, gpu_arch::PANEL_GPU_PRESETS.to_vec());
     }
 
     #[test]
@@ -366,11 +384,17 @@ mod tests {
         unit_size = safe.unit_size;
 
         assert_eq!(detected.slug, "rx9070xt");
+        // 64 x 128 is the Profit tier for this card. It replaced 48 x 48, which
+        // was doubly wrong: 48 work groups is a measured scheduling dip (32 CUs
+        // at 2 groups each leave a half empty tail on odd multiples of 32), and
+        // 48 units left the card starved on a kernel that is latency bound.
         assert_eq!(
             (profile.as_str(), work_groups, unit_size),
-            (safe.profile, 48, 48)
+            (safe.profile, 64, 128)
         );
         assert_ne!((work_groups, unit_size), (1536, 96));
+        assert_ne!(work_groups, 48, "48 work groups is a measured dip");
+        assert_ne!(work_groups, 96, "96 work groups is a measured dip");
     }
 
     #[test]

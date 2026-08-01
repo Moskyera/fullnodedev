@@ -160,6 +160,21 @@ impl MinerApp {
                 self.apply_panel_tuning();
             }
         }
+        // A mode that cannot differ must not silently pretend to. Said here,
+        // where the choice is made, and not only in a worker log line nobody
+        // reads: with no power reading every candidate is divided by the same
+        // configured constant, so Eco and Profit rank exactly as Max does.
+        //
+        // Only when a probe has actually answered. Before that `power_measured`
+        // is `None` and the panel says nothing rather than guessing.
+        if self.selected_gpu_power_measured() == Some(false) {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("! {}", t.mode_no_power_sensor))
+                    .color(theme::colors::GOLD)
+                    .size(11.5),
+            );
+        }
 
         ui.add_space(14.0);
         self.autotune_card(ui);
@@ -167,15 +182,25 @@ impl MinerApp {
 
     /// Auto Tune, in the tinted inner card the mockup gives it: what it does on
     /// the left, the one button on the right.
+    ///
+    /// On CUDA the button is disabled and the card says why. The tuner measures
+    /// OpenCL launch shapes only, so with CUDA selected pressing it wrote a
+    /// config poworker refuses, waited, failed, and rolled the settings back
+    /// without CUDA ever being mentioned.
     fn autotune_card(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
+        let cuda = self.cuda_backend_selected();
         theme::section_card_active().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     theme::card_title(ui, t.autotune_title, t.autotune_hint);
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::btn_primary(ui, t.btn_run_autotune).clicked() {
+                    let clicked = ui
+                        .add_enabled_ui(!cuda, |ui| theme::btn_primary(ui, t.btn_run_autotune))
+                        .inner
+                        .clicked();
+                    if clicked {
                         self.run_benchmark();
                     }
                     if self.benchmarking {
@@ -189,6 +214,14 @@ impl MinerApp {
                     }
                 });
             });
+            if cuda {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("! {}", t.autotune_cuda_unsupported))
+                        .color(theme::colors::GOLD)
+                        .size(11.5),
+                );
+            }
         });
     }
 }

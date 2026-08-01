@@ -554,7 +554,12 @@ impl MinerApp {
             },
         );
 
-        // 4. Efficiency, and the estimated draw it is divided by.
+        // 4. Efficiency, and the draw it is divided by - which since the card's
+        //    own power sensor exists is a measurement on a rig that has one and
+        //    a configured estimate on a rig that does not. The label says which,
+        //    every time, because a 256 W reading and a 350 W guess divided into
+        //    the same hash rate give two different efficiencies and only one of
+        //    them is true.
         dashboard::kpi_card(
             ui,
             narrow,
@@ -562,7 +567,7 @@ impl MinerApp {
                 label: t.stat_efficiency,
                 value: &format!("{:.1}", s.kh_per_j),
                 unit: "kH/J",
-                sub: &format!("{:.0} W · {}", s.watts, t.stat_power.to_lowercase()),
+                sub: &format!("{:.0} W · {}", s.watts, self.power_label(t).to_lowercase()),
                 foot: if is_hacd {
                     ""
                 } else {
@@ -842,6 +847,33 @@ impl MinerApp {
         });
     }
 
+    /// The label for the `watts` figure: "measured" only where the worker says
+    /// the WHOLE total came from sensors, "estimate" everywhere else.
+    ///
+    /// A rig with a measured card and CPU assist threads reads "estimate" here,
+    /// which is not a demotion of the measurement but the truth about the total:
+    /// the CPU part of it can only ever be `cpu_watts_per_thread` from the ini.
+    /// The measured card is shown on its own in the detail rows, so nothing real
+    /// is hidden by the honest label on the sum.
+    fn power_label(&self, t: &Strings) -> &'static str {
+        let now_ms = crate::stats_poll::now_unix_ms();
+        if crate::stats_poll::watts_are_measured(&self.stats, now_ms) {
+            t.stat_power_measured
+        } else {
+            t.stat_power
+        }
+    }
+
+    /// The detail row for a measured GPU board draw, or nothing at all where no
+    /// card measured one. Absent means absent all the way to the pixels: there
+    /// is no "0 W" row and no greyed-out placeholder, because either the sensor
+    /// answered or the operator has only the estimate above.
+    fn measured_gpu_power_row(&self, t: &Strings) -> Option<(String, String)> {
+        let now_ms = crate::stats_poll::now_unix_ms();
+        let watts = crate::stats_poll::live_gpu_board_power_w(&self.stats, now_ms)?;
+        Some((t.stat_gpu_board_power.to_string(), format!("{watts:.0} W")))
+    }
+
     fn dash_limit_rows(&self, t: &Strings, d: &DashLabels) -> Vec<(String, String)> {
         let s = &self.stats;
         let is_hacd = self.mining_kind == MiningKind::Hacd;
@@ -857,6 +889,8 @@ impl MinerApp {
                 t.stat_cpu_threads.to_string(),
                 format!("{active} / {configured}"),
             ));
+            // HACD is CPU-only: there is no GPU board to measure, so this row
+            // is always the configured per-thread estimate and says so.
             rows.push((t.stat_power.to_string(), format!("{:.0} W", s.watts)));
             rows.push((
                 t.dash_detail_wallet.to_string(),
@@ -876,7 +910,11 @@ impl MinerApp {
                 format!("{}°C", self.max_temp_c)
             },
         ));
-        rows.push((t.stat_power.to_string(), format!("{:.0} W", s.watts)));
+        rows.push((self.power_label(t).to_string(), format!("{:.0} W", s.watts)));
+        // The card's own reading, on its own row, whenever one exists. On a rig
+        // with CPU assist the total above is honestly labelled an estimate, and
+        // this is where the part that really was measured stays visible.
+        rows.extend(self.measured_gpu_power_row(t));
         // When a cap has actually bitten, the row says which one. "1,536 /
         // 1,536" and "768 / 1,536 because the card got hot" are different
         // facts, and only the second explains a hash rate that dropped. Which

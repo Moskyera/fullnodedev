@@ -84,6 +84,32 @@ const HASHRATE_EWMA_NEW_WEIGHT: f64 = 0.25;
 const TARGET_BLOCK_TIME: f64 = 300.0;
 const ONEDAY_BLOCK_NUM: f64 = 288.0;
 
+/// HAC a single hash per second earns in a day, at the difficulty `target_hash`
+/// encodes and the block reward paid at `height`.
+///
+/// This is the mining line's own arithmetic, factored out so the auto-tuner can
+/// price a hash with it instead of inventing a second formula that would drift
+/// from the one the operator sees on screen: `hac_per_day` on that line is
+/// exactly `hashrate * this`.
+///
+/// It is only meaningful for a NETWORK target. A pool serves a share target,
+/// which is far weaker, and feeding one in here would value a hash at hundreds
+/// of times what it is worth; the caller is responsible for not doing that.
+#[cfg(feature = "ocl")]
+pub(crate) fn hac_per_day_per_hashrate(height: u64, target_hash: &[u8]) -> Option<f64> {
+    // The array length is inferred from `hash_to_rates`, exactly as the mining
+    // line does it, so a change to the hash width cannot leave this behind.
+    let Ok(target) = target_hash.to_vec().try_into() else {
+        return None;
+    };
+    let target_rates = hash_to_rates(&target, TARGET_BLOCK_TIME);
+    if !target_rates.is_finite() || target_rates <= 0.0 {
+        return None;
+    }
+    let value = ONEDAY_BLOCK_NUM * block_reward_number(height) as f64 / target_rates;
+    value.is_finite().then_some(value)
+}
+
 static MINING_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(0);
 /// Set while the upstream (pool bridge or fullnode) tells us the work it is
 /// serving is no longer being refreshed. The installed template can no longer win
@@ -1811,10 +1837,25 @@ fn deal_block_mining_results(
     let active_cpu = cnf.runtime.active_cpu_assist.load(Relaxed);
     cnf.runtime
         .maybe_adjust_supervene(&cnf.efficiency, gpu_nonce_space, cpu_nonce_space);
-    if should_pause_for_profit(&cnf.efficiency, hac1day, &cnf.gpu_profile, active_cpu) {
+    // One reading, used for the pause decision and the line that reports it, so
+    // the operator can never be shown a cost that disagrees with the cost the
+    // rig was paused on.
+    let measured_gpu_w = cnf.runtime.gpu_board_power_w();
+    if should_pause_for_profit(
+        &cnf.efficiency,
+        hac1day,
+        &cnf.gpu_profile,
+        active_cpu,
+        measured_gpu_w,
+    ) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
         wlogln!(
-            "\n[efficiency] Mining paused: estimated cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw."
+            "\n[efficiency] Mining paused: {} cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw.",
+            if measured_gpu_w.is_some() {
+                "measured"
+            } else {
+                "estimated"
+            }
         );
     } else {
         cnf.runtime.paused_unprofitable.store(false, Relaxed);
@@ -1826,6 +1867,7 @@ fn deal_block_mining_results(
         &cnf.efficiency,
         &cnf.gpu_profile,
         active_cpu,
+        measured_gpu_w,
     );
     flush!(
         "{} {} | {} | best {}.        \r",
