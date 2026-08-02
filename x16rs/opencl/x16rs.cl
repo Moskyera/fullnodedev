@@ -4,7 +4,7 @@
 #ifndef __CUDA__
 #define OCL_AS_ULONG_UINT2_S10(v) as_ulong(as_uint2(v).s10)
 #ifdef AMD_GFX_GFX1201
-/* RDNA4: use __constant lookup tables — avoids ~34KB __local per work-group. */
+/* RDNA4: use __constant lookup tables, avoids ~34KB __local per work-group. */
 #define __local_array /**/
 #define OCL_LOCAL_PTR __constant
 #else
@@ -29,7 +29,7 @@ typedef int sph_s32;
     // CUDA build: match the algorithm kernels (jh.cl etc.) which do
     // `typedef ulong sph_u64`. ulong is supplied by ocl_compat.cuh. Using the same
     // spelling keeps sph_u64 a single consistent type across the whole CUDA
-    // translation unit — nvcc rejects a conflicting `unsigned long long` here vs
+    // translation unit, nvcc rejects a conflicting `unsigned long long` here vs
     // `ulong` in jh.cl as an "invalid redeclaration". OpenCL is unaffected (#else).
     typedef ulong sph_u64;
   #else
@@ -281,8 +281,67 @@ typedef union ALIGN {
                     hash_x16rs_func_15(&(local_hashes)[hash_pos[0]]); \
                     break; \
             } \
-            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); \
         } \
+        /* ONE barrier per round, at the end of the round, and it is load bearing. \
+         * \
+         * Why one per round is enough. `local_order` is a PERMUTATION of the \
+         * group's slot indices: the scatter pass above writes each slot index \
+         * (index + h) to exactly one position, and the positions it can reach are \
+         * exactly [starting_index[mod], starting_index[mod] + histogram[mod]), \
+         * whose union over the 16 buckets is [0, local_size * unit_size). The hash \
+         * pass then reads position (local_size * h) + local_id, which over all \
+         * (h, local_id) covers that same range exactly once. So inside the hash \
+         * pass every slot is read and written by exactly ONE work item in exactly \
+         * ONE iteration of h: no two iterations of h can collide, and a barrier \
+         * between them prevents nothing. The only cross work item dependency in \
+         * the whole macro is round r's hash pass writing slots that round r+1's \
+         * histogram pass reads, and one barrier here covers all of it. Removing \
+         * removing the per hash barrier is worth this much, and how much \
+         * depends strongly on unit_size, because the barriers are a fixed cost \
+         * per hash while the work between them is not. Paired A/B on a \
+         * gfx1201, both trees alternating inside one process with the order \
+         * swapped, every run also reporting byte identical output: \
+         * \
+         *     64x256x12    +45.84%   (barriers dominate) \
+         *     64x256x48     +8.20% \
+         *     48x256x48     +8.14% \
+         *     64x256x64     +6.54%   <- the shipped poworker.config.ini \
+         *     64x256x96     +4.10% \
+         *     64x256x192    +1.41% \
+         * \
+         * An earlier note here read "+8.96% at the shipped shape (unit_size \
+         * 12)". Both halves were wrong together: 8.96 came from a run at \
+         * unit_size 48, and unit_size 12 measures 45.84 on this card. The \
+         * honest headline for an operator on the shipped shape is +6.5%. \
+         * \
+         * Why the fence must name GLOBAL. `local_hashes` is not local. Both OpenCL \
+         * call sites and the CUDA one alias it onto GLOBAL memory: \
+         * x16rs_main.cl, x16rs_diamond.cl and x16rs-cuda/cuda/block_miner.cu all \
+         * do `local_hashes = global_hashes + (group_id * local_size * unit_size)`. \
+         * The hash functions above therefore write global memory, and a \
+         * CLK_LOCAL_MEM_FENCE alone would order none of it. CLK_LOCAL_MEM_FENCE is \
+         * kept alongside so the macro stays correct if a caller ever does pass a \
+         * genuinely __local buffer, and because it is what lets the histogram reset \
+         * barrier at the top of the round stay LOCAL only: the two are a pair. \
+         * \
+         * What breaks if someone deletes it. Two separate races, not one. \
+         * (1) Round r+1's histogram pass reads (local_hashes)[index + h] for its \
+         * own slots, but those slots were written in round r by OTHER work items, \
+         * because the permutation does not map a slot back to its owner. Without \
+         * this barrier the histogram, and therefore the algorithm order, is built \
+         * from a mix of round r and round r-1 values, and the hash silently \
+         * diverges from consensus on any device that does not happen to run the \
+         * group in lockstep. \
+         * (2) The LAST round's writes would be unfenced against everything after \
+         * the macro. None of the three call sites has a barrier between the macro \
+         * and its first read of another work item's slots: x16rs_main.cl reads \
+         * local_hashes[index + i] in the share loop and the best_hash loop, \
+         * x16rs_diamond.cl in diamond_hash(local_hashes[index]...), block_miner.cu \
+         * in the same two places, all BEFORE their next __syncthreads(). This is \
+         * also why upgrading the histogram reset barrier to LOCAL|GLOBAL is not an \
+         * alternative to keeping a barrier here: that would fix (1) and leave (2) \
+         * open, because there is no round r+1 after the last round. */ \
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); \
     }
 
 // blake

@@ -13,7 +13,7 @@ self-testing instruments. Never point a miner at one.
 
 faults   three deliberate defects, used to prove the gate can fail:
            faults/A  shabal (algo 13) counter Wlow 1 -> 2      one algorithm, always wrong
-           faults/B  the barrier at x16rs.cl:269 deleted        a race, not one algorithm
+           faults/B  the round's TRAILING barrier deleted       a race, not one algorithm
            faults/C  one bit flipped in blake's IV              a single-bit constant
 
 BOTH BACKENDS. These trees drive the CUDA gate as well as the OpenCL one, because
@@ -83,16 +83,34 @@ SELECTORS = [
      "            switch (%d) { \\"),
 ]
 
-BARRIER = ("            } \\\n"
-           "            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); \\\n"
-           "        } \\\n    }")
+# The round's TRAILING barrier, the last statement of X16RS_RUN_REPEAT_LOOP's
+# body. Deleting it leaves the round with no LOCAL|GLOBAL fence after the hash
+# pass, which is the defect fault B exists to inject.
+#
+# This anchor is deliberately pinned to the macro terminator `\n    }` rather
+# than to the barrier text alone, because x16rs.cl contains a SECOND
+# `barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)` earlier in the same
+# macro, between the scatter pass and the hash pass. Only the trailing one is
+# followed by the end of the macro, so the match stays unique and
+# `replace_once` keeps its assertion honest.
+#
+# It moved once already. Until v0.5.6 the barrier sat INSIDE the per-hash loop,
+# and this anchor matched `} \ barrier \ } \ }` (switch close, barrier, hash
+# loop close, macro close). When the barrier was hoisted out of the per-hash
+# loop to the end of the round, that anchor stopped matching and this script
+# died on the assertion in `replace_once` instead of quietly writing a tree with
+# no fault in it. That loud failure is the intended behaviour: a fault tree that
+# silently becomes a no-op turns the whole gate green over nothing. If you move
+# the barrier again, this constant moves with it.
+BARRIER = ("        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); \\\n"
+           "    }\n")
 
 
 def build_faults(src, out, base):
     a = replace_once(base,
                      "  sph_u32 Wlow = 1, Whigh = 0;\n\n  INPUT_BLOCK_ADD;",
                      "  sph_u32 Wlow = 2, Whigh = 0;\n\n  INPUT_BLOCK_ADD;")
-    b = replace_once(base, BARRIER, "            } \\\n        } \\\n    }")
+    b = replace_once(base, BARRIER, "    }\n")
     c = base.replace("SPH_C64(0x6A09E667F3BCC908)",
                      "SPH_C64(0x6A09E667F3BCC909)", 1)
     assert c != base
