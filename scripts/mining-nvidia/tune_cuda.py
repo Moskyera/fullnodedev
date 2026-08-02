@@ -160,6 +160,58 @@ est_refine = 0.4 * (est_oracle + est_launch)                  # up to 8 neighbou
 est_final  = 300.0                                            # 255-threshold proof
 est_total  = est_oracle + est_launch + est_sweep + est_soak + est_refine + est_final
 
+def refuse_if_the_card_is_busy():
+    """Refuse to start if something else is already measuring on this GPU.
+
+    Run this cell twice by accident and two tuners share one card and one oracle
+    core. It does not produce wrong numbers, because each still proves its own
+    candidates against the CPU, but it produces MEANINGLESS ones, and they look
+    exactly like real ones. Measured on a T4 the moment it happened:
+
+        one tuner   64x256x32   6.22 MH/s   p95  86ms
+        two tuners  64x256x32   3.66 MH/s   p95 190ms
+
+    Half the rate and twice the latency, and nothing on screen says why. The
+    honest thing a measuring tool can do is decline.
+    """
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return  # no ps: better to run than to refuse for a missing tool
+    mine = os.getpid()
+    busy = []
+    for line in out.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        pid_text, _, args = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == mine:
+            continue
+        if "release/poworker" in args or "release/x16rs_gate" in args:
+            busy.append((pid, args.strip()[:90]))
+    if not busy:
+        return
+    print("")
+    print("#" * 72)
+    print("#  STOP: something else is already on this GPU.")
+    for pid, args in busy:
+        print("#    pid %-8s %s" % (pid, args))
+    print("#")
+    print("#  Two measurements on one card time each other's contention, and the")
+    print("#  numbers look normal. Stop the other run, or wait for it, then start")
+    print("#  this one again:")
+    print("#      !pkill -f 'release/poworker'")
+    print("#" * 72)
+    sys.exit(2)
+
+
+refuse_if_the_card_is_busy()
+
 print("")
 print("SIZE = %s: [gpu] work_groups = %d, [efficiency] benchmark_seconds = %d"
       % (SIZE, size["cap"], size["seconds"]))
