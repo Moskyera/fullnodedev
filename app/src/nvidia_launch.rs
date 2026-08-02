@@ -432,15 +432,33 @@ pub struct NvidiaPreset {
 /// allow, and it exists to be REPLACED by `x16rs_gate`/autotune on the operator's
 /// own card. The panel's Auto Tune button is what turns these into numbers.
 ///
-/// **unit_size 64 on every tier: the one measured value, not a spread.**
-/// The T4 measured 64 -> 7.54 MH/s, 96 -> 7.19, 128 -> 7.06. Every tier in the
-/// table this replaces named 96 or 128, i.e. every NVIDIA operator shipped with
-/// a value the only NVIDIA measurement ranks LAST or second to last. Spreading
-/// unit_size across the tiers was the invention being removed: with exactly one
-/// resident block per SM (see [`residency`]) unit_size does not trade power for
-/// throughput in a way anything here can predict, and the two cards measured
-/// disagree about its direction. So it is pinned to the one value that won, and
-/// the tuner's axis runs 32/48/64/96/128 so a card that wants less can find it.
+/// **unit_size 64 on every tier, and the first reason given for it was wrong.**
+///
+/// This used to cite a hand sweep: 64 -> 7.54 MH/s, 96 -> 7.19, 128 -> 7.06, and
+/// conclude that smaller wins. That sweep ran the three shapes back to back in
+/// one loop on a passively cooled card that climbed from 63 to 74 C as it went,
+/// so it may have measured nothing but the order they ran in. The tuner, which
+/// re-runs finalists in alternating order for exactly this reason, disagrees: at
+/// 256 work groups it measured 32 -> 6.62, 64 -> 6.91, 128 -> 7.29, the opposite
+/// ordering.
+///
+/// 64 survives, but as the partner of a high work-group count rather than as a
+/// small value that wins on its own. At a MATCHED batch of 8.39M nonces:
+///
+/// ```text
+///     512 x 256 x 64   7.48 MH/s
+///     256 x 256 x 128  7.29 MH/s
+/// ```
+///
+/// Same nonces, arranged two ways, and the wider one wins. That is the axis this
+/// vendor cares about: with one resident block per SM (see [`residency`]),
+/// work_groups is blocks spread across the multiprocessors, while unit_size is
+/// serial work inside a thread. NVIDIA wants width. The RX 9070 XT wanted depth,
+/// where unit_size beat work_groups by about 11% at a matched batch, which is
+/// why no single table serves both.
+///
+/// The tuner's axis still runs 32/48/64/96/128 so a card that wants otherwise
+/// can find it.
 ///
 /// **work_groups: a wave count, bounded by the latency ceiling.**
 /// Derived: one resident block per SM makes work_groups a wave count, and
@@ -451,11 +469,43 @@ pub struct NvidiaPreset {
 /// `every_nvidia_preset_lands_inside_the_derived_bracket` against the real
 /// multiprocessor counts of every NVIDIA card in `PANEL_GPU_PRESETS`.
 ///
-/// What the ladder is NOT is a claim that a higher tier is faster. On the one
-/// NVIDIA card measured it would not be: the card sat on its power limit, where
-/// a longer batch buys nothing. The ladder is an aggressiveness dial whose top
-/// end stays inside the latency ceiling, which is a much weaker claim, and the
-/// weaker claim is the true one.
+/// On the one NVIDIA card measured, a higher tier IS faster, and this used to
+/// say the opposite. A full tune on a Colab T4 at repeat 16, every candidate
+/// proved against the CPU oracle over its whole window before its number
+/// counted:
+///
+/// ```text
+///     256 x 256 x 64   6.91 MH/s     <- what nvidia_balanced resolves near
+///     384 x 256 x 64   7.29
+///     512 x 256 x 64   7.48   66 W   111.7 kH/J   <- tier 3, the winner
+/// ```
+///
+/// About +8% from the middle of the ladder to tier 3, well outside the 2.6%
+/// between-process spread. The card drew 66 W against its 70 W cap throughout,
+/// so this is not more power buying more hashes; it is the same power spread
+/// across more of the chip.
+///
+/// Three things that run WITH that number and must travel with it:
+///
+/// The tune could not separate the top two. 512x256x64 measured 7.468 and
+/// 192x256x128 measured 7.457, 0.14% apart, while one shape's own three repeats
+/// spanned 2.35%. The tuner said so rather than crowning one, and the tier 3
+/// entry is the larger median of a coin toss.
+///
+/// The soak did not settle. 36 passes over 123 s and the hashrate was still
+/// drifting 0.35%, so the winner is NOT proven to sustain and the tuner refused
+/// to write it into a config. The drift is twenty times smaller than the gain,
+/// which is why the ladder keeps the shape; it is not a reason to call it
+/// settled.
+///
+/// One card, one session. A T4 is 40 SMs at a 70 W cap and a datacenter blower;
+/// a desktop 4090 is none of those things. This is the best evidence anyone has
+/// and it is still one card.
+///
+/// So the ladder is an aggressiveness dial whose top end stays inside the
+/// latency ceiling. On the T4 the dial also happens to order by speed. That is a
+/// measurement on one card, not a promise about yours, and it is what the tuner
+/// exists to settle.
 pub const PRESET_LADDER: [NvidiaPreset; 5] = [
     NvidiaPreset {
         tier: 0,
