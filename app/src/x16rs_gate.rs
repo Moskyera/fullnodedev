@@ -46,6 +46,21 @@ use std::time::Instant;
 /// Height whose `block_hash_repeat` is the mainnet maximum, 16.
 pub const REPEAT16_HEIGHT: u64 = 800_000;
 
+/// How far apart two SEPARATE invocations of this binary land on identical work.
+///
+/// Measured on this rig by running `baseline` repeatedly over the fixed corpus:
+/// within one process the runs reproduce to a few tenths of a percent, but the
+/// card settles into one of several clock and power states for the LIFE of a
+/// process, so two processes on the same work have disagreed by about this much.
+///
+/// It is the bar for any claim that compares a number from one run against a
+/// number from another run - a different build, a different day, a different
+/// kernel - and it is stated once here because two things now quote it: the
+/// baseline report, and the auto-tuner, whose CUDA path cannot fall back to the
+/// in-process A/B that resolves ten times finer (`run_ab` is OpenCL-only, and
+/// structurally so: nvcc compiles CUDA kernels into the binary).
+pub const BETWEEN_PROCESS_SPREAD_PCT: f64 = 2.6;
+
 /// The 89-byte block intro layout the kernel and the CPU agree on.
 pub const BLOCK_INTRO_BYTES: usize = 89;
 
@@ -643,21 +658,99 @@ impl std::fmt::Display for Shape {
     }
 }
 
+/// Whether a device allocated for `allocated` may be LAUNCHED at `wanted`, on a
+/// backend that takes its launch shape per call.
+///
+/// That is OpenCL: `do_group_block_mining_opencl` receives work_groups,
+/// local_size and unit_size on every call, so one allocation serves every
+/// smaller shape - which is what lets the auto-tuner measure forty candidates
+/// against one set of buffers. Larger is refused rather than clamped:
+/// `initialize_opencl` sizes `global_hashes` and `global_order` from the shape
+/// it was opened with and the kernel indexes them by the shape it is LAUNCHED
+/// with, so a larger launch writes past the buffers, which on a GPU is not a
+/// crash but a wrong answer somewhere else.
+///
+/// Free-standing and feature-free so the rule can be tested without a card.
+pub fn launch_fits_allocation(allocated: Shape, wanted: Shape) -> Result<(), String> {
+    if wanted.local_size != allocated.local_size
+        || wanted.work_groups > allocated.work_groups
+        || wanted.unit_size > allocated.unit_size
+    {
+        return Err(format!(
+            "launch shape {wanted} does not fit a device allocated for {allocated}: this backend \
+             may be launched at any SMALLER shape with the same local_size, never a larger one"
+        ));
+    }
+    Ok(())
+}
+
+/// The same question on a backend that bakes `unit_size` into the allocation AND
+/// hands it to the kernel from there.
+///
+/// That is CUDA: `mine_batch_inner` passes `miner.unit_size`, so a miner built
+/// at 64 asked for 128 does not fail - it runs 64 nonces per thread, returns
+/// correct hashes for 64, and the caller labels the result 128. Nothing
+/// downstream could catch that: the hashes are right, the equivalence proof
+/// passes, and only the TIME is attributed to the wrong shape. So unit_size must
+/// match exactly. Work groups are clamped per launch by
+/// `mine_block_batch_shares`, so fewer is a real launch of fewer and more is
+/// refused for the same reason a mislabelled unit_size is.
+pub fn launch_fits_bound_allocation(allocated: Shape, wanted: Shape) -> Result<(), String> {
+    if wanted.unit_size != allocated.unit_size || wanted.local_size != allocated.local_size {
+        return Err(format!(
+            "launch shape {wanted} cannot run on a device built for {allocated}: unit_size and \
+             local_size are fixed at allocation and passed to the kernel from it, so this launch \
+             would run unit_size {} and be reported as {}",
+            allocated.unit_size, wanted.unit_size
+        ));
+    }
+    if wanted.work_groups > allocated.work_groups {
+        return Err(format!(
+            "launch shape {wanted} asks for more work groups than were allocated ({allocated})"
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Everything below needs a real device.
 // ---------------------------------------------------------------------------
 
-/// One opened device, at one launch shape.
+/// One opened device, and the launch shapes it can be asked for.
 ///
 /// Three operations, and they are the only thing a backend has to supply. Every
 /// piece of judgement - what to hash, what to compare it with, what counts as a
 /// pass, which algorithm to blame - is above this line and is compiled once.
+///
+/// The launch shape is a PARAMETER of each operation rather than a property of
+/// the device, because the two are not the same thing and the difference is the
+/// whole reason the auto-tuner can share this trait. A device is opened with
+/// buffers sized for one shape ([`GateDevice::allocated_shape`]); an OpenCL
+/// device can then be launched at any smaller shape against those same buffers,
+/// which is how the tuner measures forty candidates without recompiling a kernel
+/// forty times, while a CUDA device cannot, because `unit_size` is baked into
+/// its allocation AND passed to the kernel from the miner. Each backend says
+/// which it is through [`GateBackend::device_is_bound_to_its_shape`], and each
+/// device refuses a shape it cannot honestly launch instead of quietly running a
+/// different one.
 #[cfg(any(feature = "ocl", feature = "cuda"))]
 pub trait GateDevice {
-    /// The shape this device was opened at.
-    fn shape(&self) -> Shape;
+    /// The shape this device's buffers were sized for.
+    fn allocated_shape(&self) -> Shape;
 
-    /// Launch at `shape()` from `nonce_start` with `share_target`, and return
+    /// True when this already-open device can launch `shape` honestly: not
+    /// beyond its allocation, and not by quietly running a different shape.
+    ///
+    /// The auto-tuner asks before every candidate. Answering it wrongly in the
+    /// permissive direction is the failure that would not announce itself: a
+    /// CUDA miner asked for a `unit_size` it was not built with runs the one it
+    /// WAS built with, returns correct hashes for that shape, passes every
+    /// equivalence proof, and hands back a time the tuner would attribute to the
+    /// shape it asked for. Each implementation answers from the same rule its
+    /// launch path enforces, so the two cannot drift.
+    fn can_launch(&self, shape: Shape) -> bool;
+
+    /// Launch at `shape` from `nonce_start` with `share_target`, and return
     /// (total hits the kernel counted, the entries that fit in the share list).
     ///
     /// The total is the KERNEL's own count, including hits it could not store.
@@ -665,6 +758,7 @@ pub trait GateDevice {
     /// every hash in the window, not about the ones that fit down the pipe.
     fn count_and_shares(
         &self,
+        shape: Shape,
         height: u64,
         intro: &[u8],
         nonce_start: u32,
@@ -674,7 +768,13 @@ pub trait GateDevice {
     /// The best-hash reduction: one nonce and hash for the whole window. This is
     /// a different code path from the share list and it is the ONLY one solo
     /// mining reads, so the gate proves it separately.
-    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String>;
+    fn best(
+        &self,
+        shape: Shape,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+    ) -> Result<(u32, [u8; 32]), String>;
 
     /// Every hash the card produced for a window, in NONCE ORDER.
     ///
@@ -686,12 +786,14 @@ pub trait GateDevice {
     /// dump would silently shrink the gate to a sample.
     fn dump_window(
         &self,
+        shape: Shape,
         height: u64,
         intro: &[u8],
         nonce_start: u32,
     ) -> Result<Vec<[u8; 32]>, String> {
-        let count = self.shape().nonces();
-        let (hits, shares) = self.count_and_shares(height, intro, nonce_start, &[0xffu8; 32])?;
+        let count = shape.nonces();
+        let (hits, shares) =
+            self.count_and_shares(shape, height, intro, nonce_start, &[0xffu8; 32])?;
         if hits != count {
             return Err(format!(
                 "{DETECTED}kernel counted {hits} hits for a {count}-nonce window; with target 0xff..ff every \
@@ -751,6 +853,23 @@ pub trait GateBackend {
 
     /// Open a device with buffers sized for `shape`.
     fn open(&self, shape: Shape) -> Result<Self::Device, String>;
+
+    /// True when a device opened at one shape can only ever launch THAT shape,
+    /// so measuring a different one means opening a new device.
+    ///
+    /// False for OpenCL: `do_group_block_mining_opencl` takes work_groups,
+    /// local_size and unit_size per launch, so one allocation sized at the top
+    /// of a grid serves every point under it. True for CUDA: `cuda_mine_batch`
+    /// reads `unit_size` from the miner it was built with and hands THAT to the
+    /// kernel, so a CudaMiner allocated at unit_size 64 cannot be asked for 128
+    /// at all - it would silently run 64 again and report the wrong shape's
+    /// number.
+    ///
+    /// The auto-tuner asks this and nothing else about the difference. Getting
+    /// it wrong in the safe direction costs a device open per candidate; getting
+    /// it wrong the other way would have every CUDA candidate measure the same
+    /// unit_size and the tuner would then write a shape it never ran.
+    fn device_is_bound_to_its_shape(&self) -> bool;
 }
 
 /// Open one device with buffers sized for `unit_size`.
@@ -804,41 +923,64 @@ pub struct OclGateDevice {
 }
 
 #[cfg(feature = "ocl")]
+impl OclGateDevice {
+    /// A launch this device's buffers can actually hold. See
+    /// [`launch_fits_allocation`], which is where the rule lives so it can be
+    /// tested without a card.
+    fn check_launch(&self, shape: Shape) -> Result<(), String> {
+        launch_fits_allocation(self.shape, shape)
+    }
+}
+
+#[cfg(feature = "ocl")]
 impl GateDevice for OclGateDevice {
-    fn shape(&self) -> Shape {
+    fn allocated_shape(&self) -> Shape {
         self.shape
+    }
+
+    fn can_launch(&self, shape: Shape) -> bool {
+        self.check_launch(shape).is_ok()
     }
 
     fn count_and_shares(
         &self,
+        shape: Shape,
         height: u64,
         intro: &[u8],
         nonce_start: u32,
         share_target: &[u8; 32],
     ) -> Result<(u64, Vec<(u32, [u8; 32])>), String> {
+        self.check_launch(shape)?;
         let out = do_group_block_mining_opencl_shares(
             &self.resources,
             height,
             intro.to_vec(),
             nonce_start,
-            self.shape.work_groups,
-            self.shape.local_size,
-            self.shape.unit_size,
+            shape.work_groups,
+            shape.local_size,
+            shape.unit_size,
             Some(share_target),
         )
         .map_err(|e| e.display())?;
         Ok((out.share_hits, out.shares))
     }
 
-    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String> {
+    fn best(
+        &self,
+        shape: Shape,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+    ) -> Result<(u32, [u8; 32]), String> {
+        self.check_launch(shape)?;
         crate::opencl_gpu::block::do_group_block_mining_opencl(
             &self.resources,
             height,
             intro.to_vec(),
             nonce_start,
-            self.shape.work_groups,
-            self.shape.local_size,
-            self.shape.unit_size,
+            shape.work_groups,
+            shape.local_size,
+            shape.unit_size,
         )
         .map_err(|e| e.display())
     }
@@ -889,6 +1031,10 @@ impl GateBackend for OclBackend {
             shape,
         })
     }
+
+    fn device_is_bound_to_its_shape(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,34 +1053,57 @@ pub struct CudaGateDevice {
 }
 
 #[cfg(feature = "cuda")]
+impl CudaGateDevice {
+    /// A launch this miner can really perform. See
+    /// [`launch_fits_bound_allocation`], which is where the rule lives so it
+    /// can be tested without a card.
+    fn check_launch(&self, shape: Shape) -> Result<(), String> {
+        launch_fits_bound_allocation(self.shape, shape)
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl GateDevice for CudaGateDevice {
-    fn shape(&self) -> Shape {
+    fn allocated_shape(&self) -> Shape {
         self.shape
+    }
+
+    fn can_launch(&self, shape: Shape) -> bool {
+        self.check_launch(shape).is_ok()
     }
 
     fn count_and_shares(
         &self,
+        shape: Shape,
         height: u64,
         intro: &[u8],
         nonce_start: u32,
         share_target: &[u8; 32],
     ) -> Result<(u64, Vec<(u32, [u8; 32])>), String> {
+        self.check_launch(shape)?;
         let out = self
             .miner
             .mine_block_batch_shares(
                 height,
                 intro,
                 nonce_start,
-                self.shape.work_groups,
+                shape.work_groups,
                 Some(share_target),
             )
             .map_err(|e| e.to_string())?;
         Ok((out.share_hits, out.shares))
     }
 
-    fn best(&self, height: u64, intro: &[u8], nonce_start: u32) -> Result<(u32, [u8; 32]), String> {
+    fn best(
+        &self,
+        shape: Shape,
+        height: u64,
+        intro: &[u8],
+        nonce_start: u32,
+    ) -> Result<(u32, [u8; 32]), String> {
+        self.check_launch(shape)?;
         self.miner
-            .mine_block_batch(height, intro, nonce_start, self.shape.work_groups)
+            .mine_block_batch(height, intro, nonce_start, shape.work_groups)
             .map_err(|e| e.to_string())
     }
 }
@@ -1030,6 +1199,10 @@ impl GateBackend for CudaBackend {
                 })?;
         Ok(CudaGateDevice { miner, shape })
     }
+
+    fn device_is_bound_to_its_shape(&self) -> bool {
+        true
+    }
 }
 
 /// Everything `equiv` needs that is not the device.
@@ -1119,7 +1292,7 @@ pub fn run_equivalence_on<B: GateBackend>(
                     // A distinct nonce base per (shape, height, header, batch)
                     // so the gate never re-tests the same hashes twice.
                     let nonce_start = nonce_base(unit_size, height, header_index, batch);
-                    let gpu = device.dump_window(height, &intro, nonce_start)?;
+                    let gpu = device.dump_window(shape, height, &intro, nonce_start)?;
                     let cpu = cpu_hash_window(height, &intro, nonce_start, count, threads);
                     report.exhaustive_batches += 1;
                     compare_window(
@@ -1183,7 +1356,7 @@ pub fn run_equivalence_on<B: GateBackend>(
             for rank in ranks.iter().copied() {
                 let target = sorted[(rank - 1) as usize];
                 let (share_hits, shares) =
-                    device.count_and_shares(height, &intro, nonce_start, &target)?;
+                    device.count_and_shares(prod_shape, height, &intro, nonce_start, &target)?;
                 report.production_count_checks += 1;
                 if share_hits != rank {
                     return Err(format!(
@@ -1217,7 +1390,7 @@ pub fn run_equivalence_on<B: GateBackend>(
             // The best-hash reduction is a separate code path from the share
             // list, and it is the ONLY path solo mining reads. It must return
             // the true minimum of the window, which the sorted oracle knows.
-            let (best_nonce, best_hash) = device.best(height, &intro, nonce_start)?;
+            let (best_nonce, best_hash) = device.best(prod_shape, height, &intro, nonce_start)?;
             if best_hash != sorted[0] {
                 return Err(format!(
                     "{DETECTED}production shape best-hash reduction returned {} for nonce {best_nonce}; \
@@ -1489,16 +1662,18 @@ impl BaselineReport {
              WARNING          : the within-process figure is NOT the bar for comparing two builds.\n                     \
              This card settles into one of several clock/power states for the life of a\n                     \
              process, and separate invocations of THIS command on identical work have\n                     \
-             disagreed by ~2.6% on this rig. To compare two OPENCL kernel trees, use\n                     \
+             disagreed by ~{:.1}% on this rig. To compare two OPENCL kernel trees, use\n                     \
              `x16rs_gate ab`, which alternates them inside one process and resolves ~0.3%.\n                     \
              CUDA kernels are compiled into the binary by nvcc, so no in-process A/B\n                     \
              exists for them: two CUDA builds can only be compared across processes, and\n                     \
-             a difference under the ~2.6% between-process spread is not a result.\n",
+             a difference under the ~{:.1}% between-process spread is not a result.\n",
             crate::bench_mainnet_repeat16::fmt_rate(self.median()),
             crate::bench_mainnet_repeat16::fmt_rate(self.min()),
             crate::bench_mainnet_repeat16::fmt_rate(self.max()),
             spread_p10_p90(&self.sorted_rates(), self.median()),
             self.spread_pct(),
+            BETWEEN_PROCESS_SPREAD_PCT,
+            BETWEEN_PROCESS_SPREAD_PCT,
         ));
         text
     }
@@ -1534,7 +1709,7 @@ pub fn run_baseline_on<B: GateBackend>(
     for w in 0..warmup_batches {
         let start = 0xF000_0000u32.wrapping_add(w.wrapping_mul(per_batch as u32));
         device
-            .best(height, &intros[0], start)
+            .best(shape, height, &intros[0], start)
             .map_err(|e| format!("warm-up batch {}: {e}", w + 1))?;
     }
 
@@ -1547,7 +1722,7 @@ pub fn run_baseline_on<B: GateBackend>(
             let header_index = header_indices[batch as usize];
             let start = nonce_start.wrapping_add(batch.wrapping_mul(per_batch as u32));
             let (nonce, hash) = device
-                .best(height, &intros[header_index as usize], start)
+                .best(shape, height, &intros[header_index as usize], start)
                 .map_err(|e| format!("run {} batch {}: {e}", run + 1, batch + 1))?;
             results.push((nonce, hash, header_index));
         }
@@ -2242,3 +2417,75 @@ mod tests {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The launch-fit rules, which are what stop a measurement being attributed to a
+// shape that never ran. Compiled and tested without a card, on purpose: neither
+// rule needs one, and both are the kind of thing that is only ever exercised on
+// hardware nobody has.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod launch_fit_tests {
+    use super::*;
+
+    fn shape(work_groups: u32, local_size: u32, unit_size: u32) -> Shape {
+        Shape {
+            work_groups,
+            local_size,
+            unit_size,
+        }
+    }
+
+    #[test]
+    fn a_per_call_backend_launches_anything_that_fits_its_buffers() {
+        let allocated = shape(64, 256, 192);
+        // The whole reason the auto-tuner opens one OpenCL device for a session:
+        // every smaller point on the grid runs against the same allocation.
+        assert!(launch_fits_allocation(allocated, allocated).is_ok());
+        assert!(launch_fits_allocation(allocated, shape(32, 256, 64)).is_ok());
+        assert!(launch_fits_allocation(allocated, shape(64, 256, 32)).is_ok());
+
+        // Larger in either axis writes past global_hashes / global_order.
+        assert!(launch_fits_allocation(allocated, shape(96, 256, 192)).is_err());
+        assert!(launch_fits_allocation(allocated, shape(64, 256, 256)).is_err());
+        // A different block size is a different indexing, not a smaller launch.
+        assert!(launch_fits_allocation(allocated, shape(64, 128, 64)).is_err());
+    }
+
+    #[test]
+    fn a_bound_backend_refuses_the_launch_that_would_lie_about_its_shape() {
+        let allocated = shape(256, 256, 64);
+        assert!(launch_fits_bound_allocation(allocated, allocated).is_ok());
+        // Work groups ARE a per-launch parameter on this backend, so fewer of
+        // them is a real launch of fewer and one miner serves the whole
+        // work-group axis at its unit_size.
+        assert!(launch_fits_bound_allocation(allocated, shape(128, 256, 64)).is_ok());
+        assert!(launch_fits_bound_allocation(allocated, shape(48, 256, 64)).is_ok());
+
+        // unit_size is not, and this is the case with no other line of defence:
+        // the kernel would run 64, return hashes that are correct FOR 64, pass
+        // every equivalence proof, and hand back a time the caller would file
+        // under 128. Only the time would be wrong, so only refusing the launch
+        // catches it.
+        let mislabelled = launch_fits_bound_allocation(allocated, shape(256, 256, 128));
+        let message = mislabelled.expect_err("a unit_size the miner was not built with");
+        assert!(message.contains("would run unit_size 64"), "{message}");
+        assert!(message.contains("reported as 128"), "{message}");
+
+        assert!(launch_fits_bound_allocation(allocated, shape(512, 256, 64)).is_err());
+        assert!(launch_fits_bound_allocation(allocated, shape(256, 128, 64)).is_err());
+    }
+
+    #[test]
+    fn the_two_rules_disagree_exactly_where_the_backends_do() {
+        // One shape, two backends, opposite answers, and that difference is the
+        // entire reason `device_is_bound_to_its_shape` exists. A tuner that used
+        // the permissive rule on the strict backend would measure the same
+        // unit_size over and over and write a shape it never ran.
+        let allocated = shape(256, 256, 128);
+        let smaller_unit = shape(256, 256, 64);
+        assert!(launch_fits_allocation(allocated, smaller_unit).is_ok());
+        assert!(launch_fits_bound_allocation(allocated, smaller_unit).is_err());
+    }
+}

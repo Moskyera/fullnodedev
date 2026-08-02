@@ -80,6 +80,111 @@ pub struct CudaDeviceInfo {
     pub multiprocessor_count: i32,
 }
 
+/// Device memory one nonce slot of a batch costs.
+///
+/// `alloc_device_buffers` gives every nonce in the launch window a 32-byte hash
+/// in `global_hashes` and a 4-byte index in `global_order`; everything else it
+/// allocates is per work group or fixed. So a launch of
+/// `work_groups * local_size * unit_size` nonces needs that many times this, and
+/// an auto-tuner can decide whether a candidate shape fits the card BEFORE
+/// asking cudaMalloc for it and having the whole tune die on an allocation
+/// failure.
+pub const DEVICE_BYTES_PER_NONCE: u64 = (HASH_BYTES + 4) as u64;
+
+/// What one CUDA device can be asked for, measured rather than assumed.
+///
+/// This exists for the auto-tuner. The OpenCL side learns a card's launch limits
+/// by opening it through `initialize_opencl` and reading `OpenCLResources`;
+/// nothing equivalent existed for CUDA, so a tuner had no honest way to choose
+/// the work-group axis and would have had to guess it from a table. Every field
+/// here is a runtime query, and the two derived helpers below turn them into the
+/// two numbers a candidate grid actually needs.
+#[derive(Debug, Clone)]
+pub struct CudaDeviceLimits {
+    pub device: CudaDeviceInfo,
+    /// Free and total device memory at the moment of the query. Free is the one
+    /// that bounds a launch: on a rig where the miner is already running, or on
+    /// a shared Colab GPU, total is not available to this process.
+    pub free_global_mem: u64,
+    pub total_global_mem: u64,
+    pub max_threads_per_block: i32,
+    pub max_threads_per_multiprocessor: i32,
+    pub warp_size: i32,
+    pub registers_per_multiprocessor: i32,
+    pub shared_mem_per_multiprocessor: i32,
+    /// `x16rs_cuda_main`'s own attributes, from cudaFuncGetAttributes. The batch
+    /// kernel is register-bound (255 registers a thread measured on sm_75), and
+    /// `kernel_max_threads_per_block` is what decides whether the fixed
+    /// 256-thread block this kernel requires is launchable at all.
+    pub kernel_max_threads_per_block: i32,
+    pub kernel_num_regs: i32,
+    pub kernel_static_shared_bytes: u64,
+    pub kernel_local_bytes_per_thread: u64,
+    /// Blocks of [`DEFAULT_LOCAL_SIZE`] threads that can be resident on one SM
+    /// at once, straight from cudaOccupancyMaxActiveBlocksPerMultiprocessor
+    /// rather than from occupancy arithmetic done here. 0 when the runtime
+    /// declined to answer, which the callers treat as "assume one".
+    pub blocks_per_multiprocessor: i32,
+}
+
+impl CudaDeviceLimits {
+    /// The smallest work-group count that puts a resident block on every SM.
+    ///
+    /// Below this the card is idle by construction: a launch of fewer blocks
+    /// than the device has multiprocessors leaves some of them with no work at
+    /// all, so its hashrate says nothing about the shape and everything about
+    /// the launch being too small. It is the floor of the tuner's work-group
+    /// axis for that reason, not a preference.
+    pub fn work_groups_that_fill_the_card(&self) -> u32 {
+        let mps = self.device.multiprocessor_count.max(1) as u32;
+        let per_mp = self.blocks_per_multiprocessor.max(1) as u32;
+        mps.saturating_mul(per_mp).max(1)
+    }
+
+    /// The largest work-group count whose buffers fit in `share` of free device
+    /// memory at `unit_size`.
+    ///
+    /// `share` is well under 1 on purpose: cudaMalloc needs contiguous space, the
+    /// CUDA context itself holds a few hundred megabytes that `cudaMemGetInfo`
+    /// has already excluded but a display driver has not, and a tuner that sized
+    /// its grid to the last free byte would spend the sweep watching allocations
+    /// fail.
+    pub fn max_work_groups_for(&self, unit_size: u32, share: f64) -> u32 {
+        let unit_size = unit_size.max(1) as u64;
+        let per_group = (DEFAULT_LOCAL_SIZE as u64)
+            .saturating_mul(unit_size)
+            .saturating_mul(DEVICE_BYTES_PER_NONCE);
+        if per_group == 0 {
+            return 1;
+        }
+        let budget = (self.free_global_mem as f64 * share.clamp(0.05, 0.95)) as u64;
+        (budget / per_group).clamp(1, u32::MAX as u64) as u32
+    }
+
+    /// One line an operator can read, and a reviewer can check against
+    /// `nvidia-smi -q`.
+    pub fn describe(&self) -> String {
+        format!(
+            "device #{} {} (SM {}.{}, {} MPs, {:.1}/{:.1} GiB free, {} block(s) of {} threads \
+             resident per MP; kernel numRegs={} staticShared={}B localPerThread={}B \
+             maxThreadsPerBlock={})",
+            self.device.index,
+            self.device.name,
+            self.device.compute_major,
+            self.device.compute_minor,
+            self.device.multiprocessor_count,
+            self.free_global_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.total_global_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.blocks_per_multiprocessor,
+            DEFAULT_LOCAL_SIZE,
+            self.kernel_num_regs,
+            self.kernel_static_shared_bytes,
+            self.kernel_local_bytes_per_thread,
+            self.kernel_max_threads_per_block,
+        )
+    }
+}
+
 /// The device allocations one miner instance owns. Kept together behind a mutex
 /// inside `CudaMiner` so a sticky-fault recovery can destroy the CUDA context and
 /// swap in a freshly allocated set without the caller having to rebuild the miner.
@@ -231,6 +336,18 @@ impl CudaMiner {
         cuda_list_devices()
     }
 
+    /// Everything one device can be asked for, without allocating a miner.
+    ///
+    /// Binds the CUDA context for `device_index` (cudaMemGetInfo and the kernel
+    /// attribute queries both need one), so it is not free; it is meant to be
+    /// called once by a caller that is about to use the device anyway.
+    pub fn limits(device_index: i32) -> CudaResult<CudaDeviceLimits> {
+        if !cuda_available() {
+            return Err(CudaError::NotCompiled);
+        }
+        cuda_device_limits(device_index)
+    }
+
     pub fn new(device_index: i32, workgroups: u32, unit_size: u32) -> CudaResult<Self> {
         if !cuda_available() {
             return Err(CudaError::NotCompiled);
@@ -369,6 +486,22 @@ mod driver {
         fn cudaGetErrorString(err: CudaError_t) -> *const i8;
         fn cudaFuncGetAttributes(attr: *mut CudaFuncAttributes, func: *const c_void)
         -> CudaError_t;
+        // Free and total device memory for the CURRENT device, so cudaSetDevice
+        // has to come first. `free` is what bounds a launch: it already excludes
+        // the primary context's own few hundred megabytes, and on a shared card
+        // it excludes whatever the other process holds.
+        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> CudaError_t;
+        // The runtime's own occupancy calculator. Used rather than re-deriving
+        // blocks-per-SM from registers and shared memory here: the arithmetic
+        // has per-architecture allocation granularities in it, and a tuner that
+        // got them subtly wrong would size its work-group axis from a number
+        // that looks authoritative and is not.
+        fn cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            num_blocks: *mut i32,
+            func: *const c_void,
+            block_size: i32,
+            dynamic_smem_size: usize,
+        ) -> CudaError_t;
     }
 
     // Mirrors CUDA's `cudaFuncAttributes` (leading fields only; trailing reserved for
@@ -449,9 +582,14 @@ mod driver {
     const CUDA_ERROR_DEVICE_UNINITIALIZED: i32 = 201;
 
     // Stable cudaDeviceAttr enum values (CUDA runtime API).
+    const CUDA_DEV_ATTR_MAX_THREADS_PER_BLOCK: i32 = 1;
+    const CUDA_DEV_ATTR_WARP_SIZE: i32 = 10;
     const CUDA_DEV_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
+    const CUDA_DEV_ATTR_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
     const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+    const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
+    const CUDA_DEV_ATTR_MAX_REGISTERS_PER_MULTIPROCESSOR: i32 = 82;
 
     // Oversized tail so cudaGetDeviceProperties (which writes the FULL struct)
     // never overflows across CUDA versions. Only `name` (offset 0) is read from
@@ -591,6 +729,84 @@ mod driver {
             });
         }
         Ok(out)
+    }
+
+    /// One device attribute, or `default` when this runtime does not know it.
+    ///
+    /// Not every enumerant exists on every toolkit, and a limits probe must not
+    /// fail as a whole because one of its dozen queries is newer than the
+    /// installed CUDA. The caller decides what a zero means.
+    fn attr_or(index: i32, attr: i32, default: i32) -> i32 {
+        let mut value = 0i32;
+        if unsafe { cudaDeviceGetAttribute(&mut value, attr, index) } == CUDA_SUCCESS {
+            value
+        } else {
+            default
+        }
+    }
+
+    pub fn cuda_device_limits(index: i32) -> CudaResult<CudaDeviceLimits> {
+        let device = cuda_list_devices()?
+            .into_iter()
+            .find(|d| d.index == index)
+            .ok_or_else(|| {
+                CudaError::InvalidArgs(format!("CUDA device #{index} is not present"))
+            })?;
+
+        // cudaMemGetInfo and cudaFuncGetAttributes both read the CURRENT
+        // device's context, so bind it first or the answers describe device 0.
+        check(unsafe { cudaSetDevice(index) })?;
+
+        let mut free = 0usize;
+        let mut total = 0usize;
+        check(unsafe { cudaMemGetInfo(&mut free, &mut total) })?;
+
+        let mut attrs = CudaFuncAttributes::zeroed();
+        let kernel_ok = unsafe {
+            cudaFuncGetAttributes(&mut attrs, x16rs_cuda_main as *const c_void)
+        } == CUDA_SUCCESS;
+
+        // Blocks resident per SM at the ONE block size this kernel is correct
+        // at. Asking about any other size would describe a launch that cannot
+        // happen: the batch kernel's shared local_nonces[256] and its
+        // power-of-two tree reduction fix the block at DEFAULT_LOCAL_SIZE.
+        let mut blocks = 0i32;
+        let occupancy_ok = unsafe {
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut blocks,
+                x16rs_cuda_main as *const c_void,
+                DEFAULT_LOCAL_SIZE as i32,
+                0,
+            )
+        } == CUDA_SUCCESS;
+
+        Ok(CudaDeviceLimits {
+            device,
+            free_global_mem: free as u64,
+            total_global_mem: total as u64,
+            max_threads_per_block: attr_or(index, CUDA_DEV_ATTR_MAX_THREADS_PER_BLOCK, 0),
+            max_threads_per_multiprocessor: attr_or(
+                index,
+                CUDA_DEV_ATTR_MAX_THREADS_PER_MULTIPROCESSOR,
+                0,
+            ),
+            warp_size: attr_or(index, CUDA_DEV_ATTR_WARP_SIZE, 0),
+            registers_per_multiprocessor: attr_or(
+                index,
+                CUDA_DEV_ATTR_MAX_REGISTERS_PER_MULTIPROCESSOR,
+                0,
+            ),
+            shared_mem_per_multiprocessor: attr_or(
+                index,
+                CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+                0,
+            ),
+            kernel_max_threads_per_block: if kernel_ok { attrs.max_threads_per_block } else { 0 },
+            kernel_num_regs: if kernel_ok { attrs.num_regs } else { 0 },
+            kernel_static_shared_bytes: if kernel_ok { attrs.shared_size_bytes as u64 } else { 0 },
+            kernel_local_bytes_per_thread: if kernel_ok { attrs.local_size_bytes as u64 } else { 0 },
+            blocks_per_multiprocessor: if occupancy_ok { blocks } else { 0 },
+        })
     }
 
     /// Never rebuild the context more than this many times in a row without a clean
@@ -1193,6 +1409,11 @@ fn cuda_list_devices() -> CudaResult<Vec<CudaDeviceInfo>> {
 }
 
 #[cfg(not(cuda_available))]
+fn cuda_device_limits(_: i32) -> CudaResult<CudaDeviceLimits> {
+    Err(CudaError::NotCompiled)
+}
+
+#[cfg(not(cuda_available))]
 fn cuda_init_miner(_: i32, _: u32, _: u32) -> CudaResult<CudaMiner> {
     Err(CudaError::NotCompiled)
 }
@@ -1584,5 +1805,97 @@ mod tests {
             share_capacity_for(Some(&[0u8; HASH_BYTES])) as usize,
             SHARE_LIST_CAPACITY
         );
+    }
+
+    /// A Tesla T4 as `cudaDeviceGetAttribute` and `cudaMemGetInfo` describe it,
+    /// with the batch kernel's own attributes as they were measured on that card
+    /// (numRegs 255, 33984 B of static shared, 792 B of local per thread,
+    /// maxThreadsPerBlock 256, arch 7.5).
+    fn tesla_t4() -> CudaDeviceLimits {
+        CudaDeviceLimits {
+            device: CudaDeviceInfo {
+                index: 0,
+                name: "Tesla T4".to_string(),
+                compute_major: 7,
+                compute_minor: 5,
+                multiprocessor_count: 40,
+            },
+            // 15109 MiB of a 15360 MiB card, which is what a fresh Colab session
+            // reports before a context is bound.
+            free_global_mem: 15_109 * 1024 * 1024,
+            total_global_mem: 15_360 * 1024 * 1024,
+            max_threads_per_block: 1024,
+            max_threads_per_multiprocessor: 1024,
+            warp_size: 32,
+            registers_per_multiprocessor: 65_536,
+            shared_mem_per_multiprocessor: 65_536,
+            kernel_max_threads_per_block: 256,
+            kernel_num_regs: 255,
+            kernel_static_shared_bytes: 33_984,
+            kernel_local_bytes_per_thread: 792,
+            // 255 registers x 256 threads is 65280 of the SM's 65536, so exactly
+            // one block of this kernel is resident per multiprocessor.
+            blocks_per_multiprocessor: 1,
+        }
+    }
+
+    #[test]
+    fn the_work_group_floor_is_one_resident_block_on_every_multiprocessor() {
+        let t4 = tesla_t4();
+        // 40 SMs, one block each. A launch smaller than this leaves whole
+        // multiprocessors with nothing to do, so its hashrate measures the
+        // launch being too small rather than the shape being wrong.
+        assert_eq!(t4.work_groups_that_fill_the_card(), 40);
+
+        // A card that fits two blocks per SM needs twice as many work groups to
+        // be full, and the floor follows the occupancy rather than the SM count.
+        let roomy = CudaDeviceLimits {
+            blocks_per_multiprocessor: 2,
+            ..tesla_t4()
+        };
+        assert_eq!(roomy.work_groups_that_fill_the_card(), 80);
+
+        // A runtime that declined to answer the occupancy query must not produce
+        // a floor of zero, which would make every launch "full".
+        let unknown = CudaDeviceLimits {
+            blocks_per_multiprocessor: 0,
+            ..tesla_t4()
+        };
+        assert_eq!(unknown.work_groups_that_fill_the_card(), 40);
+    }
+
+    #[test]
+    fn the_work_group_ceiling_is_the_memory_a_batch_really_needs() {
+        let t4 = tesla_t4();
+        // A launch costs local_size * unit_size * 36 bytes per work group. At
+        // unit_size 128 that is 256 * 128 * 36 = 1179648 bytes a group, so half
+        // of 15109 MiB is a few thousand groups. Checked against the arithmetic
+        // rather than against a remembered number.
+        let share = 0.5;
+        let per_group = (DEFAULT_LOCAL_SIZE as u64) * 128 * DEVICE_BYTES_PER_NONCE;
+        let expected = ((t4.free_global_mem as f64 * share) as u64) / per_group;
+        assert_eq!(t4.max_work_groups_for(128, share) as u64, expected);
+
+        // The ceiling has to fall as unit_size rises, or the tuner would size
+        // its grid from the cheapest shape and then fail to allocate the
+        // expensive one.
+        assert!(t4.max_work_groups_for(64, share) > t4.max_work_groups_for(128, share));
+
+        // A card with almost nothing free still yields a launchable shape rather
+        // than zero work groups, which is not a shape at all.
+        let tight = CudaDeviceLimits {
+            free_global_mem: 1024,
+            ..tesla_t4()
+        };
+        assert_eq!(tight.max_work_groups_for(128, 0.5), 1);
+    }
+
+    #[test]
+    fn a_nonce_costs_the_bytes_the_allocator_asks_for() {
+        // `alloc_device_buffers` gives every nonce a 32-byte hash in
+        // global_hashes and a 4-byte index in global_order. If that ever changes
+        // and this does not, a tuner sizing its work-group ceiling from free
+        // memory would ask cudaMalloc for more than it believed.
+        assert_eq!(DEVICE_BYTES_PER_NONCE, (HASH_BYTES + 4) as u64);
     }
 }

@@ -95,7 +95,7 @@ const ONEDAY_BLOCK_NUM: f64 = 288.0;
 /// It is only meaningful for a NETWORK target. A pool serves a share target,
 /// which is far weaker, and feeding one in here would value a hash at hundreds
 /// of times what it is worth; the caller is responsible for not doing that.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 pub(crate) fn hac_per_day_per_hashrate(height: u64, target_hash: &[u8]) -> Option<f64> {
     // The array length is inferred from `hash_to_rates`, exactly as the mining
     // line does it, so a change to the hash width cannot leave this behind.

@@ -272,18 +272,47 @@ pub fn resolve_gpu_tuning(
 }
 
 /// Fixed work_groups / unit_size for named gpu_profile presets.
+///
+/// # None of these is a measurement, and the NVIDIA rows say so out loud
+///
+/// Exactly one shape in this whole table has ever been measured against
+/// alternatives on the hardware it names: the RDNA4 path, which does not come
+/// through here at all (see `panel_tuning::resolve_panel_tuning`, which pins the
+/// RX 9070 XT to 64 x 256 x 192 with the sweep that produced it quoted). Every
+/// other row is a starting point for the tuner. That was true before this
+/// comment existed; what was missing was anything saying it.
+///
+/// The NVIDIA rows are now derived rather than invented, and
+/// [`crate::nvidia_launch::PRESET_LADDER`] carries the derivation line by line.
+/// The short version: the batch kernel takes 255 registers on 256 threads, which
+/// is the entire 65536-register file of an NVIDIA multiprocessor, so exactly one
+/// block is resident per SM on every architecture from Volta to Blackwell. That
+/// makes work_groups a WAVE COUNT above the SM count and nothing else, and the
+/// p95 batch-latency ceiling caps it at about 17 waves at unit_size 64 - a
+/// figure that is card-size independent because both the batch and the rate
+/// scale with the multiprocessor count. The ladder spans that bracket.
+///
+/// unit_size is 64 on every NVIDIA tier because 64 is the only NVIDIA value
+/// anyone has measured to win: a Tesla T4 at repeat 16 gave 7.54 MH/s at 64,
+/// 7.19 at 96 and 7.06 at 128. The table this replaces named 96 or 128 on all
+/// five tiers, so every NVIDIA operator shipped on a value the one NVIDIA
+/// measurement ranks last or second to last, and nvidia_max's 3584 x 256 x 128
+/// was a 15.6-second batch on that card against a 1.5-second ceiling.
+///
+/// The AMD and Intel rows are untouched and remain unvalidated guesses. They are
+/// not being changed here because nothing has been measured that would justify
+/// a different guess, and swapping one invention for another would only move
+/// which numbers look authoritative.
 pub fn profile_tuning(profile: &str) -> (u32, u32) {
+    if let Some(nvidia) = crate::nvidia_launch::preset_tuning(profile) {
+        return nvidia;
+    }
     match profile {
         "amd_eco" => (768, 128),
         "amd_balanced" => (1024, 128),
         "amd_profit" => (1536, 96),
         "amd_performance" => (2048, 96),
         "amd_max" => (4096, 128),
-        "nvidia_eco" => (512, 128),
-        "nvidia_balanced" => (1024, 128),
-        "nvidia_profit" => (1280, 96),
-        "nvidia_performance" => (1792, 96),
-        "nvidia_max" => (3584, 128),
         "intel_eco" => (384, 96),
         "intel_balanced" => (512, 128),
         "intel_profit" => (768, 96),
@@ -1000,16 +1029,50 @@ pub fn plausible_board_power_w(value: f32) -> Option<f32> {
     (value.is_finite() && value > 0.0 && value < 1000.0).then_some(value)
 }
 
-/// A second query on the same tool that answers the board's draw in watts.
+/// A further query on the same tool, asking for one named quantity.
 ///
 /// Separate from the temperature query rather than folded into it because the
 /// temperature parsers accept any labelled number, and a query that returned
-/// both would let a watt figure be read as a temperature or the reverse. Two
-/// queries, each asking for exactly one quantity, cannot be confused.
+/// both would let a watt figure be read as a temperature or the reverse. Each
+/// query asks for exactly what its caller parses.
 #[derive(Clone, Debug)]
-struct BoardPowerQuery {
+struct ToolQuery {
     program: &'static str,
     args: Vec<String>,
+}
+
+/// One reading of everything a card will say about itself at an instant.
+///
+/// Taken together rather than one quantity at a time because on the tools that
+/// answer through a process (`nvidia-smi`) each separate query costs a spawn,
+/// and because three numbers read seconds apart are not a sample of one moment.
+/// Any field is `None` where this card or this tool does not report it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuSample {
+    pub temp_c: Option<f32>,
+    pub watts: Option<f32>,
+    pub clock_mhz: Option<f32>,
+}
+
+/// A shader clock that is a clock. Zero is what an idle or unsupported slot
+/// reports, and no shipping GPU runs above 10 GHz.
+fn plausible_clock_mhz(value: f32) -> Option<f32> {
+    (value.is_finite() && value > 0.0 && value < 10_000.0).then_some(value)
+}
+
+/// The fields of a single `--format=csv,noheader,nounits` row.
+///
+/// `nvidia-smi` prints `[N/A]` for a quantity the card does not expose, which
+/// does not parse and therefore becomes `None` for that field alone: a card with
+/// no power sensor still yields its temperature and its clock.
+fn parse_csv_row(text: &str) -> Vec<Option<f32>> {
+    let Some(first) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return Vec::new();
+    };
+    first
+        .split(',')
+        .map(|field| field.trim().parse::<f32>().ok())
+        .collect()
 }
 
 /// Watts from a tool invoked with a power-only, unit-less, header-less query.
@@ -1035,7 +1098,18 @@ enum GpuTempSensorSource {
         /// AMD `*-smi` sources, whose power reporting is not uniform across
         /// rocm-smi and amd-smi versions, and inventing a watt figure from a
         /// query we did not make would be a guess wearing a measurement's label.
-        power: Option<BoardPowerQuery>,
+        power: Option<ToolQuery>,
+        /// One query that returns temperature, draw and shader clock together,
+        /// in that order. Only `nvidia-smi` has one, and it is what lets a tuner
+        /// sample a card once a second instead of spawning three processes for
+        /// three numbers taken at three different moments.
+        sample: Option<ToolQuery>,
+        /// The board power CAP, which is a static property of the card and its
+        /// configuration rather than a reading. Queried once. It is the
+        /// difference between "this shape drew 66 W" and "this shape sat on a
+        /// 70 W limit", which is the difference between a card that would go
+        /// faster with more work and one that would not.
+        power_limit: Option<ToolQuery>,
     },
     /// The AMD display driver's own library, which is the only one of these
     /// that exists on a consumer Windows install. Bound to one ADL adapter at
@@ -1111,6 +1185,68 @@ impl GpuTempSensorBackend {
         }
     }
 
+    /// Temperature, board draw and shader clock as of one moment.
+    ///
+    /// Where the backend has a combined query (`nvidia-smi`) or a driver library
+    /// that answers all three at once (ADL), this is ONE call and the three
+    /// numbers describe the same instant. Everywhere else it falls back to the
+    /// separate queries and reports no clock, because nothing under those
+    /// backends returns one and a fabricated clock would be worse than a missing
+    /// one: the auto-tuner treats an absent signal as "not judged" and an
+    /// invented one as evidence.
+    pub(crate) fn read_sample(&self) -> GpuSample {
+        match &self.source {
+            GpuTempSensorSource::Command {
+                sample: Some(query),
+                ..
+            } => {
+                let Some(output) =
+                    command_stdout_with_timeout(query.program, &query.args, SENSOR_COMMAND_TIMEOUT)
+                else {
+                    return GpuSample::default();
+                };
+                let fields = parse_csv_row(&String::from_utf8_lossy(&output));
+                let at = |index: usize| fields.get(index).copied().flatten();
+                GpuSample {
+                    temp_c: at(0).and_then(valid_gpu_temp),
+                    watts: at(1).and_then(plausible_board_power_w),
+                    clock_mhz: at(2).and_then(plausible_clock_mhz),
+                }
+            }
+            #[cfg(windows)]
+            GpuTempSensorSource::AmdDriver { adapter_index } => {
+                match crate::gpu_temp_adl::sample(*adapter_index) {
+                    Some(reading) => GpuSample {
+                        temp_c: reading.temp_c.and_then(valid_gpu_temp),
+                        watts: reading.board_power_w.and_then(plausible_board_power_w),
+                        clock_mhz: reading.gfx_clock_mhz.and_then(plausible_clock_mhz),
+                    },
+                    None => GpuSample::default(),
+                }
+            }
+            _ => GpuSample {
+                temp_c: self.read_c(),
+                watts: self.read_board_power_w(),
+                clock_mhz: None,
+            },
+        }
+    }
+
+    /// The board power CAP this card is running under, where the tool reports
+    /// one. A static property, so callers read it once rather than per sample.
+    pub(crate) fn read_power_limit_w(&self) -> Option<f32> {
+        match &self.source {
+            GpuTempSensorSource::Command {
+                power_limit: Some(query),
+                ..
+            } => {
+                let output =
+                    command_stdout_with_timeout(query.program, &query.args, SENSOR_COMMAND_TIMEOUT)?;
+                parse_board_power_output(&String::from_utf8_lossy(&output))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn command_sensor(
@@ -1126,6 +1262,8 @@ fn command_sensor(
             args,
             parser,
             power: None,
+            sample: None,
+            power_limit: None,
         },
     }
 }
@@ -1134,7 +1272,27 @@ impl GpuTempSensorBackend {
     /// Attach the same tool's board-power query to a command sensor.
     fn with_power_query(mut self, program: &'static str, args: Vec<String>) -> GpuTempSensorBackend {
         if let GpuTempSensorSource::Command { power, .. } = &mut self.source {
-            *power = Some(BoardPowerQuery { program, args });
+            *power = Some(ToolQuery { program, args });
+        }
+        self
+    }
+
+    /// Attach the combined temperature/power/clock query.
+    fn with_sample_query(mut self, program: &'static str, args: Vec<String>) -> GpuTempSensorBackend {
+        if let GpuTempSensorSource::Command { sample, .. } = &mut self.source {
+            *sample = Some(ToolQuery { program, args });
+        }
+        self
+    }
+
+    /// Attach the board power-limit query.
+    fn with_power_limit_query(
+        mut self,
+        program: &'static str,
+        args: Vec<String>,
+    ) -> GpuTempSensorBackend {
+        if let GpuTempSensorSource::Command { power_limit, .. } = &mut self.source {
+            *power_limit = Some(ToolQuery { program, args });
         }
         self
     }
@@ -1230,6 +1388,30 @@ fn nvidia_sensor(gpu_index: u32) -> GpuTempSensorBackend {
             "--query-gpu=power.draw".into(),
             "--format=csv,noheader,nounits".into(),
             "-i".into(),
+            index.clone(),
+        ],
+    )
+    // One row, three quantities, in the order `read_sample` unpacks them. The
+    // shader clock is the third because of what it is worth on this vendor: a
+    // Tesla T4 measured at repeat 16 sat at 66 to 67 W against a 70 W cap with
+    // its SM clock swinging 1140 to 1305 MHz, which is a card riding its POWER
+    // limit rather than one starved of work. Without the clock, a tuner sees
+    // only that the bigger launch shape was slower and cannot say why.
+    .with_sample_query(
+        "nvidia-smi",
+        vec![
+            "--query-gpu=temperature.gpu,power.draw,clocks.sm".into(),
+            "--format=csv,noheader,nounits".into(),
+            "-i".into(),
+            index.clone(),
+        ],
+    )
+    .with_power_limit_query(
+        "nvidia-smi",
+        vec![
+            "--query-gpu=power.limit".into(),
+            "--format=csv,noheader,nounits".into(),
+            "-i".into(),
             index,
         ],
     )
@@ -1298,6 +1480,36 @@ pub fn read_gpu_temp_amd_smi(gpu_index: u32) -> Option<f32> {
 
 pub fn read_gpu_temp_nvidia_smi(gpu_index: u32) -> Option<f32> {
     detect_gpu_temp_sensor("", gpu_index, crate::gpu_arch::GpuVendor::Nvidia).map(|(_, temp)| temp)
+}
+
+/// Temperature, board draw and shader clock for one GPU, as of one moment.
+///
+/// One call, so on the backends that can answer all three at once the three
+/// numbers describe the same instant instead of three spawns apart. `None` when
+/// nothing on this machine reports this card at all; individual fields are
+/// `None` where the card or the tool does not expose that quantity.
+pub fn read_gpu_sample(
+    thermal_file: &str,
+    gpu_index: u32,
+    vendor: crate::gpu_arch::GpuVendor,
+) -> Option<GpuSample> {
+    let (backend, _) = detect_gpu_temp_sensor(thermal_file, gpu_index, vendor)?;
+    Some(backend.read_sample())
+}
+
+/// The board power CAP this GPU is running under, where the vendor's tool
+/// reports one. A setting rather than a reading, so callers read it once.
+///
+/// It is what turns "this shape drew 66 W" into "this shape sat on a 70 W
+/// limit", which is the difference between a card that would go faster with a
+/// bigger launch and one that would not.
+pub fn read_gpu_power_limit_w(
+    thermal_file: &str,
+    gpu_index: u32,
+    vendor: crate::gpu_arch::GpuVendor,
+) -> Option<f32> {
+    let (backend, _) = detect_gpu_temp_sensor(thermal_file, gpu_index, vendor)?;
+    backend.read_power_limit_w()
 }
 
 /// This card's real board draw right now, or `None` where nothing on this
@@ -1734,6 +1946,96 @@ mod tests {
     /// decides `measures_power` from `read_board_power_w`, which returned `None`
     /// for every command source, so every NVIDIA card scored every candidate on
     /// one configured constant and Eco, Profit and Max ranked identically.
+    #[test]
+    fn the_combined_sample_query_and_its_parser_agree_on_the_column_order() {
+        let GpuTempSensorSource::Command {
+            sample: Some(sample),
+            power_limit: Some(limit),
+            ..
+        } = nvidia_sensor(1).source
+        else {
+            panic!("the nvidia sensor must carry a combined sample query and a power-limit query");
+        };
+        assert_eq!(sample.program, "nvidia-smi");
+        // The order in the query IS the order `read_sample` unpacks: temperature
+        // first, draw second, clock third. Reorder one and not the other and a
+        // 66 W draw becomes a 66 C temperature, which is plausible enough to be
+        // believed. Pinned here rather than left to a comment.
+        assert!(
+            sample
+                .args
+                .iter()
+                .any(|a| a == "--query-gpu=temperature.gpu,power.draw,clocks.sm"),
+            "{:?}",
+            sample.args
+        );
+        assert!(
+            sample
+                .args
+                .iter()
+                .any(|a| a == "--format=csv,noheader,nounits"),
+            "the parser reads bare numbers, so the query must not print units or a header"
+        );
+        assert_eq!(
+            sample.args.windows(2).find(|w| w[0] == "-i").map(|w| &w[1]),
+            Some(&"1".to_string())
+        );
+        assert!(limit.args.iter().any(|a| a == "--query-gpu=power.limit"));
+
+        // A T4's row under load, and the same row on a card that exposes no
+        // power sensor: `[N/A]` does not parse, so that field alone is absent
+        // and the other two survive.
+        let row = parse_csv_row("63, 66.51, 1305\n");
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0], Some(63.0));
+        assert_eq!(row[1], Some(66.51));
+        assert_eq!(row[2], Some(1305.0));
+
+        let partial = parse_csv_row("63, [N/A], 1305");
+        assert_eq!(partial[0], Some(63.0));
+        assert_eq!(partial[1], None);
+        assert_eq!(partial[2], Some(1305.0));
+
+        // Zero is what an unsupported slot reports, and no board draws zero
+        // watts while hashing, so it is absence rather than free electricity.
+        assert_eq!(plausible_clock_mhz(0.0), None);
+        assert_eq!(plausible_clock_mhz(1305.0), Some(1305.0));
+        assert_eq!(plausible_clock_mhz(f32::NAN), None);
+    }
+
+    #[test]
+    fn a_backend_with_no_combined_query_still_samples_what_it_has() {
+        // A hwmon temperature file holds a temperature and nothing else. The
+        // fallback must report exactly that: no invented clock, no invented
+        // watts. The tuner treats an absent signal as "not judged" and an
+        // invented one as evidence, so the difference is not cosmetic.
+        let missing = GpuTempSensorBackend {
+            label: "thermal file".to_string(),
+            source: GpuTempSensorSource::File(PathBuf::from(
+                "/definitely/not/a/hwmon/temp1_input",
+            )),
+        };
+        let sample = missing.read_sample();
+        assert_eq!(sample.temp_c, None);
+        assert_eq!(sample.watts, None);
+        assert_eq!(sample.clock_mhz, None);
+        assert_eq!(missing.read_power_limit_w(), None);
+
+        // The AMD `*-smi` sources were never given a power or clock query, so
+        // they must not answer with either.
+        for sensor in amd_sensor_candidates(0) {
+            assert!(
+                matches!(
+                    sensor.source,
+                    GpuTempSensorSource::Command { sample: None, .. }
+                ),
+                "{} has no combined query and must not pretend to one",
+                sensor.label()
+            );
+            assert_eq!(sensor.read_power_limit_w(), None);
+        }
+    }
+
     #[test]
     fn only_the_nvidia_command_sensor_carries_a_power_query() {
         for index in [0, 3] {

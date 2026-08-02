@@ -101,20 +101,40 @@
 //! covers the identical (header_index, nonce) multiset in the identical order,
 //! and `coverage_signature` proves it element by element rather than asserting
 //! it in a comment. What changed is only how big that multiset is.
+//!
+//! # Both backends, one tuner
+//!
+//! This measures through [`crate::x16rs_gate`]'s two traits, so a `--features
+//! cuda` build tunes an NVIDIA card with the same corpus, the same CPU oracle,
+//! the same latency ceiling, the same soak and the same equivalence proof an
+//! OpenCL build uses on an AMD one. That is not a convenience. The whole reason
+//! a tuner exists rather than a table is that two cards want opposite things:
+//! on an RX 9070 XT the kernel is latency bound and unit_size 192 beats 64 by
+//! about 9%, while on a Tesla T4 at repeat 16 the ordering REVERSES (64 -> 7.54
+//! MH/s, 96 -> 7.19, 128 -> 7.06) because that card sits at 66 to 67 W against
+//! a 70 W cap and a bigger batch cannot buy work the power limit will not
+//! allow. Two cards, opposite optima, one standard for judging them.
+//!
+//! What the CUDA path cannot borrow from OpenCL is `x16rs_gate ab`, which
+//! alternates two KERNEL TREES inside one process and resolves ~0.3%. nvcc
+//! compiles CUDA kernels into the binary, so two CUDA kernels are two binaries.
+//! Launch SHAPES are a different question and are alternated in-process here on
+//! both backends; how finely that resolved is measured from the finalists' own
+//! repeats and printed, rather than assumed. See `resolution_note`.
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 use crate::efficiency::{BenchmarkPick, EfficiencyMode};
 
 // ---------------------------------------------------------------------------
 // The fixed corpus
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub use crate::x16rs_gate::Shape;
 
 /// Greatest common divisor, iterative so a pathological pair cannot blow a
 /// stack in a mining process.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let t = a % b;
@@ -125,7 +145,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 /// Least common multiple, or `None` on overflow.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn lcm(a: u64, b: u64) -> Option<u64> {
     if a == 0 || b == 0 {
         return None;
@@ -140,7 +160,7 @@ fn lcm(a: u64, b: u64) -> Option<u64> {
 /// A candidate covers each segment with a whole number of its own batches,
 /// which is what makes the (header, nonce) multiset identical for every
 /// candidate rather than merely similar.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Corpus {
     pub nonce_start: u32,
@@ -150,7 +170,7 @@ pub struct Corpus {
 }
 
 /// One launch: which corpus header, and where in the nonce space.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorpusBatch {
     pub header_index: u32,
@@ -158,7 +178,7 @@ pub struct CorpusBatch {
     pub nonces: u64,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl Corpus {
     pub fn total_nonces(&self) -> u64 {
         self.segment_nonces.saturating_mul(self.segments as u64)
@@ -274,7 +294,7 @@ impl Corpus {
 /// `None` when the answer would exceed `cap`. The caller's job then is to drop
 /// the candidate that is forcing the quantum up and try again, which is honest:
 /// a shape that cannot share the corpus cannot be compared on it.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn shared_segment_nonces(batch_sizes: &[u64], min_nonces: u64, cap: u64) -> Option<u64> {
     let mut quantum = 1u64;
     for size in batch_sizes {
@@ -290,7 +310,7 @@ pub fn shared_segment_nonces(batch_sizes: &[u64], min_nonces: u64, cap: u64) -> 
 
 /// The corpus segment a set of shapes needs, given that a segment must be at
 /// least `min_nonces` and no more than `cap`.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn segment_for(shapes: &[Shape], min_nonces: u64, cap: u64) -> Option<u64> {
     let sizes: Vec<u64> = shapes.iter().map(|shape| shape.nonces()).collect();
     shared_segment_nonces(&sizes, min_nonces, cap)
@@ -313,7 +333,7 @@ fn segment_for(shapes: &[Shape], min_nonces: u64, cap: u64) -> Option<u64> {
 /// 216 832 nonces (7 x 256 x 121) forces the quantum up by a factor of 847 while
 /// a batch of 262 144 (32 x 256 x 32) divides it away entirely. Dropping by size
 /// would throw away the useful shape and keep the awkward one.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn plan_corpus(
     shapes: &[Shape],
     nonce_start: u32,
@@ -376,31 +396,31 @@ pub fn plan_corpus(
 // ---------------------------------------------------------------------------
 
 /// Where a tuning corpus starts in the 32-bit nonce space.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const NONCE_BASE: u32 = 0x2000_0000;
 
 /// Where the probe hashes, kept clear of the corpus so a probe batch can never
 /// be mistaken for corpus work.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const PROBE_NONCE_BASE: u32 = 0x1000_0000;
 
 /// Smallest corpus segment worth timing. Below about a quarter of a second the
 /// per-launch overheads and the sampler's 100 ms period start to show.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const MIN_SEGMENT_NONCES: u64 = 1 << 21;
 
 /// The share of the operator's budget the sweeps may spend. The soak runs on
 /// top of the budget, so the sweeps are not allowed all of it.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const SWEEP_BUDGET_SHARE: f64 = 0.8;
 
 /// Passes the refinement stage is budgeted for: two finalists, up to four
 /// neighbours each on a two-axis grid.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const REFINE_PASS_ALLOWANCE: u32 = 8;
 
 /// Passes the final round is budgeted for: three finalists, three passes each.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const FINAL_PASS_ALLOWANCE: u32 = 9;
 
 /// How much of the longest settleable pass the plan is allowed to use.
@@ -409,7 +429,7 @@ pub const FINAL_PASS_ALLOWANCE: u32 = 9;
 /// its probe said, or a first pass that carries a kernel upload, must not push
 /// the plan over it. 0.6 leaves the soak room for a pass two thirds longer than
 /// planned and still settle.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const SOAK_PASS_MARGIN: f64 = 0.6;
 
 /// How much faster than the probe shape a large shape is allowed to be before
@@ -421,25 +441,25 @@ pub const SOAK_PASS_MARGIN: f64 = 0.6;
 /// side of the only spread anyone has measured, so a shape is dropped for
 /// latency only when it cannot fit the ceiling even at the best rate this
 /// kernel has ever shown.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const LATENCY_HEADROOM: f64 = 1.6;
 
 /// Passes that must be flat together before a soak is accepted.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn soak_window_passes() -> usize {
     SettleLimits::default().window.max(2)
 }
 
 /// The soak's wall-clock cap. Long enough for an air-cooled card to reach a
 /// steady temperature, and larger when the operator's budget is larger.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn soak_cap_seconds(budget_seconds: u64) -> f64 {
     (budget_seconds as f64 * 0.5).max(90.0).min(900.0)
 }
 
 /// The soak's minimum duration, so a shape cannot be declared settled on five
 /// passes taken over fifteen seconds.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn soak_floor_seconds(budget_seconds: u64) -> f64 {
     45.0f64.min(soak_cap_seconds(budget_seconds))
 }
@@ -454,14 +474,14 @@ pub fn soak_floor_seconds(budget_seconds: u64) -> f64 {
 /// module did not check anywhere: a card whose pass exceeded it soaked for the
 /// whole cap, never reached five passes, and was told to re-run with a larger
 /// `benchmark_seconds`, which does not shorten a pass.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn max_soak_pass_seconds(budget_seconds: u64) -> f64 {
     soak_cap_seconds(budget_seconds) / (soak_window_passes() as f64 - 1.0)
 }
 
 /// Everything one tuning session will measure, and what it will cost, decided
 /// before a single candidate is measured.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Debug)]
 pub struct SessionPlan {
     pub corpus: Corpus,
@@ -487,7 +507,7 @@ pub struct SessionPlan {
     pub budget_for_every_shape: Option<u64>,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl SessionPlan {
     /// A tune is a comparison. One shape measured is a report.
     pub fn is_a_comparison(&self) -> bool {
@@ -507,7 +527,7 @@ impl SessionPlan {
 /// This is the function the fix lives in, and it is deliberately free of the
 /// device so it can be driven from a test at any hashrate for any card in
 /// `PANEL_GPU_PRESETS`. `tune` calls it and does what it says.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[allow(clippy::too_many_arguments)]
 pub fn plan_session(
     min_work_groups: u32,
@@ -669,7 +689,7 @@ pub fn plan_session(
 /// spread over the passes it will make, and the soak's settling window. The soak
 /// cap saturates at 900 s, so beyond a certain quantum no budget buys the shapes
 /// back and the answer is `None` rather than a number that would not work.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn budget_for_every_shape(
     shapes: &[Shape],
     probe_hps: f64,
@@ -694,7 +714,7 @@ fn budget_for_every_shape(
 // ---------------------------------------------------------------------------
 
 /// Hacash targets one block every 300 seconds.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const TARGET_BLOCK_SECONDS: f64 = 300.0;
 
 /// The p95 batch-latency ceiling, and where the number comes from.
@@ -707,11 +727,11 @@ pub const TARGET_BLOCK_SECONDS: f64 = 300.0;
 /// card can make. It is a ceiling on the p95 rather than the mean because what
 /// hurts is the tail: a shape whose worst batches take four seconds delays every
 /// template change by four seconds however good its average is.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const P95_BATCH_CEILING_MS: f64 = 1_500.0;
 
 /// Fraction of hashing thrown away by template changes, for a given mean batch.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn stale_fraction(mean_batch_seconds: f64) -> f64 {
     if !mean_batch_seconds.is_finite() || mean_batch_seconds <= 0.0 {
         return 0.0;
@@ -721,7 +741,7 @@ pub fn stale_fraction(mean_batch_seconds: f64) -> f64 {
 
 /// Raw hashrate discounted by the work template changes will throw away. This,
 /// not the raw figure, is what "sustained valid H/s" means.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn sustained_valid_hps(hashrate: f64, mean_batch_seconds: f64) -> f64 {
     if !hashrate.is_finite() || hashrate <= 0.0 {
         return 0.0;
@@ -732,7 +752,7 @@ pub fn sustained_valid_hps(hashrate: f64, mean_batch_seconds: f64) -> f64 {
 /// Where the watts in a score came from. Printed next to every number, because
 /// a measured 291 W and a configured 350 W lead to different winners and the
 /// operator has to be able to tell which one picked theirs.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WattsSource {
     /// The card's own board-power sensor.
@@ -741,7 +761,7 @@ pub enum WattsSource {
     Estimated,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl WattsSource {
     pub fn label(self) -> &'static str {
         match self {
@@ -753,7 +773,7 @@ impl WattsSource {
 
 /// The prices a Profit score needs, and the one quantity that is not a price:
 /// how much HAC a hash per second earns in a day at the current difficulty.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Economics {
     pub power_cost_kwh: f64,
@@ -766,7 +786,7 @@ pub struct Economics {
     pub cpu_watts: f64,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl Economics {
     pub fn eur_per_hps_day(&self) -> Option<f64> {
         let hac = self.hac_per_hps_day?;
@@ -779,7 +799,7 @@ impl Economics {
 }
 
 /// What the tuner is actually maximising.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Objective {
     /// Sustained valid hashes per second.
@@ -790,7 +810,7 @@ pub enum Objective {
     NetIncome,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl Objective {
     pub fn label(self) -> &'static str {
         match self {
@@ -809,7 +829,7 @@ impl Objective {
 /// merely inaccurate, it is undefined, and the honest fallback is the one that
 /// maximises revenue: throughput. Silently ranking on kH/J instead would answer
 /// a different question and never say it did.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn resolve_objective(
     mode: EfficiencyMode,
     econ: &Economics,
@@ -840,7 +860,7 @@ pub fn resolve_objective(
 }
 
 /// Everything the score of one candidate is computed from.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug)]
 pub struct ScoreInput {
     pub hashrate: f64,
@@ -850,7 +870,7 @@ pub struct ScoreInput {
     pub gpu_watts: f64,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl ScoreInput {
     pub fn valid_hps(&self) -> f64 {
         sustained_valid_hps(self.hashrate, self.mean_batch_seconds)
@@ -886,7 +906,7 @@ impl ScoreInput {
 ///
 /// `None` means the candidate is not admissible at all: a measurement that is
 /// not finite and positive, or a shape that blows the latency ceiling.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn score(input: &ScoreInput, objective: Objective, econ: &Economics, ceiling_ms: f64) -> Option<f64> {
     if !input.hashrate.is_finite() || input.hashrate <= 0.0 {
         return None;
@@ -907,18 +927,23 @@ pub fn score(input: &ScoreInput, objective: Objective, econ: &Economics, ceiling
 // ---------------------------------------------------------------------------
 
 /// One pass of the corpus during the soak, with the telemetry taken while it ran.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SoakPass {
     pub seconds: f64,
     pub hashrate: f64,
+    /// The pass's p95 BATCH latency, which is the quantity the miner's stale
+    /// work is priced from and the one that moves when a card starts throttling
+    /// under a sustained load. Recorded per pass rather than only for the last
+    /// one, so a soak that settles on hashrate while its tail grows is visible.
+    pub p95_ms: f64,
     pub temp_c: Option<f32>,
     pub watts: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
 /// How flat is flat enough.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug)]
 pub struct SettleLimits {
     /// Passes that must all be flat together.
@@ -929,7 +954,7 @@ pub struct SettleLimits {
     pub rate_span_pct: f64,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl Default for SettleLimits {
     /// The numbers are the card's own noise, not aspirations. Within one process
     /// the fixed-corpus baseline reproduces to about 0.3%, so a 1% hashrate span
@@ -949,7 +974,7 @@ impl Default for SettleLimits {
 
 /// The spans measured over the settling window, and whether they are all inside
 /// the limits. Sensors the card does not have are `None` and are not required.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SettleState {
     pub passes: usize,
@@ -960,7 +985,7 @@ pub struct SettleState {
     pub settled: bool,
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl SettleState {
     /// The signals this card never reported, so "settled" can be read for what
     /// it is worth.
@@ -985,7 +1010,7 @@ impl SettleState {
     }
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn span(values: &[f64]) -> Option<(f64, f64)> {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
@@ -999,7 +1024,7 @@ fn span(values: &[f64]) -> Option<(f64, f64)> {
     (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn span_pct(values: &[f64]) -> Option<f64> {
     let (lo, hi) = span(values)?;
     let mid = (lo + hi) / 2.0;
@@ -1011,7 +1036,7 @@ fn span_pct(values: &[f64]) -> Option<f64> {
 /// A sensor that is absent on every pass is not a reason to refuse to settle:
 /// an NVIDIA card with no board-power sensor would otherwise soak forever. A
 /// sensor that is present must be flat.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn settle_state(passes: &[SoakPass], limits: &SettleLimits) -> SettleState {
     let window = limits.window.max(2);
     if passes.len() < window {
@@ -1066,7 +1091,7 @@ pub fn settle_state(passes: &[SoakPass], limits: &SettleLimits) -> SettleState {
 /// peak, had nothing to compare, and returned `Ok`, so a ceiling the operator
 /// set was silently satisfied by every shape including the one that cooks the
 /// card. Absent is now its own state and it is said out loud.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TempCeiling {
     /// `max_temp_c` is 0 or unset: nothing to enforce, and nothing to warn about.
@@ -1078,7 +1103,7 @@ pub enum TempCeiling {
     Unenforceable { limit_c: f32 },
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 impl TempCeiling {
     /// Resolve the state from the operator's setting and what the card offers.
     pub fn resolve(max_temp_c: Option<f32>, sensor_reports_temperature: bool) -> TempCeiling {
@@ -1118,7 +1143,7 @@ impl TempCeiling {
 /// refuses before the sweep when the card has no sensor at all; a `NotMeasured`
 /// after that guard is a sampling gap in one short window, which the caller
 /// reports rather than treats as proof of anything.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TempWindow {
     /// No ceiling was asked for, so there is nothing to check.
@@ -1130,7 +1155,7 @@ pub enum TempWindow {
 }
 
 /// Judge one window's peak against the operator's ceiling.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn temp_window_state(
     peak_c: Option<f32>,
     max_temp_c: Option<f32>,
@@ -1154,7 +1179,7 @@ pub fn temp_window_state(
 // ---------------------------------------------------------------------------
 
 /// Nearest-rank percentile of an ascending sample.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -1163,7 +1188,7 @@ pub fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
@@ -1176,6 +1201,181 @@ pub fn median(values: &[f64]) -> f64 {
     } else {
         sorted[mid]
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sizing one device allocation to serve several candidates
+// ---------------------------------------------------------------------------
+
+/// The work-group count one device must be ALLOCATED with so that it can launch
+/// `shape` and every other planned shape sharing `shape`'s unit_size.
+///
+/// This exists for the backends where `unit_size` is baked into the allocation
+/// and the kernel reads it from the miner (CUDA), so a candidate with a new
+/// unit_size needs a new device while work groups can be clamped per launch.
+/// Opening one device per unit_size instead of one per candidate is the
+/// difference between three device opens in a sweep and twenty-four, and each
+/// open costs an allocation, a kernel self-test and two warm-up batches.
+///
+/// The rule is per unit_size and NOT "the largest shape in the plan", and the
+/// difference is a real allocation failure rather than a nicety: a plan holding
+/// both 3072x256x32 and 256x256x128 would, on the naive rule, allocate
+/// 3072x256x128 - 100 M nonces, 3.6 GB - for a launch nobody was ever going to
+/// make. Filtering by unit_size bounds the allocation by the largest batch the
+/// plan actually contains.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+pub fn shared_allocation_work_groups(plan: &[Shape], shape: Shape) -> u32 {
+    plan.iter()
+        .filter(|planned| {
+            planned.local_size == shape.local_size && planned.unit_size == shape.unit_size
+        })
+        .map(|planned| planned.work_groups)
+        .max()
+        .unwrap_or(shape.work_groups)
+        .max(shape.work_groups)
+}
+
+// ---------------------------------------------------------------------------
+// How well the final round can actually tell two shapes apart
+// ---------------------------------------------------------------------------
+
+/// One finalist's repeated passes in the final round.
+///
+/// The final round runs the finalists in alternating order and takes each one's
+/// median, which cancels the drift that would otherwise hand the win to whichever
+/// shape happened to run while the card was cool. What it does NOT do by itself
+/// is say how far apart two medians have to be before the difference is real,
+/// and until now nothing did: a tune could report a 0.2% win over a card whose
+/// own repeats spanned 3% and the report would read exactly like a 20% win.
+///
+/// The passes needed for that number are already being run. This keeps them.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+#[derive(Clone, Debug)]
+pub struct FinalistRuns {
+    pub shape: Shape,
+    /// The objective's value on each pass, in the order the passes ran.
+    pub scores: Vec<f64>,
+}
+
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+impl FinalistRuns {
+    pub fn median(&self) -> f64 {
+        median(&self.scores)
+    }
+
+    /// Peak-to-peak span of this shape's OWN repeated passes, as a percentage of
+    /// its median. Identical work, identical shape, same card, minutes apart: a
+    /// non-zero span here is pure measurement noise.
+    pub fn span_pct(&self) -> f64 {
+        let centre = self.median();
+        if self.scores.len() < 2 || centre <= 0.0 {
+            return 0.0;
+        }
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for value in &self.scores {
+            if !value.is_finite() {
+                return f64::INFINITY;
+            }
+            lo = lo.min(*value);
+            hi = hi.max(*value);
+        }
+        (hi - lo) / centre * 100.0
+    }
+}
+
+/// The resolution of the final round: the largest noise span any one finalist
+/// showed on its own repeated passes.
+///
+/// A margin between two DIFFERENT shapes that is smaller than the spread one
+/// shape shows against itself has not been demonstrated. This is the same
+/// argument `x16rs_gate ab` makes with its paired p10-p90, measured here from
+/// the passes the tuner runs anyway rather than assumed from a constant.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+pub fn comparison_resolution_pct(finalists: &[FinalistRuns]) -> f64 {
+    finalists
+        .iter()
+        .filter(|f| f.scores.len() >= 2)
+        .map(|f| f.span_pct())
+        .fold(0.0f64, f64::max)
+}
+
+/// The winner's margin over the runner-up, as a percentage of the runner-up.
+/// `None` when fewer than two finalists produced a score.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+pub fn winning_margin_pct(finalists: &[FinalistRuns]) -> Option<f64> {
+    let mut medians: Vec<f64> = finalists
+        .iter()
+        .filter(|f| !f.scores.is_empty())
+        .map(|f| f.median())
+        .collect();
+    if medians.len() < 2 {
+        return None;
+    }
+    medians.sort_by(|a, b| b.total_cmp(a));
+    (medians[1] > 0.0).then(|| (medians[0] - medians[1]) / medians[1] * 100.0)
+}
+
+/// The sentence a tune has to be able to say about its own answer.
+///
+/// Three claims, and the third is the one that only became sayable when the
+/// tuner learned to measure CUDA:
+///
+///   * what the choice between finalists was resolved to, MEASURED from the
+///     finalists' own repeats;
+///   * whether the winner's margin cleared it;
+///   * that the absolute hashrate above is a number from THIS process, and two
+///     processes on this rig have disagreed by
+///     [`crate::x16rs_gate::BETWEEN_PROCESS_SPREAD_PCT`] on identical work.
+///
+/// The third matters more on CUDA than on OpenCL and the note says why. Two
+/// OpenCL KERNEL trees can be alternated inside one process (`x16rs_gate ab`)
+/// because OpenCL compiles kernels at runtime from a directory; nvcc compiles
+/// CUDA kernels into the binary, so two CUDA kernel builds are two binaries and
+/// can only ever be compared across processes. Two launch SHAPES are a different
+/// question and are compared in-process on both backends, which is what the
+/// first two claims are about - the tuner does not inherit the between-process
+/// figure just because it is running on CUDA.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
+pub fn resolution_note(finalists: &[FinalistRuns], backend: &str) -> String {
+    let resolution = comparison_resolution_pct(finalists);
+    let mut text = format!(
+        "  resolution       : the finalists were re-run in alternating order inside ONE process; \
+         the widest\n                     spread any single shape showed against itself was \
+         {resolution:.2}%, which is what this\n                     comparison can resolve"
+    );
+    match winning_margin_pct(finalists) {
+        Some(margin) if margin >= resolution && resolution > 0.0 => text.push_str(&format!(
+            ".\n                     The winner beat the runner-up by {margin:.2}%, which clears it"
+        )),
+        Some(margin) => text.push_str(&format!(
+            ".\n                     The winner beat the runner-up by only {margin:.2}%, which does \
+             NOT clear it: these two\n                     shapes were not told apart, and either \
+             would do"
+        )),
+        None => text.push_str(
+            ".\n                     Only one finalist produced a score, so nothing was compared \
+             in this round",
+        ),
+    }
+    text.push_str(&format!(
+        "\n  across runs      : the hashrate above is this process's. Separate runs of this binary \
+         on\n                     identical work have disagreed by ~{:.1}% on this rig, so a number \
+         from\n                     another run is not comparable with it below that.",
+        crate::x16rs_gate::BETWEEN_PROCESS_SPREAD_PCT
+    ));
+    if backend == "cuda" {
+        text.push_str(
+            "\n                     For CUDA that bound also applies to KERNEL changes and cannot \
+             be beaten:\n                     nvcc compiles the kernel into the binary, so two \
+             kernel builds are two\n                     binaries and there is no in-process A/B \
+             for them the way `x16rs_gate ab`\n                     alternates two OpenCL kernel \
+             trees. Launch shapes, which is what this\n                     tune compares, are \
+             alternated in-process and resolve as stated above.",
+        );
+    }
+    text.push('\n');
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1393,7 @@ pub fn median(values: &[f64]) -> f64 {
 /// or forces candidates out of the comparison. A grid step of roughly 1.5x is
 /// also finer than this kernel's response to either axis, so nothing is lost by
 /// it: on the 9070 XT the whole work-group axis is 32, 48, 64.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn dyadic_grid(min: u32, max: u32) -> Vec<u32> {
     let min = min.max(1);
     let max = max.max(min);
@@ -1224,13 +1424,13 @@ pub fn dyadic_grid(min: u32, max: u32) -> Vec<u32> {
 }
 
 /// Unit sizes, before clamping to the device.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn unit_size_grid(max_unit_size: u32) -> Vec<u32> {
     dyadic_grid(32, max_unit_size.max(32))
 }
 
 /// Work-group counts, before clamping to the device.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn work_group_grid(min_wg: u32, max_wg: u32) -> Vec<u32> {
     dyadic_grid(min_wg, max_wg)
 }
@@ -1240,20 +1440,54 @@ pub fn work_group_grid(min_wg: u32, max_wg: u32) -> Vec<u32> {
 /// This is what makes a coarse pass coarse: the sweep visits half the grid, and
 /// the refinement fills in the neighbours of whatever won, so a full product
 /// sweep is never paid for.
-#[cfg(any(feature = "ocl", test))]
+///
+/// # Which half, and why it is not a free choice
+///
+/// The dyadic grid alternates `2^k` and `3 * 2^k`, so taking every other point
+/// takes one of those two families whole. Both cover the axis equally after
+/// refinement, but they cost wildly different amounts to MEASURE: the shared
+/// corpus segment is a common multiple of every candidate's batch, so a family
+/// of pure powers of two gives a segment equal to the largest batch, while one
+/// 3-multiple multiplies it by three. `plan_corpus` then has to drop shapes to
+/// fit the budget, and it drops the 3-multiples first, for exactly that reason.
+///
+/// Starting at index 0 unconditionally leaves which family is chosen to the
+/// arbitrary question of whether the grid's bottom end happened to be cut by
+/// `min`. It is 32 on an RX 9070 XT, so index 0 is a power of two and the sweep
+/// is cheap. It is 48 on a Tesla T4 - whose 40 multiprocessors put the floor
+/// between 32 and 48 - so index 0 is 48, every coarse candidate is a
+/// 3-multiple, `plan_corpus` drops every one of them to fit the corpus, and the
+/// tune ends with "only 0 launch shapes survived planning" on a card that has
+/// nothing wrong with it. That is not a hypothetical: it is what a 90-second
+/// budget does on the one NVIDIA card this kernel has been measured on.
+///
+/// So the offset is chosen rather than assumed: whichever of the two families
+/// contains more powers of two. Ties keep index 0, so nothing already measured
+/// moves, and the axis covered is identical either way.
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 fn coarse_axis(full: &[u32]) -> Vec<u32> {
-    let mut out: Vec<u32> = full.iter().copied().step_by(2).collect();
-    if let Some(last) = full.last() {
-        if !out.contains(last) {
-            out.push(*last);
+    let family = |offset: usize| -> Vec<u32> {
+        let mut out: Vec<u32> = full.iter().copied().skip(offset).step_by(2).collect();
+        if let Some(last) = full.last() {
+            if !out.contains(last) {
+                out.push(*last);
+            }
         }
+        out.sort_unstable();
+        out
+    };
+    let powers_of_two = |axis: &[u32]| axis.iter().filter(|v| v.is_power_of_two()).count();
+    let evens = family(0);
+    let odds = family(1);
+    if powers_of_two(&odds) > powers_of_two(&evens) {
+        odds
+    } else {
+        evens
     }
-    out.sort_unstable();
-    out
 }
 
 /// The coarse candidate set for a device.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn coarse_candidates(
     min_wg: u32,
     max_wg: u32,
@@ -1281,7 +1515,7 @@ pub fn coarse_candidates(
 /// same corpus as the coarse sweep rather than on one rebuilt around them. What
 /// survives the prune is `SessionPlan::usable`, and refinement draws only from
 /// there.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn candidate_universe(
     min_wg: u32,
     max_wg: u32,
@@ -1303,7 +1537,7 @@ pub fn candidate_universe(
 
 /// The immediate neighbours of a shape on the full grid: the points the coarse
 /// sweep skipped.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn refine_candidates(base: Shape, min_wg: u32, max_wg: u32, max_unit_size: u32) -> Vec<Shape> {
     let neighbours = |grid: &[u32], value: u32| -> Vec<u32> {
         let Some(index) = grid.iter().position(|entry| *entry == value) else {
@@ -1332,7 +1566,7 @@ pub fn refine_candidates(base: Shape, min_wg: u32, max_wg: u32, max_unit_size: u
 
 /// Name the winning shape with the profile tier it sits closest to, so the ini
 /// the panel reads keeps meaning what it meant.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn profile_for_shape(
     vendor: crate::gpu_arch::GpuVendor,
     shape: Shape,
@@ -1351,7 +1585,7 @@ pub fn profile_for_shape(
     crate::efficiency::tier_profile_for_vendor(vendor, tier).to_string()
 }
 
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn pick_for_shape(
     vendor: crate::gpu_arch::GpuVendor,
     shape: Shape,
@@ -1369,14 +1603,38 @@ pub fn pick_for_shape(
 // Everything below needs a real device.
 // ===========================================================================
 
-#[cfg(feature = "ocl")]
+/// The device half of the tuner: one implementation, both backends.
+///
+/// Nothing below this line is written twice. `x16rs_gate` already reduced a GPU
+/// backend to two traits - a way to open a device at a launch shape
+/// ([`crate::x16rs_gate::GateBackend`]) and three operations on the device
+/// itself ([`crate::x16rs_gate::GateDevice`]) - and proved that the corpus, the
+/// CPU oracle, the threshold arithmetic and the comparison do not need to know
+/// which card they are running on. A tuner needs exactly those three operations
+/// and nothing more: `best` to time a candidate, `count_and_shares` to prove it,
+/// and `best` again for the reduction solo mining reads.
+///
+/// So this module is generic over the same two traits, and the CUDA tuner is not
+/// a second tuner. The corpus, the scoring, the latency ceiling, the soak, the
+/// settling test, the temperature ceiling and the blame for a wrong hash are the
+/// SAME CODE for an RX 9070 XT and a Tesla T4, which is the only way two cards'
+/// answers can be compared at all.
+///
+/// # What the two backends really do differ in, and where it is handled
+///
+/// One thing, and it is not a preference: an OpenCL device takes its launch
+/// shape per call, so one allocation sized at the top of the grid serves every
+/// candidate under it, while a CUDA miner has `unit_size` baked into its device
+/// buffers AND passed to the kernel from the miner struct, so a candidate with a
+/// different `unit_size` needs a different miner. That is the whole difference,
+/// it is answered by `GateBackend::device_is_bound_to_its_shape` and
+/// `GateDevice::can_launch`, and [`Devices`] is the twenty lines that act on it.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 mod device {
     use super::*;
-    use crate::opencl_gpu::{OpenCLResources, SHARE_LIST_CAPACITY};
-    use crate::opencl_gpu::block::{do_group_block_mining_opencl, do_group_block_mining_opencl_shares};
     use crate::x16rs_gate::{
-        REPEAT16_HEIGHT, corpus_header, cpu_hash, cpu_hash_window, threshold_miss_probability,
-        threshold_ranks,
+        GateBackend, GateDevice, REPEAT16_HEIGHT, SHARE_LIST_CAPACITY, corpus_header, cpu_hash,
+        cpu_hash_window, threshold_miss_probability, threshold_ranks,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1412,6 +1670,18 @@ mod device {
         /// nvidia-smi) a draw, while an Intel part has neither, and a tuner that
         /// conflated them would refuse the wrong rigs.
         pub measures_temperature: bool,
+        /// The board power CAP this card is running under, where the tool
+        /// reports one. Read once, because it is a setting and not a reading.
+        ///
+        /// It is here because of what a Tesla T4 measured at repeat 16: 66 to
+        /// 67 W against a 70 W limit, SM clock swinging 1140 to 1305 MHz, and
+        /// unit_size 64 beating 96 beating 128 - the exact REVERSE of the
+        /// ordering on an RX 9070 XT, where the kernel is latency bound and a
+        /// bigger batch helps. Both orderings are real and the tuner finds
+        /// either one from the hashrate alone. What the cap adds is the reason,
+        /// which is the difference between an operator believing the tune and an
+        /// operator overriding it.
+        pub power_limit_w: Option<f32>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1469,6 +1739,10 @@ mod device {
                         source: "AMD driver (ADL) board power, temperature and shader clock at 10 Hz",
                         measures_power,
                         measures_temperature,
+                        // ADL reports a board draw but no board power LIMIT
+                        // through the path this build uses, so there is nothing
+                        // honest to put here on an AMD card.
+                        power_limit_w: None,
                     };
                 }
             }
@@ -1477,12 +1751,18 @@ mod device {
             // sampled once a second because each read costs a process spawn.
             match crate::efficiency::detect_gpu_temp_sensor(thermal_file, gpu_index, vendor) {
                 Some((backend, _)) => {
-                    let measures_power = backend.read_board_power_w().is_some();
+                    // One combined read, so the three capabilities are decided
+                    // by what the card actually answered rather than by three
+                    // separate probes that could disagree. On NVIDIA this is a
+                    // single `nvidia-smi` spawn for all three quantities.
+                    let first = backend.read_sample();
+                    let measures_power = first.watts.is_some();
                     // `detect_gpu_temp_sensor` only returns a backend that has
                     // already answered with a temperature, so this is true; it
                     // is computed rather than assumed so that a future backend
                     // that reports power alone cannot claim a thermometer.
-                    let measures_temperature = backend.read_c().is_some();
+                    let measures_temperature = first.temp_c.is_some();
+                    let power_limit_w = backend.read_power_limit_w();
                     let sink = Arc::clone(&readings);
                     let flag = Arc::clone(&stop);
                     let label: &'static str = Box::leak(
@@ -1490,14 +1770,13 @@ mod device {
                     );
                     let handle = std::thread::spawn(move || {
                         while !flag.load(Ordering::Relaxed) {
-                            let temp_c = backend.read_c();
-                            let watts = backend.read_board_power_w();
+                            let sample = backend.read_sample();
                             if let Ok(mut out) = sink.lock() {
                                 out.push(Reading {
                                     at: Instant::now(),
-                                    temp_c,
-                                    watts,
-                                    clock_mhz: None,
+                                    temp_c: sample.temp_c,
+                                    watts: sample.watts,
+                                    clock_mhz: sample.clock_mhz,
                                 });
                             }
                             std::thread::sleep(Duration::from_millis(1000));
@@ -1510,6 +1789,7 @@ mod device {
                         source: label,
                         measures_power,
                         measures_temperature,
+                        power_limit_w,
                     }
                 }
                 None => Sampler {
@@ -1519,6 +1799,7 @@ mod device {
                     source: "no GPU sensor on this machine",
                     measures_power: false,
                     measures_temperature: false,
+                    power_limit_w: None,
                 },
             }
         }
@@ -1553,7 +1834,24 @@ mod device {
                 .filter_map(|r| r.temp_c)
                 .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))))
         }
+
+        /// What fraction of this card's power cap a measured draw is, where both
+        /// numbers exist.
+        pub fn power_cap_load(&self, watts: Option<f32>) -> Option<f64> {
+            let limit = f64::from(self.power_limit_w?);
+            let watts = f64::from(watts?);
+            (limit > 0.0).then_some(watts / limit)
+        }
     }
+
+    /// Draw at or above this share of the cap is a card being held BY the cap.
+    ///
+    /// Measured rather than chosen: a T4 under this kernel reported 66 to 67 W
+    /// against a 70 W limit, which is 0.94 to 0.96, while the same card idle
+    /// between batches sits near 0.15. Anything in that top band is the limiter
+    /// doing the deciding, and it is the one condition under which "give the
+    /// card more nonces per launch" is the wrong instinct.
+    pub const POWER_CAPPED_FRACTION: f64 = 0.93;
 
     impl Drop for Sampler {
         fn drop(&mut self) {
@@ -1612,8 +1910,8 @@ mod device {
     /// Correctness is checked outside the timed region, deliberately: a CPU
     /// re-hash inside it would be measuring the CPU.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_corpus(
-        opencl: &OpenCLResources,
+    pub fn run_corpus<D: GateDevice>(
+        device: &D,
         shape: Shape,
         corpus: &Corpus,
         intros: &[Vec<u8>],
@@ -1628,16 +1926,12 @@ mod device {
         let wall_start = Instant::now();
         for batch in &batches {
             let at = Instant::now();
-            let (nonce, hash) = do_group_block_mining_opencl(
-                opencl,
+            let (nonce, hash) = device.best(
+                shape,
                 height,
-                intros[batch.header_index as usize].clone(),
+                &intros[batch.header_index as usize],
                 batch.nonce_start,
-                shape.work_groups,
-                shape.local_size,
-                shape.unit_size,
-            )
-            .map_err(|e| e.display())?;
+            )?;
             batch_ms.push(at.elapsed().as_secs_f64() * 1000.0);
             results.push((nonce, hash, batch.header_index));
         }
@@ -1760,8 +2054,8 @@ mod device {
     /// accumulates a mismatch census for a human to read and aborts the run,
     /// while this one is an admission ticket: a candidate that fails is dropped
     /// and the tune continues.
-    pub fn prove_shape(
-        opencl: &OpenCLResources,
+    pub fn prove_shape<D: GateDevice>(
+        device: &D,
         shape: Shape,
         height: u64,
         intro: &[u8],
@@ -1777,44 +2071,32 @@ mod device {
         let mut sorted = cpu.clone();
         sorted.sort_unstable();
 
-        let launch = |target: Option<&[u8; 32]>| {
-            do_group_block_mining_opencl_shares(
-                opencl,
-                height,
-                intro.to_vec(),
-                nonce_start,
-                shape.work_groups,
-                shape.local_size,
-                shape.unit_size,
-                target,
-            )
-            .map_err(|e| e.display())
+        let launch = |target: &[u8; 32]| {
+            device.count_and_shares(shape, height, intro, nonce_start, target)
         };
 
         // 1. The whole window, counted.
-        let all = launch(Some(&[0xffu8; 32]))?;
-        if all.share_hits != window {
+        let (all_hits, _) = launch(&[0xffu8; 32])?;
+        if all_hits != window {
             return Err(format!(
-                "with a target every nonce beats, the kernel counted {} hits over a {window}-nonce \
-                 window; this shape does not hash the work it is given",
-                all.share_hits
+                "with a target every nonce beats, the kernel counted {all_hits} hits over a \
+                 {window}-nonce window; this shape does not hash the work it is given"
             ));
         }
 
         // 2. Rank thresholds.
-        let ranks = threshold_ranks(window, SHARE_LIST_CAPACITY as u64, thresholds);
+        let ranks = threshold_ranks(window, SHARE_LIST_CAPACITY, thresholds);
         for rank in ranks.iter().copied() {
             let target = sorted[(rank - 1) as usize];
-            let out = launch(Some(&target))?;
-            if out.share_hits != rank {
+            let (hits, shares) = launch(&target)?;
+            if hits != rank {
                 return Err(format!(
                     "the CPU says exactly {rank} of the {window} hashes are <= {}, the kernel \
-                     counted {}; this shape's hashes differ from the CPU's",
+                     counted {hits}; this shape's hashes differ from the CPU's",
                     hex::encode(target),
-                    out.share_hits
                 ));
             }
-            for (nonce, hash) in &out.shares {
+            for (nonce, hash) in &shares {
                 let offset = nonce.wrapping_sub(nonce_start) as u64;
                 if offset >= window {
                     return Err(format!("shape returned nonce {nonce}, outside the window"));
@@ -1830,16 +2112,7 @@ mod device {
         }
 
         // 3. The reduction solo mining actually reads.
-        let (best_nonce, best_hash) = do_group_block_mining_opencl(
-            opencl,
-            height,
-            intro.to_vec(),
-            nonce_start,
-            shape.work_groups,
-            shape.local_size,
-            shape.unit_size,
-        )
-        .map_err(|e| e.display())?;
+        let (best_nonce, best_hash) = device.best(shape, height, intro, nonce_start)?;
         if best_hash != sorted[0] {
             return Err(format!(
                 "the best-hash reduction returned {} for nonce {best_nonce}; the CPU minimum over \
@@ -1860,12 +2133,38 @@ mod device {
         })
     }
 
+    /// Which card, on which backend.
+    ///
+    /// An enum rather than a set of optional fields so that the two backends
+    /// cannot both be half-specified, and so a build that lacks one of them can
+    /// still NAME it: a CUDA operator on an OpenCL-only binary gets a sentence
+    /// about CUDA, which is the whole point of this variant existing in every
+    /// build rather than behind a feature gate.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum TuneTarget {
+        OpenCl {
+            opencl_dir: String,
+            platform: u32,
+            device_ids: String,
+        },
+        Cuda {
+            device_index: i32,
+        },
+    }
+
+    impl TuneTarget {
+        pub fn label(&self) -> &'static str {
+            match self {
+                TuneTarget::OpenCl { .. } => "opencl",
+                TuneTarget::Cuda { .. } => "cuda",
+            }
+        }
+    }
+
     /// Everything the caller has to tell the tuner about the rig.
     #[derive(Clone, Debug)]
     pub struct TuneRequest {
-        pub opencl_dir: String,
-        pub platform: u32,
-        pub device_ids: String,
+        pub target: TuneTarget,
         pub local_size: u32,
         pub min_work_groups: u32,
         pub max_work_groups: u32,
@@ -1905,6 +2204,19 @@ mod device {
     pub struct TuneOutcome {
         pub pick: BenchmarkPick,
         pub shape: Shape,
+        /// Which backend measured this, and which device it opened. Free text,
+        /// straight from the backend, so a report cannot be mistaken for the
+        /// other card's.
+        pub backend: &'static str,
+        pub device: String,
+        /// Devices opened over the session. One on OpenCL; one per distinct
+        /// (local_size, unit_size, larger work_groups) on CUDA, and printed so
+        /// the cost of that is visible rather than inferred.
+        pub device_opens: u32,
+        /// The finalists' medians and the span each one showed across its own
+        /// repeated passes. THIS is the resolution of the choice the tuner made:
+        /// see `resolution_note`.
+        pub finalists: Vec<FinalistRuns>,
         pub objective: Objective,
         pub watts_source: WattsSource,
         pub soak: Vec<SoakPass>,
@@ -1915,6 +2227,10 @@ mod device {
         pub total_seconds: f64,
         pub final_proof: ShapeProof,
         pub peak_temp_c: Option<f32>,
+        /// The card's own board power cap, and what fraction of it the winning
+        /// shape drew. Both `None` where nothing reports one.
+        pub power_limit_w: Option<f32>,
+        pub power_cap_load: Option<f64>,
         /// What the operator's `max_temp_c` was worth on this card. Carried into
         /// the report so a tune that ran without a ceiling says so in the proof
         /// block rather than only in a log line nobody keeps.
@@ -1952,8 +2268,8 @@ mod device {
     /// first buffer touch, and counting it would under-report the card by enough
     /// to change the plan. The last answer is re-hashed on the CPU, because a
     /// rate taken from a kernel that returned a wrong hash is not a rate.
-    fn probe_rate(
-        opencl: &OpenCLResources,
+    fn probe_rate<D: GateDevice>(
+        device: &D,
         shape: Shape,
         height: u64,
         intro: &[u8],
@@ -1962,18 +2278,7 @@ mod device {
         if batch == 0 || batch > u32::MAX as u64 {
             return Err(format!("probe shape hashes {batch} nonces"));
         }
-        let launch = |nonce_start: u32| {
-            do_group_block_mining_opencl(
-                opencl,
-                height,
-                intro.to_vec(),
-                nonce_start,
-                shape.work_groups,
-                shape.local_size,
-                shape.unit_size,
-            )
-            .map_err(|e| e.display())
-        };
+        let launch = |nonce_start: u32| device.best(shape, height, intro, nonce_start);
         launch(PROBE_NONCE_BASE)?;
 
         let started = Instant::now();
@@ -2010,8 +2315,222 @@ mod device {
         Ok(hashed as f64 / seconds)
     }
 
+    /// Throwaway batches run after a device is opened, before anything is timed.
+    ///
+    /// The first launch on a fresh allocation carries the kernel upload (OpenCL)
+    /// or the module load and the first touch of several hundred megabytes of
+    /// device buffers (CUDA). On the OpenCL path the session opens one device and
+    /// the probe absorbs that cost once. On the CUDA path a candidate with a new
+    /// `unit_size` needs a new miner, so WITHOUT this every CUDA candidate's
+    /// first timed batch would carry it - and not equally: a shape with four
+    /// batches per pass would wear a quarter of it and a shape with forty a
+    /// fortieth, which is a bias that scales with the axis being tuned. Two
+    /// rather than one because the second is what shows the first was enough.
+    const WARMUP_BATCHES_AFTER_OPEN: u32 = 2;
+
+    /// Where warm-up batches hash: far from the corpus and far from the probe, so
+    /// a warm-up launch can never be confused with measured work.
+    const WARMUP_NONCE_BASE: u32 = 0xF000_0000;
+
+    /// The devices a session opens, and the one place the two backends differ.
+    ///
+    /// OpenCL takes the launch shape per call, so a single allocation sized at
+    /// the top corner of the grid serves every candidate under it: that is what
+    /// `device_is_bound_to_its_shape() == false` buys, and it is why an OpenCL
+    /// tune opens exactly one device and every candidate runs against the same
+    /// allocation, none of them flattered by a fresh context.
+    ///
+    /// CUDA cannot: `cuda_mine_batch` hands the kernel `miner.unit_size`, so a
+    /// miner built at 64 asked for 128 would run 64 and report 128. So on that
+    /// backend a device is opened per unit_size rather than per CANDIDATE. Work
+    /// groups are NOT baked in - `mine_block_batch_shares` clamps them per launch
+    /// against buffers sized at construction - so once the session knows which
+    /// shapes it will measure, one miner allocated at the largest work-group
+    /// count for a given unit_size serves every candidate that shares it. On a
+    /// typical grid that is a third of them, and it is the difference between
+    /// three device opens and twenty-four.
+    struct Devices<'b, B: GateBackend> {
+        backend: &'b B,
+        /// The allocation shared by every candidate, where the backend allows a
+        /// shared one. Ignored entirely when it does not.
+        allocation: Shape,
+        bound: bool,
+        /// Shapes this session may ask for. Used only to size a bound backend's
+        /// allocations, and empty until the plan exists: the probe runs before
+        /// there is a plan, and it gets an allocation of its own exact shape.
+        plan: Vec<Shape>,
+        open: Option<(Shape, B::Device)>,
+        height: u64,
+        warm_intro: Vec<u8>,
+        opens: u32,
+    }
+
+    impl<'b, B: GateBackend> Devices<'b, B> {
+        fn new(backend: &'b B, allocation: Shape, height: u64, warm_intro: Vec<u8>) -> Self {
+            Devices {
+                backend,
+                allocation,
+                bound: backend.device_is_bound_to_its_shape(),
+                plan: Vec::new(),
+                open: None,
+                height,
+                warm_intro,
+                opens: 0,
+            }
+        }
+
+        /// Tell the pool which shapes the session will ask for, so a bound
+        /// backend can allocate once per unit_size instead of once per shape.
+        fn will_measure(&mut self, shapes: &[Shape]) {
+            self.plan = shapes.to_vec();
+        }
+
+        /// The shape a device must be ALLOCATED at to be able to launch `shape`.
+        ///
+        /// On an unbound backend that is the grid ceiling, always, so the whole
+        /// session runs against one allocation. On a bound one it is `shape`'s
+        /// own unit_size, which there is no choice about, with the work-group
+        /// count [`shared_allocation_work_groups`] derives from the plan.
+        fn allocation_for(&self, shape: Shape) -> Shape {
+            if !self.bound {
+                return self.allocation;
+            }
+            Shape {
+                work_groups: shared_allocation_work_groups(&self.plan, shape),
+                ..shape
+            }
+        }
+
+        /// A device that can really launch `shape`, opening one if the currently
+        /// open device cannot.
+        fn at(&mut self, shape: Shape) -> Result<&B::Device, String> {
+            let serves = self
+                .open
+                .as_ref()
+                .is_some_and(|(_, device)| device.can_launch(shape));
+            if !serves {
+                let allocate_at = self.allocation_for(shape);
+                self.backend.check_shape(allocate_at)?;
+                // Dropped BEFORE the new one is asked for. On CUDA the old
+                // miner holds hundreds of megabytes of device memory and the
+                // new one needs its own; holding both would make the largest
+                // candidate fail to allocate on exactly the cards where it
+                // matters most.
+                self.open = None;
+                let device = self.backend.open(allocate_at)?;
+                if !device.can_launch(shape) {
+                    return Err(format!(
+                        "{} opened a device for {allocate_at} that cannot launch {shape}",
+                        self.backend.name()
+                    ));
+                }
+                warm_up(&device, shape, self.height, &self.warm_intro)?;
+                self.opens += 1;
+                self.open = Some((allocate_at, device));
+            }
+            Ok(&self
+                .open
+                .as_ref()
+                .expect("a device was just opened or already served this shape")
+                .1)
+        }
+    }
+
+    /// Untimed launches that leave the card in the state a measurement expects.
+    fn warm_up<D: GateDevice>(
+        device: &D,
+        shape: Shape,
+        height: u64,
+        intro: &[u8],
+    ) -> Result<(), String> {
+        let batch = shape.nonces();
+        for index in 0..WARMUP_BATCHES_AFTER_OPEN {
+            let nonce_start =
+                WARMUP_NONCE_BASE.wrapping_add(((index as u64 * batch) % (1u64 << 32)) as u32);
+            device
+                .best(shape, height, intro, nonce_start)
+                .map_err(|error| format!("warm-up batch {} at {shape}: {error}", index + 1))?;
+        }
+        Ok(())
+    }
+
     /// Run the tune. Returns the shape to write, or the reason there is none.
+    ///
+    /// The dispatch is the only place either backend is named. Everything after
+    /// it is [`tune_on`], compiled once and identical for both.
     pub fn tune(request: &TuneRequest) -> Result<TuneOutcome, String> {
+        match &request.target {
+            TuneTarget::OpenCl {
+                opencl_dir,
+                platform,
+                device_ids,
+            } => {
+                #[cfg(feature = "ocl")]
+                {
+                    tune_on(
+                        &crate::x16rs_gate::OclBackend {
+                            opencl_dir: opencl_dir.clone(),
+                            platform: *platform,
+                            device: device_ids.clone(),
+                        },
+                        request,
+                    )
+                }
+                #[cfg(not(feature = "ocl"))]
+                {
+                    let _ = (opencl_dir, platform, device_ids);
+                    Err("this binary was built without the OpenCL backend, so it cannot tune an \
+                         OpenCL device. Rebuild with --features ocl. Config unchanged"
+                        .to_string())
+                }
+            }
+            TuneTarget::Cuda { device_index } => {
+                #[cfg(feature = "cuda")]
+                {
+                    // Two different failures with two different remedies, and
+                    // the reason this check is here rather than at the call
+                    // site: `cuda` is a cargo feature that only adds the crate,
+                    // while whether that crate holds KERNELS is decided by its
+                    // build script finding nvcc. A binary can have the feature
+                    // and no kernels, and every device call then returns
+                    // NotCompiled, which used to reach the operator as a driver
+                    // error.
+                    if !crate::x16rs_gate::cuda_kernels_available() {
+                        return Err(
+                            "this binary has the cuda feature but NO CUDA kernels: \
+                             x16rs-cuda/build.rs did not find nvcc when it was built, so \
+                             cfg(cuda_available) was never set and every device call returns \
+                             `x16rs-cuda built without CUDA kernels`. Install the CUDA Toolkit, \
+                             set CUDA_PATH, and rebuild with --features cuda; the build prints \
+                             `Using CUDA Toolkit at ...` when it found one. Config unchanged"
+                                .to_string(),
+                        );
+                    }
+                    tune_on(
+                        &crate::x16rs_gate::CudaBackend {
+                            device_index: *device_index,
+                        },
+                        request,
+                    )
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = device_index;
+                    Err("this binary was built without the CUDA backend, so it cannot tune an \
+                         NVIDIA card. Rebuild with --features cuda (the CUDA Toolkit must be \
+                         installed and CUDA_PATH set, or the build silently produces a binary \
+                         with no kernels). Config unchanged"
+                        .to_string())
+                }
+            }
+        }
+    }
+
+    /// The tune itself, on whichever backend was handed in.
+    pub fn tune_on<B: GateBackend>(
+        backend: &B,
+        request: &TuneRequest,
+    ) -> Result<TuneOutcome, String> {
         let started = Instant::now();
         let height = REPEAT16_HEIGHT;
         let repeat = x16rs::block_hash_repeat(height);
@@ -2029,6 +2548,26 @@ mod device {
         if universe.is_empty() {
             return Err("no launch shape fits this device's limits".to_string());
         }
+
+        // The exhaustive proof each candidate has to pass reads the kernel's own
+        // share list, so a backend whose list is a different size would make
+        // every "over its whole window" claim mean something else. This is the
+        // same refusal `run_equivalence_on` makes, for the same reason, before
+        // anything is measured.
+        let capacity = backend.share_capacity();
+        if capacity != SHARE_LIST_CAPACITY {
+            return Err(format!(
+                "{} reports a share list capacity of {capacity}, this tuner proves shapes against \
+                 {SHARE_LIST_CAPACITY}",
+                backend.name()
+            ));
+        }
+        wlogln!(
+            "[autotune] backend {} on {}",
+            backend.name(),
+            backend.describe()
+        );
+
         let sampler = Sampler::start(&request.thermal_file, request.gpu_index, request.vendor);
         let watts_source = if sampler.measures_power {
             WattsSource::Measured
@@ -2089,24 +2628,23 @@ mod device {
             ));
         }
 
-        // The device is opened once, at the top corner of the whole grid, so
-        // every candidate runs against the same allocation and none of them is
-        // flattered by a fresh context. It is the whole grid rather than the
-        // planned subset on purpose: the plan is not known until the probe has
-        // run on this device, and an allocation that changed with the probe's
-        // answer would make the sweep depend on it twice. The winner is re-opened
-        // at its own exact shape for the soak, which is what it will mine with.
+        // On a backend that allows it the device is opened once, at the top
+        // corner of the whole grid, so every candidate runs against the same
+        // allocation and none of them is flattered by a fresh context. It is the
+        // whole grid rather than the planned subset on purpose: the plan is not
+        // known until the probe has run on this device, and an allocation that
+        // changed with the probe's answer would make the sweep depend on it
+        // twice. On a backend where a shape is baked into the allocation this
+        // ceiling is unused and [`Devices`] opens per shape instead. Either way
+        // the winner is re-opened at its own exact shape for the soak, which is
+        // what it will mine with.
         let ceiling = Shape {
             work_groups: universe.iter().map(|s| s.work_groups).max().unwrap_or(1),
             local_size,
             unit_size: universe.iter().map(|s| s.unit_size).max().unwrap_or(32),
         };
-        let opencl = crate::x16rs_gate::open_device(
-            &request.opencl_dir,
-            request.platform,
-            &request.device_ids,
-            ceiling,
-        )?;
+        let probe_intro = corpus_header(0);
+        let mut devices = Devices::new(backend, ceiling, height, probe_intro.clone());
 
         // Probe first, plan second. The corpus is sized from what this card
         // really does, so a pass is a known number of seconds before anything is
@@ -2117,8 +2655,10 @@ mod device {
             .copied()
             .min_by_key(|shape| shape.nonces())
             .unwrap_or(universe[0]);
-        let probe_intro = corpus_header(0);
-        let probe_hps = probe_rate(&opencl, probe_shape, height, &probe_intro)?;
+        let probe_hps = {
+            let device = devices.at(probe_shape)?;
+            probe_rate(device, probe_shape, height, &probe_intro)?
+        };
         let plan = plan_session(
             request.min_work_groups,
             request.max_work_groups,
@@ -2132,6 +2672,11 @@ mod device {
         let corpus = plan.corpus;
         let usable = plan.usable.clone();
         let candidates = plan.candidates.clone();
+        // Every shape this session can still ask for, coarse points and their
+        // refinement neighbours alike. A backend that bakes the shape into the
+        // allocation uses it to open once per unit_size instead of once per
+        // candidate; an unbound one ignores it.
+        devices.will_measure(&usable);
 
         wlogln!(
             "[autotune] probe {}x{}x{}: {} -> a pass may last {:.1}s (sweep budget {}s, soak needs \
@@ -2144,7 +2689,13 @@ mod device {
             request.budget_seconds,
             max_soak_pass_seconds(request.budget_seconds),
         );
-        for shape in &plan.over_ceiling {
+        // Named individually up to a point, then counted. On an RX 9070 XT the
+        // whole grid is fifteen shapes and every drop fits on screen; a card
+        // whose work-group ceiling is measured from its VRAM has a grid of
+        // seventy-five, and a wall of near-identical lines is how an operator
+        // learns to scroll past the ones that matter.
+        const NAMED_DROPS: usize = 8;
+        for shape in plan.over_ceiling.iter().take(NAMED_DROPS) {
             wlogln!(
                 "[autotune] not measured: {}x{}x{} would take about {:.0} ms per batch, over the \
                  {:.0} ms ceiling, so it would be refused however fast it hashed",
@@ -2155,7 +2706,15 @@ mod device {
                 P95_BATCH_CEILING_MS,
             );
         }
-        for shape in &plan.off_corpus {
+        if plan.over_ceiling.len() > NAMED_DROPS {
+            wlogln!(
+                "[autotune] and {} more shape(s) over the {:.0} ms batch ceiling, all larger than \
+                 the ones above",
+                plan.over_ceiling.len() - NAMED_DROPS,
+                P95_BATCH_CEILING_MS,
+            );
+        }
+        for shape in plan.off_corpus.iter().take(NAMED_DROPS) {
             wlogln!(
                 "[autotune] not measured: {}x{}x{} ({} nonces per batch) would push the shared \
                  corpus segment past the {:.1}s a pass may take",
@@ -2164,6 +2723,12 @@ mod device {
                 shape.unit_size,
                 shape.nonces(),
                 plan.pass_ceiling_seconds,
+            );
+        }
+        if plan.off_corpus.len() > NAMED_DROPS {
+            wlogln!(
+                "[autotune] and {} more shape(s) the shared corpus cannot afford",
+                plan.off_corpus.len() - NAMED_DROPS
             );
         }
         if !plan.off_corpus.is_empty() {
@@ -2221,16 +2786,18 @@ mod device {
         let mut reference: Option<Measured> = None;
         let mut results: Vec<Measured> = Vec::new();
         for shape in &candidates {
-            match measure_candidate(
-                &opencl,
-                *shape,
-                &corpus,
-                &intros,
-                height,
-                &sampler,
-                request,
-                reference.as_ref(),
-            ) {
+            match devices.at(*shape).and_then(|device| {
+                measure_candidate(
+                    device,
+                    *shape,
+                    &corpus,
+                    &intros,
+                    height,
+                    &sampler,
+                    request,
+                    reference.as_ref(),
+                )
+            }) {
                 Ok(measured) => {
                     report_candidate(&measured, objective, request, watts_source, "");
                     if reference.is_none() {
@@ -2302,16 +2869,18 @@ mod device {
             );
         }
         for shape in &neighbours {
-            match measure_candidate(
-                &opencl,
-                *shape,
-                &corpus,
-                &intros,
-                height,
-                &sampler,
-                request,
-                reference.as_ref(),
-            ) {
+            match devices.at(*shape).and_then(|device| {
+                measure_candidate(
+                    device,
+                    *shape,
+                    &corpus,
+                    &intros,
+                    height,
+                    &sampler,
+                    request,
+                    reference.as_ref(),
+                )
+            }) {
                 Ok(measured) => {
                     report_candidate(&measured, objective, request, watts_source, " (refine)");
                     results.push(measured);
@@ -2335,23 +2904,34 @@ mod device {
             .map(|(m, _)| m.shape)
             .collect();
 
+        let mut finalist_runs: Vec<FinalistRuns> = finalists
+            .iter()
+            .map(|shape| FinalistRuns {
+                shape: *shape,
+                scores: Vec::new(),
+            })
+            .collect();
         let winner = if finalists.len() > 1 {
             let rounds = 3;
-            let mut per_shape: Vec<(Shape, Vec<f64>)> =
-                finalists.iter().map(|s| (*s, Vec::new())).collect();
             wlogln!(
                 "[autotune] final round: {} finalists x {rounds} passes, order alternated so the \
-                 last one is not flattered by a hotter card",
+                 last one is not flattered by a hotter card. Each shape's own spread across its \
+                 repeats is what this comparison can resolve, and it is reported",
                 finalists.len()
             );
             for round in 0..rounds {
-                let mut order: Vec<usize> = (0..per_shape.len()).collect();
+                let mut order: Vec<usize> = (0..finalist_runs.len()).collect();
                 if round % 2 == 1 {
                     order.reverse();
                 }
                 for index in order {
-                    let shape = per_shape[index].0;
-                    match run_corpus(&opencl, shape, &corpus, &intros, height, &sampler) {
+                    let shape = finalist_runs[index].shape;
+                    let measured = devices
+                        .at(shape)
+                        .and_then(|device| {
+                            run_corpus(device, shape, &corpus, &intros, height, &sampler)
+                        });
+                    match measured {
                         Ok(measured) => {
                             if let Some(reference) = reference.as_ref() {
                                 if let Err(error) = agree_on_segments(reference, &measured) {
@@ -2365,7 +2945,7 @@ mod device {
                             if let Some(value) =
                                 score(&input, objective, &request.economics, P95_BATCH_CEILING_MS)
                             {
-                                per_shape[index].1.push(value);
+                                finalist_runs[index].scores.push(value);
                             }
                         }
                         Err(error) => wlogln!(
@@ -2376,35 +2956,54 @@ mod device {
                     }
                 }
             }
-            for (shape, values) in &per_shape {
+            for runs in &finalist_runs {
                 wlogln!(
-                    "[autotune] final {}x{}x{}: median {} = {:.4} over {} passes",
-                    shape.work_groups,
+                    "[autotune] final {}x{}x{}: median {} = {:.4} over {} passes, own spread \
+                     {:.2}%",
+                    runs.shape.work_groups,
                     local_size,
-                    shape.unit_size,
+                    runs.shape.unit_size,
                     objective.label(),
-                    median(values),
-                    values.len()
+                    runs.median(),
+                    runs.scores.len(),
+                    runs.span_pct(),
                 );
             }
-            per_shape
+            let resolution = comparison_resolution_pct(&finalist_runs);
+            match winning_margin_pct(&finalist_runs) {
+                Some(margin) if margin < resolution => wlogln!(
+                    "[autotune] the top two finalists are {margin:.2}% apart and a single shape's \
+                     own repeats spanned {resolution:.2}%, so this round did NOT tell them apart. \
+                     The winner below is the larger median, and it is a coin toss between two \
+                     shapes that measure the same"
+                ),
+                Some(margin) => wlogln!(
+                    "[autotune] the winner beat the runner-up by {margin:.2}% against a \
+                     {resolution:.2}% measurement spread, so the choice is resolved"
+                ),
+                None => {}
+            }
+            finalist_runs
                 .iter()
-                .filter(|(_, values)| !values.is_empty())
-                .max_by(|a, b| median(&a.1).total_cmp(&median(&b.1)))
-                .map(|(shape, _)| *shape)
+                .filter(|runs| !runs.scores.is_empty())
+                .max_by(|a, b| a.median().total_cmp(&b.median()))
+                .map(|runs| runs.shape)
                 .unwrap_or(finalists[0])
         } else {
             finalists[0]
         };
-        drop(opencl);
+        let device_opens_in_sweep = devices.opens;
+        // Every allocation the sweep made is released before the soak asks for
+        // its own. On CUDA the sweep's miner and the soak's would otherwise both
+        // hold their global_hashes buffers, and the winner is usually one of the
+        // largest shapes measured.
+        drop(devices);
 
-        // Soak, at the winner's own allocation.
-        let soak_device = crate::x16rs_gate::open_device(
-            &request.opencl_dir,
-            request.platform,
-            &request.device_ids,
-            winner,
-        )?;
+        // Soak, at the winner's own allocation: the buffers the miner will
+        // really run with, on both backends.
+        backend.check_shape(winner)?;
+        let soak_device = backend.open(winner)?;
+        warm_up(&soak_device, winner, height, &intros[0])?;
         let (soak, settle, soak_seconds, final_measure) = soak_until_settled(
             &soak_device,
             winner,
@@ -2446,6 +3045,7 @@ mod device {
         );
         drop(soak_device);
 
+        let final_measure_watts = final_measure.telemetry.watts;
         let pick = pick_for_shape(
             request.vendor,
             winner,
@@ -2455,6 +3055,12 @@ mod device {
         Ok(TuneOutcome {
             pick,
             shape: winner,
+            backend: backend.name(),
+            device: backend.describe(),
+            // The soak's own device is counted too: it is a real allocation and
+            // on CUDA it is a whole extra miner.
+            device_opens: device_opens_in_sweep + 1,
+            finalists: finalist_runs,
             objective,
             watts_source,
             soak,
@@ -2465,6 +3071,10 @@ mod device {
             total_seconds: started.elapsed().as_secs_f64(),
             final_proof,
             peak_temp_c: sampler.peak_temp(),
+            power_limit_w: sampler.power_limit_w,
+            // Measured on the WINNER's own soak window, not on the session, so
+            // it describes the shape the config is about to be given.
+            power_cap_load: sampler.power_cap_load(final_measure_watts),
             ceiling: ceiling_state,
             sensors: sampler.source,
             plan,
@@ -2473,8 +3083,8 @@ mod device {
 
     /// Prove a shape, then measure it, then check it agrees with the reference.
     #[allow(clippy::too_many_arguments)]
-    fn measure_candidate(
-        opencl: &OpenCLResources,
+    fn measure_candidate<D: GateDevice>(
+        device: &D,
         shape: Shape,
         corpus: &Corpus,
         intros: &[Vec<u8>],
@@ -2484,7 +3094,7 @@ mod device {
         reference: Option<&Measured>,
     ) -> Result<Measured, String> {
         let proof = prove_shape(
-            opencl,
+            device,
             shape,
             height,
             &intros[0],
@@ -2503,7 +3113,7 @@ mod device {
             proof.thresholds,
             proof.miss_probability
         );
-        let measured = run_corpus(opencl, shape, corpus, intros, height, sampler)?;
+        let measured = run_corpus(device, shape, corpus, intros, height, sampler)?;
         if let TempWindow::NotMeasured { limit_c } =
             within_temperature_limit(&measured.telemetry, request.max_temp_c)?
         {
@@ -2583,8 +3193,8 @@ mod device {
     /// Hash the corpus over and over until temperature, board power, shader
     /// clock and hashrate have all stopped moving, or the cap is reached.
     #[allow(clippy::too_many_arguments)]
-    fn soak_until_settled(
-        opencl: &OpenCLResources,
+    fn soak_until_settled<D: GateDevice>(
+        device: &D,
         shape: Shape,
         corpus: &Corpus,
         intros: &[Vec<u8>],
@@ -2627,7 +3237,7 @@ mod device {
         );
         while started.elapsed() < cap {
             let at = Instant::now();
-            let measured = run_corpus(opencl, shape, corpus, intros, height, sampler)?;
+            let measured = run_corpus(device, shape, corpus, intros, height, sampler)?;
             let telemetry = sampler.window(at);
             // A shape can pass a two-second sweep and then climb past the
             // ceiling once it has been running for a minute. That is exactly
@@ -2640,6 +3250,7 @@ mod device {
             passes.push(SoakPass {
                 seconds: measured.seconds,
                 hashrate: measured.hashrate,
+                p95_ms: measured.p95_ms(),
                 temp_c: telemetry.temp_c,
                 watts: telemetry.watts,
                 clock_mhz: telemetry.clock_mhz,
@@ -2701,7 +3312,9 @@ mod device {
     pub fn render(outcome: &TuneOutcome, request: &TuneRequest) -> String {
         let input = outcome.winner.score_input(request.estimated_watts);
         let mut text = format!(
-            "  workload         : x16rs repeat = {} (height {}), the same rounds the live chain runs\n  \
+            "  backend / device : {} / {}\n  \
+             devices opened   : {} ({})\n  \
+             workload         : x16rs repeat = {} (height {}), the same rounds the live chain runs\n  \
              corpus           : {} segments x {} nonces = {} nonces, headers {}, nonce base {}\n                     \
              every candidate hashed exactly these nonces against exactly these headers\n  \
              chosen shape     : work_groups={} local_size={} unit_size={} ({} nonces per batch)\n  \
@@ -2715,6 +3328,15 @@ mod device {
              equivalence      : {} count thresholds over the whole {}-nonce launch window; one \
 wrong hash escapes with p = {:.1e}\n  \
              CPU verification : {} batches re-hashed with x16rs::block_hash, byte-equal\n",
+            outcome.backend,
+            outcome.device,
+            outcome.device_opens,
+            if outcome.device_opens > 2 {
+                "this backend bakes the launch shape into the allocation, so a candidate with a \
+                 new unit_size needs its own device; each one is warmed up before it is timed"
+            } else {
+                "one allocation served the sweep, plus the winner's own for the soak"
+            },
             x16rs::block_hash_repeat(crate::x16rs_gate::REPEAT16_HEIGHT),
             crate::x16rs_gate::REPEAT16_HEIGHT,
             outcome.corpus.segments,
@@ -2775,8 +3397,41 @@ wrong hash escapes with p = {:.1e}\n  \
         if let Some(net) = input.net_eur_per_day(&request.economics) {
             text.push_str(&format!("  net              : {net:.4} EUR/day\n"));
         }
+        // Why the winning shape won, where the card itself supplies the reason.
+        //
+        // A card sitting on its power cap and a card starved of work in flight
+        // want OPPOSITE things from unit_size, and both have been measured under
+        // this kernel: an RX 9070 XT gains about 9% going from 64 to 192, while a
+        // Tesla T4 at 66 W against a 70 W cap loses going the same way, because
+        // the larger batch cannot draw more power, only hold the card at the
+        // limit for longer. The tuner finds either optimum from the hashrate
+        // alone. This line is so the operator is not left to guess which regime
+        // their card is in, and does not "fix" a correct answer by hand.
+        if let Some(load) = outcome.power_cap_load {
+            text.push_str(&format!(
+                "  power limit      : {}\n",
+                if load >= POWER_CAPPED_FRACTION {
+                    format!(
+                        "the winner drew {:.0}% of this card's {:.0} W cap, so it is POWER CAPPED. \
+                         A larger\n                     launch cannot buy more work here, it only \
+                         holds the card at the limit for\n                     longer; expect the \
+                         smaller unit_size to win and read the batch latency above",
+                        load * 100.0,
+                        outcome.power_limit_w.unwrap_or_default(),
+                    )
+                } else {
+                    format!(
+                        "the winner drew {:.0}% of this card's {:.0} W cap, so it is not power \
+                         limited",
+                        load * 100.0,
+                        outcome.power_limit_w.unwrap_or_default(),
+                    )
+                }
+            ));
+        }
         text.push_str(&format!(
             "  soak             : {} passes over {:.0}s, {}\n                     \
+             p95 batch {:.0} ms on the first pass, {:.0} ms on the last\n                     \
              hashrate span {:.2}%{}{}{}\n",
             outcome.soak.len(),
             outcome.soak_seconds,
@@ -2785,6 +3440,12 @@ wrong hash escapes with p = {:.1e}\n  \
             } else {
                 "DID NOT SETTLE within the cap; the numbers above are the last pass"
             },
+            // The tail is what a template change waits on, and it is what grows
+            // when a card that started cold settles onto a power or thermal
+            // limit. Reported at both ends of the soak so the growth is visible
+            // rather than averaged away.
+            outcome.soak.first().map(|pass| pass.p95_ms).unwrap_or(0.0),
+            outcome.soak.last().map(|pass| pass.p95_ms).unwrap_or(0.0),
             outcome.settle.rate_span_pct,
             outcome
                 .settle
@@ -2832,21 +3493,23 @@ wrong hash escapes with p = {:.1e}\n  \
             "  planned / actual : sweep {:.0}s planned, {:.0}s of tune in total\n",
             outcome.plan.sweep_seconds, outcome.total_seconds
         ));
+        text.push_str(&resolution_note(&outcome.finalists, outcome.backend));
         text
     }
 }
 
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 pub use device::{
-    Measured, ShapeProof, TelemetryWindow, TuneOutcome, TuneRequest, agree_on_segments, prove_shape,
-    render, run_corpus, tune, within_temperature_limit,
+    Measured, POWER_CAPPED_FRACTION, ShapeProof, TelemetryWindow, TuneOutcome, TuneRequest,
+    TuneTarget, agree_on_segments, prove_shape, render, run_corpus, tune, tune_on,
+    within_temperature_limit,
 };
 
 /// The last thing a candidate has to survive before its number is believed:
 /// hashing the same work as the reference and agreeing with it hash for hash.
 ///
 /// Exposed outside `device` so the corpus tests can name it.
-#[cfg(any(feature = "ocl", test))]
+#[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub fn coverage_matches(corpus: &Corpus, reference: Shape, other: Shape) -> Result<(), String> {
     let want = corpus.coverage_signature(reference)?;
     let got = corpus.coverage_signature(other)?;
@@ -3348,6 +4011,7 @@ mod tests {
             .map(|i| SoakPass {
                 seconds: 1.0,
                 hashrate: 19_000_000.0 + i as f64 * 1_000.0,
+                p95_ms: 320.0,
                 temp_c: Some(76.0),
                 watts: Some(291.0),
                 clock_mhz: Some(3_300.0),
@@ -3768,11 +4432,18 @@ mod tests {
         // The 9x bound is real and it is not enough on its own. These are the
         // quanta the unbounded plan produces, in nonces, for the two ends of the
         // preset table. The RX 9070 XT's is 18.9 M, about 0.65 s at its measured
-        // 28.8 MH/s. The largest NVIDIA preset's is 604 M, 32 times as much,
-        // because the bound is 9x a batch that is itself 32x bigger. That is why
-        // `plan_session` caps the quantum in seconds and not in batches: the
-        // grid's own arithmetic cannot bound it in a way that survives a card
-        // with a 3072 work-group ceiling.
+        // 28.8 MH/s. The largest NVIDIA preset's is 151 M, eight times as much,
+        // because the bound is 9x a batch that is itself eight times bigger.
+        // That is why `plan_session` caps the quantum in seconds and not in
+        // batches: the grid's own arithmetic cannot bound it in a way that
+        // survives a card with a wide work-group ceiling.
+        //
+        // 151 M was 604 M until the NVIDIA presets were derived rather than
+        // guessed. `nvidia_max` named 3584 work groups, which on the one NVIDIA
+        // card ever measured is 90 waves of a kernel that holds exactly one
+        // resident block per multiprocessor, and a 15.6-second batch against a
+        // 1.5-second latency ceiling. It now names 768. The quantum is a
+        // consequence of that, not a target: see `nvidia_launch::PRESET_LADDER`.
         let quantum_for = |slug: &str, mode: EfficiencyMode, cu: u32| -> u64 {
             let (_, profile, vram) = PANEL_GPU_PRESETS
                 .iter()
@@ -3783,7 +4454,7 @@ mod tests {
             plan_window(min_wg, max_wg, max_us).0.segment_nonces
         };
         assert_eq!(quantum_for("rx9070xt", EfficiencyMode::Max, 32), 18_874_368);
-        assert_eq!(quantum_for("rtx5090", EfficiencyMode::Max, 170), 603_979_776);
+        assert_eq!(quantum_for("rtx5090", EfficiencyMode::Max, 170), 150_994_944);
     }
 
     /// Refinement may only ever ask for points the corpus was planned around,
@@ -3879,22 +4550,57 @@ mod tests {
                 "rx7900xtx Profit",
                 "rx7900xtx Max",
                 "rx9070xt Max",
-                "rtx3060 Eco",
-                "rtx3060 Profit",
-                "rtx4060 Eco",
-                "rtx4060 Profit",
-                "rtx3070 Eco",
-                "rtx4090 Profit",
-                "rtx4090 Max",
-                "rtx5060 Eco",
-                "rtx5060 Profit",
-                "rtx5090 Profit",
-                "rtx5090 Max",
                 "arc_a380 Profit",
                 "arc_a770 Max",
             ],
             "the set of cards that cannot search upward on either axis changed"
         );
+
+        // Ten NVIDIA entries used to be on that list and none is now, which is
+        // the point of deriving the presets rather than guessing them.
+        //
+        // The old table put every NVIDIA tier at unit_size 96 or 128 while the
+        // axis ends at 128, so a tune on those cards could only confirm the
+        // shipped value or move DOWN from it - and on the one NVIDIA card
+        // anyone has measured the answer is down, so that direction was at
+        // least the useful one. It was still a search space with the shipped
+        // shape wedged in its corner, which is the same defect the RX 9070 XT
+        // had in the other direction and which cost that card 50% for a year.
+        // At unit_size 64 the axis runs 32 and 48 below and 96 and 128 above,
+        // so a card nobody has measured is bracketed from both sides.
+        assert!(
+            !boxed_in.iter().any(|entry| entry.starts_with("rtx")),
+            "an NVIDIA card is back in the corner of its own search space: {boxed_in:?}"
+        );
+        for (slug, profile, vram) in PANEL_GPU_PRESETS {
+            if crate::gpu_arch::profile_vendor(profile) != crate::gpu_arch::GpuVendor::Nvidia {
+                continue;
+            }
+            for mode in [
+                EfficiencyMode::Eco,
+                EfficiencyMode::Profit,
+                EfficiencyMode::Max,
+            ] {
+                let shipped = crate::panel_tuning::resolve_panel_tuning(slug, profile, vram, mode);
+                let (min_wg, max_wg, max_us) = tuner_window(slug, profile, vram, mode, 170);
+                let universe = candidate_universe(min_wg, max_wg, max_us, 256);
+                assert!(
+                    universe.iter().any(|s| s.unit_size < shipped.unit_size),
+                    "{slug} {mode:?}: nothing below the shipped unit_size {}",
+                    shipped.unit_size
+                );
+                assert!(
+                    universe.iter().any(|s| s.unit_size > shipped.unit_size),
+                    "{slug} {mode:?}: nothing above the shipped unit_size {}",
+                    shipped.unit_size
+                );
+                assert_eq!(
+                    shipped.unit_size,
+                    crate::nvidia_launch::MEASURED_T4_BEST_UNIT_SIZE,
+                    "{slug} {mode:?} does not ship at the one measured NVIDIA optimum"
+                );
+            }
+        }
     }
 
     /// The narrowest space any shipped card gets, named so it cannot regress
@@ -4240,6 +4946,344 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The NVIDIA grid: can the corpus planner finish on it?
+    // -----------------------------------------------------------------------
+
+    /// Way 1. Bisection on the real planner, judged by the planner's own
+    /// opinion of whether the soak can settle.
+    fn required_hps_from_the_planner(
+        min_wg: u32,
+        max_wg: u32,
+        max_us: u32,
+        budget: u64,
+    ) -> Option<f64> {
+        bisect_required(|hps| {
+            plan_session(min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE)
+                .is_ok_and(|plan| plan.is_a_comparison() && plan.soak_can_settle(budget))
+        })
+    }
+
+    /// Way 2. Bisection on the real planner, judged by an independent
+    /// re-implementation of `soak_until_settled`'s loop.
+    ///
+    /// `SessionPlan::soak_can_settle` is a closed-form inequality; the free
+    /// `soak_can_settle` above steps the loop pass by pass. They are two
+    /// different pieces of code and this is what makes them answer the same
+    /// question about the same plan.
+    fn required_hps_from_the_soak_loop(
+        min_wg: u32,
+        max_wg: u32,
+        max_us: u32,
+        budget: u64,
+    ) -> Option<f64> {
+        bisect_required(|hps| {
+            plan_session(min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE)
+                .is_ok_and(|plan| plan.is_a_comparison() && soak_can_settle(plan.pass_seconds, budget))
+        })
+    }
+
+    /// Way 3. Algebra, with no planner in it at all.
+    ///
+    /// A tune is a comparison, so at least two shapes have to survive together,
+    /// and `plan_session` puts three separate gates between a shape and the
+    /// measurement. Write all three down for the two cheapest shapes a device
+    /// offers, which are its smallest work-group count at unit_size 32 and at
+    /// 64: batches B and 2B, l.c.m. 2B.
+    ///
+    ///   (a) **The latency prune.** A shape is dropped before anything is
+    ///       measured unless its batch fits
+    ///       `P95_BATCH_CEILING_MS * LATENCY_HEADROOM` at the probed rate. The
+    ///       second shape is the one that has to get through, so
+    ///       `hps >= 2B / (1.5 * 1.6)`. On the windows the NVIDIA presets
+    ///       produce this is the gate that binds, which is worth knowing: the
+    ///       corpus is not what a slow card runs out of, the p95 ceiling is.
+    ///   (b) **The quantum cap.** The segment is a common multiple of the kept
+    ///       batches and may not exceed a pass, so `hps >= 2B / pass_ceiling`
+    ///       unless `MIN_SEGMENT_NONCES` already covers it.
+    ///   (c) **The soak.** One segment is the smallest corpus and the pass has
+    ///       to fit `max_soak_pass_seconds`.
+    ///
+    /// The requirement is the largest of the three. Everything the planner adds
+    /// on top of this keeps MORE shapes and makes the corpus bigger, so this is
+    /// a lower bound on ways 1 and 2, and the test asserts that relationship
+    /// rather than assuming it.
+    fn required_hps_closed_form(min_wg: u32, max_wg: u32, max_us: u32, budget: u64) -> f64 {
+        let grid = work_group_grid(min_wg, max_wg);
+        let wg0 = grid.first().copied().unwrap_or(min_wg) as u64;
+        let units = unit_size_grid(max_us);
+        // The two cheapest points that are powers of two, which is the family
+        // `coarse_axis` chooses and `plan_corpus` keeps.
+        let mut pair: Vec<u64> = units
+            .iter()
+            .copied()
+            .filter(|u| u.is_power_of_two())
+            .take(2)
+            .map(u64::from)
+            .collect();
+        if pair.len() < 2 {
+            pair = units.iter().take(2).map(|u| u64::from(*u)).collect();
+        }
+        let batches: Vec<u64> = pair.iter().map(|unit| wg0 * 256 * unit).collect();
+        let second = batches.iter().copied().max().unwrap_or(1);
+        let quantum = batches
+            .iter()
+            .fold(1u64, |acc, batch| lcm(acc, *batch).unwrap_or(u64::MAX));
+        let segment = quantum * MIN_SEGMENT_NONCES.div_ceil(quantum).max(1);
+
+        // (a) the latency prune has to admit the second shape.
+        let by_latency = second as f64 / ((P95_BATCH_CEILING_MS / 1000.0) * LATENCY_HEADROOM);
+        // (b) the quantum cap has to hold their common multiple. Below
+        //     MIN_SEGMENT_NONCES the cap's own floor already does.
+        let expected_passes = coarse_candidates(min_wg, max_wg, max_us, 256).len() as f64
+            + REFINE_PASS_ALLOWANCE as f64
+            + FINAL_PASS_ALLOWANCE as f64;
+        let sweep_pass = budget as f64 * SWEEP_BUDGET_SHARE / expected_passes;
+        let pass_ceiling = sweep_pass.min(max_soak_pass_seconds(budget) * SOAK_PASS_MARGIN);
+        let by_quantum = if quantum <= MIN_SEGMENT_NONCES {
+            0.0
+        } else {
+            quantum as f64 / pass_ceiling
+        };
+        // (c) the pass has to settle.
+        let by_soak = segment as f64 / max_soak_pass_seconds(budget);
+
+        by_latency.max(by_quantum).max(by_soak)
+    }
+
+    fn bisect_required(finishes: impl Fn(f64) -> bool) -> Option<f64> {
+        let (mut low, mut high) = (1.0e3, 1.0e9);
+        if !finishes(high) {
+            return None;
+        }
+        for _ in 0..60 {
+            let middle = (low + high) / 2.0;
+            if finishes(middle) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        Some(high)
+    }
+
+    /// Multiprocessor counts of the NVIDIA cards in the panel table, which is
+    /// what `tune_workgroups` scales the preset by. Kept next to the slugs it
+    /// belongs to in `nvidia_launch`, and asserted equal there.
+    fn nvidia_sm_count(slug: &str) -> Option<u32> {
+        crate::nvidia_launch::NVIDIA_PANEL_SM_COUNTS
+            .iter()
+            .find(|(entry, _)| *entry == slug)
+            .map(|(_, sms)| *sms)
+    }
+
+    /// Every NVIDIA card, both entry points, three ways of asking what hashrate
+    /// a tune needs before it can finish. A T4 does 7.54 MH/s.
+    ///
+    /// This is the NVIDIA half of
+    /// `every_card_can_finish_a_tune_at_a_rate_it_could_plausibly_have`, done
+    /// separately because the NVIDIA grid is now derived from the hardware
+    /// (`nvidia_launch`) rather than from the preset table, and because a
+    /// requirement above about 2 MH/s on a card that does 7.54 is a design
+    /// error rather than a tight fit. It prints the table, so
+    /// `cargo test -- --nocapture nvidia_grid` is the audit.
+    #[test]
+    fn the_corpus_planner_finishes_on_every_nvidia_grid_three_ways() {
+        use crate::gpu_arch::{PANEL_GPU_PRESETS, profile_vendor, GpuVendor};
+
+        // A T4 sustains 7.54 MH/s. A tune that needs more than this fraction of
+        // it is a tune that cannot run on the one NVIDIA card ever measured.
+        const NVIDIA_BOUND_HPS: f64 = 2.0e6;
+
+        let mut rows: Vec<String> = Vec::new();
+        let mut worst: (f64, String) = (0.0, String::new());
+        let mut checked = 0usize;
+
+        println!(
+            "\n{:<10} {:<18} {:>4} {:>16} {:>9} {:>9} {:>9}",
+            "card", "entry", "SMs", "window", "planner", "soakloop", "algebra"
+        );
+        for (slug, profile, vram) in PANEL_GPU_PRESETS {
+            if profile_vendor(profile) != GpuVendor::Nvidia {
+                continue;
+            }
+            let sms = nvidia_sm_count(slug)
+                .unwrap_or_else(|| panic!("{slug} has no multiprocessor count"));
+            // Both entry points, driven at the card's real multiprocessor count
+            // as well as at the extremes of the CU sweep, because
+            // `tune_workgroups` scales the preset by it.
+            for cu in [8u32, sms, 170] {
+                let windows = [
+                    ("panel button", panel_button_window(slug, profile, vram, cu)),
+                    (
+                        "hand-written ini",
+                        tuner_window(slug, profile, vram, EfficiencyMode::Max, cu),
+                    ),
+                ];
+                for (entry, (min_wg, max_wg, max_us)) in windows {
+                    let where_ =
+                        format!("{slug} {entry} {cu} CU ({min_wg}..={max_wg} x {max_us})");
+                    let planner =
+                        required_hps_from_the_planner(min_wg, max_wg, max_us, PANEL_BUDGET_SECONDS)
+                            .unwrap_or_else(|| panic!("{where_}: no hashrate finishes a tune"));
+                    let soak_loop = required_hps_from_the_soak_loop(
+                        min_wg,
+                        max_wg,
+                        max_us,
+                        PANEL_BUDGET_SECONDS,
+                    )
+                    .unwrap_or_else(|| panic!("{where_}: no hashrate finishes a tune"));
+                    let algebra =
+                        required_hps_closed_form(min_wg, max_wg, max_us, PANEL_BUDGET_SECONDS);
+
+                    // The two bisections ask different code the same question.
+                    // They resolve to well under a hash per second, so anything
+                    // beyond rounding between them is a real disagreement about
+                    // when a soak settles.
+                    assert!(
+                        (planner - soak_loop).abs() / planner < 1e-6,
+                        "{where_}: the planner says {planner:.0} H/s and the soak loop says \
+                         {soak_loop:.0} H/s; two pieces of code disagree about settling"
+                    );
+                    // And the algebra is a floor: everything the planner adds
+                    // makes the corpus bigger, never smaller.
+                    assert!(
+                        algebra <= planner * 1.000_001,
+                        "{where_}: the closed form wants {algebra:.0} H/s, ABOVE the planner's \
+                         {planner:.0}. One of the two is modelling the wrong corpus"
+                    );
+
+                    for (way, value) in [
+                        ("planner", planner),
+                        ("soak loop", soak_loop),
+                        ("algebra", algebra),
+                    ] {
+                        assert!(
+                            value < NVIDIA_BOUND_HPS,
+                            "{where_}: {way} needs {:.2} MH/s, and a Tesla T4 does 7.54",
+                            value / 1e6
+                        );
+                    }
+                    if planner > worst.0 {
+                        worst = (planner, where_.clone());
+                    }
+                    rows.push(format!(
+                        "{:<10} {:<18} {:>4} {:>16} {:>8.2}M {:>8.2}M {:>8.2}M",
+                        slug,
+                        entry,
+                        cu,
+                        format!("{min_wg}..{max_wg}x{max_us}"),
+                        planner / 1e6,
+                        soak_loop / 1e6,
+                        algebra / 1e6
+                    ));
+                    checked += 1;
+                }
+            }
+        }
+        for row in &rows {
+            println!("{row}");
+        }
+        println!(
+            "worst NVIDIA requirement {:.2} MH/s ({}), against 7.54 MH/s measured on a T4\n",
+            worst.0 / 1e6,
+            worst.1
+        );
+
+        assert!(checked >= 50, "only {checked} NVIDIA windows were checked");
+        // Named so a change that quietly doubles it fails here rather than in an
+        // operator's log.
+        //
+        // 1.75 MH/s is where every window the PRESETS produce sits, and it is
+        // not the corpus: it is gate (a), the latency prune needing to admit
+        // 256 x 256 x 64, whose 4 194 304-nonce batch has to come in under
+        // 1.5 s x 1.6. 1.86 is the panel Auto Tune button on a 4090 or 5090,
+        // whose window is deliberately the card's whole safe range (3584 work
+        // groups) rather than the preset. A T4 does 7.54 MH/s, so the tightest
+        // of these leaves a factor of four.
+        assert!(
+            worst.0 < 2.0e6,
+            "the hardest NVIDIA window now needs {:.2} MH/s ({})",
+            worst.0 / 1e6,
+            worst.1
+        );
+        // The windows the presets themselves produce are the tighter number,
+        // and they are the ones a change to `nvidia_launch::PRESET_LADDER`
+        // would move.
+        let preset_worst = PANEL_GPU_PRESETS
+            .iter()
+            .filter(|(_, profile, _)| profile_vendor(profile) == GpuVendor::Nvidia)
+            .flat_map(|(slug, profile, vram)| {
+                [8u32, 170].into_iter().map(move |cu| {
+                    let (a, b, c) = tuner_window(slug, profile, *vram, EfficiencyMode::Max, cu);
+                    required_hps_from_the_planner(a, b, c, PANEL_BUDGET_SECONDS).unwrap()
+                })
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            preset_worst < 1.8e6,
+            "the NVIDIA preset windows need {:.2} MH/s",
+            preset_worst / 1e6
+        );
+
+        // And end to end at the rate the card really does: a full plan, at the
+        // T4's own multiprocessor count and its own measured hashrate.
+        let (min_wg, max_wg, max_us) = (
+            crate::nvidia_launch::work_group_floor(crate::nvidia_launch::MEASURED_T4_SM_COUNT, 1),
+            7_387,
+            128,
+        );
+        let plan = plan_session(
+            min_wg,
+            max_wg,
+            max_us,
+            256,
+            crate::nvidia_launch::MEASURED_T4_HPS,
+            PANEL_BUDGET_SECONDS,
+            4,
+            NONCE_BASE,
+        )
+        .expect("a T4 at its measured rate must be plannable");
+        assert!(plan.is_a_comparison() && plan.soak_can_settle(PANEL_BUDGET_SECONDS));
+        assert!(soak_can_settle(plan.pass_seconds, PANEL_BUDGET_SECONDS));
+        // The measured optimum, 256 x 256 x 64, has to survive planning: a tune
+        // that drops the answer for cost is not a tune.
+        assert!(
+            plan.usable.contains(&shape(
+                256,
+                crate::nvidia_launch::MEASURED_T4_BEST_UNIT_SIZE
+            )),
+            "the T4's measured winner was planned out of its own search"
+        );
+        println!(
+            "T4 end to end: {} coarse candidates, {} usable, {:.2}s a pass at 7.54 MH/s",
+            plan.candidates.len(),
+            plan.usable.len(),
+            plan.pass_seconds
+        );
+    }
+
+    /// The multiprocessor counts live in one place.
+    #[test]
+    fn every_nvidia_panel_card_has_a_multiprocessor_count() {
+        use crate::gpu_arch::{PANEL_GPU_PRESETS, profile_vendor, GpuVendor};
+        let mut named = 0;
+        for (slug, profile, _) in PANEL_GPU_PRESETS {
+            if profile_vendor(profile) != GpuVendor::Nvidia {
+                assert!(
+                    nvidia_sm_count(slug).is_none(),
+                    "{slug} is not an NVIDIA card but has an SM count"
+                );
+                continue;
+            }
+            let sms = nvidia_sm_count(slug)
+                .unwrap_or_else(|| panic!("{slug} is an NVIDIA card with no multiprocessor count"));
+            assert!((16..=256).contains(&sms), "{slug}: {sms} multiprocessors");
+            named += 1;
+        }
+        assert_eq!(named, crate::nvidia_launch::NVIDIA_PANEL_SM_COUNTS.len());
+    }
+
     /// The soak's arithmetic, from three directions that have to agree.
     ///
     /// `max_soak_pass_seconds` is what `plan_session` sizes the corpus against,
@@ -4542,5 +5586,307 @@ mod tests {
                 < score(&frugal, Objective::HashesPerJoule, &econ, P95_BATCH_CEILING_MS),
             "with real watts Eco must be able to prefer the slower shape"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The T4 measurement, and what the tuner has to be able to say about it
+    // -----------------------------------------------------------------------
+
+    /// Every launch shape measured on a real Tesla T4 is on the tuner's grid,
+    /// and the tuner can reach the one that won.
+    ///
+    /// Measured on a Colab T4 at repeat 16 over a fixed corpus, steady state
+    /// after 40 warm-up batches, flat to 0.57%:
+    ///
+    ///   work_groups 256, local_size 256, unit_size  64  ->  7.54 MH/s
+    ///   work_groups 256, local_size 256, unit_size  96  ->  7.19 MH/s
+    ///   work_groups 256, local_size 256, unit_size 128  ->  7.06 MH/s
+    ///
+    /// That ordering is the REVERSE of the RX 9070 XT's, where unit_size 192
+    /// beats 64 by about 9%. Two cards, opposite optima, which is exactly why
+    /// the grid may not be a fixed table. What this pins is that a T4-shaped
+    /// device window puts all three of those points in the universe, and that
+    /// the winner is reachable from a point the coarse sweep actually visits.
+    #[test]
+    fn the_shapes_measured_on_a_real_t4_are_on_the_grid_and_the_winner_is_reachable() {
+        // A T4 as the CUDA probe describes it: 40 multiprocessors, one resident
+        // block of 256 threads each, so 40 is the smallest launch that fills it.
+        let min_wg = 40;
+        // Roughly what 55% of ~15 GiB free holds at unit_size 128, 36 bytes a
+        // nonce. The exact figure is the CUDA crate's to compute; what matters
+        // here is that the window is wide.
+        let max_wg = 7_000;
+        let max_unit = 128;
+        let universe = candidate_universe(min_wg, max_wg, max_unit, 256);
+
+        for unit_size in [64u32, 96, 128] {
+            assert!(
+                universe.contains(&shape(256, unit_size)),
+                "256x256x{unit_size} was measured on a T4 and must be a shape the tuner can try"
+            );
+        }
+
+        // The coarse sweep is half the grid, so 256 work groups is a refinement
+        // point rather than a coarse one. It must still be reachable: a tune
+        // that could never propose the shape that won on the one NVIDIA card
+        // anyone has measured would be a tuner in name only.
+        let coarse = coarse_candidates(min_wg, max_wg, max_unit, 256);
+        let reachable = coarse.iter().any(|base| {
+            refine_candidates(*base, min_wg, max_wg, max_unit).contains(&shape(256, base.unit_size))
+        });
+        assert!(
+            reachable,
+            "no coarse candidate refines to 256 work groups; the T4 optimum is unreachable"
+        );
+
+        // The small end of the unit_size axis is where a power-capped card's
+        // optimum lives, so the grid must not start above it.
+        assert_eq!(
+            unit_size_grid(max_unit).first().copied(),
+            Some(32),
+            "a power-capped card wants a SMALL unit_size; the axis has to start below 64"
+        );
+    }
+
+    #[test]
+    fn a_win_smaller_than_the_measurement_noise_is_reported_as_unresolved() {
+        // Two shapes whose medians differ by well under a percent, each of which
+        // wandered by about 3% across its own repeats. Nothing was demonstrated
+        // here, and the tuner has to say so rather than print a winner and stop.
+        let noisy = vec![
+            FinalistRuns {
+                shape: shape(256, 64),
+                scores: vec![7.40e6, 7.54e6, 7.62e6],
+            },
+            FinalistRuns {
+                shape: shape(256, 96),
+                scores: vec![7.35e6, 7.51e6, 7.58e6],
+            },
+        ];
+        let resolution = comparison_resolution_pct(&noisy);
+        let margin = winning_margin_pct(&noisy).expect("two finalists have a margin");
+        assert!(resolution > 2.0, "each shape spanned about 3% of itself");
+        assert!(margin < 1.0);
+        assert!(margin < resolution);
+        let note = resolution_note(&noisy, "cuda");
+        assert!(note.contains("does NOT clear it"), "{note}");
+
+        // The same two medians, measured on a card that reproduced to a tenth of
+        // a percent: now the margin is a result.
+        let steady = vec![
+            FinalistRuns {
+                shape: shape(256, 64),
+                scores: vec![7.539e6, 7.540e6, 7.541e6],
+            },
+            FinalistRuns {
+                shape: shape(256, 96),
+                scores: vec![7.189e6, 7.190e6, 7.191e6],
+            },
+        ];
+        let note = resolution_note(&steady, "cuda");
+        assert!(comparison_resolution_pct(&steady) < 0.1);
+        assert!(winning_margin_pct(&steady).unwrap() > 4.0);
+        assert!(note.contains("which clears it"), "{note}");
+    }
+
+    #[test]
+    fn a_single_finalist_never_claims_a_comparison() {
+        // One shape survived to the final round. There is a number, but there is
+        // no comparison, and "resolved" would be a claim about nothing.
+        let alone = vec![FinalistRuns {
+            shape: shape(256, 64),
+            scores: vec![7.54e6, 7.55e6, 7.53e6],
+        }];
+        assert_eq!(winning_margin_pct(&alone), None);
+        let note = resolution_note(&alone, "cuda");
+        assert!(note.contains("nothing was compared"), "{note}");
+
+        // And a finalist with a single pass contributes no noise estimate: one
+        // measurement cannot disagree with itself, and counting it as 0% would
+        // make every margin look resolved.
+        let one_pass = vec![
+            FinalistRuns {
+                shape: shape(256, 64),
+                scores: vec![7.54e6],
+            },
+            FinalistRuns {
+                shape: shape(256, 96),
+                scores: vec![7.19e6, 7.60e6, 7.30e6],
+            },
+        ];
+        assert!(
+            comparison_resolution_pct(&one_pass) > 5.0,
+            "the resolution must come from the shape that actually repeated"
+        );
+    }
+
+    #[test]
+    fn the_report_says_what_a_number_from_another_run_is_worth_and_says_more_on_cuda() {
+        let finalists = vec![
+            FinalistRuns {
+                shape: shape(256, 64),
+                scores: vec![7.539e6, 7.540e6, 7.541e6],
+            },
+            FinalistRuns {
+                shape: shape(256, 96),
+                scores: vec![7.189e6, 7.190e6, 7.191e6],
+            },
+        ];
+        // Both backends carry the between-process bound, because it is a
+        // property of the card settling into a clock state for the life of a
+        // process and not of the GPU API.
+        for backend in ["opencl", "cuda"] {
+            let note = resolution_note(&finalists, backend);
+            assert!(
+                note.contains(&format!(
+                    "{:.1}%",
+                    crate::x16rs_gate::BETWEEN_PROCESS_SPREAD_PCT
+                )),
+                "{backend}: {note}"
+            );
+        }
+        // Only CUDA carries the extra claim, and it is the true one: nvcc
+        // compiles the kernel into the binary, so two CUDA KERNELS are two
+        // binaries and `x16rs_gate ab`'s in-process alternation is not available
+        // for them. Launch shapes, which is what a tune compares, are alternated
+        // in-process on both backends and resolve far finer.
+        let cuda = resolution_note(&finalists, "cuda");
+        let opencl = resolution_note(&finalists, "opencl");
+        assert!(
+            cuda.contains("nvcc compiles the kernel into the binary"),
+            "{cuda}"
+        );
+        assert!(!opencl.contains("nvcc"), "{opencl}");
+        assert!(cuda.len() > opencl.len());
+    }
+
+    /// One device allocation may serve several candidates, and it is sized from
+    /// the ones it will really launch.
+    ///
+    /// This is the rule a backend that bakes unit_size into its buffers depends
+    /// on. Getting it wrong in the tempting direction - allocate for the largest
+    /// shape in the plan - asks the card for memory no launch would ever use.
+    #[test]
+    fn a_shared_allocation_is_sized_from_the_shapes_that_share_its_unit_size() {
+        let plan = vec![
+            shape(3072, 32),
+            shape(1536, 32),
+            shape(512, 64),
+            shape(256, 128),
+            shape(128, 128),
+        ];
+
+        // Work groups come from the plan, so one device at unit_size 32 serves
+        // both 1536 and 3072, and one at 128 serves both 128 and 256.
+        assert_eq!(shared_allocation_work_groups(&plan, shape(1536, 32)), 3072);
+        assert_eq!(shared_allocation_work_groups(&plan, shape(128, 128)), 256);
+        assert_eq!(shared_allocation_work_groups(&plan, shape(512, 64)), 512);
+
+        // The unit_size filter is the whole point. The largest work-group count
+        // in this plan is 3072 and the largest unit_size is 128, but no planned
+        // shape is 3072x256x128: allocating one would be 100 M nonces and 3.6 GB
+        // of device memory for a launch that cannot happen.
+        let naive_nonces = 3072u64 * 256 * 128;
+        let real = shared_allocation_work_groups(&plan, shape(256, 128)) as u64 * 256 * 128;
+        assert_eq!(real, 256 * 256 * 128);
+        assert!(
+            real * 10 < naive_nonces,
+            "sizing by the plan's largest shape would over-allocate by more than 10x"
+        );
+
+        // A shape the plan never mentioned still gets an allocation it can use,
+        // which is what the probe needs before a plan exists.
+        assert_eq!(shared_allocation_work_groups(&[], shape(48, 32)), 48);
+        assert_eq!(shared_allocation_work_groups(&plan, shape(4096, 32)), 4096);
+
+        // local_size is part of the identity too: a device allocated for one
+        // block size cannot serve another.
+        let other_block = Shape {
+            work_groups: 4096,
+            local_size: 64,
+            unit_size: 32,
+        };
+        assert_eq!(shared_allocation_work_groups(&[other_block], shape(256, 32)), 256);
+    }
+
+    /// A T4-shaped device window plans a real comparison at the shipped budget.
+    ///
+    /// This is a regression test for a failure that had nothing to do with the
+    /// card. A Tesla T4 has 40 multiprocessors and this kernel gets one resident
+    /// block on each, so the work-group axis starts at 48 - the first dyadic
+    /// grid point at or above 40. Taking every other point from index 0 then
+    /// makes EVERY coarse candidate a 3-multiple; the shared corpus segment is a
+    /// common multiple of the candidates' batches, so one 3-multiple triples it;
+    /// `plan_corpus` drops the shapes that will not fit the budget and drops the
+    /// 3-multiples first; and the coarse set comes back empty. The operator's
+    /// tune then ends with "only 0 launch shapes survived planning" on a card
+    /// with nothing wrong with it.
+    ///
+    /// The floor is not negotiable - below one block per multiprocessor the card
+    /// is idle by construction - so `coarse_axis` chooses the family instead.
+    #[test]
+    fn a_t4_shaped_device_window_plans_a_comparison_at_the_shipped_budget() {
+        // 40 multiprocessors, one resident block each; ~7400 work groups is what
+        // 55% of a T4's free memory holds at unit_size 128, 36 bytes a nonce.
+        let (min_wg, max_wg, max_unit) = (40, 7_387, 128);
+
+        // The probe runs the SMALLEST shape, which under-feeds this kernel, so it
+        // reads below the 7.5 MH/s the card sustains at a good shape. Planned
+        // across the range a probe could plausibly return.
+        for probe_hps in [3.0e6f64, 5.0e6, 7.5e6] {
+            let plan = plan_session(min_wg, max_wg, max_unit, 256, probe_hps, 90, 4, NONCE_BASE)
+                .unwrap_or_else(|error| {
+                    panic!("a T4 at {:.1} MH/s must be plannable: {error}", probe_hps / 1e6)
+                });
+            assert!(
+                plan.is_a_comparison(),
+                "at {:.1} MH/s the coarse set was {} shapes",
+                probe_hps / 1e6,
+                plan.candidates.len()
+            );
+            // Every planned candidate has to tile the corpus it was planned for,
+            // or the shapes are not being measured on the same work.
+            for shape in &plan.candidates {
+                assert!(
+                    plan.corpus.fits(*shape),
+                    "{shape} cannot tile the {}-nonce segment it was planned onto",
+                    plan.corpus.segment_nonces
+                );
+                coverage_matches(&plan.corpus, plan.candidates[0], *shape).unwrap();
+            }
+            assert!(plan.soak_can_settle(90));
+            // The T4's measured optimum sits at 256 work groups, and it must be
+            // a shape the sweep really measures rather than one the corpus
+            // dropped for cost.
+            assert!(
+                plan.candidates.iter().any(|shape| shape.work_groups == 256),
+                "at {:.1} MH/s no candidate had the 256 work groups the T4 was measured at",
+                probe_hps / 1e6
+            );
+        }
+
+        // The family chosen for a grid that starts at 48 is the one the shared
+        // corpus can afford. The one exception is the axis's top end, which
+        // `coarse_axis` always appends whichever family it belongs to, because
+        // the largest launch the device permits is worth visiting on its own.
+        let coarse = coarse_candidates(min_wg, max_wg, max_unit, 256);
+        let top = work_group_grid(min_wg, max_wg).last().copied().unwrap();
+        assert!(
+            coarse
+                .iter()
+                .all(|shape| shape.work_groups.is_power_of_two() || shape.work_groups == top),
+            "the coarse work-group axis must be the family the shared corpus can afford, \
+             plus the grid's top end"
+        );
+
+        // A grid that starts on a power of two is untouched: this is the RX 9070
+        // XT's window, and its coarse axis is what it always was.
+        let amd = coarse_candidates(32, 64, 192, 256);
+        let amd_axis: Vec<u32> = {
+            let mut wg: Vec<u32> = amd.iter().map(|shape| shape.work_groups).collect();
+            wg.dedup();
+            wg
+        };
+        assert_eq!(amd_axis, vec![32, 64]);
     }
 }

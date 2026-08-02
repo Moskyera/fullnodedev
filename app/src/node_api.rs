@@ -142,6 +142,14 @@ fn build_capabilities(config: &EngineConf, setup: &ProtocolSetup, height: u64) -
             "type4_mainnet": type4_mainnet,
             "exact_unsigned_simulation": false,
         },
+        // Registered by the mint API service in this same fullnode process.
+        // Clients must not infer write support from a version string.
+        "api": {
+            "balance_query": true,
+            "transaction_submit": true,
+            "transaction_query": true,
+            "reconciliation_by_tx_hash": true,
+        },
         "limits": {
             "max_tx_size": config.max_tx_size,
             "max_tx_actions": config.max_tx_actions.min(TX_ACTIONS_MAX),
@@ -190,6 +198,14 @@ mod node_capabilities_tests {
         assert_eq!(value["api_version"].as_u64(), Some(1));
         assert_eq!(value["istanbul"]["active"].as_bool(), Some(true));
         assert_eq!(value["features"]["type4_mainnet"].as_bool(), Some(false));
+        for name in [
+            "balance_query",
+            "transaction_submit",
+            "transaction_query",
+            "reconciliation_by_tx_hash",
+        ] {
+            assert_eq!(value["api"][name].as_bool(), Some(true), "API {name}");
+        }
         assert_eq!(
             value["features"]["exact_unsigned_simulation"].as_bool(),
             Some(false),

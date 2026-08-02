@@ -18,6 +18,11 @@ pub mod mining_batch;
 pub mod mining_guard;
 pub mod mining_runtime;
 pub mod mining_stats;
+/// What an NVIDIA card can hold of the x16rs batch kernel, derived from the
+/// kernel's own attributes and the published per-multiprocessor budgets. No
+/// CUDA, so the NVIDIA search space and the NVIDIA presets are testable on a
+/// machine with no NVIDIA card in it.
+pub mod nvidia_launch;
 pub mod panel_tuning;
 pub mod rpc_http;
 #[macro_use]

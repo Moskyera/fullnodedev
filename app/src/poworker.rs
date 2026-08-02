@@ -496,12 +496,12 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
 /// 1 - p, where p is printed by the tuner. 31 keeps a candidate's proof under a
 /// second on this card while leaving a shape bug, which corrupts many hashes and
 /// not one, with no way through: the miss probabilities multiply.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 const AUTOTUNE_PROOF_THRESHOLDS: u32 = 31;
 
 /// Corpus headers. Four distinct block intros, so the tune cannot be an artefact
 /// of one header's algorithm chain.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 const AUTOTUNE_CORPUS_HEADERS: u32 = 4;
 
 /// What a hash is worth per day, read from the node the miner is configured to
@@ -511,7 +511,7 @@ const AUTOTUNE_CORPUS_HEADERS: u32 = 4;
 /// not attempted when a pool is configured: a pool serves a SHARE target, which
 /// is orders of magnitude weaker than the network target, so pricing a hash from
 /// it would overstate revenue enormously and make every extra watt look free.
-#[cfg(feature = "ocl")]
+#[cfg(any(feature = "ocl", feature = "cuda"))]
 fn network_hac_per_hps_day(cnf: &PoWorkConf) -> Option<f64> {
     if !cnf.pool_worker.is_empty() {
         wlogln!(
@@ -539,51 +539,315 @@ fn network_hac_per_hps_day(cnf: &PoWorkConf) -> Option<f64> {
     Some(value)
 }
 
-/// Auto Tune measures OpenCL launch shapes, and only those.
+/// Which backend a tune has to measure, decided by the same rule the MINER is
+/// built from.
 ///
-/// The tuner opens an OpenCL device, sweeps `work_groups` x `unit_size` over the
-/// grid that backend allows, and proves each shape against the CPU through the
-/// OpenCL kernel. None of that exists for CUDA, whose shape space is a different
-/// size entirely (the shipped CUDA config starts at 131072 x 256 x 8, above
-/// anything the OpenCL grid contains), so there is nothing here to translate.
+/// `build_gpu_backends` prefers CUDA (`if cnf.usecuda { .. } else if
+/// cnf.useopencl { .. }`) and hands `cnf.workgroups` / `cnf.unitsize` to
+/// `initialize_cuda`, while `apply_benchmark_pick` writes exactly those two
+/// numbers. So the tuner must measure whatever the next run will mine on, and
+/// never the other backend: a tune that ran on OpenCL with `use_cuda = true`
+/// still in the file would land its winner in the numbers the CUDA miner is
+/// built from, and the two grids are three orders of magnitude apart (the
+/// shipped CUDA config starts at 131072 x 256 x 8; the OpenCL grid tops out in
+/// the low thousands of work groups).
 ///
-/// It is said as its own sentence because the alternative is what shipped: a
-/// CUDA owner pressed Auto Tune, waited, and was told to enable a backend they
-/// had deliberately turned off, with CUDA never mentioned.
-fn cuda_backend_refusal(cnf: &PoWorkConf) -> bool {
-    if !cnf.usecuda {
-        return false;
+/// This used to be a refusal. It is now a route, because both backends can be
+/// measured.
+fn tuning_backend(cnf: &PoWorkConf) -> Option<&'static str> {
+    if cnf.usecuda {
+        Some("cuda")
+    } else if cnf.useopencl {
+        Some("opencl")
+    } else {
+        None
     }
-    wlogln!(
-        "[autotune] Auto Tune does not support the CUDA backend yet. This config has [gpu] \
-         use_cuda = true, so the miner runs on CUDA, while the tuner only measures OpenCL launch \
-         shapes and would write numbers the CUDA miner cannot use. Nothing was measured and the \
-         config is unchanged. To tune, set use_cuda = false and use_opencl = true and run it \
-         again; to keep mining on CUDA, set [efficiency] benchmark_seconds = 0 and tune \
-         work_groups / unit_size by hand."
-    );
-    true
+}
+
+/// Everything the tuner needs about money, which is the same on both backends.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+fn autotune_economics(cnf: &PoWorkConf) -> crate::autotune16::Economics {
+    crate::autotune16::Economics {
+        power_cost_kwh: cnf.efficiency.power_cost_kwh,
+        hac_price: cnf.efficiency.hac_price,
+        hac_per_hps_day: if cnf.efficiency.mode == EfficiencyMode::Profit {
+            network_hac_per_hps_day(cnf)
+        } else {
+            None
+        },
+        cpu_watts: cnf.efficiency.initial_active_supervene(cnf.supervene) as f64
+            * cnf.efficiency.cpu_watts_per_thread,
+    }
+}
+
+/// The CPU oracle is what proves each shape, and it is the only part of a tune
+/// that competes with the rest of the machine. Two cores are left alone so that
+/// a node syncing beside the tuner keeps running.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+fn autotune_oracle_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+}
+
+/// Report the tune and patch the ini, or say why it did not.
+///
+/// Shared by both backends deliberately: "the card never settled, so the config
+/// is unchanged" is a statement about the soak, not about the GPU API, and a
+/// CUDA operator has to get exactly the same guarantee an OpenCL one does.
+#[cfg(any(feature = "ocl", feature = "cuda"))]
+fn finish_tune(
+    config_path: &str,
+    request: &crate::autotune16::TuneRequest,
+    outcome: &crate::autotune16::TuneOutcome,
+) {
+    wlogln!("\n================ AUTO TUNE (x16rs repeat = 16) ================");
+    wlogln!("{}", crate::autotune16::render(outcome, request));
+    if !outcome.settle.settled {
+        // The soak has already said which of the two it was, and they have
+        // different answers. A corpus that could not fit the settling window is
+        // a planning failure, and `plan_session` refuses those before the sweep,
+        // so reaching here means the card really was still moving.
+        wlogln!(
+            "[autotune] The card never settled, so this shape is not proven to sustain. Config \
+             unchanged. The soak made {} passes over {:.0}s with the hashrate still spanning \
+             {:.2}%; a larger benchmark_seconds buys a longer soak (up to 900s) and is the thing \
+             to try.",
+            outcome.soak.len(),
+            outcome.soak_seconds,
+            outcome.settle.rate_span_pct,
+        );
+        return;
+    }
+    match apply_benchmark_pick(config_path, &outcome.pick) {
+        Ok(()) => {
+            wlogln!("[autotune] Config updated only after a settled soak at the chosen shape.")
+        }
+        Err(error) => wlogln!("[autotune] Could not patch ini: {error}"),
+    }
 }
 
 fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
-    // Before the feature split, because the answer is the same in both builds
-    // and a CUDA operator must not be told to rebuild for OpenCL when the real
-    // reason is that their backend has no tuner.
-    if cuda_backend_refusal(cnf) {
+    match tuning_backend(cnf) {
+        Some("cuda") => run_cuda_benchmark(cnf, config_path),
+        Some("opencl") => run_opencl_benchmark(cnf, config_path),
+        _ => wlogln!(
+            "[autotune] Neither [gpu] use_cuda nor [gpu] use_opencl is set, so there is no GPU \
+             backend to measure. Config unchanged."
+        ),
+    }
+}
+
+/// Auto Tune on a build with no CUDA backend at all.
+///
+/// The message names CUDA, because that is what the operator asked for. The
+/// version this replaced told a CUDA owner to enable OpenCL, a backend they had
+/// deliberately turned off, and never mentioned CUDA at all.
+#[cfg(not(feature = "cuda"))]
+fn run_cuda_benchmark(cnf: &PoWorkConf, config_path: &str) {
+    let _ = (cnf, config_path);
+    wlogln!(
+        "[autotune] This config has [gpu] use_cuda = true, so the miner runs on CUDA, but THIS \
+         BINARY was built without the CUDA backend and has no way to open an NVIDIA device or to \
+         measure one. Nothing was measured and the config is unchanged. Rebuild with \
+         `cargo build --release --features cuda` (the CUDA Toolkit must be installed and CUDA_PATH \
+         set, or the build produces a binary with the feature and no kernels), or set use_cuda = \
+         false and use_opencl = true to tune the OpenCL backend instead."
+    );
+}
+
+/// Auto Tune on CUDA. Same tuner, same corpus, same proof, same soak.
+#[cfg(feature = "cuda")]
+fn run_cuda_benchmark(cnf: &PoWorkConf, config_path: &str) {
+    // The kernels, not the feature. `--features cuda` only adds the crate;
+    // whether it holds compiled kernels was decided by its build script finding
+    // nvcc, and without them every device call returns NotCompiled. Said in
+    // words about nvcc rather than as a driver error.
+    if !crate::x16rs_gate::cuda_kernels_available() {
+        wlogln!(
+            "[autotune] This binary has the cuda feature but NO CUDA KERNELS: x16rs-cuda's build \
+             script did not find nvcc when it was built, so cfg(cuda_available) was never set and \
+             every CUDA call returns `x16rs-cuda built without CUDA kernels`. Install the CUDA \
+             Toolkit, set CUDA_PATH, and rebuild; the build prints `Using CUDA Toolkit at ...` \
+             when it found one. Nothing was measured and the config is unchanged."
+        );
         return;
     }
-    #[cfg(not(feature = "ocl"))]
-    {
-        let _ = (cnf, config_path);
-        wlogln!("[benchmark] Rebuild with --features ocl and use_opencl=true");
-        return;
-    }
-    #[cfg(feature = "ocl")]
-    {
-        if !cnf.useopencl {
-            wlogln!("[benchmark] Set use_opencl=true in [gpu]");
+
+    let devices = match x16rs_cuda::CudaMiner::list_devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            wlogln!(
+                "[autotune] No CUDA device could be enumerated: {error}. This is the driver or the \
+                 card, not the build: the kernels are compiled in. Check `nvidia-smi` runs, and \
+                 that the driver is not older than the CUDA runtime this binary was built \
+                 against. Nothing was measured and the config is unchanged."
+            );
             return;
         }
+    };
+    if devices.is_empty() {
+        wlogln!(
+            "[autotune] The CUDA runtime reports zero devices on this machine. Nothing was \
+             measured and the config is unchanged."
+        );
+        return;
+    }
+    if !devices.iter().any(|d| d.index == cnf.cudadevice) {
+        wlogln!(
+            "[autotune] [gpu] cuda_device = {} is not present. This machine has: {}. Set \
+             cuda_device to one of those. Config unchanged.",
+            cnf.cudadevice,
+            devices
+                .iter()
+                .map(|d| format!("#{} {}", d.index, d.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return;
+    }
+
+    let limits = match x16rs_cuda::CudaMiner::limits(cnf.cudadevice) {
+        Ok(limits) => limits,
+        Err(error) => {
+            wlogln!(
+                "[autotune] CUDA device #{} could not be probed: {error}. Config unchanged.",
+                cnf.cudadevice
+            );
+            return;
+        }
+    };
+    wlogln!("[autotune] CUDA {}", limits.describe());
+
+    // The block size is not a tuning axis on this backend and cannot be made
+    // one: `x16rs_cuda_main` declares `__shared__ unsigned int
+    // local_nonces[256]` and reduces over a power-of-two tree across the block,
+    // so 256 is the only block size it is correct at. Said out loud when the ini
+    // disagrees, because the alternative is a tune whose answer silently does
+    // not match the local_size the operator wrote.
+    let local_size = x16rs_cuda::DEFAULT_LOCAL_SIZE;
+    if cnf.localsize != local_size {
+        wlogln!(
+            "[autotune] [gpu] local_size = {} is ignored on CUDA: block_miner.cu's shared \
+             local_nonces[{local_size}] and its tree reduction are correct at {local_size} threads \
+             a block and no other, so the tune measures {local_size}.",
+            cnf.localsize
+        );
+    }
+    if limits.kernel_max_threads_per_block > 0
+        && (limits.kernel_max_threads_per_block as u32) < local_size
+    {
+        wlogln!(
+            "[autotune] the batch kernel supports only {} threads a block on this device but its \
+             reduction requires {local_size}. This device cannot run the CUDA miner at all, so \
+             there is nothing to tune. Config unchanged.",
+            limits.kernel_max_threads_per_block
+        );
+        return;
+    }
+
+    // The two ends of the work-group axis, both measured from the card.
+    //
+    // The floor is the smallest launch that puts a resident block on every
+    // multiprocessor: below it some SMs have no work and the hashrate describes
+    // the launch being too small rather than the shape. The ceiling is what the
+    // FREE device memory holds at the largest unit_size the grid explores, since
+    // a batch needs 36 bytes a nonce; it is then also capped by the operator's
+    // own [gpu] work_groups, exactly as the OpenCL path is capped by the device
+    // work-group count it was opened with.
+    let min_wg = limits.work_groups_that_fill_the_card();
+    let memory_wg = limits.max_work_groups_for(CUDA_MAX_UNIT_SIZE, CUDA_TUNE_VRAM_SHARE);
+    let max_wg = memory_wg.min(cnf.workgroups.max(min_wg)).max(min_wg);
+    wlogln!(
+        "[autotune] work-group axis {min_wg}..{max_wg}: {min_wg} is one resident block on each of \
+         the {} multiprocessors, {memory_wg} is what {:.0}% of the {:.1} GiB free fits at \
+         unit_size {CUDA_MAX_UNIT_SIZE} ({} bytes a nonce), and [gpu] work_groups = {} caps it",
+        limits.device.multiprocessor_count,
+        CUDA_TUNE_VRAM_SHARE * 100.0,
+        limits.free_global_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        x16rs_cuda::DEVICE_BYTES_PER_NONCE,
+        cnf.workgroups,
+    );
+
+    // nvidia-smi's `-i` index and the CUDA device index are the same ordering on
+    // a default setup, so the sensor follows the card being tuned unless the
+    // operator named a different one in [efficiency] thermal_gpu_index.
+    let sensor_index = if cnf.efficiency.thermal_gpu_index != 0 {
+        cnf.efficiency.thermal_gpu_index
+    } else {
+        cnf.cudadevice.max(0) as u32
+    };
+
+    let request = crate::autotune16::TuneRequest {
+        target: crate::autotune16::TuneTarget::Cuda {
+            device_index: cnf.cudadevice,
+        },
+        local_size,
+        min_work_groups: min_wg,
+        max_work_groups: max_wg,
+        max_unit_size: CUDA_MAX_UNIT_SIZE,
+        vendor: crate::gpu_arch::GpuVendor::Nvidia,
+        mode: cnf.efficiency.mode,
+        budget_seconds: cnf.efficiency.benchmark_seconds.max(30) as u64,
+        economics: autotune_economics(cnf),
+        estimated_watts: cnf.efficiency.estimate_gpu_watts(&cnf.gpu_profile),
+        thermal_file: cnf.efficiency.thermal_file.clone(),
+        gpu_index: sensor_index,
+        oracle_threads: autotune_oracle_threads(),
+        headers: AUTOTUNE_CORPUS_HEADERS,
+        proof_thresholds: AUTOTUNE_PROOF_THRESHOLDS,
+        max_temp_c: (cnf.efficiency.max_temp_c > 0).then_some(cnf.efficiency.max_temp_c as f32),
+    };
+
+    match crate::autotune16::tune(&request) {
+        Ok(outcome) => finish_tune(config_path, &request, &outcome),
+        Err(error) => {
+            wlogln!("[autotune] REJECTED: {error}");
+            wlogln!("[autotune] Config unchanged.");
+        }
+    }
+}
+
+/// The largest `unit_size` the NVIDIA grid explores.
+///
+/// 128 rather than the 192 the RDNA4 path allows, and the reason is a
+/// measurement rather than caution. On a Tesla T4 at repeat 16, work_groups 256
+/// and local_size 256: unit_size 64 gave 7.54 MH/s, 96 gave 7.19 and 128 gave
+/// 7.06. That is the REVERSE of the RX 9070 XT, where the kernel is latency
+/// bound and 192 beats 64 by about 9%, and the reason is that the T4 sat at 66
+/// to 67 W against a 70 W cap: a bigger batch cannot buy more work on a card
+/// already at its power limit. So on this vendor the optimum is at the SMALL end
+/// and the grid's job is to bracket it, which 32..128 does from both sides.
+///
+/// It is also what `ArchLimits::max_unit_size()` gives every non-gfx1201 slug,
+/// so a shape written by this tune stays inside the range the rest of the config
+/// and the panel already understand.
+#[cfg(feature = "cuda")]
+const CUDA_MAX_UNIT_SIZE: u32 = 128;
+
+/// Share of FREE device memory the CUDA candidate grid may size itself to.
+///
+/// Not 1.0 and not close to it: cudaMalloc needs contiguous space, a display
+/// driver on the same card takes memory `cudaMemGetInfo` has already counted as
+/// free, and the tuner opens the winner's own miner for the soak while the
+/// sweep's allocation is still being released. A grid sized to the last free
+/// byte would spend the sweep watching allocations fail on exactly the largest
+/// shapes, which are the ones the latency ceiling was going to drop anyway.
+#[cfg(feature = "cuda")]
+const CUDA_TUNE_VRAM_SHARE: f64 = 0.55;
+
+#[cfg(not(feature = "ocl"))]
+fn run_opencl_benchmark(cnf: &PoWorkConf, config_path: &str) {
+    let _ = (cnf, config_path);
+    wlogln!(
+        "[autotune] This config has [gpu] use_opencl = true, but this binary was built without the \
+         OpenCL backend. Rebuild with `cargo build --release --features ocl`. Config unchanged."
+    );
+}
+
+#[cfg(feature = "ocl")]
+fn run_opencl_benchmark(cnf: &PoWorkConf, config_path: &str) {
+    {
         let scan = crate::opencl_diag::scan_opencl();
         // One probe open, purely to learn this device's hard limits. Everything
         // measured afterwards happens inside the tuner, which opens the device
@@ -600,7 +864,13 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             false,
         );
         if probe.is_empty() {
-            wlogln!("[autotune] No OpenCL devices");
+            wlogln!(
+                "[autotune] No OpenCL device could be opened (platform {}, device_ids '{}', \
+                 kernels from '{}'). Nothing was measured and the config is unchanged.",
+                cnf.platformid,
+                cnf.deviceids,
+                cnf.opencldir,
+            );
             return;
         }
         if probe.len() != 1 {
@@ -620,21 +890,12 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
         let vendor = probe[0].vendor;
         drop(probe);
 
-        let economics = crate::autotune16::Economics {
-            power_cost_kwh: cnf.efficiency.power_cost_kwh,
-            hac_price: cnf.efficiency.hac_price,
-            hac_per_hps_day: if cnf.efficiency.mode == EfficiencyMode::Profit {
-                network_hac_per_hps_day(cnf)
-            } else {
-                None
-            },
-            cpu_watts: cnf.efficiency.initial_active_supervene(cnf.supervene) as f64
-                * cnf.efficiency.cpu_watts_per_thread,
-        };
         let request = crate::autotune16::TuneRequest {
-            opencl_dir: cnf.opencldir.clone(),
-            platform: cnf.platformid,
-            device_ids: cnf.deviceids.clone(),
+            target: crate::autotune16::TuneTarget::OpenCl {
+                opencl_dir: cnf.opencldir.clone(),
+                platform: cnf.platformid,
+                device_ids: cnf.deviceids.clone(),
+            },
             local_size: cnf.localsize,
             min_work_groups: min_wg,
             max_work_groups: max_wg,
@@ -642,16 +903,11 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
             vendor,
             mode: cnf.efficiency.mode,
             budget_seconds: cnf.efficiency.benchmark_seconds.max(30) as u64,
-            economics,
+            economics: autotune_economics(cnf),
             estimated_watts: cnf.efficiency.estimate_gpu_watts(&cnf.gpu_profile),
             thermal_file: cnf.efficiency.thermal_file.clone(),
             gpu_index: cnf.efficiency.thermal_gpu_index,
-            // The CPU oracle is what proves each shape, and it is the only part
-            // of a tune that competes with the rest of the machine. Two cores are
-            // left alone so that a node syncing beside the tuner keeps running.
-            oracle_threads: std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                .unwrap_or(4),
+            oracle_threads: autotune_oracle_threads(),
             headers: AUTOTUNE_CORPUS_HEADERS,
             proof_thresholds: AUTOTUNE_PROOF_THRESHOLDS,
             max_temp_c: (cnf.efficiency.max_temp_c > 0)
@@ -659,33 +915,7 @@ fn run_block_mining_benchmark(cnf: &PoWorkConf, config_path: &str) {
         };
 
         match crate::autotune16::tune(&request) {
-            Ok(outcome) => {
-                wlogln!("\n================ AUTO TUNE (x16rs repeat = 16) ================");
-                wlogln!("{}", crate::autotune16::render(&outcome, &request));
-                if !outcome.settle.settled {
-                    // The soak has already said which of the two it was, and
-                    // they have different answers. A corpus that could not fit
-                    // the settling window is a planning failure, and
-                    // `plan_session` refuses those before the sweep, so reaching
-                    // here means the card really was still moving.
-                    wlogln!(
-                        "[autotune] The card never settled, so this shape is not proven to \
-                         sustain. Config unchanged. The soak made {} passes over {:.0}s with the \
-                         hashrate still spanning {:.2}%; a larger benchmark_seconds buys a longer \
-                         soak (up to 900s) and is the thing to try.",
-                        outcome.soak.len(),
-                        outcome.soak_seconds,
-                        outcome.settle.rate_span_pct,
-                    );
-                    return;
-                }
-                match apply_benchmark_pick(config_path, &outcome.pick) {
-                    Ok(()) => wlogln!(
-                        "[autotune] Config updated only after a settled soak at the chosen shape."
-                    ),
-                    Err(error) => wlogln!("[autotune] Could not patch ini: {error}"),
-                }
-            }
+            Ok(outcome) => finish_tune(config_path, &request, &outcome),
             Err(error) => {
                 wlogln!("[autotune] REJECTED: {error}");
                 wlogln!("[autotune] Config unchanged.");
@@ -736,66 +966,77 @@ debug = 0
         path
     }
 
-    /// Auto Tune on a CUDA-only rig does nothing at all, and says nothing about
-    /// CUDA.
+    /// Auto Tune on a CUDA rig is routed to the CUDA tuner, and a build that has
+    /// no CUDA backend says exactly that and touches nothing.
     ///
-    /// This is the config the NVIDIA install script writes. The tuner's only
-    /// backend gate is `use_opencl`, so with `use_cuda = true` and
-    /// `use_opencl = false` it returns before opening any device and before
-    /// touching the file. The operator's `benchmark_seconds` therefore stays at
-    /// 90, which is exactly what the panel reads back as "the benchmark did not
-    /// produce a valid profile".
+    /// This is the config the NVIDIA install script writes. The test suite runs
+    /// without `--features cuda`, so what it pins here is the honest refusal: no
+    /// device is opened, no OpenCL shape is measured, and the file is
+    /// byte-identical afterwards. `benchmark_seconds` therefore stays at 90,
+    /// which is what the panel reads back as "the benchmark did not produce a
+    /// valid profile", rather than a config quietly filled with numbers measured
+    /// on a backend this rig does not use.
     #[test]
-    fn auto_tune_on_a_cuda_only_config_refuses_and_leaves_the_file_untouched() {
-        let path = temp_ini("cuda-autotune-noop", CUDA_INI);
+    fn a_cuda_config_is_routed_to_cuda_and_a_build_without_it_leaves_the_file_untouched() {
+        let path = temp_ini("cuda-autotune-route", CUDA_INI);
         let cnf = PoWorkConf::new(&sys::load_config_path(&path));
         assert!(cnf.usecuda, "the shipped CUDA config selects CUDA");
         assert!(!cnf.useopencl, "the shipped CUDA config leaves OpenCL off");
         assert_eq!(cnf.efficiency.benchmark_seconds, 90);
-
-        // The refusal is CUDA's, and it is reached before any OpenCL question is
-        // asked, so a --features cuda build says "CUDA" instead of telling the
-        // operator to rebuild for a backend they turned off on purpose.
-        assert!(cuda_backend_refusal(&cnf));
+        assert_eq!(
+            tuning_backend(&cnf),
+            Some("cuda"),
+            "a CUDA config must be measured on CUDA, never on OpenCL"
+        );
 
         run_block_mining_benchmark(&cnf, path.to_str().unwrap());
 
-        // Byte-identical: no tune ran, no profile was chosen, and nothing was
-        // patched. benchmark_seconds is still 90, so the panel's success test
-        // (`loaded.benchmark_seconds == Some(0)`) fails and it rolls back.
+        // Byte-identical whichever way the build went: with no CUDA feature
+        // nothing could be measured, and with one nothing is written until a
+        // soak settles.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), CUDA_INI);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The CUDA refusal fires on `use_cuda` and on nothing else.
+    /// The routing follows `use_cuda` first, and `use_opencl` only after it.
     ///
-    /// An OpenCL rig must reach the tuner exactly as before: this gate is a new
-    /// sentence for CUDA owners, not a new way for anyone else to be refused.
+    /// This is the ordering `build_gpu_backends` uses to decide what the MINER
+    /// runs, and the tuner has to agree with it: the next test shows what
+    /// disagreeing costs.
     #[test]
-    fn the_cuda_refusal_is_about_cuda_and_not_about_opencl() {
+    fn the_tuner_measures_whichever_backend_the_miner_will_run() {
         let opencl_ini = CUDA_INI
             .replace("use_cuda = true", "use_cuda = false")
             .replace("use_opencl = false", "use_opencl = true");
-        let path = temp_ini("opencl-autotune-allowed", &opencl_ini);
+        let path = temp_ini("opencl-autotune-route", &opencl_ini);
         let cnf = PoWorkConf::new(&sys::load_config_path(&path));
-        assert!(!cnf.usecuda);
-        assert!(cnf.useopencl);
-        assert!(
-            !cuda_backend_refusal(&cnf),
-            "an OpenCL config must not be refused for a backend it does not use"
-        );
+        assert!(!cnf.usecuda && cnf.useopencl);
+        assert_eq!(tuning_backend(&cnf), Some("opencl"));
         let _ = std::fs::remove_file(&path);
 
         // Both flags on: CUDA still wins, because `build_gpu_backends` prefers
-        // CUDA and the shape the tuner would write is the one the CUDA miner
-        // would then be built from.
+        // CUDA and the shape a tune writes is the one the CUDA miner is then
+        // built from.
         let both = CUDA_INI.replace("use_opencl = false", "use_opencl = true");
         let path = temp_ini("both-backends-autotune", &both);
         let cnf = PoWorkConf::new(&sys::load_config_path(&path));
         assert!(cnf.usecuda && cnf.useopencl);
-        assert!(cuda_backend_refusal(&cnf));
+        assert_eq!(
+            tuning_backend(&cnf),
+            Some("cuda"),
+            "with both backends enabled the miner runs CUDA, so the tune must measure CUDA"
+        );
         run_block_mining_benchmark(&cnf, path.to_str().unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), both);
+        let _ = std::fs::remove_file(&path);
+
+        // Neither: nothing to measure, and nothing written.
+        let neither = CUDA_INI.replace("use_cuda = true", "use_cuda = false");
+        let path = temp_ini("no-backend-autotune", &neither);
+        let cnf = PoWorkConf::new(&sys::load_config_path(&path));
+        assert_eq!(tuning_backend(&cnf), None);
+        run_block_mining_benchmark(&cnf, path.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), neither);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -13,6 +13,7 @@ The run is **build, prove, measure**, in that order, and it does not reach
 | 3 | The `x16rs-cuda` test suite, which covers the pool share list itself | 3 to 6 min |
 | 4 | Build `fullnode`, `poworker`, `hbit-pool-server` | 5 to 12 min |
 | 5 | Configs for the node, the CUDA miner and the CPU rival | seconds |
+| 5b | **The tuner.** Measure this card's own launch shape, prove every candidate against the CPU, and check the winner against the shipped preset | 20 to 55 min |
 | 6 | Sync the node to the real mainnet tip | 30 min to 2 h |
 | 7 | Run the pool, the CUDA miner and the CPU rival, and sample | ~11 min |
 | 8 | Raw submission counts | seconds |
@@ -179,7 +180,25 @@ Verified on the authoring machine (Windows, CUDA 13.3, no NVIDIA device):
 
 **Not run anywhere, and unrunnable here:**
 
-- Cells 2, 3 and 6 through 9 as a whole. No NVIDIA device.
+- Cells 2, 3, 5b and 6 through 9 as a whole. No NVIDIA device.
+- Every number Cell 5b prints. The tuner has never measured a CUDA device: its
+  CUDA path compiles, its device-independent halves (the planner, the corpus, the
+  launch-fit rules, the NVIDIA occupancy arithmetic) are unit tested on the
+  authoring machine, and its OpenCL path is the one that has ever run a sweep.
+  What a T4 does with it is unobserved.
+- `x16rs_gate baseline --backend cuda`, which is what the tuned-versus-preset
+  comparison is measured with. The OpenCL side of that command has produced the
+  ~2.6% between-process spread the comparison is judged against; the CUDA side
+  has only ever been compiled.
+- The estimates in the SIZE table. They are grid arithmetic on a 40-SM card at
+  the one hashrate a T4 has been observed at, not a session anyone has timed.
+- Cell 5b's logic itself HAS been executed, against fake `poworker` and
+  `x16rs_gate` binaries replaying canned output, over eight cases: a clean win, a
+  gain inside the noise, a loss to the preset, a candidate that failed the CPU
+  oracle, a soak that never settled, a refused session, an "Applied" line whose
+  file was not patched, and a missing miner config. All eight refused or
+  installed as intended. That exercises the parsing and the verdicts, and it
+  proves nothing whatever about the card.
 - The equivalence PASS itself on CUDA. The OpenCL half of this gate passes on the
   AMD card and the CUDA half shares every line of judgement with it, but "the
   CUDA kernels agree with the CPU" is a claim only a T4 run can make.
@@ -696,6 +715,832 @@ print("configs written to", D)
 print("GPU worker:", GPU_WORKER)
 print("CPU worker:", CPU_WORKER)
 ```
+
+---
+
+## Cell 5b: tune this card, and prove the tune was worth having
+
+### Why this cell exists
+
+The shape a GPU miner launches (`work_groups` x `local_size` x `unit_size`) is
+not a preference, it is worth double-digit percentages, and the optimum is not
+the same on two cards:
+
+- On an RX 9070 XT, `unit_size` 192 beats 64 by about 9%. That kernel is latency
+  bound and underfed, so more nonces in flight help.
+- On a Tesla T4 at repeat 16 the ordering REVERSES: 64 gave 7.54 MH/s, 96 gave
+  7.19, 128 gave 7.06, while `nvidia-smi` showed 66 to 67 W against a 70 W cap.
+  The card is power capped, and a bigger batch cannot buy more work on a card
+  already at its limit, it only holds it there longer.
+
+No fixed table serves both, which is the whole reason the tuner has to work on a
+card nobody has measured. The NVIDIA rows in `efficiency.rs` are now derived
+rather than invented (`nvidia_launch.rs` carries the derivation), but derived is
+still not measured, and on YOUR card only a tune is.
+
+### What this cell runs, and what it will not do
+
+It runs the real tuner: `app/src/autotune16.rs`, reached the way an operator
+reaches it, by putting `[efficiency] benchmark_seconds` above zero in a poworker
+config with `[gpu] use_cuda = true`. There is no reimplementation of a sweep, a
+score, a proof or a pick anywhere in the cell. The tuner probes the card, plans a
+shared corpus from what it measured, proves every candidate against
+`x16rs::block_hash` over its entire launch window, sweeps, refines around the
+leaders, soaks the winner until temperature, power, clock and hashrate stop
+moving, and patches the ini it was given.
+
+Three things the cell adds on top, none of which the tuner can do for itself:
+
+1. **An independent check.** After the tune, `x16rs_gate baseline --backend cuda`
+   measures the chosen shape and the shipped preset on *identical* fixed work
+   (`--headers 1` and batch counts chosen so both hash exactly the same nonce
+   range), in two separate processes. A CUDA binary holds one kernel build, so
+   there is no in-process A/B for it: the bar is the ~2.6% between-process spread
+   this rig has measured, and a difference under it is reported as no gain.
+2. **A refusal.** If any candidate failed the CPU oracle, or the soak never
+   settled, or the tuner refused the session, nothing is copied into the config
+   the miner runs. The tuner patches its own config in `/content/tune`; that file
+   is not what Cell 7 mines with, and this cell only copies out of it on a pass.
+3. **A clock.** The estimate is printed before any work starts, the tuner's own
+   estimate is projected against the timeout the moment it prints, and there is a
+   hard kill.
+
+### The two exit-code traps
+
+`%%bash` swallows exit codes, and so does `!cmd`: IPython ignores the status, so
+a failed command does not stop the notebook and the next cell runs on whatever
+the last successful run left behind. Everything here goes through `subprocess`
+and every exit code is printed on a line of its own.
+
+The second one is specific to this binary and is worse, because it looks like a
+verdict: **poworker exits 0 even when the tune was refused.**
+`run_block_mining_benchmark` returns, `poworker()` returns, `main()` returns,
+status 0. "[autotune] REJECTED", "the card never settled" and a clean win all
+exit 0 alike. So the exit code is necessary and never sufficient, and this cell
+parses the report and says which of the two it is reading.
+
+### Where the time goes, and why the estimate is printed first
+
+A warmup measured in BATCHES rather than seconds cost this project 37 minutes of
+blank screen once. Every wait below is announced before it is spent.
+
+On a free 2-vCPU Colab VM the dominant cost is not the GPU. `autotune_oracle_threads`
+is `available_parallelism() - 2` floored at 1, so the CPU oracle gets ONE thread,
+and `prove_shape` CPU-hashes every candidate's whole launch window at repeat 16
+before that candidate's speed is allowed to count. At the 60 kH/s per core that
+`x16rs_gate::CPU_ORACLE_HPS_PER_CORE` quotes, that is minutes per candidate.
+
+`SIZE` picks one number, `[gpu] work_groups`, which is the ceiling of the tuner's
+work-group axis. The floor is the card's multiprocessor count (40 on a T4), the
+grid is dyadic, and the coarse sweep takes the powers-of-two family of it, so:
+
+| SIZE | work_groups ceiling | coarse work-group axis | candidates | oracle nonces | estimate on a free T4 |
+| --- | --- | --- | --- | --- | --- |
+| `fast` | 256 | 64, 128, 256 | 9 | 25.7 M | about 20 min |
+| `default` | 512 | 64, 128, 256, 512 | 12 | 55.1 M | about 35 min |
+| `full` | 768 | 64, 128, 256, 512, 768 | 15 minus the ones over the batch ceiling | 73.9 M | about 50 min |
+
+The unit-size axis is 32/64/128 in all three, and 128 is the top because the T4
+measurement says the NVIDIA optimum is at the SMALL end: the grid's job is to
+bracket it from both sides. The oracle-nonce column is the sum of those
+candidates' launch windows, and it is an upper bound: the latency prune and the
+shared corpus only ever remove shapes. The `full` row already has one such
+removal in it. Its largest shape, 768x256x128, is a 25.2 M-nonce batch, which at
+7.54 MH/s is 3.3 s against a 1.5 s p95 ceiling, so the tuner drops it before
+proving it: 99.1 M nonces of grid become 73.9 M. A card that probes slower drops
+more, never fewer.
+
+Those estimates are arithmetic on two constants (7.54 MH/s and 60 kH/s per
+oracle core), not measurements of your session, and they assume a 40-SM card. The
+tuner prints its own measured estimate within the first minute and the cell
+echoes it, projects it through the soak and the final proof, and kills the run
+immediately if the projection does not fit `TIMEOUT_MIN`. That is the check worth
+watching; the table is only there so nobody stares at a blank cell before it.
+
+The tune needs no node and no pool: it finishes and returns before poworker ever
+contacts `connect`. Run it any time after Cell 4, and after Cell 5 if you want
+the result installed into the miner's config automatically.
+
+### The cell
+
+```python
+# ===========================================================================
+# Cell 5b: tune this card with the REAL tuner, and prove the tune was worth it
+# ===========================================================================
+#
+# WHAT RUNS. app/src/autotune16.rs, reached the way an operator reaches it:
+# [efficiency] benchmark_seconds > 0 in a poworker config with [gpu] use_cuda =
+# true. poworker::run_cuda_benchmark builds the TuneRequest, the tuner probes the
+# card, plans a shared corpus, proves EVERY candidate against x16rs::block_hash
+# over its whole launch window, sweeps, refines, soaks until the card stops
+# moving, and patches the ini it was given. Nothing here re-implements a sweep, a
+# score, a proof or a pick. What this cell adds is the one thing the tuner cannot
+# do for itself: an independent fixed-work measurement of the shape it chose
+# against the shape it started from, and a refusal to let a tune that failed its
+# own proofs reach the config the miner runs.
+#
+# TWO EXIT-CODE TRAPS, both already walked into on this project:
+#
+#   * %%bash swallows exit codes, and so does `!cmd`: IPython ignores the status,
+#     so the next cell runs on whatever the last successful run left behind.
+#     Every process below runs under subprocess and its exit code is PRINTED on
+#     its own line and then read.
+#   * poworker exits 0 EVEN WHEN THE TUNE WAS REFUSED. run_block_mining_benchmark
+#     returns, poworker() returns, main() returns, status 0. "[autotune]
+#     REJECTED", "the card never settled" and a clean win all exit 0 alike. The
+#     exit code here is necessary and never sufficient: the verdict is parsed out
+#     of the report, and this cell says which of the two it is reading.
+#
+# THE COST TRAP. A warmup measured in BATCHES rather than seconds cost this
+# project 37 minutes of blank screen once. So: the estimate is printed BEFORE any
+# work starts, the tuner's own estimate is echoed and projected the moment it
+# appears, a heartbeat prints during silence, and a hard timeout kills the run
+# rather than letting it eat the session.
+#
+# WHERE THE TIME GOES, and it is not where you would guess. On a free 2-vCPU
+# Colab VM the CPU oracle runs on ONE thread (autotune_oracle_threads is
+# available_parallelism() - 2, floored at 1) and it CPU-hashes every candidate's
+# entire launch window at repeat 16. That is minutes per candidate and it dwarfs
+# the GPU sweep. It is also the thing being bought: a shape whose hashes were
+# never proved equal to the CPU's is a number, not a result.
+
+import math, os, queue, re, shutil, subprocess, sys, threading, time
+
+# ------------------------------------------------------------------ knobs --
+D            = "/content/fullnodedev"
+REL          = os.path.join(D, "target", "release")
+TUNE_DIR     = "/content/tune"                            # the tuner's own config
+MINER_CONFIG = os.path.join(REL, "poworker.config.ini")   # what Cell 7 mines with
+CUDA_DEVICE  = 0
+SIZE         = "default"   # "fast" | "default" | "full", see SIZES below
+MODE         = "max"       # "max" ranks sustained hashrate, "eco" ranks kH/J
+PRESET       = "nvidia_balanced"   # the shipped shape the tune is judged against
+TIMEOUT_MIN  = 75          # hard kill on the tune. Nothing may outlive the session.
+INSTALL      = True        # copy a PASSING tune into MINER_CONFIG
+
+# The three sizes differ in ONE thing: [gpu] work_groups, which is the ceiling of
+# the tuner's work-group axis (poworker.rs: max_wg = memory_wg.min(work_groups)).
+# The floor is the card's multiprocessor count, so on a 40-SM T4 the axis is
+# 48..cap on the dyadic grid, the coarse sweep takes the powers-of-two family of
+# it, and the unit-size axis is 32/64/128 whatever the cap is.
+#
+# grid_nonces is the sum of those coarse candidates' launch windows on a 40-SM
+# card, which is what the CPU oracle has to hash. It is an UPPER BOUND: the
+# latency prune and the shared corpus only ever remove shapes.
+SIZES = {
+    #           wg ceiling      benchmark_seconds   sum of candidate windows
+    "fast":    {"cap": 256, "seconds": 180, "grid_nonces": 25.7e6},
+    "default": {"cap": 512, "seconds": 240, "grid_nonces": 55.1e6},
+    "full":    {"cap": 768, "seconds": 360, "grid_nonces": 73.9e6},
+}
+
+# Constants the estimate is arithmetic on, each with its source.
+T4_MHS          = 7.54e6   # measured on a real T4, repeat 16, at 256x256x64
+ORACLE_HPS_CORE = 60_000.0 # x16rs_gate::CPU_ORACLE_HPS_PER_CORE
+PROOF_LAUNCHES  = 33       # per candidate: 1 all-ones count, 31 rank thresholds,
+                           # 1 best-hash reduction, each reading the whole window
+SPREAD_PCT      = 2.6      # x16rs_gate::BETWEEN_PROCESS_SPREAD_PCT
+BASELINE_RUNS   = 7
+BASELINE_WARMUP = 4        # BATCHES, not seconds. Printed in both units below.
+BASELINE_TARGET = 25e6     # nonces per baseline run, about 3.3 s on a T4
+BASELINE_BUDGET = 20 * 60  # seconds allowed for both baselines together
+
+
+def die(msg):
+    """Stop the notebook loudly. A nonzero exit does not stop a Colab notebook,
+    so everything here raises rather than trusting a status nobody reads."""
+    lines = msg.strip().splitlines()
+    print("\n" + "#" * 72)
+    print("#  STOP")
+    for line in lines:
+        print("#  " + line)
+    print("#" * 72)
+    sys.stdout.flush()
+    raise RuntimeError(lines[0])
+
+
+def hhmm(seconds):
+    seconds = int(max(0, seconds))
+    return "%02d:%02d" % (seconds // 60, seconds % 60)
+
+
+def wrap(text, width=66):
+    out, line = [], ""
+    for word in text.split():
+        if len(line) + len(word) + 1 > width:
+            out.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+# --------------------------------------------------------------- preflight --
+if shutil.which("nvidia-smi") is None:
+    die("""No nvidia-smi. This runtime has no NVIDIA GPU, so there is no card to
+tune and every number below would be a measurement of nothing.
+Runtime -> Change runtime type -> T4 GPU.""")
+
+POWORKER = os.path.join(REL, "poworker")
+GATE     = os.path.join(REL, "x16rs_gate")
+for path, cell in ((POWORKER, "Cell 4"), (GATE, "Cell 2")):
+    if not os.path.exists(path):
+        die("%s is missing. Run %s first." % (path, cell))
+if SIZE not in SIZES:
+    die("SIZE must be one of: %s" % ", ".join(sorted(SIZES)))
+size = SIZES[SIZE]
+
+gpu_name = subprocess.run(
+    ["nvidia-smi", "--query-gpu=name,power.limit,memory.total",
+     "--format=csv,noheader"], capture_output=True, text=True).stdout.strip()
+cpus = os.cpu_count() or 2
+oracle_threads = max(1, cpus - 2)   # autotune_oracle_threads(), poworker.rs
+is_t4 = "T4" in gpu_name.upper()
+
+print("card            :", gpu_name)
+print("vCPUs           : %d, so the tuner's CPU oracle gets %d thread(s)"
+      % (cpus, oracle_threads))
+
+# --------------------------------------------------- what this will cost ----
+# All arithmetic on the two constants above, none of it measured on YOUR card.
+# The tuner prints its own estimate within the first minute and that one IS
+# measured; this is here so nobody stares at a blank cell until then.
+est_oracle = size["grid_nonces"] / (ORACLE_HPS_CORE * oracle_threads)
+est_launch = size["grid_nonces"] * PROOF_LAUNCHES / T4_MHS
+est_sweep  = 0.8 * size["seconds"]                            # SWEEP_BUDGET_SHARE
+est_soak   = min(900.0, max(90.0, size["seconds"] / 2.0))     # soak_cap_seconds
+est_refine = 0.4 * (est_oracle + est_launch)                  # up to 8 neighbours
+est_final  = 300.0                                            # 255-threshold proof
+est_total  = est_oracle + est_launch + est_sweep + est_soak + est_refine + est_final
+
+print("")
+print("SIZE = %s: [gpu] work_groups = %d, [efficiency] benchmark_seconds = %d"
+      % (SIZE, size["cap"], size["seconds"]))
+print("estimate, at the 7.54 MH/s measured on a T4 and %d kH/s per oracle core:"
+      % (ORACLE_HPS_CORE / 1000))
+for label, value in (("CPU oracle, proves every candidate", est_oracle),
+                     ("proof launches on the card", est_launch),
+                     ("timed sweep passes", est_sweep),
+                     ("refinement allowance", est_refine),
+                     ("soak, at most", est_soak),
+                     ("final 255-threshold proof, allowance", est_final)):
+    print("    %-38s %5.0f s" % (label, value))
+print("    %-38s %5.0f s  (about %d min)"
+      % ("TOTAL, upper bound", est_total, round(est_total / 60)))
+print("hard timeout    : %d min" % TIMEOUT_MIN)
+if not is_t4:
+    print("NOTE: this is not a T4. That estimate is grid arithmetic for a 40-")
+    print("      multiprocessor card at 7.54 MH/s and does not transfer. Read the")
+    print("      tuner's own '[autotune] estimated total' line instead.")
+if MODE != "max":
+    print("NOTE: MODE = %s, so the tuner ranks candidates on something other than"
+          % MODE)
+    print("      throughput. The fixed-work check at the end is a HASHRATE")
+    print("      comparison, so a tuned shape that trades hashrate for watts is")
+    print("      expected to lose it. Read the kH/J line above it.")
+if est_total > TIMEOUT_MIN * 60:
+    die("""The estimate (%d min) is longer than TIMEOUT_MIN (%d min), so this would
+be killed part way and prove nothing. Raise TIMEOUT_MIN, or set SIZE = "fast",
+which searches 48..256 work groups instead of 48..%d."""
+    % (round(est_total / 60), TIMEOUT_MIN, size["cap"]))
+sys.stdout.flush()
+
+
+# ---------------------------------------------------- streaming subprocess --
+def run_streaming(argv, cwd, deadline, label, watch=None):
+    """Run argv, stamp every line with elapsed time, print a heartbeat while the
+    child is quiet, kill it at `deadline`. `watch(line)` may return a string,
+    which kills the child and becomes the abort reason.
+
+    Returns (exit_code, lines, abort_reason); exit_code is None if it was killed.
+    """
+    print("\n>>> %s" % label)
+    print(">>> " + " ".join(argv))
+    sys.stdout.flush()
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    lines, abort, q = [], None, queue.Queue()
+
+    def reader():
+        for line in proc.stdout:
+            q.put(line.rstrip("\n"))
+        q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = last_seen = time.time()
+    last_line = ""
+    while True:
+        try:
+            line = q.get(timeout=5)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            break
+        if line != "":
+            lines.append(line)
+            last_seen, last_line = time.time(), line
+            print("[+%s] %s" % (hhmm(time.time() - started), line))
+            sys.stdout.flush()
+            if watch is not None:
+                abort = watch(line)
+                if abort:
+                    break
+        elif time.time() - last_seen > 45:
+            print("[+%s] ... still running, %ds since the last line. The CPU oracle"
+                  " is silent while it hashes. Last line: %s"
+                  % (hhmm(time.time() - started), int(time.time() - last_seen),
+                     last_line[:80]))
+            sys.stdout.flush()
+            last_seen = time.time()
+        if time.time() > deadline:
+            abort = "the hard timeout"
+            break
+    if abort:
+        print("\n[+%s] KILLING %s: %s" % (hhmm(time.time() - started), label, abort))
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("exit code (%s): killed, no status" % label)
+        sys.stdout.flush()
+        return None, lines, abort
+    rc = proc.wait()
+    print("[+%s] %s finished" % (hhmm(time.time() - started), label))
+    print("exit code (%s): %d" % (label, rc))
+    sys.stdout.flush()
+    return rc, lines, None
+
+
+# --------------------------------- what shape does the SHIPPED preset give? --
+# Read out of the binary rather than copied out of nvidia_launch.rs, so this
+# cannot quote a ladder the build does not contain. A config with gpu_profile set
+# and NO work_groups / unit_size keys makes resolve_gpu_tuning fall back to the
+# preset, and PoWorkConf::new prints what it resolved before anything else runs.
+os.makedirs(os.path.join(TUNE_DIR, "preset"), exist_ok=True)
+preset_cfg = os.path.join(TUNE_DIR, "preset", "poworker.config.ini")
+open(preset_cfg, "w").write("""connect = 127.0.0.1:1
+supervene = 0
+
+[gpu]
+use_opencl = false
+use_cuda = false
+gpu_profile = %s
+
+[efficiency]
+mode = %s
+benchmark_seconds = 0
+""" % (PRESET, MODE))
+
+print("\n>>> asking this build what %s resolves to" % PRESET)
+sys.stdout.flush()
+proc = subprocess.Popen([POWORKER, preset_cfg], cwd=REL, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+killer = threading.Timer(60, proc.kill)   # it must not be able to hang the cell
+killer.start()
+RE_EFF = re.compile(
+    r"\[efficiency\] mode=(\S+) profile=(\S+) work_groups=(\d+) unit_size=(\d+)")
+preset_line = None
+try:
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        print("   ", line)
+        preset_line = RE_EFF.search(line)
+        if preset_line:
+            break
+finally:
+    killer.cancel()
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+if preset_line is None:
+    die("""poworker never printed its [efficiency] line, so the shipped preset for
+%s could not be read out of this build, and there is nothing to judge a tune
+against.""" % PRESET)
+preset_shape = (int(preset_line.group(3)), int(preset_line.group(4)))
+print("shipped preset  : %s = work_groups %d, unit_size %d, local_size 256"
+      % (PRESET, preset_shape[0], preset_shape[1]))
+if preset_shape[0] > size["cap"]:
+    print("NOTE: the preset's %d work groups is ABOVE this SIZE's %d ceiling, so"
+          % (preset_shape[0], size["cap"]))
+    print("      the tuner cannot reach the preset's own shape. The comparison at")
+    print("      the end is still valid, it just is not a search that contains it.")
+sys.stdout.flush()
+
+
+# ------------------------------------------------------- the tuner's config --
+# Every key the tune writes back MUST already be present: apply_benchmark_pick
+# REPLACES keys, it does not add them, so a missing unit_size line would mean a
+# tune that silently keeps the old value. gpu_profile, work_groups, unit_size and
+# benchmark_seconds are all here for that reason.
+#
+# supervene = 0 means no CPU assist threads, so Economics::cpu_watts is 0 and the
+# watts in the report are the card's, straight from nvidia-smi.
+os.makedirs(TUNE_DIR, exist_ok=True)
+tune_cfg = os.path.join(TUNE_DIR, "poworker.config.ini")
+open(tune_cfg, "w").write("""connect = 127.0.0.1:18082
+supervene = 0
+nonce_max = 4294967295
+notice_wait = 3
+
+[gpu]
+use_opencl = false
+use_cuda = true
+cuda_device = %d
+gpu_profile = %s
+work_groups = %d
+local_size = 256
+unit_size = 64
+
+[efficiency]
+mode = %s
+benchmark_seconds = %d
+dynamic_supervene = false
+oom_fallback = true
+max_temp_c = 0
+pause_if_unprofitable = false
+power_cost_kwh = 0
+hac_price = 0
+stats_file = tune-stats.json
+""" % (CUDA_DEVICE, PRESET, size["cap"], MODE, size["seconds"]))
+print("\ntune config     :", tune_cfg)
+print("miner config    : %s %s" % (MINER_CONFIG,
+      "" if os.path.exists(MINER_CONFIG) else "(MISSING: Cell 5 writes it)"))
+print("no node needed  : the tune finishes and returns before poworker ever")
+print("                  contacts `connect`.")
+sys.stdout.flush()
+
+
+# ------------------------------------------------------------- run the tune --
+RE_ESTIMATE = re.compile(r"estimated total before the soak: about (\d+)s")
+started_at = time.time()
+deadline = started_at + TIMEOUT_MIN * 60
+
+
+def watch(line):
+    """Early abort. The tuner's own estimate covers the timed sweep passes and
+    the CPU oracle. It does NOT cover the 33 proof launches per candidate, the
+    refinement, the soak or the 255-threshold final proof, so this projects it by
+    1.5 and adds the soak cap and the final-proof allowance. Better to stop in
+    the first minute than to be killed 60 minutes in with nothing to show."""
+    m = RE_ESTIMATE.search(line)
+    if not m:
+        return None
+    tuner_est = float(m.group(1))
+    need = tuner_est * 1.5 + est_soak + est_final
+    left = deadline - time.time()
+    print("    >>> the tuner's OWN estimate is %ds. Projected through the final"
+          " proof: %d min. Left before the hard timeout: %d min."
+          % (tuner_est, round(need / 60), round(left / 60)))
+    sys.stdout.flush()
+    if need > left:
+        return ("this tune projects to %d more minutes and only %d remain. Nothing"
+                " has been wasted yet: set SIZE = \"fast\", or raise TIMEOUT_MIN."
+                % (round(need / 60), round(left / 60)))
+    return None
+
+
+rc, log, abort = run_streaming(
+    [POWORKER, tune_cfg], REL, deadline,
+    "the tuner (poworker, benchmark_seconds=%d)" % size["seconds"], watch=watch)
+text = "\n".join(log)
+
+# --------------------------------------------------------------- read it ----
+UNITS = {"H/s": 1.0, "kH/s": 1e3, "MH/s": 1e6}
+chosen = re.search(
+    r"chosen shape\s*:\s*work_groups=(\d+) local_size=(\d+) unit_size=(\d+)", text)
+sust = re.search(
+    r"sustained\s*:\s*([\d.]+) (MH/s|kH/s|H/s) raw, ([\d.]+) (MH/s|kH/s|H/s)", text)
+lat = re.search(r"batch latency\s*:\s*p50 (\d+) ms, p95 (\d+) ms", text)
+power = re.search(r"board power\s*:\s*([\d.]+) W (measured|estimated)", text)
+soak = re.search(
+    r"soak\s*:\s*(\d+) passes over (\d+)s, (settled|DID NOT SETTLE[^\n]*)", text)
+applied = re.search(
+    r"\[benchmark\] Applied gpu_profile=(\S+) \(work_groups=(\d+), unit_size=(\d+)\)",
+    text)
+rejects = [l for l in log if "REJECTED" in l and "[autotune] REJECTED:" not in l]
+proof_bad = [l for l in rejects if "failed the equivalence proof" in l]
+refused = [l for l in log if "[autotune] REJECTED:" in l]
+
+fail = []
+if abort:
+    fail.append("the run was killed: %s." % abort)
+elif rc != 0:
+    fail.append("poworker exited %s. It exits 0 even when a tune is refused, so a"
+                " nonzero status is something else: a panic, or the VM's OOM"
+                " killer." % rc)
+if refused:
+    fail.append("the tuner refused the whole session. %s" % refused[0])
+if proof_bad:
+    fail.append("%d candidate(s) FAILED THE CPU ORACLE, or errored inside the"
+                " proof that runs it. A shape whose hashes were not proved equal"
+                " to x16rs::block_hash must not reach a mining config, so nothing"
+                " was installed. The first one: %s" % (len(proof_bad), proof_bad[0]))
+elif rejects:
+    fail.append("%d candidate(s) were rejected for reasons other than the proof."
+                " A healthy tune rejects none, so this cell will not install a"
+                " config over it." % len(rejects))
+if chosen is None or sust is None:
+    fail.append("no report block was printed, so no shape was chosen.")
+if soak is not None and not soak.group(3).startswith("settled"):
+    fail.append("the soak did not settle, so the shape is not proven to sustain:"
+                " %s" % soak.group(3))
+if applied is None and not fail:
+    fail.append("the tuner never printed '[benchmark] Applied ...', so it reported"
+                " a winner and did not patch its own config.")
+
+print("\n" + "=" * 72)
+print(" THE TUNE")
+print("=" * 72)
+for line in rejects + refused:
+    print("  rejection:", line)
+shape = raw = valid = None
+if chosen and sust:
+    shape = (int(chosen.group(1)), int(chosen.group(3)))
+    raw = float(sust.group(1)) * UNITS[sust.group(2)]
+    valid = float(sust.group(3)) * UNITS[sust.group(4)]
+    print("  chosen shape    : work_groups=%d local_size=256 unit_size=%d"
+          % (shape[0], shape[1]))
+    print("  hashrate        : %.2f MH/s raw, %.2f MH/s after the stale work a"
+          " template change throws away" % (raw / 1e6, valid / 1e6))
+    if lat:
+        print("  batch latency   : p50 %s ms, p95 %s ms, against the 1500 ms ceiling"
+              % (lat.group(1), lat.group(2)))
+    if power and power.group(2) == "measured":
+        watts = float(power.group(1))
+        print("  board power     : %.0f W, measured by nvidia-smi" % watts)
+        print("  efficiency      : %.1f kH/J raw, %.1f kH/J after stale work."
+              % (raw / watts / 1e3, valid / watts / 1e3))
+        print("                    Card only: supervene = 0 here, so the tuner's")
+        print("                    cpu_watts term is 0 and this is the whole draw")
+        print("                    it scored on.")
+    else:
+        print("  board power     : NOT MEASURED, so there is no kH/J. On NVIDIA")
+        print("                    that means nvidia-smi did not report power.draw,")
+        print("                    and an eco tune would have ranked every shape on")
+        print("                    one constant, which is max mode by another name.")
+    if soak:
+        print("  soak            : %s passes over %ss, %s"
+              % (soak.group(1), soak.group(2), soak.group(3)))
+else:
+    print("  no report. The last lines the tuner printed were:")
+    for line in log[-15:]:
+        print("      " + line)
+sys.stdout.flush()
+
+
+# ------------------- an independent fixed-work check: tuned vs the preset ----
+# Two `x16rs_gate baseline` runs: the same kernel, the same height (repeat 16) and
+# the same fixed corpus the tuner used, measured by a DIFFERENT binary in a
+# different process, so the tune does not mark its own homework.
+#
+# Identical work on both sides on purpose: --headers 1 pins both shapes to one
+# intro, and the batch counts are chosen so both hash exactly the same nonce
+# range. What is left is the between-process spread, about 2.6% on this kernel,
+# and that is the bar a claimed gain has to clear.
+compare = None
+if shape and not fail:
+    if shape == preset_shape:
+        print("\nThe tuner chose the shipped preset's own shape, so there is nothing")
+        print("to compare: the baseline would be the same shape twice.")
+    else:
+        per_w = shape[0] * 256 * shape[1]
+        per_p = preset_shape[0] * 256 * preset_shape[1]
+        block = (per_w * per_p) // math.gcd(per_w, per_p)   # identical work needs
+        total = block * max(1, math.ceil(BASELINE_TARGET / block))  # a common multiple
+        rate = raw if raw and raw > 0 else T4_MHS
+        runs = BASELINE_RUNS
+        while runs > 3 and 2 * runs * total / rate > BASELINE_BUDGET / 2:
+            runs -= 1
+        print("\nfixed-work check: %d runs of %d nonces on EACH shape, the same"
+              % (runs, total))
+        print("nonces and the same single header on both sides, about %.1f s a run"
+              % (total / rate))
+        print("at the tuned shape's own %.2f MH/s." % (rate / 1e6))
+        print("warmup is %d BATCHES, once, before any timed run: about %.1f s for"
+              % (BASELINE_WARMUP, BASELINE_WARMUP * per_w / rate))
+        print("the tuned shape and %.1f s for the preset. Both sides together:"
+              % (BASELINE_WARMUP * per_p / rate))
+        print("about %d min." % max(1, round(2 * runs * total / rate / 60 + 1)))
+        sys.stdout.flush()
+        bl_deadline = time.time() + BASELINE_BUDGET
+
+        def baseline(what, wg, us):
+            rc2, out, ab = run_streaming(
+                [GATE, "baseline", "--backend", "cuda",
+                 "--cuda-device", str(CUDA_DEVICE),
+                 "--work-groups", str(wg), "--local-size", "256",
+                 "--unit-size", str(us), "--headers", "1",
+                 "--batches", str(total // (wg * 256 * us)), "--runs", str(runs),
+                 "--warmup", str(BASELINE_WARMUP)],
+                REL, bl_deadline, "baseline %s (%dx256x%d)" % (what, wg, us))
+            if ab or rc2 != 0:
+                return None, None
+            body = "\n".join(out)
+            med = re.search(r"median\s*:\s*([\d.]+) (MH/s|kH/s|H/s)", body)
+            spr = re.search(r"peak-to-peak ([\d.]+)%", body)
+            if med is None:
+                return None, None
+            return (float(med.group(1)) * UNITS[med.group(2)],
+                    float(spr.group(1)) if spr else None)
+
+        tuned_hps, tuned_spread = baseline("tuned", shape[0], shape[1])
+        preset_hps, preset_spread = baseline("preset", preset_shape[0], preset_shape[1])
+        if tuned_hps is None or preset_hps is None:
+            fail.append("the fixed-work baseline did not complete, so the tuned"
+                        " shape was never compared with the shipped preset by"
+                        " anything except the tuner itself.")
+        else:
+            delta = (tuned_hps - preset_hps) / preset_hps * 100.0
+            compare = (tuned_hps, preset_hps, delta)
+            print("\n" + "=" * 72)
+            print(" TUNED vs SHIPPED PRESET: fixed work, separate processes")
+            print("=" * 72)
+            print("  tuned  %5dx256x%-4d: %6.2f MH/s   (its own runs spanned %s)"
+                  % (shape[0], shape[1], tuned_hps / 1e6,
+                     "%.2f%%" % tuned_spread if tuned_spread is not None else "?"))
+            print("  preset %5dx256x%-4d: %6.2f MH/s   (its own runs spanned %s)"
+                  % (preset_shape[0], preset_shape[1], preset_hps / 1e6,
+                     "%.2f%%" % preset_spread if preset_spread is not None else "?"))
+            print("  difference          : %+.2f%%, against the %.1f%% between-"
+                  "process spread" % (delta, SPREAD_PCT))
+            if abs(delta) < SPREAD_PCT:
+                print("  VERDICT             : NO GAIN SHOWN. These two shapes measure")
+                print("                        the same here. The tune is still worth")
+                print("                        having, it PROVED the shape against the")
+                print("                        CPU, but do not quote a speedup.")
+            elif delta > 0:
+                print("  VERDICT             : the tuned shape BEATS the shipped preset")
+                print("                        by %.2f%%, which clears the spread." % delta)
+            else:
+                print("  VERDICT             : the tuned shape LOST to the preset by")
+                print("                        %.2f%%, outside the spread. That is a"
+                      % -delta)
+                print("                        contradiction worth reporting, and no")
+                print("                        config is installed over it.")
+                fail.append("the tuned shape measured %.2f%% SLOWER than the shipped"
+                            " preset in an independent fixed-work run." % -delta)
+sys.stdout.flush()
+
+
+# ------------------------------------------------- install, or say why not ---
+def patch_ini(path, wg, us, profile):
+    """Rewrite [gpu] work_groups / unit_size / gpu_profile, ADDING the keys when
+    they are absent. efficiency.rs apply_benchmark_pick only replaces keys that
+    already exist, which is right for the tuner's own config (written above with
+    all of them) and not enough for a config written by Cell 5."""
+    want = {"gpu_profile": str(profile), "work_groups": str(wg), "unit_size": str(us)}
+    out, in_gpu, seen, gpu_at = [], False, set(), None
+    for line in open(path).read().splitlines():
+        t = line.strip()
+        if t.startswith("["):
+            in_gpu = t.lower() == "[gpu]"
+            if in_gpu:
+                gpu_at = len(out) + 1        # the line just after the header
+        elif in_gpu and "=" in t and not t.startswith(("#", ";")):
+            key = t.split("=", 1)[0].strip()
+            if key in want:
+                seen.add(key)
+                line = "%s = %s" % (key, want[key])
+        out.append(line)
+    missing = ["%s = %s" % (k, v) for k, v in want.items() if k not in seen]
+    if gpu_at is None:
+        out += ["", "[gpu]"] + missing
+    else:
+        out[gpu_at:gpu_at] = missing
+    open(path, "w").write("\n".join(out) + "\n")
+
+
+print("\n" + "#" * 72)
+if fail:
+    print("#  RESULT: FAIL. Nothing was written to the miner's config.")
+    for reason in fail:
+        print("#")
+        for line in wrap(reason):
+            print("#  " + line)
+    print("#")
+    for line in wrap("The tuner may still have patched its OWN config at %s. That"
+                     " file is not what Cell 7 mines with, and this cell copied"
+                     " nothing out of it." % tune_cfg):
+        print("#  " + line)
+    print("#" * 72)
+    print("total wall time : %s" % hhmm(time.time() - started_at))
+    raise RuntimeError(fail[0])
+
+print("#  RESULT: PASS")
+print("#  shape %dx256x%d, proved against the CPU over its whole %d-nonce window,"
+      % (shape[0], shape[1], shape[0] * 256 * shape[1]))
+print("#  settled under soak, and %s"
+      % ("measured %+.2f%% against the shipped preset." % compare[2] if compare
+         else "identical to the shipped preset."))
+print("#" * 72)
+print("the tuner patched its own config: %s -> gpu_profile=%s work_groups=%s"
+      " unit_size=%s" % (tune_cfg, applied.group(1), applied.group(2),
+                         applied.group(3)))
+if (int(applied.group(2)), int(applied.group(3))) != shape:
+    die("""The shape in the report and the shape written to the ini disagree.
+The report says %dx%d, the ini was given %sx%s. Do not mine on either until that
+is understood.""" % (shape[0], shape[1], applied.group(2), applied.group(3)))
+# And read it back off the disk, because "Applied" is a log line and the file is
+# the thing. apply_benchmark_pick REPLACES keys and never adds them, so a config
+# missing a key would print exactly this line and change nothing.
+on_disk = dict(re.findall(r"^\s*(work_groups|unit_size)\s*=\s*(\d+)\s*$",
+                          open(tune_cfg).read(), re.M))
+if (int(on_disk.get("work_groups", -1)), int(on_disk.get("unit_size", -1))) != shape:
+    die("""The tuner said it applied %dx%d but %s holds work_groups=%s
+unit_size=%s. Nothing was installed."""
+    % (shape[0], shape[1], tune_cfg, on_disk.get("work_groups"),
+       on_disk.get("unit_size")))
+if INSTALL and os.path.exists(MINER_CONFIG):
+    patch_ini(MINER_CONFIG, shape[0], shape[1], applied.group(1))
+    print("installed into %s:" % MINER_CONFIG)
+    for line in open(MINER_CONFIG).read().splitlines():
+        if line.strip().startswith(("work_groups", "unit_size", "gpu_profile")):
+            print("    " + line)
+elif INSTALL:
+    print("MINER_CONFIG does not exist yet (Cell 5 writes it). Run this cell again")
+    print("after Cell 5, or set [gpu] work_groups = %d and unit_size = %d there by"
+          % (shape[0], shape[1]))
+    print("hand.")
+print("total wall time : %s" % hhmm(time.time() - started_at))
+```
+
+### What PASS and FAIL look like
+
+The blocks below are what the cell's own printing produces given the tuner's
+format strings. The rates in them are the ones measured on a real T4 at
+256x256x64; **the cell itself has never been executed against an NVIDIA device by
+anyone here**, so read them as the shape of the output, not as a prediction of
+your card's numbers.
+
+**PASS.** Four things have to be true together: no candidate was rejected, the
+soak settled, the ini on disk really holds the chosen shape, and the independent
+fixed-work run did not contradict the tune.
+
+```
+========================================================================
+ THE TUNE
+========================================================================
+  chosen shape    : work_groups=256 local_size=256 unit_size=64
+  hashrate        : 7.54 MH/s raw, 7.40 MH/s after the stale work a template change throws away
+  batch latency   : p50 552 ms, p95 571 ms, against the 1500 ms ceiling
+  board power     : 66 W, measured by nvidia-smi
+  efficiency      : 114.2 kH/J raw, 112.1 kH/J after stale work.
+  soak            : 6 passes over 148s, settled
+
+========================================================================
+ TUNED vs SHIPPED PRESET: fixed work, separate processes
+========================================================================
+  tuned    256x256x64  :   7.54 MH/s   (its own runs spanned 0.93%)
+  preset   320x256x64  :   7.10 MH/s   (its own runs spanned 0.93%)
+  difference          : +6.20%, against the 2.6% between-process spread
+  VERDICT             : the tuned shape BEATS the shipped preset
+                        by 6.20%, which clears the spread.
+
+########################################################################
+#  RESULT: PASS
+########################################################################
+```
+
+**PASS with no gain.** This is a result, not a disappointment, and the cell says
+so in as many words. The preset ladder was derived from the same occupancy
+arithmetic the tuner searches around, so the tuner landing on something that
+measures the same is the expected outcome on a T4. What was bought is the proof:
+this shape's hashes were compared against `x16rs::block_hash` over its whole
+window, which no preset has ever been.
+
+```
+  difference          : +0.94%, against the 2.6% between-process spread
+  VERDICT             : NO GAIN SHOWN. These two shapes measure
+                        the same here. The tune is still worth
+                        having, it PROVED the shape against the
+                        CPU, but do not quote a speedup.
+```
+
+**FAIL.** The cell prints a bordered `RESULT: FAIL` block naming every reason and
+then raises, so the notebook stops. Nothing is written to the miner's config in
+any of these.
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| `N candidate(s) FAILED THE CPU ORACLE` with the `[autotune] WxU: REJECTED (failed the equivalence proof: ...)` line quoted | A candidate's hashes did not equal `x16rs::block_hash`, or the proof errored on the device. On a card whose kernels passed Cell 2, the first reading is a shape-dependent defect: how nonces are placed or how the per-work-group reduction is built | Stop. This is Cell 2 territory: rerun the gate, and quote the failing shape. Do not mine on this build |
+| `N candidate(s) were rejected for reasons other than the proof` | Out of memory, a launch the device refused, a shape the corpus could not tile | Read the quoted line. A healthy tune rejects none, which is why this also refuses to install |
+| `the soak did not settle` | The winner's hashrate, temperature, power or clock were still moving after the soak cap, so the shape is not proven to sustain | Raise `benchmark_seconds` (the soak cap is half of it, up to 900 s). On Colab, also suspect a shared host |
+| `the tuner refused the whole session` (`[autotune] REJECTED: ...`) | Planning failed before anything was measured. Usually "only 1 launch shape survived planning": a tune of one shape is a report, not a comparison | The message names the fix, and it is normally a lower `SIZE` or a larger `benchmark_seconds` |
+| `the tuned shape measured X% SLOWER than the shipped preset` | The tune and an independent fixed-work run disagree by more than the between-process spread | Worth reporting. Keep both logs: this is either a real regression in the pick or a real hole in the comparison |
+| `poworker exited N` | Not a refused tune, which exits 0. A panic, or the VM's OOM killer taking the process | Check the tail of the log. The oracle peaks at 64 bytes a nonce, so a 16.8 M-nonce window wants about 1.1 GB |
+| `the run was killed: the hard timeout` | The tune outlived `TIMEOUT_MIN` | Lower `SIZE` or raise `TIMEOUT_MIN`. If it was killed in the first minute instead, the cell projected the tuner's own estimate past the timeout and stopped before spending it |
+
+**After a PASS**, `target/release/poworker.config.ini` holds the tuned shape and
+Cell 7 mines with it. The tune's own log is beside its config, at
+`/content/tune/poworker.log`, and it holds every candidate's rate, watts,
+temperature and proof line: keep it, because the report block alone does not
+carry the losers.
+
 
 ---
 
