@@ -1,4 +1,4 @@
-; HAC block miner — NVIDIA CUDA (RTX 20xx / 30xx / 40xx)
+; HAC block miner: NVIDIA CUDA (RTX 20xx / 30xx / 40xx)
 ; Copy via INSTALL-CUDA-CONFIG.bat or edit target\release\poworker.config.ini
 
 connect = 127.0.0.1:8080
@@ -12,9 +12,13 @@ power_cost_kwh = 0.15
 gpu_watts = 0
 cpu_watts_per_thread = 8
 hac_price = 0
+; dynamic_supervene does nothing unless supervene_max > 0: spawn_supervene
+; refuses to rebalance without a ceiling to rebalance towards. This said true
+; next to a 0 cap, so the CPU assist never moved. The cap is the configured
+; thread count above, which is what the flag was always meant to reach.
 dynamic_supervene = true
 supervene_min = 2
-supervene_max = 0
+supervene_max = 4
 oom_fallback = true
 max_temp_c = 0
 throttle_work_groups = 1024
@@ -28,8 +32,13 @@ benchmark_seconds = 0
 use_cuda = true
 use_opencl = false
 cuda_device = 0
+; cpu_assist assumes poworker is the ONLY miner on this box. The diamond
+; worker's automatic thread count already takes every logical CPU but two, and
+; those two are the fullnode's and this card's feed thread. Running both with
+; cpu_assist on spends them twice: set this false, or lower diaworker's
+; supervene by these threads.
 cpu_assist = true
-; RTX starting point — tune work_groups / unit_size after genesis test
+; RTX starting point: tune work_groups / unit_size after genesis test
 work_groups = 131072
 local_size = 256
 unit_size = 8

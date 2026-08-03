@@ -276,8 +276,23 @@ impl MinerApp {
             &mut use_cuda,
             currency,
         );
-        if mining_kind == MiningKind::Hacd && cpus[cpu_idx].supervene == 0 {
-            cpu_idx = cpus.iter().position(|p| p.supervene > 0).unwrap_or(cpu_idx);
+        if mining_kind == MiningKind::Hacd {
+            // The thread count above came from `poworker.config.ini`, which is
+            // the only file the rest of these settings live in. A HACD operator's
+            // thread count is written to `diaworker.config.ini` and was never
+            // read back, so every restart threw the choice away and the panel
+            // showed a number the diamond miner was not running. Read the file
+            // this mode actually writes.
+            if let Some(sv) = load_panel_ini(&dia_config_path).supervene {
+                if let Some(i) = presets::cpu_idx_for_supervene(&cpus, sv) {
+                    cpu_idx = i;
+                }
+            }
+            if cpus[cpu_idx].supervene == 0 {
+                // The smallest rung was the old substitute and it is the wrong
+                // one: a diamond miner that must pick something picks the machine.
+                cpu_idx = presets::hacd_default_idx(&cpus).unwrap_or(cpu_idx);
+            }
         }
         let mode = match mode_idx {
             0 => EfficiencyMode::Eco,
@@ -519,7 +534,20 @@ impl MinerApp {
     }
 
     fn cpu_label(&self, idx: usize) -> &str {
-        self.cpu_presets[idx].label
+        &self.cpu_presets[idx].label
+    }
+
+    /// CPU threads the panel will really write for the currently selected
+    /// worker. Not always the picker's raw number: see
+    /// `config::effective_supervene`. Every place that shows the operator a
+    /// thread count goes through here, so the dashboard cannot claim one number
+    /// while the config file holds another.
+    fn configured_cpu_threads(&self) -> u32 {
+        config::effective_supervene(
+            self.cpu_presets[self.cpu_idx].supervene,
+            self.gpu_presets[self.gpu_idx].slug,
+            self.mining_kind == MiningKind::Hacd,
+        )
     }
 
     fn gpu_label(&self, idx: usize) -> &str {
@@ -626,7 +654,7 @@ impl MinerApp {
             MiningKind::Hacd => self.hacd_wallet.clone(),
         };
         if kind == MiningKind::Hacd && self.cpu_presets[self.cpu_idx].supervene == 0 {
-            if let Some(idx) = self.cpu_presets.iter().position(|p| p.supervene > 0) {
+            if let Some(idx) = presets::hacd_default_idx(&self.cpu_presets) {
                 self.cpu_idx = idx;
             }
         }

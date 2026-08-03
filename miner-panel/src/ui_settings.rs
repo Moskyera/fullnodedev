@@ -19,22 +19,17 @@ impl MinerApp {
         if self.mining_kind == MiningKind::Hacd {
             let col = crate::ui_settings_tab::col_width(ui);
             theme::field_col(ui, col, "CPU mining threads:", |ui, w| {
-                let selected = &self.cpu_presets[self.cpu_idx];
+                // Every label already carries its own thread count, so the
+                // count is not appended again here.
+                let selected = self.cpu_presets[self.cpu_idx].label.clone();
                 egui::ComboBox::from_id_salt("hacd_cpu")
                     .icon(theme::combo_chevron)
-                    .selected_text(format!(
-                        "{}: {} threads",
-                        selected.label, selected.supervene
-                    ))
+                    .selected_text(selected)
                     .width(w - 24.0)
                     .show_ui(ui, |ui| {
                         for (i, preset) in self.cpu_presets.iter().enumerate() {
                             if preset.supervene > 0 {
-                                ui.selectable_value(
-                                    &mut self.cpu_idx,
-                                    i,
-                                    format!("{}: {} threads", preset.label, preset.supervene),
-                                );
+                                ui.selectable_value(&mut self.cpu_idx, i, preset.label.clone());
                             }
                         }
                     });
@@ -82,7 +77,7 @@ impl MinerApp {
                     .width(w - 24.0)
                     .show_ui(ui, |ui| {
                         for (i, preset) in self.cpu_presets.iter().enumerate() {
-                            ui.selectable_value(&mut self.cpu_idx, i, preset.label);
+                            ui.selectable_value(&mut self.cpu_idx, i, preset.label.clone());
                         }
                     });
             });

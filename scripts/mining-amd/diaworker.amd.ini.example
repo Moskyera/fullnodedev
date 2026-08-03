@@ -3,14 +3,17 @@
 ; Requires [diamondminer] enable = true in hacash.config.ini.
 
 connect = 127.0.0.1:8080
-supervene = 4
+; 0 = fit this machine: all logical CPUs but two. Set a number only to take less.
+supervene = 0
 
 [efficiency]
 mode = profit
 power_cost_kwh = 0.15
 cpu_watts_per_thread = 8
-dynamic_supervene = true
+; No GPU in this process, so there is no GPU/CPU ratio to rebalance against.
+dynamic_supervene = false
 supervene_min = 1
+; 0 = no cap.
 supervene_max = 0
 benchmark_seconds = 0
 

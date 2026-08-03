@@ -172,6 +172,11 @@ pub struct Strings {
     pub stat_net_day: &'static str,
     pub stat_gpu_profile: &'static str,
     pub stat_diamond_best: &'static str,
+    /// Why the "best diamond" string looks weaker than it used to: the CPU
+    /// miner now runs the sha3-only half of the difficulty check before the
+    /// x16rs rounds, so the sampled best is drawn only from the nonces that
+    /// passed it. Display only; the diamonds found and submitted are the same.
+    pub stat_diamond_best_hint: &'static str,
     pub stat_cpu_threads: &'static str,
     pub dash_details_title: &'static str,
     pub dash_detail_cpu: &'static str,
@@ -449,6 +454,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Net / day",
             stat_gpu_profile: "GPU profile",
             stat_diamond_best: "Best diamond",
+            stat_diamond_best_hint: "Display only: sampled after the difficulty prefilter",
             stat_cpu_threads: "CPU threads",
             dash_details_title: "Configuration & connection",
             dash_detail_cpu: "CPU preset",
@@ -643,6 +649,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Καθαρό / μέρα",
             stat_gpu_profile: "Προφίλ GPU",
             stat_diamond_best: "Καλύτερο diamond",
+            stat_diamond_best_hint: "Μόνο ένδειξη: δείγμα μετά το προφίλτρο δυσκολίας",
             stat_cpu_threads: "CPU threads",
             dash_details_title: "Ρυθμίσεις & σύνδεση",
             dash_detail_cpu: "CPU preset",
@@ -837,6 +844,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Net / gün",
             stat_gpu_profile: "GPU profili",
             stat_diamond_best: "En iyi elmas",
+            stat_diamond_best_hint: "Yalnızca gösterim: zorluk ön filtresinden sonraki örnek",
             stat_cpu_threads: "CPU iş parçacığı",
             dash_details_title: "Yapılandırma ve bağlantı",
             dash_detail_cpu: "CPU ön ayarı",
@@ -1031,6 +1039,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "净收益 / 天",
             stat_gpu_profile: "GPU 配置",
             stat_diamond_best: "最佳钻石",
+            stat_diamond_best_hint: "仅供显示：难度预筛选之后的样本",
             stat_cpu_threads: "CPU 线程",
             dash_details_title: "配置与连接",
             dash_detail_cpu: "CPU 预设",
@@ -1225,6 +1234,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "純利益 / 日",
             stat_gpu_profile: "GPU プロファイル",
             stat_diamond_best: "最高ダイヤ",
+            stat_diamond_best_hint: "表示のみ: 難易度の事前フィルター後のサンプル",
             stat_cpu_threads: "CPU スレッド",
             dash_details_title: "設定と接続",
             dash_detail_cpu: "CPU プリセット",
@@ -1419,6 +1429,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Neto / día",
             stat_gpu_profile: "Perfil GPU",
             stat_diamond_best: "Mejor diamante",
+            stat_diamond_best_hint: "Solo visual: muestra posterior al prefiltro de dificultad",
             stat_cpu_threads: "Hilos CPU",
             dash_details_title: "Configuración y conexión",
             dash_detail_cpu: "Preset CPU",
@@ -1613,6 +1624,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Net / jour",
             stat_gpu_profile: "Profil GPU",
             stat_diamond_best: "Meilleur diamant",
+            stat_diamond_best_hint: "Affichage seul : échantillon après le préfiltre de difficulté",
             stat_cpu_threads: "Threads CPU",
             dash_details_title: "Configuration et connexion",
             dash_detail_cpu: "Preset CPU",
@@ -1807,6 +1819,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "สุทธิ / วัน",
             stat_gpu_profile: "โปรไฟล์ GPU",
             stat_diamond_best: "ไดมอนด์ที่ดีที่สุด",
+            stat_diamond_best_hint: "แสดงผลเท่านั้น: ตัวอย่างหลังตัวกรองความยากเบื้องต้น",
             stat_cpu_threads: "เธรด CPU",
             dash_details_title: "การตั้งค่าและการเชื่อมต่อ",
             dash_detail_cpu: "พรีเซ็ต CPU",
@@ -2001,6 +2014,7 @@ pub fn strings(lang: Lang) -> Strings {
             stat_net_day: "Чистая / день",
             stat_gpu_profile: "Профиль GPU",
             stat_diamond_best: "Лучший алмаз",
+            stat_diamond_best_hint: "Только для показа: выборка после предфильтра сложности",
             stat_cpu_threads: "Потоки CPU",
             dash_details_title: "Настройки и подключение",
             dash_detail_cpu: "Пресет CPU",
@@ -2403,6 +2417,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every language explains why the "best diamond" reading got weaker.
+    ///
+    /// The CPU miner now prefilters on the sha3-only half of the difficulty
+    /// check, so the sampled best is drawn from roughly a tenth of the nonces
+    /// and shows fewer leading zeros than the same machine showed yesterday. A
+    /// language shipping this blank would show its speakers a regression with no
+    /// explanation next to it, on the one card they watch to decide whether the
+    /// miner is working. The count is asserted, not assumed.
+    #[test]
+    fn every_language_explains_the_prefiltered_best_diamond() {
+        assert_eq!(Lang::ALL.len(), 9, "the panel ships nine languages");
+        let mut seen = std::collections::BTreeSet::new();
+        for lang in Lang::ALL {
+            let s = strings(lang);
+            let hint = s.stat_diamond_best_hint;
+            assert!(
+                !hint.trim().is_empty(),
+                "{} never explains the prefiltered best diamond",
+                lang.code()
+            );
+            assert!(
+                !hint.contains('\u{2014}'),
+                "{} uses an em dash: {hint}",
+                lang.code()
+            );
+            // The card footer truncates at one line, so a newline would hide
+            // half the explanation rather than show it.
+            assert!(
+                !hint.contains('\n'),
+                "{} needs more than the one line the card footer has",
+                lang.code()
+            );
+            assert_ne!(
+                hint,
+                s.stat_diamond_best,
+                "{} repeats the label instead of explaining it",
+                lang.code()
+            );
+            seen.insert(hint);
+        }
+        assert_eq!(
+            seen.len(),
+            Lang::ALL.len(),
+            "two languages ship the same sentence, so one of them was never translated"
+        );
     }
 
     /// The two sentences that stop a silent no-op exist in all nine languages,

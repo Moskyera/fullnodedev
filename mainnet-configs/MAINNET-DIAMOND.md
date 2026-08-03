@@ -81,8 +81,17 @@ Remove-Item Env:\HACASH_REPEAT16_BENCH_SECONDS
 
 ```ini
 connect = 127.0.0.1:8080
-supervene = 6
+; 0 = fit this machine: every logical CPU but two.
+supervene = 0
 ```
+
+`supervene = 0` is not "no threads": HACD is CPU-only, so it means the worker
+counts the logical CPUs it has and takes all of them but two, keeping one for
+the fullnode and one for the desktop or a co-running GPU miner's feed thread. On
+a 16-core / 32-thread CPU that is 30 threads. Measured on a Ryzen 9 9950X, 1 to
+32 threads is 71,728 to 1,442,210 H/s, and the 6 this file used to pin was
+320,097, so a fixed number cost 78% of the machine. Set a number here only to
+take less than the automatic count; a number is obeyed exactly.
 
 The `[gpu]` section is ignored: diamonds are CPU-only and enforced as such in
 code. Start after the node is up:

@@ -6,6 +6,10 @@ include! {"version.rs"}
 #[macro_use]
 pub mod worker_log;
 
+/// How many CPU threads a worker takes, derived from the machine's own logical
+/// CPU count. Shared by the workers and the panel so a shipped config, a GUI
+/// preset and a running worker cannot disagree about what "all cores" means.
+pub mod cpu_threads;
 pub mod efficiency;
 pub mod gpu_arch;
 pub mod gpu_oom;

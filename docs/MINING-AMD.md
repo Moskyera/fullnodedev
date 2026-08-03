@@ -27,8 +27,8 @@ chmod +x scripts/mining-amd/*.sh
 
 **End users (GitHub Releases):**
 
-- **`hacash-miner-full-windows-x64*.zip`** — clean PC: fullnode + miners + panel → run `SETUP.bat`
-- **`hacash-miner-only-windows-x64*.zip`** — you already have fullnode → run `SETUP-MINER.bat`
+- **`hacash-miner-full-windows-x64*.zip`** for a clean PC: fullnode + miners + panel → run `SETUP.bat`
+- **`hacash-miner-only-windows-x64*.zip`** when you already have a fullnode: run `SETUP-MINER.bat`
 
 **Maintainers:** push a new SemVer tag such as `vX.Y.Z`, or run **Actions → Release (Windows + Linux miners) → Run workflow** for artifacts without publishing a tagged release.
 
@@ -47,7 +47,8 @@ chmod +x scripts/mining-amd/*.sh
    ```
 5. Configure the workers (or use the panel):
    - HAC `poworker.config.ini`: set OpenCL `platform_id` / `device_ids`
-   - HACD `diaworker.config.ini`: set CPU `supervene`; GPU keys stay disabled
+   - HACD `diaworker.config.ini`: leave `supervene = 0` to fit the machine
+     (every logical CPU but two); GPU keys stay disabled
 6. Run fullnode (`hacash.exe`) with RPC enabled (`[server] enable = true`).
 7. Start mining:
    ```bat
@@ -76,7 +77,9 @@ reward = YOUR_HACD_PRIVAKEY_3x
 The HACD reward value is a private key that starts with `3`. Keep it secret and never paste it into Fleet peers, logs or support messages.
 
 HACD mining is CPU/fullnode-only. In `diaworker.config.ini`, keep
-`use_opencl = false` and use `supervene` to select CPU threads.
+`use_opencl = false`. Leave `supervene = 0` and the worker takes every logical
+CPU but two, which is measured to be roughly 20x one thread on a 32-thread CPU;
+set a number only to take less.
 
 ## HAC GPU section reference
 
@@ -107,9 +110,9 @@ These are generic starting candidates. Runtime device limits always win, and Aut
 | `amd_performance` | 2048 | 96 | Performance candidate for older RX architectures |
 | `amd_max` | 4096 | 128 | Aggressive generic candidate; use only through Auto Tune |
 
-**RX 9070 XT / gfx1201:** validated hard ranges are `work_groups 32–64` and `unit_size 32–64`. Do not copy the generic 2048/4096 values into an RDNA4 config. First-run detection maps `gfx1201` to the RX 9070 XT preset before mining starts.
+**RX 9070 XT / gfx1201:** validated hard ranges are `work_groups 32 to 64` and `unit_size 32 to 64`. Do not copy the generic 2048/4096 values into an RDNA4 config. First-run detection maps `gfx1201` to the RX 9070 XT preset before mining starts.
 
-Auto Tune is fail-closed for more than one selected GPU because one INI currently stores one shared WG/US pair. Use one `poworker` instance/config per GPU—especially for heterogeneous cards—and aggregate them with Miner Fleet.
+Auto Tune is fail-closed for more than one selected GPU because one INI currently stores one shared WG/US pair. Use one `poworker` instance/config per GPU, especially for heterogeneous cards, and aggregate them with Miner Fleet.
 
 ### Cost-aware mining (`[efficiency]`)
 
@@ -136,14 +139,14 @@ When `max_temp_c > 0`, a valid `amd-smi`/`rocm-smi`, `nvidia-smi` or explicit `t
 Hashrate units are selected automatically (`H/s`, `kH/s` or `MH/s`). Watts, kH/J and daily values are estimates unless an external telemetry source is supplied.
 
 Scripts:
-- `CONFIGURE-MINING.bat` — pick CPU + GPU
-- `BENCHMARK-AMD.bat` — run the benchmark helper
+- `CONFIGURE-MINING.bat`: pick CPU + GPU
+- `BENCHMARK-AMD.bat`: run the benchmark helper
 
 Use the panel Auto Tune for GPU WG/US values. `TUNE-AMD-EFFICIENCY.bat` only adjusts basic CPU `supervene` settings.
 
 ### HAC hybrid mining
 
-With `cpu_assist = true`, the GPU runs OpenCL and Ryzen threads mine on CPU **in parallel** — better total hashrate than GPU-only.
+With `cpu_assist = true`, the GPU runs OpenCL and Ryzen threads mine on CPU **in parallel**, better total hashrate than GPU-only.
 
 ## AMD optimizations
 
@@ -153,7 +156,8 @@ Every gfx1201 startup runs a Groestl integrity self-test, and every production G
 
 ## HAC CPU-only fallback (Ryzen, no GPU)
 
-Build without `ocl` or set `use_opencl = false` and increase `supervene` to your core count:
+Build without `ocl` or set `use_opencl = false`. For HACD leave `supervene = 0`
+and the worker takes every logical CPU but two; `poworker` still needs a number:
 
 ```ini
 supervene = 8

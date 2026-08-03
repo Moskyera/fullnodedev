@@ -470,7 +470,13 @@ impl MinerApp {
                     value: &number,
                     unit: "",
                     sub: &format!("{}: {best}", t.stat_diamond_best),
-                    foot: "",
+                    // The CPU miner skips the x16rs rounds for any nonce whose
+                    // sha3 already fails the difficulty check, so `best` is now
+                    // sampled from ~11% of nonces and reads weaker than it used
+                    // to. Without this line an operator sees the regression and
+                    // not the reason. It is display only: the diamonds actually
+                    // found and submitted are unchanged.
+                    foot: t.stat_diamond_best_hint,
                     foot_accent: false,
                     spark: &[],
                     highlight: false,
@@ -736,7 +742,7 @@ impl MinerApp {
             let (filled, centre, over_limit) = temperature_gauge(temp, self.max_temp_c);
             (Some(filled), centre, d.gauge_temp, over_limit)
         } else if is_hacd {
-            let configured = self.cpu_presets[self.cpu_idx].supervene;
+            let configured = self.configured_cpu_threads();
             // The configured count is the panel's own and always true. The
             // active count is the worker's, so it is used only while its
             // snapshot is current.
@@ -879,7 +885,7 @@ impl MinerApp {
         let is_hacd = self.mining_kind == MiningKind::Hacd;
         let mut rows = Vec::new();
         if is_hacd {
-            let configured = self.cpu_presets[self.cpu_idx].supervene;
+            let configured = self.configured_cpu_threads();
             let active = if s.active_cpu_threads > 0 {
                 s.active_cpu_threads
             } else {
@@ -952,7 +958,11 @@ impl MinerApp {
         // running, which the row says in words, or the worker is running threads
         // this panel did not ask for, and then the count it reported is the
         // whole of what is known.
-        let configured = self.cpu_presets[self.cpu_idx].supervene;
+        //
+        // The picker's number and the written number are not always the same for
+        // a GPU rig: CPU assist is capped so the card's feed thread keeps a core.
+        // This row shows what was written, because that is what is running.
+        let configured = self.configured_cpu_threads();
         rows.push((
             t.stat_cpu_threads.to_string(),
             if configured > 0 {

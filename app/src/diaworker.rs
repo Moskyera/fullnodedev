@@ -19,7 +19,7 @@ use mint::action::*;
 use mint::genesis::*;
 use sys::*;
 
-use crate::hash_util::diamond_better;
+use crate::hash_util::{DiamondSha3Gate, diamond_better, diamond_name_is_valid};
 
 #[cfg(feature = "ocl")]
 use crate::gpu_oom::GpuBatchError;
@@ -60,7 +60,19 @@ impl DiaWorkConf {
     pub fn new(ini: &IniObj) -> DiaWorkConf {
         let sec = &ini_section(ini, "default"); // default = root
         let efficiency = EfficiencyConf::from_ini(ini);
-        let configured_supervene = (ini_must_u64(sec, "supervene", 2) as u32).max(1);
+        // An absent `supervene`, or an explicit 0, means "fit this machine".
+        //
+        // Both used to end at 1 thread: the key defaulted to 2 and 0 was raised
+        // to 1 by `.max(1)`. Neither is a choice anybody made. HACD is CPU-only,
+        // so 0 cannot mean "no CPU mining" the way it does for the GPU block
+        // miner; it can only mean the operator never set a number. A shipped ini
+        // cannot count the cores of a machine it has never seen, so it says 0 and
+        // this does the counting. See `crate::cpu_threads` for the measurement
+        // that fixes the reserve at two logical threads.
+        let configured_supervene = match ini_must_u64(sec, "supervene", 0) as u32 {
+            0 => crate::cpu_threads::hacd_threads(),
+            explicit => explicit,
+        };
         let active = efficiency.initial_active_supervene(configured_supervene);
         let runtime = MiningRuntimeState::new(0, active);
         // HACD is officially CPU/full-node mining. Legacy GPU keys are ignored
@@ -108,12 +120,19 @@ mod config_tests {
 
     use super::*;
 
-    #[test]
-    fn legacy_hacd_gpu_config_is_forced_to_cpu_only() {
+    fn ini_with_root(entries: &[(&str, &str)]) -> IniObj {
         let mut ini = IniObj::new();
         let mut default = HashMap::new();
-        default.insert("supervene".to_string(), Some("0".to_string()));
+        for (k, v) in entries {
+            default.insert(k.to_string(), Some(v.to_string()));
+        }
         ini.insert("default".to_string(), default);
+        ini
+    }
+
+    #[test]
+    fn legacy_hacd_gpu_config_is_forced_to_cpu_only() {
+        let mut ini = ini_with_root(&[("supervene", "0")]);
         let mut gpu = HashMap::new();
         gpu.insert("use_opencl".to_string(), Some("true".to_string()));
         gpu.insert("cpu_assist".to_string(), Some("true".to_string()));
@@ -122,13 +141,59 @@ mod config_tests {
         ini.insert("gpu".to_string(), gpu);
 
         let config = DiaWorkConf::new(&ini);
-        assert_eq!(config.supervene, 1);
+        // 0 is not a thread count here, it is an unanswered question, and the
+        // answer is this machine. It used to be silently raised to 1.
+        assert_eq!(config.supervene, crate::cpu_threads::hacd_threads());
         assert!(!config.useopencl);
         assert!(!config.cpu_assist);
         assert_eq!(config.workgroups, 0);
         assert_eq!(config.unitsize, 0);
         assert_eq!(config.gpu_slug, "none");
         assert!(config.gpu_profile.is_empty());
+    }
+
+    /// A config that says nothing about threads must not get the number 2, and
+    /// must not get the number 6 that used to ship. It gets the machine.
+    #[test]
+    fn a_config_without_a_thread_count_fits_the_machine_it_runs_on() {
+        let auto = DiaWorkConf::new(&ini_with_root(&[])).supervene;
+        assert_eq!(auto, crate::cpu_threads::hacd_threads());
+        assert!(auto >= 1);
+        let logical = crate::cpu_threads::logical_cpus();
+        if logical > crate::cpu_threads::HOST_RESERVE_THREADS {
+            assert_eq!(auto, logical - crate::cpu_threads::HOST_RESERVE_THREADS);
+        }
+    }
+
+    /// Auto is a default, never an override. An operator who typed a number owns
+    /// it, including a deliberately small one on a large machine.
+    #[test]
+    fn an_explicit_thread_count_is_obeyed_exactly() {
+        for n in [1u32, 2, 3, 6, 12, 30, 64, 255] {
+            let config = DiaWorkConf::new(&ini_with_root(&[("supervene", &n.to_string())]));
+            assert_eq!(config.supervene, n, "supervene = {n}");
+        }
+    }
+
+    /// `initial_active_supervene` runs over the auto value, so a default-shaped
+    /// efficiency section must not quietly clamp the machine back down. This is
+    /// the second half of the shipped-config bug: `supervene_max = 0` means
+    /// "uncapped", and if that ever changed to mean "zero" the auto count would
+    /// vanish.
+    #[test]
+    fn the_auto_count_survives_the_shipped_efficiency_section() {
+        let mut ini = ini_with_root(&[]);
+        let mut eff = HashMap::new();
+        eff.insert("supervene_min".to_string(), Some("1".to_string()));
+        eff.insert("supervene_max".to_string(), Some("0".to_string()));
+        eff.insert("dynamic_supervene".to_string(), Some("false".to_string()));
+        ini.insert("efficiency".to_string(), eff);
+
+        let config = DiaWorkConf::new(&ini);
+        let auto = crate::cpu_threads::hacd_threads();
+        assert_eq!(config.supervene, auto);
+        assert_eq!(config.efficiency.clamp_supervene(config.supervene), auto);
+        assert_eq!(config.runtime.active_cpu_assist.load(Relaxed), auto);
     }
 }
 
@@ -524,7 +589,19 @@ pub fn diaworker_with_stop(stop_flag: Option<Arc<AtomicBool>>) {
         }
     } else {
         let thrnum = cnf.efficiency.clamp_supervene(cnf.supervene) as usize;
-        wlogln!("\n[Start] Create #{} diamond miner worker thread.", thrnum);
+        // Say what was taken and what was left. An operator who also runs the
+        // GPU block miner on this box needs to see this arithmetic: the two
+        // threads left free are one for the fullnode and one for a GPU feed
+        // thread, and enabling `cpu_assist` in poworker.config.ini as well would
+        // spend them twice.
+        let logical = crate::cpu_threads::logical_cpus();
+        wlogln!(
+            "\n[Start] Create #{} diamond miner worker thread ({} of {} logical CPUs, {} left free).",
+            thrnum,
+            thrnum,
+            logical,
+            logical.saturating_sub(thrnum as u32)
+        );
         for thrid in 0..thrnum {
             let cnf2 = cnf.clone();
             let rstx = res_tx.clone();
@@ -882,8 +959,6 @@ fn do_diamond_group_mining(
     nonce_space: u64,
 ) -> DiamondMiningResult {
     let empthbytes = [0u8; 0];
-    let prevhash: &[u8; HASH_WIDTH] = prevblockhash;
-    let address: &[u8; 21] = rwdaddr;
     let custom_nonce: &[u8] = maybe!(
         number > DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE,
         custom_message.as_bytes(),
@@ -906,18 +981,71 @@ fn do_diamond_group_mining(
     let mut most_diastr = [b'W'; DIAMOND_HASH_LEN];
     let mut most_noncebytes = [0u8; 8];
 
+    // Everything below that depends only on `number` is hoisted out of the nonce
+    // loop: the x16rs round count and the two step-1 difficulty terms are
+    // constant for the whole round.
+    let repeat = x16rs::mine_diamond_hash_repeat(number);
+    let gate = DiamondSha3Gate::for_number(number);
+    // The pre-image is built ONCE and only bytes 32..40 (the big-endian nonce)
+    // are overwritten per attempt. `diamond_pre_image` is the single place both
+    // the CPU and the OpenCL path build it, and its doc comment records that it
+    // is byte-identical to what `x16rs::mine_diamond` concatenates, so this
+    // stays consensus-identical while dropping the five Vec allocations
+    // `mine_diamond` makes per nonce (four `to_vec` plus the `concat`).
+    let mut stuff = diamond_pre_image(prevblockhash, &[0u8; 8], rwdaddr, custom_nonce);
+
     // start mining
     for nonce in nonce_start..nonce_start.saturating_add(nonce_space) {
         // std::thread::sleep(std::time::Duration::from_micros(333)); // test
         let nonce_bytes = nonce.to_be_bytes();
-        let (firhx, resxh, diastr) =
-            x16rs::mine_diamond(number, prevhash, &nonce_bytes, address, custom_nonce);
+        stuff[HASH_WIDTH..HASH_WIDTH + 8].copy_from_slice(&nonce_bytes);
+        // SHA3. Part of the 2.7% of an attempt that is not x16rs; measured at
+        // 361 ns for everything-except-x16rs against 12,943 ns for x16rs itself.
+        let firhx = x16rs::calculate_hash(&stuff);
+
+        // THE PREFILTER, and the only reason HACD mining got faster.
+        //
+        // Step 1 of `x16rs::check_diamond_difficulty` reads ONLY this sha3 hash;
+        // it never looks at the x16rs hash. So when it fails, that function
+        // returns false for every possible x16rs hash, and the `repeat` rounds
+        // of x16rs below (97.3% of an attempt, 17 rounds at diamond 133,700)
+        // cannot produce a diamond no matter what they compute. Skipping them is
+        // therefore not an approximation: the set of accepted diamonds is
+        // unchanged. That implication is proved, quantified over the x16rs hash,
+        // by `a_failing_gate_forbids_every_possible_x16rs_hash` in hash_util.rs,
+        // and the converse (the gate never rejects what the original accepts) by
+        // `the_gate_never_rejects_a_nonce_the_original_accepts`. Below diamond
+        // 42,000 the gate passes everything and costs 32 byte comparisons.
+        //
+        // ONE BEHAVIOUR DOES CHANGE, and an operator will see it: `most.dia_str`,
+        // the "best so far" string in the console line and in mining_stats, now
+        // only ever reflects the nonces that passed the gate (~11% at 133,700,
+        // ~1% at 300,000), so it will look weaker than it used to. That is
+        // DISPLAY ONLY. `most.dia_str` reaches exactly three places -- the
+        // `diamond_better` comparisons here and in `deal_diamond_mining_results`,
+        // the `flush!` console line, and `mining_stats::emit_from_batch_aggregate`
+        // -- and never `is_success`, `check_diamer_success`, or a submission.
+        // The local `most_diastr` below does feed `check_diamer_success` after
+        // the loop, but that call is the same conjunction as the winner test
+        // inside the loop, so it can only return Some for a nonce that already
+        // hit the `break` -- and a gate-failing nonce can never be that nonce.
+        if !gate.passes(&firhx) {
+            continue;
+        }
+
+        let resxh = x16rs::x16rs_hash(repeat, &firhx);
+        let diastr = x16rs::diamond_hash(&resxh);
         // A valid diamond has EXACTLY DMD_L leading zeros followed by a non-zero name. The
         // "most powerful" heuristic below maximises leading zeros, which overshoots into invalid
         // territory once difficulty is low (LOCAL TESTNET only). Test each candidate for validity
         // directly and take the first one that actually qualifies.
-        if x16rs::check_diamond_hash_result(&diastr).is_some()
-            && x16rs::check_diamond_difficulty(number, &firhx, &resxh)
+        //
+        // `diamond_name_is_valid` replaces `check_diamond_hash_result(..).is_some()`
+        // (which allocated a Vec per attempt). The two differ on arbitrary bytes,
+        // but agree on every output of `diamond_hash`, whose alphabet is exactly
+        // DIAMOND_HASH_BASE_CHARS; both halves of that argument are asserted in
+        // `diamond_name_is_valid_matches_check_diamond_hash_result_on_diamond_hash_output`.
+        if diamond_name_is_valid(&diastr) && x16rs::check_diamond_difficulty(number, &firhx, &resxh)
         {
             most.u64_nonce = nonce;
             most.dia_str = diastr.clone();
@@ -1384,6 +1512,14 @@ mod diamond_job_reorg_tests {
             let pre_image = diamond_pre_image(&prev, &nonce_bytes, &addr, custom_nonce);
             assert_eq!(pre_image.len(), if with_custom { 93 } else { 61 });
 
+            // The CPU nonce loop builds the pre-image once and then splices the
+            // big-endian nonce into bytes 32..40 in place. Pin that the spliced
+            // buffer is byte-identical to a freshly built one, because the whole
+            // hot loop now depends on those being the same 61 (or 93) bytes.
+            let mut spliced = diamond_pre_image(&prev, &[0u8; 8], &addr, custom_nonce);
+            spliced[HASH_WIDTH..HASH_WIDTH + 8].copy_from_slice(&nonce_bytes);
+            assert_eq!(spliced, pre_image);
+
             let (ssshash, reshash, diastr) =
                 x16rs::mine_diamond(number, &prev, &nonce_bytes, &addr, custom_nonce);
             // Same SHA3 input as consensus.
@@ -1436,6 +1572,165 @@ mod diamond_job_reorg_tests {
         assert!(install_diamond_job(100, hash_of(5)));
         assert!(!diamond_job_is_current(snap_num, snap_epoch));
         assert!(diamond_job_is_current(100, current_diamond_epoch()));
+    }
+}
+
+#[cfg(test)]
+mod diamond_prefilter_tests {
+    use super::*;
+
+    fn fixture(number: u32) -> (Hash, Address, Hash, Vec<u8>) {
+        let prev = Hash::from([0x5au8; HASH_WIDTH]);
+        let addr = Address::from([0x11u8; 21]);
+        let custom = Hash::from([0x7cu8; HASH_WIDTH]);
+        let cm: Vec<u8> = if number > DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE {
+            custom.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        (prev, addr, custom, cm)
+    }
+
+    const CORPUS_NUMBERS: [(u32, u64); 10] = [
+        (1, 20_000),
+        (41_999, 20_000),
+        (42_000, 20_000),
+        (65_535, 20_000),
+        (65_536, 20_000),
+        (65_537, 20_000),
+        (84_000, 20_000),
+        (133_700, 30_000),
+        (210_000, 20_000),
+        (300_000, 12_000),
+    ];
+
+    /// End to end on the REAL function, and this test exists because its absence
+    /// was a hole big enough to ship a miner that never finds anything.
+    ///
+    /// An adversarial pass broke the hot loop five ways and the entire 306-test
+    /// suite stayed green: the nonce splice off by one in each direction, the
+    /// splice deleted, the nonce written little-endian, and worst,
+    /// `if !gate.passes` inverted to `if gate.passes`, which computes x16rs
+    /// ONLY for nonces that provably cannot mint. That last one runs at 8x,
+    /// prints a plausible hashrate, and finds a diamond never.
+    ///
+    /// The cause was that nothing called `do_diamond_group_mining`. The other
+    /// tests re-implement the loop inside themselves, so they pin the idea and
+    /// not the code. This one calls the real function and holds it to its own
+    /// output: whatever nonce
+    /// `do_diamond_group_mining` reports as its best must, when handed back to
+    /// x16rs::mine_diamond, reproduce exactly the dia_str it reported. A
+    /// mis-spliced nonce buffer shows up here even though the internal
+    /// comparison in audit_23 would still be self-consistent.
+    #[test]
+    fn audit_2e_the_real_mining_function_reports_a_nonce_that_reproduces_its_hash() {
+        for (number, n_nonce) in CORPUS_NUMBERS {
+            let (prev, addr, custom, cm) = fixture(number);
+            let space = n_nonce.min(8_000);
+            for start in [0u64, 1, 4096, 1_000_000_000] {
+                let res = do_diamond_group_mining(number, &prev, &addr, &custom, start, space);
+                assert_eq!(res.number, number);
+                assert_eq!(res.msg_nonce, cm);
+                // The reported best must be a real nonce in the window.
+                assert!(
+                    res.u64_nonce >= start && res.u64_nonce < start + space,
+                    "n={number} start={start} reported nonce {} outside window",
+                    res.u64_nonce
+                );
+                let (_f, _r, dia) =
+                    x16rs::mine_diamond(number, &prev, &res.u64_nonce.to_be_bytes(), &addr, &cm);
+                assert_eq!(
+                    dia, res.dia_str,
+                    "n={number} start={start} nonce={} reported {:?} but mine_diamond says {:?}",
+                    res.u64_nonce,
+                    String::from_utf8_lossy(&res.dia_str),
+                    String::from_utf8_lossy(&dia)
+                );
+                // And it really is the best over the gate-passing nonces.
+                let gate = DiamondSha3Gate::for_number(number);
+                let repeat = x16rs::mine_diamond_hash_repeat(number);
+                let mut best = [b'W'; DIAMOND_HASH_LEN];
+                for nonce in start..start + space {
+                    let (f, r, d) =
+                        x16rs::mine_diamond(number, &prev, &nonce.to_be_bytes(), &addr, &cm);
+                    let _ = (r, repeat);
+                    if !gate.passes(&f) {
+                        continue;
+                    }
+                    if diamond_better(&d, &best) {
+                        best = d;
+                    }
+                }
+                assert_eq!(
+                    best, res.dia_str,
+                    "n={number} start={start}: best over gate-passing nonces disagrees"
+                );
+            }
+        }
+        println!("AUDIT2e ok");
+    }
+
+    /// The equivalence proof in hash_util.rs quantifies over the x16rs hash on
+    /// synthetic inputs. This is the same claim on REAL data: real SHA3 outputs
+    /// from the real pre-image, at a real diamond number, checked against the
+    /// real `check_diamer_success` the submit path uses.
+    ///
+    /// If this ever fails, the prefilter is dropping a mintable nonce and HACD
+    /// mining is losing money.
+    #[test]
+    fn the_prefilter_never_skips_a_nonce_that_could_have_minted() {
+        // 133,700 is the measured point: repeat 17, gate pass rate ~10.9%.
+        let number = 133_700u32;
+        let prev = Hash::from([0x5au8; HASH_WIDTH]);
+        let addr = Address::from([0x11u8; 21]);
+        let custom = Hash::from([0u8; HASH_WIDTH]);
+        let custom_nonce: &[u8] = if number > DIAMOND_ABOVE_NUMBER_OF_CREATE_BY_CUSTOM_MESSAGE {
+            custom.as_bytes()
+        } else {
+            &[]
+        };
+        let gate = DiamondSha3Gate::for_number(number);
+        let repeat = x16rs::mine_diamond_hash_repeat(number);
+        let mut stuff = diamond_pre_image(&prev, &[0u8; 8], &addr, custom_nonce);
+
+        let mut skipped = 0usize;
+        let mut kept = 0usize;
+        for nonce in 0u64..3000 {
+            let nonce_bytes = nonce.to_be_bytes();
+            stuff[HASH_WIDTH..HASH_WIDTH + 8].copy_from_slice(&nonce_bytes);
+            let firhx = x16rs::calculate_hash(&stuff);
+            if gate.passes(&firhx) {
+                kept += 1;
+                continue;
+            }
+            skipped += 1;
+            // The work the prefilter skipped, done in full: if it could ever have
+            // produced a diamond, this is where it shows up.
+            let resxh = x16rs::x16rs_hash(repeat, &firhx);
+            let diastr = x16rs::diamond_hash(&resxh);
+            assert!(
+                !x16rs::check_diamond_difficulty(number, &firhx, &resxh),
+                "prefilter skipped nonce {nonce} which passes the real difficulty check"
+            );
+            assert!(
+                check_diamer_success(number, firhx, resxh, diastr).is_none(),
+                "prefilter skipped nonce {nonce} which is a mintable diamond"
+            );
+            // And the winner test the loop actually uses agrees with the one it
+            // replaced, on real diamond_hash output.
+            assert_eq!(
+                diamond_name_is_valid(&diastr),
+                x16rs::check_diamond_hash_result(diastr).is_some()
+            );
+        }
+        // Non-vacuity, and the documented saving: the gate must reject the large
+        // majority at this number (measured ~89.1%) while still passing some.
+        assert!(kept > 0, "the gate rejected every nonce");
+        assert!(
+            skipped * 10 > (skipped + kept) * 8,
+            "gate rejected only {skipped} of {} nonces; expected ~89% at number {number}",
+            skipped + kept
+        );
     }
 }
 
