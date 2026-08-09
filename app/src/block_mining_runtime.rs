@@ -132,6 +132,40 @@ static MINER_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 static SHARE_HITS_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `MINER_CLOCK` millis at the last undersampling line (0 = never).
 static SHARE_OVERFLOW_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+/// How long a profitability pause holds before the rig is allowed to measure
+/// again. One minute: long enough that a rig which really is unprofitable spends
+/// almost nothing, short enough that a rig paused on a momentary reading, or on a
+/// HAC price that has since recovered, is not finished for the day.
+const PROFIT_PAUSE_RECHECK_MS: u64 = 60_000;
+/// Result-thread clock millis at which THIS worker's profitability pause began,
+/// or 0 when it did not set one.
+///
+/// The pause stops the very workers whose results are the only thing that clears
+/// it, so without a way back it is a one-way latch: `run_block_mining_item`
+/// returns early while gated, the drain then sees nothing, and the clear sits
+/// past the empty-drain return. A rig paused on one bad reading never mined
+/// again for the life of the process, and the operator was told only that its
+/// power cost exceeded its revenue.
+///
+/// Zero also means "this worker did not pause the rig". `diaworker` shares the
+/// flag, and the HACD side's pause is not this side's to lift on a timer.
+static PROFIT_PAUSE_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+/// Result-thread clock millis at the last "this header cannot be priced" line
+/// (0 = never). The drain runs about eight times a second, so an unsound header
+/// would otherwise fill the console faster than an operator could read it.
+static UNPRICEABLE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Is the "this header cannot be priced" line due? Records that it was said.
+fn unpriceable_template_line_due(now_ms: u64) -> bool {
+    let last = UNPRICEABLE_LAST_LOG_MS.load(Relaxed);
+    // Said once at startup (last == 0), then at most once a minute. A clock that
+    // steps backwards reads as due rather than silencing a live fault.
+    if last != 0 && now_ms >= last && now_ms - last < PROFIT_PAUSE_RECHECK_MS {
+        return false;
+    }
+    UNPRICEABLE_LAST_LOG_MS.store(now_ms.max(1), Relaxed);
+    true
+}
 
 #[derive(Clone)]
 pub(crate) enum MinerBackend {
@@ -174,6 +208,16 @@ pub(crate) struct BlockMiningResult {
     pub coinbase_nonce: Vec<u8>,
     pub result_hash: Vec<u8>,
     pub target_hash: Vec<u8>,
+    /// Header `difficulty` of the template this result was mined against, which is
+    /// always the NETWORK difficulty whatever `target_hash` above happens to be.
+    /// Pooled, `target_hash` is the pool's SHARE target, easier than a block by
+    /// 2^share_bits, so it cannot say what a day of mining is worth. This can: a
+    /// block whose `difficulty` field is not the value the node recomputes is
+    /// rejected, so a pool cannot shrink it and still be paid for the block.
+    /// Carried on the result rather than read from the live template so the
+    /// hashrate, the height and the difficulty all come from ONE snapshot and can
+    /// never describe different jobs.
+    network_difficulty: u32,
     use_secs: f64,
     is_gpu: bool,
 }
@@ -1557,6 +1601,10 @@ fn run_block_mining_item(
     // never touches the GPU share path at all.
     let share_target = pool_share_target(_cnf, &stuff);
     let prevhash = stuff.block_intro.prevhash().to_vec();
+    // The network difficulty of the header these batches hash, read from the same
+    // template snapshot as everything else here. Pooled, `stuff.target_hash` is
+    // the pool's share target and says nothing at all about the network.
+    let network_difficulty = stuff.block_intro.difficulty().uint();
     let mut coinbase_tx = stuff.coinbase_tx.clone();
     coinbase_tx.set_nonce(coinbase_nonce);
     let mut block_intro = stuff.block_intro.clone();
@@ -1644,6 +1692,7 @@ fn run_block_mining_item(
             coinbase_nonce: coinbase_nonce.to_vec(),
             result_hash: result_hash.to_vec(),
             target_hash: stuff.target_hash.to_vec(),
+            network_difficulty,
             use_secs,
             is_gpu: is_gpu_backend,
         };
@@ -1672,6 +1721,7 @@ fn run_block_mining_item(
                 coinbase_nonce: coinbase_nonce.to_vec(),
                 result_hash: share.hash.to_vec(),
                 target_hash: stuff.target_hash.to_vec(),
+                network_difficulty,
                 use_secs: 0.0,
                 is_gpu: is_gpu_backend,
             };
@@ -1817,16 +1867,62 @@ fn deal_block_mining_results(
         }
     }
     if recv_count == 0 {
+        // A paused rig produces no results, so this is the ONLY branch it ever
+        // reaches again. Let the pause expire here, or it is permanent: the rig
+        // would need a restart even after the reason for it had gone. One fresh
+        // measurement window is all this buys; if the rig is still unprofitable
+        // the very next tick pauses it again, so the cost is seconds of power
+        // rather than a wrong answer that lasts all day.
+        let since = PROFIT_PAUSE_SINCE_MS.load(Relaxed);
+        if since != 0
+            && now_ms.saturating_sub(since) >= PROFIT_PAUSE_RECHECK_MS
+            && cnf.runtime.paused_unprofitable.load(Relaxed)
+        {
+            PROFIT_PAUSE_SINCE_MS.store(0, Relaxed);
+            cnf.runtime.paused_unprofitable.store(false, Relaxed);
+        }
         return;
     }
     if hash_more_power(&most.result_hash, most_hash) {
         *most_hash = most.result_hash.clone();
     }
-    let Ok(tarhx) = most.target_hash.clone().try_into() else {
+    if most.target_hash.len() != HASH_WIDTH {
         wlogerr!("[Mining] Ignoring result with invalid target hash length.");
         return;
-    };
-    let target_rates = hash_to_rates(&tarhx, TARGET_BLOCK_TIME);
+    }
+    // A header claiming difficulty 0 is one no node will ever accept, so nothing
+    // below can say what a day of mining on it is worth. `set_pending_block_stuff`
+    // validates only the served `target_hash`; the intro's difficulty is a
+    // separate field it never inspects, so a pool really can install one of these.
+    //
+    // This does NOT return. Winners are queued for submission further down, and a
+    // found block is irreplaceable money: a template this miner cannot PRICE is
+    // still a template it may have just won on, and the node decides what it
+    // accepts. What is skipped is only the profitability decision, because
+    // pausing a rig over a header the pool got wrong would cost its operator
+    // their whole income for a fault that is not theirs, and reporting a revenue
+    // of zero would be inventing a figure rather than admitting there is none.
+    let revenue_is_knowable = most.network_difficulty != 0;
+    if !revenue_is_knowable && unpriceable_template_line_due(now_ms) {
+        wlogerr!(
+            "[Mining] The served block header claims difficulty 0, which no node accepts, so \
+             this miner cannot say what its work is worth. HAC/day and the profitability pause \
+             are switched off until a sound header arrives. Shares and blocks are still \
+             submitted. Check the pool or node this miner connects to."
+        );
+    }
+    // What a day of mining is worth is set by the NETWORK target, never by the
+    // target this result happened to be measured against. Pooled, that one is the
+    // pool's share target, 2^share_bits easier than a block, so dividing by it
+    // made `mnper` hit the 1.0 clamp below: every pooled rig read as 100% of the
+    // network, claimed a full block reward every block on screen and in the panel,
+    // and `pause_if_unprofitable` could never fire however much power it burned.
+    // The header the miner is hashing carries the real difficulty, and a block
+    // whose `difficulty` field is not the value the node recomputes is rejected,
+    // so it is the one number a pool cannot quietly shrink. What this still
+    // cannot know is the pool's fee and its own luck, so it is gross
+    // network-share revenue and not the payout.
+    let target_rates = u32_to_rates(most.network_difficulty, TARGET_BLOCK_TIME);
     let rates = rate_tracker.totals(now_ms);
     let gpu_hashrate = rates.gpu_hps;
     let cpu_hashrate = rates.cpu_hps;
@@ -1849,7 +1945,10 @@ fn deal_block_mining_results(
     // the operator can never be shown a cost that disagrees with the cost the
     // rig was paused on.
     let measured_gpu_w = cnf.runtime.gpu_board_power_w();
-    if should_pause_for_profit(
+    if !revenue_is_knowable {
+        // No decision either way, and the previous one is left standing. The rig
+        // keeps doing whatever it was doing until a header it can price arrives.
+    } else if should_pause_for_profit(
         &cnf.efficiency,
         hac1day,
         &cnf.gpu_profile,
@@ -1857,8 +1956,12 @@ fn deal_block_mining_results(
         measured_gpu_w,
     ) {
         cnf.runtime.paused_unprofitable.store(true, Relaxed);
+        // Stamped so the empty-drain branch above can let it expire. Never 0:
+        // that value means this worker did not pause the rig.
+        PROFIT_PAUSE_SINCE_MS.store(now_ms.max(1), Relaxed);
         wlogln!(
-            "\n[efficiency] Mining paused: {} cost exceeds HAC revenue. Set pause_if_unprofitable=false or lower power draw.",
+            "\n[efficiency] Mining paused for up to {}s: {} cost exceeds HAC revenue. It resumes by itself to measure again. Set pause_if_unprofitable=false or lower power draw.",
+            PROFIT_PAUSE_RECHECK_MS / 1_000,
             if measured_gpu_w.is_some() {
                 "measured"
             } else {
@@ -1866,6 +1969,7 @@ fn deal_block_mining_results(
             }
         );
     } else {
+        PROFIT_PAUSE_SINCE_MS.store(0, Relaxed);
         cnf.runtime.paused_unprofitable.store(false, Relaxed);
     }
     let eff_line = format_efficiency_line(
@@ -2090,6 +2194,260 @@ mod tests {
         ));
         // Unknown live template must never cost a payout.
         assert!(!result_is_orphaned(&res, None));
+    }
+
+    #[test]
+    fn a_pooled_rig_prices_its_day_on_the_network_target_not_the_share_target() {
+        let _guard = mining_state_guard();
+        set_pending_block_stuff(500, pending_template_json(500, 0x11, 0xb1)).unwrap();
+
+        // Mainnet-shaped network difficulty: target 2^208, i.e. ~2^48 hashes per
+        // block, ~9.4e11 H/s at the 300 s block time.
+        const NETWORK_DIFFICULTY: u32 = 0xD080_0000;
+        // What a pool actually serves in `target_hash`: ~17 hashes to a share.
+        // Any real rig saturates it, and that saturation is the whole defect.
+        let share_target = vec![0x0fu8; HASH_WIDTH];
+
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        cnf.pool_worker = "1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        cnf.efficiency.pause_if_unprofitable = true;
+        cnf.efficiency.hac_price = 1.0;
+        cnf.efficiency.power_cost_kwh = 0.15;
+        cnf.efficiency.gpu_watts = 100.0;
+        // No CPU term, so the whole power bill is at most 0.36 EUR a day.
+        cnf.efficiency.cpu_watts_per_thread = 0.0;
+
+        // 1 MH/s against a 9.4e11 H/s network earns ~3e-4 HAC a day, far less than
+        // the electricity: the pause MUST fire. Priced off the share target the
+        // same rig reads as a full 288 HAC a day and never pauses.
+        let mut small = BlockMiningResult::default();
+        small.height = 500;
+        small.prevhash = vec![0x11u8; HASH_WIDTH];
+        small.nonce_space = 1_000_000;
+        small.use_secs = 1.0;
+        small.target_hash = share_target.clone();
+        // Above the share target, so this is a statistics-only result and nothing
+        // is queued for submission.
+        small.result_hash = vec![0x7fu8; HASH_WIDTH];
+        small.network_difficulty = NETWORK_DIFFICULTY;
+
+        let (small_tx, mut small_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        small_tx.send(Arc::new(small)).unwrap();
+        let (submit_tx, _submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut small_rx,
+            1,
+            &mut HashrateTracker::default(),
+            1_000,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(
+            cnf.runtime.paused_unprofitable.load(Relaxed),
+            "a 1 MH/s rig on a 9.4e11 H/s network cannot pay for its own power; \
+             pricing the day off the pool's share target hides that completely"
+        );
+
+        // Same pool, same share target, a rig that really is ~10% of the network.
+        // The revenue is real, so mining must NOT be paused: this is what stops
+        // the fix degenerating into "pooled rigs always pause".
+        let mut big = BlockMiningResult::default();
+        big.height = 500;
+        big.prevhash = vec![0x11u8; HASH_WIDTH];
+        big.nonce_space = 100_000_000;
+        big.use_secs = 0.001;
+        big.target_hash = share_target;
+        big.result_hash = vec![0x7fu8; HASH_WIDTH];
+        big.network_difficulty = NETWORK_DIFFICULTY;
+
+        let (big_tx, mut big_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        big_tx.send(Arc::new(big)).unwrap();
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut big_rx,
+            1,
+            &mut HashrateTracker::default(),
+            2_000,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(
+            !cnf.runtime.paused_unprofitable.load(Relaxed),
+            "a rig earning tens of HAC a day must keep mining"
+        );
+    }
+
+    #[test]
+    fn a_header_this_miner_cannot_price_still_submits_its_winner() {
+        let _guard = mining_state_guard();
+        set_pending_block_stuff(500, pending_template_json(500, 0x11, 0xb1)).unwrap();
+
+        // Difficulty 0: no node accepts such a block, so nothing can say what a
+        // day of work on it is worth. `set_pending_block_stuff` checks only the
+        // served `target_hash`, never the intro's difficulty, so a pool really can
+        // install one of these.
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        cnf.efficiency.pause_if_unprofitable = true;
+        cnf.efficiency.hac_price = 1.0;
+        cnf.efficiency.power_cost_kwh = 0.15;
+        cnf.efficiency.gpu_watts = 100.0;
+        cnf.efficiency.cpu_watts_per_thread = 0.0;
+
+        let mut win = BlockMiningResult::default();
+        win.height = 500;
+        win.prevhash = vec![0x11u8; HASH_WIDTH];
+        win.nonce_space = 1;
+        win.use_secs = 0.5;
+        win.head_nonce = 77;
+        win.coinbase_nonce = vec![0x05; HASH_WIDTH];
+        win.target_hash = vec![0x0f; HASH_WIDTH];
+        win.result_hash = vec![0x01; HASH_WIDTH]; // under target: a real winner
+        win.network_difficulty = 0;
+
+        let (res_tx, mut res_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        res_tx.send(Arc::new(win)).unwrap();
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx,
+            1,
+            &mut HashrateTracker::default(),
+            1,
+            &submit_tx,
+            &test_gate(),
+        );
+
+        // A block is irreplaceable and the NODE decides what it accepts. Refusing
+        // to price a template must never become refusing to submit a win on it.
+        let submitted = submit_rx
+            .try_recv()
+            .expect("a winner must be submitted even on a header this miner cannot price");
+        assert_eq!(submitted.head_nonce, 77);
+        // And no revenue was invented: a zero rate must not read as "earns
+        // nothing", which would pause a rig for a fault that is the pool's.
+        assert!(
+            !cnf.runtime.paused_unprofitable.load(Relaxed),
+            "a header that cannot be priced is not evidence the rig is unprofitable"
+        );
+
+        // The previous decision also stands untouched, in either direction.
+        cnf.runtime.paused_unprofitable.store(true, Relaxed);
+        let mut win2 = BlockMiningResult::default();
+        win2.height = 500;
+        win2.prevhash = vec![0x11u8; HASH_WIDTH];
+        win2.nonce_space = 1;
+        win2.use_secs = 0.5;
+        win2.head_nonce = 78;
+        win2.coinbase_nonce = vec![0x06; HASH_WIDTH];
+        win2.target_hash = vec![0x0f; HASH_WIDTH];
+        win2.result_hash = vec![0x02; HASH_WIDTH];
+        win2.network_difficulty = 0;
+        let (res_tx2, mut res_rx2) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        res_tx2.send(Arc::new(win2)).unwrap();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut res_rx2,
+            1,
+            &mut HashrateTracker::default(),
+            2,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(
+            cnf.runtime.paused_unprofitable.load(Relaxed),
+            "an unpriceable header must not silently resume a rig its operator's \
+             own numbers had paused"
+        );
+    }
+
+    #[test]
+    fn a_profit_pause_is_never_a_one_way_latch() {
+        let _guard = mining_state_guard();
+        set_pending_block_stuff(500, pending_template_json(500, 0x11, 0xb1)).unwrap();
+
+        const NETWORK_DIFFICULTY: u32 = 0xD080_0000;
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        cnf.pool_worker = "1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        cnf.efficiency.pause_if_unprofitable = true;
+        cnf.efficiency.hac_price = 1.0;
+        cnf.efficiency.power_cost_kwh = 0.15;
+        cnf.efficiency.gpu_watts = 100.0;
+        cnf.efficiency.cpu_watts_per_thread = 0.0;
+
+        // One tick that really is unprofitable: the rig pauses, correctly.
+        let mut small = BlockMiningResult::default();
+        small.height = 500;
+        small.prevhash = vec![0x11u8; HASH_WIDTH];
+        small.nonce_space = 1_000_000;
+        small.use_secs = 1.0;
+        small.target_hash = vec![0x0fu8; HASH_WIDTH];
+        small.result_hash = vec![0x7fu8; HASH_WIDTH];
+        small.network_difficulty = NETWORK_DIFFICULTY;
+
+        let (tx, mut rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        tx.send(Arc::new(small)).unwrap();
+        let (submit_tx, _submit_rx) = mpsc::sync_channel::<Arc<BlockMiningResult>>(4);
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut rx,
+            1,
+            &mut tracker,
+            1_000,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(cnf.runtime.paused_unprofitable.load(Relaxed));
+
+        // Paused workers produce nothing, so every later tick drains an EMPTY
+        // channel, and that is the only state this rig can now be in. Before the
+        // recheck interval the pause has to hold, or it is not a pause at all.
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut rx,
+            1,
+            &mut tracker,
+            1_000 + PROFIT_PAUSE_RECHECK_MS - 1,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(
+            cnf.runtime.paused_unprofitable.load(Relaxed),
+            "the pause must actually pause: lifting it on the next empty tick \
+             would make it worthless"
+        );
+
+        // After it, the rig has to be allowed to measure again. Without that it
+        // is finished for the life of the process even if HAC doubles in price,
+        // because the line that clears the flag sits past the empty-drain return
+        // and only a result can reach it.
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut rx,
+            1,
+            &mut tracker,
+            1_000 + PROFIT_PAUSE_RECHECK_MS + 1,
+            &submit_tx,
+            &test_gate(),
+        );
+        assert!(
+            !cnf.runtime.paused_unprofitable.load(Relaxed),
+            "the profit pause is cleared only by a result, and a paused rig \
+             produces none: without a recheck it can never mine again without a \
+             restart"
+        );
     }
 
     #[test]
