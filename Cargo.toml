@@ -14,7 +14,7 @@ default-run = "hacash"
 # checks. And `connect = https://host` was pasted into `http://{}`, so a pool
 # reached over TLS could not be reached at all and plaintext was not something an
 # operator could decline.
-version = "0.5.9"
+version = "0.5.10"
 edition = "2024"
 
 [workspace]
