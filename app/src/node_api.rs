@@ -255,6 +255,7 @@ fn build_capabilities(
             "transaction_submit": true,
             "transaction_query": true,
             "reconciliation_by_tx_hash": true,
+            "contract_sandbox_query": hvm,
         },
         "limits": {
             "max_tx_size": config.max_tx_size,
@@ -321,6 +322,10 @@ mod node_capabilities_tests {
         assert_eq!(
             value["features"]["exact_unsigned_simulation"].as_bool(),
             Some(false),
+        );
+        assert_eq!(
+            value["api"]["contract_sandbox_query"].as_bool(),
+            value["features"]["hvm"].as_bool(),
         );
         assert!(
             !numbers(&value["transactions"]["enabled"]).contains(&(TYPE4_TRANSACTION_TYPE as u64))
