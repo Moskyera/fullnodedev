@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "hacash"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "app",
  "basis",

@@ -1,7 +1,20 @@
 [package]
 name = "hacash"
 default-run = "hacash"
-version = "0.5.8"
+# The MINER's version. It ships on `v*` tags and the pool ships on its own
+# `pool-v*` tags, because they are different products for different people: see
+# hbit-pool/Cargo.toml. A pool fix must never make anyone re-download a miner,
+# and a miner fix must never wait for one.
+#
+# 0.5.9 carries two fixes for anyone mining at a pool. The day's earnings were
+# divided by the target the RESULT was measured against, which at a pool is the
+# share target, so every pooled rig read as 100% of the network and claimed a
+# full block reward every block; it now reads the difficulty out of the header it
+# is already hashing, which no pool can fake because those are the bytes the node
+# checks. And `connect = https://host` was pasted into `http://{}`, so a pool
+# reached over TLS could not be reached at all and plaintext was not something an
+# operator could decline.
+version = "0.5.9"
 edition = "2024"
 
 [workspace]
