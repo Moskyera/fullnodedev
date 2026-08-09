@@ -267,3 +267,66 @@ fn a_testnet_is_not_checked_against_a_genesis_it_cannot_have() {
     verify_chain_params(&http_client(), &node.base, &ChainParams::testnet(10, 10))
         .expect("a testnet genesis is whatever its operator made it");
 }
+
+/// The operator runbook that ships in the release archive, checked as text.
+///
+/// A doc claim about a refusal is a safety claim. An operator who believes the
+/// pool refuses to start on a syncing node stops watching the node's own sync,
+/// and this deployment's known failure is a history sync that finishes short of
+/// the tip and then ignores live blocks. The runbook said exactly that for as
+/// long as nothing was checking it, because a sentence in a markdown file is
+/// the one part of this pool the compiler never reads.
+#[test]
+fn the_runbook_does_not_promise_a_syncing_refusal_the_pool_cannot_make() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("docs/POOL-OPERATOR.md");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    // Flattened, so re-wrapping a paragraph can neither hide a claim from this
+    // test nor fake one into it.
+    let doc = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // There is no such check and there cannot be one here: the node's
+    // /query/latest answers with a height and a diamond number, and everything
+    // this file drives - the genesis hash and the tip timestamp - is evidence
+    // about the chain, never about the node's own sync state.
+    assert!(
+        !doc.contains("A node that is still syncing"),
+        "the runbook promises a refusal on a syncing node. No such check exists, \
+         and the node's API cannot report sync state at all"
+    );
+
+    // What the pool really refuses and halts on, each named where an operator
+    // will look for it.
+    for claim in [
+        "block 1",
+        "3600 seconds",
+        "7200 seconds",
+        "/query/latest",
+        "cannot detect a syncing node",
+        "hbit-v2/MAINNET-SAFETY.md",
+    ] {
+        assert!(
+            doc.contains(claim),
+            "the runbook has to say what the pool really does about the node, and \
+             `{claim}` is missing from it"
+        );
+    }
+
+    // The link above has to resolve in the archive as well as in the repository,
+    // and the archive is flat: POOL-OPERATOR.md sits at its root beside the
+    // copied directory. So the copy has to keep this name.
+    let workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join(".github/workflows/release-pool.yml");
+    let packaging = std::fs::read_to_string(&workflow).expect("read release-pool.yml");
+    assert!(
+        packaging.contains("cp -r docs/hbit-v2 \"$pooldir/hbit-v2\""),
+        "the runbook links to hbit-v2/MAINNET-SAFETY.md, so the release archive has to \
+         copy that directory under exactly that name or the link is dead for every \
+         operator who reads the shipped copy"
+    );
+}

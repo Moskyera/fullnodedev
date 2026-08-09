@@ -87,7 +87,14 @@ else
 	say "        Check that address is yours before going further."
 fi
 if grep -qE '^[[:space:]]*fast_sync[[:space:]]*=[[:space:]]*true' hacash.config.ini; then
-	bad "fast_sync = true builds a chain that cannot be extended; set it to false"
+	# Hard FAIL, not a warning. chain/src/insert.rs runs the minter block gate
+	# only when fast_sync is off, and mint/src/check/block_accept.rs is the only
+	# place a synced block's difficulty and PoW hash are ever checked.
+	bad "fast_sync = true accepts synced blocks without checking their proof of work"
+	say "        Whatever history a peer sends becomes this node's chain unchecked, and"
+	say "        the pool would credit and pay miners real HAC for work measured against"
+	say "        it. Nothing looks broken while it happens: the node still reaches the"
+	say "        tip and still answers every query. Set fast_sync = false."
 	fail=1
 else
 	ok "fast_sync is not enabled"

@@ -92,7 +92,10 @@ jobs:
           cp deploy/hbit-wait-for-node.sh "$pooldir/"
           cp deploy/README.md "$pooldir/DEPLOY.md"
           cp docs/POOL-OPERATOR.md docs/POOL-README.md "$pooldir/"
-          cp -r docs/hbit-v2 "$pooldir/docs-hbit-v2"
+          # Kept under its repository name: POOL-OPERATOR.md links into it with a
+          # relative path, and the archive is flat, so renaming the directory
+          # here silently breaks that link for everyone who reads the shipped copy.
+          cp -r docs/hbit-v2 "$pooldir/hbit-v2"
           cp scripts/hbit-vps-setup.sh "$pooldir/SETUP-POOL.sh"
           chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout \
             "$pooldir"/hacash "$pooldir"/hbit-wait-for-node.sh "$pooldir"/SETUP-POOL.sh
@@ -112,6 +115,7 @@ jobs:
             test -x "$d/$f" || { echo "missing or not executable: $f"; exit 1; }
           done
           for f in hacash.config.ini.example DEPLOY.md POOL-OPERATOR.md POOL-README.md \
+                   hbit-v2/MAINNET-SAFETY.md \
                    systemd/hacash-node.service systemd/hbit-pool.service; do
             test -f "$d/$f" || { echo "missing: $f"; exit 1; }
           done
@@ -224,5 +228,5 @@ jobs:
             The pool has run against a live mainnet node and accepted real
             shares. It has never found a block on mainnet, so block discovery
             through hold-back, maturity and payout has not executed against the
-            real chain. `docs-hbit-v2/` in the archive states what is and is not
+            real chain. `hbit-v2/` in the archive states what is and is not
             implemented, in the same words.

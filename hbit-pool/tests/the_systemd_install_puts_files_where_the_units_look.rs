@@ -272,3 +272,76 @@ fn no_unit_or_readme_still_points_at_a_script_that_does_not_exist() {
         }
     }
 }
+
+/// The pool archive carries `deploy/node/hacash.config.ini` (as
+/// `hacash.config.ini.example`) and `scripts/hbit-vps-setup.sh` (as
+/// `SETUP-POOL.sh`) side by side, so an operator reads both. Both once said
+/// `fast_sync = true` "builds a chain that cannot be extended". Commit 2532814
+/// retracted that after a controlled sync with the flag ON reached the tip with
+/// no errors at all. It corrected the config and missed the script, so the
+/// archive shipped a retracted claim next to its own retraction.
+///
+/// The refusal is right and stays hard, for the reason that survives reading the
+/// node. `chain/src/insert.rs` calls `eng.minter.blk_verify` only when
+/// `fast_sync` is off, and `mint/src/check/block_accept.rs` is the only place a
+/// synced block's difficulty and PoW hash are checked, so a node synced with the
+/// flag on took a peer's whole history on trust. Block bodies and the `tx_exist`
+/// index are written either way, so `/query/transaction` and fee accounting keep
+/// answering and nothing looks wrong while it happens. That is why this must
+/// fail the setup rather than warn.
+#[test]
+fn no_shipped_file_still_gives_the_retracted_reason_for_refusing_fast_sync() {
+    // The exact mechanism commit 2532814 withdrew.
+    const RETRACTED: &str = "cannot be extended";
+
+    let shipped = [
+        "scripts/hbit-vps-setup.sh",
+        "deploy/node/hacash.config.ini",
+        "deploy/README.md",
+        "docs/POOL-OPERATOR.md",
+        "docs/POOL-README.md",
+    ];
+    let mut checked: Vec<&str> = Vec::new();
+    for rel in shipped {
+        if !repo_root().join(rel).exists() {
+            continue;
+        }
+        checked.push(rel);
+        assert!(
+            !read(rel).contains(RETRACTED),
+            "{rel} still tells the operator that fast_sync {RETRACTED:?}. Commit 2532814 \
+             withdrew that after a controlled sync with fast_sync = true reached the tip \
+             with no errors, and this file ships in the same archive as the config that \
+             carries the withdrawal."
+        );
+    }
+    for must in ["scripts/hbit-vps-setup.sh", "deploy/node/hacash.config.ini"] {
+        assert!(
+            checked.contains(&must),
+            "{must} must be readable; this test must not pass by finding nothing"
+        );
+    }
+
+    // And the refusal stays hard, with the true cost named.
+    let setup = read("scripts/hbit-vps-setup.sh");
+    let branch = setup
+        .split_once("fast_sync[[:space:]]*=[[:space:]]*true")
+        .expect("the setup script must still check for fast_sync = true")
+        .1;
+    let branch = branch
+        .split_once("\nelse")
+        .expect("the fast_sync check must still have an else branch")
+        .0;
+    assert!(
+        branch.contains("fail=1"),
+        "the setup script no longer stops on fast_sync = true. It must: a node synced \
+         with it on accepted every block without checking its proof of work, and this \
+         pool pays real HAC for work measured against that chain."
+    );
+    assert!(
+        branch.contains("proof of work"),
+        "the setup script refuses fast_sync = true without saying what it really costs. \
+         Name the skipped proof-of-work check, so the next reader does not fill the gap \
+         with a guess the way the retracted reason was filled."
+    );
+}
