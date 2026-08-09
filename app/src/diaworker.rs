@@ -92,7 +92,11 @@ impl DiaWorkConf {
             );
         }
         DiaWorkConf {
-            rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
+            // Normalised ONCE, here, so no request site can build a URL its own
+            // way. A bare host:port stays plain HTTP, which is what every
+            // existing config has; https:// now works instead of being pasted
+            // inside another scheme.
+            rpcaddr: crate::rpc_http::base_url(&ini_must(sec, "connect", "127.0.0.1:8081")),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
             supervene: configured_supervene,
             bidaddr: Address::default(),
@@ -1131,7 +1135,7 @@ pub(crate) fn check_diamer_success(
 }
 
 fn load_init(cnf: &mut DiaWorkConf) {
-    let urlapi_pending = format!("http://{}/query/diamondminer/init", &cnf.rpcaddr);
+    let urlapi_pending = format!("{}/query/diamondminer/init", &cnf.rpcaddr);
     loop {
         let body =
             match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_pending, &cnf.api_token, None) {
@@ -1139,7 +1143,8 @@ fn load_init(cnf: &mut DiaWorkConf) {
                 Err(e) => {
                     wlogln!(
                         "Error: cannot init diamond miner from {}: {}",
-                        &urlapi_pending, e
+                        &urlapi_pending,
+                        e
                     );
                     delay_continue!(30);
                 }
@@ -1166,7 +1171,8 @@ fn load_init(cnf: &mut DiaWorkConf) {
         };
         wlogln!(
             "[Config] query diamond miner bid address: {}, reward address: {}",
-            &adr1, &adr2
+            &adr1,
+            &adr2
         );
         // ok
         cnf.bidaddr = bid_addr;
@@ -1179,7 +1185,7 @@ fn load_init(cnf: &mut DiaWorkConf) {
 fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     let mining_num = MINING_DIAMOND_NUM.load(Acquire);
 
-    let urlapi_latest = format!("http://{}/query/latest", &cnf.rpcaddr);
+    let urlapi_latest = format!("{}/query/latest", &cnf.rpcaddr);
     // get next number
     // wlogln!("urlapi_latest: {}", &urlapi_latest);
     let body = match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_latest, &cnf.api_token, None) {
@@ -1210,15 +1216,12 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     } else if next_num < mining_num {
         wlogln!(
             "[HACD] diamond tip reorg: number {} -> {}, refreshing job",
-            mining_num, next_num
+            mining_num,
+            next_num
         );
     }
     // query prev diamond (or re-query when number did not advance)
-    let urlapi_diamond = format!(
-        "http://{}/query/diamond?number={}",
-        &cnf.rpcaddr,
-        next_num - 1
-    );
+    let urlapi_diamond = format!("{}/query/diamond?number={}", &cnf.rpcaddr, next_num - 1);
     // wlogln!("urlapi_diamond: {}", &urlapi_diamond);
     let body = match crate::rpc_http::get_text(&HTTP_CLIENT, &urlapi_diamond, &cnf.api_token, None)
     {
@@ -1237,7 +1240,8 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
     let Ok(hx) = hex::decode(&prev_hash) else {
         wlogln!(
             "Error: cannot get born.hash from {}: {:?}",
-            &urlapi_diamond, &res
+            &urlapi_diamond,
+            &res
         );
         delay_return!(30); // hash error
     };
@@ -1261,7 +1265,7 @@ fn pull_and_push_diamond(cnf: &DiaWorkConf) {
 }
 
 fn push_diamond_mining_success(cnf: &DiaWorkConf, success: DiamondMint) {
-    let urlapi_success = format!("http://{}/submit/diamondminer/success", &cnf.rpcaddr);
+    let urlapi_success = format!("{}/submit/diamondminer/success", &cnf.rpcaddr);
     let actionbody = success.serialize();
     // Submitting the mined diamond is the whole payoff. Match the block submit
     // path: retry transport failures AND unrecognized HTTP-200 bodies (proxy
@@ -1640,7 +1644,8 @@ mod diamond_prefilter_tests {
                 let (_f, _r, dia) =
                     x16rs::mine_diamond(number, &prev, &res.u64_nonce.to_be_bytes(), &addr, &cm);
                 assert_eq!(
-                    dia, res.dia_str,
+                    dia,
+                    res.dia_str,
                     "n={number} start={start} nonce={} reported {:?} but mine_diamond says {:?}",
                     res.u64_nonce,
                     String::from_utf8_lossy(&res.dia_str),

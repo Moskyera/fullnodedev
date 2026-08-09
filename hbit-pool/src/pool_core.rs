@@ -1,4 +1,4 @@
-//! pool_core — the pool's off-node accounting brain. No consensus, no node
+//! pool_core - the pool's off-node accounting brain. No consensus, no node
 //! changes. Ties the two proven on-chain halves together: workers submit shares
 //! (validated here) -> PPLNS accounting -> exact payout split -> the proven
 //! batched settlement transfer.
@@ -402,9 +402,19 @@ impl Pplns {
     ) -> Self {
         let mut p = Self::new(window, horizon_ms);
         let keep = p.window;
+        // The instant this snapshot was taken: the newest arrival in it. The
+        // shares trimmed below are being evicted right now, and what they earned
+        // is measured against that instant, exactly as `record` measures against
+        // the arrival that evicts them.
+        let anchor = order.iter().map(|(_, at)| *at).max().unwrap_or(0);
         // Newest first, pushed to the FRONT, so the surviving tail comes back in
         // the order it was accepted in.
-        for (w, at) in order.into_iter().rev().take(keep) {
+        let mut trimmed: Vec<(String, u64)> = Vec::new();
+        for (i, (w, at)) in order.into_iter().rev().enumerate() {
+            if i >= keep {
+                trimmed.push((w, at));
+                continue;
+            }
             p.order.push_front((w.clone(), at));
             match p.counts.get_mut(&w) {
                 Some(c) => *c += 1,
@@ -412,6 +422,25 @@ impl Pplns {
                     p.counts.insert(w, 1);
                 }
             }
+        }
+        // BANK what was trimmed, the way `record` banks what it evicts.
+        //
+        // This used to drop it. `record` banks precisely so that eviction cannot
+        // destroy credit - the comment there says a miner able to push 4096
+        // shares in at once would otherwise wipe out everyone else's accrued
+        // credit for free - and restore quietly did the opposite. A file holding
+        // more shares than this build's window (written when the window was
+        // larger, or by an operator's hand) lost every share past the constant
+        // AND everything those shares had earned, which is money moved from the
+        // miners who were there to the miners who remain. A restart is not
+        // allowed to move money between people.
+        //
+        // Banked at `anchor` because that is when the eviction happens, so the
+        // bucket expires one horizon after the snapshot rather than one horizon
+        // after whenever the pool was restarted.
+        for (w, since) in trimmed {
+            let earned = anchor.saturating_sub(since).min(p.horizon_ms);
+            p.bank(&w, earned, anchor);
         }
         let width = p.bucket_ms();
         for (at_ms, rows) in banked {
@@ -447,7 +476,7 @@ impl Pplns {
 }
 
 /// Split `reward_units` (smallest integer units) among workers by share count
-/// using the largest-remainder method (exact — no unit created or lost), after
+/// using the largest-remainder method (exact - no unit created or lost), after
 /// taking `fee_units` off the top. Workers whose payout is below `dust_units`
 /// are dropped (their remainder stays with the pool). Returns (worker, units).
 pub fn split_payout(
@@ -492,6 +521,63 @@ mod tests {
     /// The horizon the pool really runs, so a test about a settlement-interval
     /// change uses the interval->horizon map the server uses.
     use crate::pplns_horizon_ms;
+
+    #[test]
+    fn a_restart_that_trims_the_window_does_not_move_money_between_miners() {
+        // B9. `record` banks what it evicts, precisely so eviction cannot destroy
+        // credit. `restore` dropped it. A file holding more shares than this
+        // build's window - written when the window was larger, or edited by hand -
+        // lost every share past the constant AND everything those shares had
+        // earned. That credit belongs to named miners, and dropping it hands
+        // their money to whoever is still in the window. A restart must not do
+        // that in either direction.
+        let horizon = 600_000u64;
+        let t = 1_000_000u64;
+
+        // Six shares in the file: A mined early and is about to be trimmed,
+        // B mined late and survives.
+        let order = vec![
+            ("A".to_string(), t),
+            ("A".to_string(), t + 1_000),
+            ("A".to_string(), t + 2_000),
+            ("B".to_string(), t + 100_000),
+            ("B".to_string(), t + 101_000),
+            ("B".to_string(), t + 102_000),
+        ];
+        // A window of two: four of those six are evicted on restore.
+        let p = Pplns::restore(2, horizon, order.clone(), Vec::new());
+        let credit = p.credit(t + 102_000);
+        let a = credit
+            .iter()
+            .find(|(w, _)| w == "A")
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        assert!(
+            a > 0,
+            "the miner whose shares were trimmed still earned them: {credit:?}"
+        );
+
+        // And the whole point: trimming must not change the split. Restoring the
+        // same file into a window big enough to hold all six has to credit the
+        // same people the same way.
+        let whole = Pplns::restore(16, horizon, order, Vec::new());
+        let want = whole.credit(t + 102_000);
+        let got = credit;
+        let total_want: u64 = want.iter().map(|(_, c)| *c).sum();
+        let total_got: u64 = got.iter().map(|(_, c)| *c).sum();
+        assert_eq!(
+            total_got, total_want,
+            "the same file must be worth the same credit whatever window it is \
+             restored into: trimmed {got:?} against whole {want:?}"
+        );
+        for (w, c) in &want {
+            assert_eq!(
+                got.iter().find(|(x, _)| x == w).map(|(_, c)| *c),
+                Some(*c),
+                "worker {w} is credited differently after a trim: {got:?} against {want:?}"
+            );
+        }
+    }
 
     #[test]
     fn shift_left_saturating_multiplies_and_saturates() {
@@ -762,7 +848,10 @@ mod tests {
         // by the ratio of the two bucket widths, so credit banked a second ago
         // read as decades old and was expired on the spot.
         let h120 = pplns_horizon_ms(120);
-        assert!(bucket_ms + 1_000 < h120, "the test must not sit on the edge");
+        assert!(
+            bucket_ms + 1_000 < h120,
+            "the test must not sit on the edge"
+        );
         let shorter = Pplns::restore(1, h120, order.clone(), banked.clone());
         assert_eq!(
             shorter.credit_share("gone", now).0,

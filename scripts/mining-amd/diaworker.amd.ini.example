@@ -2,6 +2,15 @@
 ; OpenCL and GPU tuning apply to HAC poworker, not HACD.
 ; Requires [diamondminer] enable = true in hacash.config.ini.
 
+; Your own fullnode, or a pool. Three forms are accepted:
+;   host:port              plain HTTP, for a node on this machine or your LAN
+;   http://host:port       the same, spelled out
+;   https://pool.example   TLS, and what you want for any pool that is not yours
+;
+; Plain HTTP to somebody else's pool is not just unencrypted: a pool credits a
+; share to whatever payout address the request names, so anyone on the path can
+; resend your work under their address and be paid for it. The miner says so at
+; startup if you point it off this machine without TLS.
 connect = 127.0.0.1:8080
 ; 0 = fit this machine: all logical CPUs but two. Set a number only to take less.
 supervene = 0

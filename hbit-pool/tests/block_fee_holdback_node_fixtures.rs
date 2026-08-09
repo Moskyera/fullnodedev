@@ -179,9 +179,19 @@ fn write_reply(stream: &mut TcpStream, r: &Reply) {
     let _ = stream.flush();
 }
 
-fn ask(intro: Reply, txs: Vec<(&'static str, Reply)>, height: u64, our_hash: &str) -> BlockFees {
+/// `tip` is what the node's own tip is supposed to be while it answers, because
+/// what a refusal MEANS depends on which side of it the height stands: above the
+/// tip a missing block is ordinary waiting, at or below it the node is failing
+/// to produce a block it must hold.
+fn ask(
+    intro: Reply,
+    txs: Vec<(&'static str, Reply)>,
+    height: u64,
+    our_hash: &str,
+    tip: u64,
+) -> BlockFees {
     let node = stub_node(intro, txs.into_iter().collect());
-    block_fees(&http_client(), &node.base, height, our_hash)
+    block_fees(&http_client(), &node.base, height, our_hash, tip)
 }
 
 /// The figure the settlement path actually holds back for one immature block:
@@ -202,7 +212,7 @@ fn holdback_units(height: u64, fees: &BlockFees) -> Option<u64> {
 
 #[test]
 fn a_real_block_with_no_transactions_holds_back_the_subsidy_and_no_more() {
-    let got = ask(Reply::ok(BLOCK_307_0TX), vec![], 307, HASH_307);
+    let got = ask(Reply::ok(BLOCK_307_0TX), vec![], 307, HASH_307, 310);
     assert_eq!(got, BlockFees::Counted(0), "body: {BLOCK_307_0TX}");
 
     // 1 HAC of subsidy is 10 payout units of 0.1 HAC, and the fixture's own
@@ -231,6 +241,7 @@ fn three_real_transaction_fees_are_summed_before_they_are_rounded_up_once() {
         ],
         309,
         HASH_309,
+        310,
     );
 
     // 0.01 + 0.003 + 0.0007 HAC = 0.0137 HAC = 13_700_000 fine steps, which is
@@ -253,7 +264,7 @@ fn three_real_transaction_fees_are_summed_before_they_are_rounded_up_once() {
     for h in [TXH_309_A, TXH_309_B, TXH_309_C] {
         assert!(BLOCK_309_3TX.contains(h), "missing {h}");
     }
-    assert_eq!(BLOCK_309_3TX.matches("\",\"").count() > 0, true);
+    assert!(BLOCK_309_3TX.matches("\",\"").count() > 0);
 }
 
 #[test]
@@ -266,6 +277,7 @@ fn fees_one_fine_step_past_a_unit_boundary_hold_back_the_next_whole_unit() {
         ],
         308,
         HASH_308,
+        310,
     );
 
     // 0.1 HAC is exactly one payout unit; the second fee is a single fine step
@@ -302,6 +314,7 @@ fn a_fee_rendered_in_an_unusual_unit_stops_settlement_instead_of_reading_as_zero
         ],
         309,
         HASH_309,
+        310,
     );
 
     assert!(
@@ -324,14 +337,14 @@ fn a_malformed_block_body_stops_settlement_instead_of_reading_as_zero() {
     // The real body of a 404 from this node: empty. `get_json` cannot parse it,
     // so it arrives as a bare JSON string rather than an object.
     assert_eq!(EMPTY_404_BODY, "");
-    let got = ask(Reply::not_found(EMPTY_404_BODY), vec![], 309, HASH_309);
+    let got = ask(Reply::not_found(EMPTY_404_BODY), vec![], 309, HASH_309, 310);
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
     assert_eq!(holdback_units(309, &got), None);
 
     // A real intro body cut short - what a dropped connection or a proxy buffer
     // limit produces. Valid JSON never resumes, so it must not be believed.
     let truncated = &BLOCK_309_3TX[..BLOCK_309_3TX.len() / 2];
-    let got = ask(Reply::ok(truncated), vec![], 309, HASH_309);
+    let got = ask(Reply::ok(truncated), vec![], 309, HASH_309, 310);
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
     assert_eq!(holdback_units(309, &got), None);
 
@@ -345,7 +358,7 @@ fn a_malformed_block_body_stops_settlement_instead_of_reading_as_zero() {
     );
     assert!(!no_list.contains("tx_hash_list"), "fixture text drifted");
     assert!(no_list.contains(HASH_309) && no_list.contains(r#""ret":0"#));
-    let got = ask(Reply::ok(&no_list), vec![], 309, HASH_309);
+    let got = ask(Reply::ok(&no_list), vec![], 309, HASH_309, 310);
     assert!(
         matches!(got, BlockFees::Unknown(_)),
         "a missing tx_hash_list must never read as an empty one, got {got:?}"
@@ -354,7 +367,7 @@ fn a_malformed_block_body_stops_settlement_instead_of_reading_as_zero() {
 
     // A transaction body cut short mid-JSON: the stub answers this way for any
     // hash it does not know.
-    let got = ask(Reply::ok(BLOCK_309_3TX), vec![], 309, HASH_309);
+    let got = ask(Reply::ok(BLOCK_309_3TX), vec![], 309, HASH_309, 310);
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
     assert_eq!(holdback_units(309, &got), None);
 }
@@ -369,14 +382,14 @@ fn the_nodes_own_error_objects_are_read_for_what_they_actually_say() {
     // that height, so it credited us nothing and there is nothing to hold back.
     assert!(BLOCK_MISSING_ERR.contains(r#""ret":1"#));
     assert!(BLOCK_MISSING_ERR.contains("cannot find block"));
-    let got = ask(Reply::ok(BLOCK_MISSING_ERR), vec![], 999_999, HASH_309);
+    let got = ask(Reply::ok(BLOCK_MISSING_ERR), vec![], 999_999, HASH_309, 310);
     assert_eq!(got, BlockFees::NotOnChain);
     assert_eq!(holdback_units(999_999, &got), Some(0));
 
     // The chain holds a block at our height, but it is not ours - another block
     // won it. Also nothing credited. (Real 307 body, asked about as if it were
     // our block.)
-    let got = ask(Reply::ok(BLOCK_307_0TX), vec![], 307, HASH_309);
+    let got = ask(Reply::ok(BLOCK_307_0TX), vec![], 307, HASH_309, 310);
     assert_eq!(got, BlockFees::NotOnChain);
 
     // But an error on a transaction the node ITSELF just listed in our block is
@@ -392,6 +405,7 @@ fn the_nodes_own_error_objects_are_read_for_what_they_actually_say() {
         ],
         309,
         HASH_309,
+        310,
     );
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
     assert_eq!(holdback_units(309, &got), None);
@@ -407,7 +421,35 @@ fn the_nodes_own_error_objects_are_read_for_what_they_actually_say() {
         ],
         309,
         HASH_309,
+        310,
     );
+    assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The same refusal on the wrong side of the tip.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_block_under_the_nodes_own_tip_stops_settlement_instead_of_reading_as_zero() {
+    // Identical bytes to the definitive case above - the node's real
+    // "cannot find block" error object - but this time the height is one the
+    // node's own tip covers. A node that holds a chain to 310 and cannot
+    // produce block 309 is not answering; it is failing. Our block may be
+    // canonical right there, with its fee income already sitting in the pool
+    // wallet, and pricing that refusal as "no fees" is what used to hand the
+    // fee income to miners at zero confirmations.
+    assert!(BLOCK_MISSING_ERR.contains(r#""ret":1"#));
+    let got = ask(Reply::ok(BLOCK_MISSING_ERR), vec![], 309, HASH_309, 310);
+    assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
+    assert_eq!(
+        holdback_units(309, &got),
+        None,
+        "None means: settle nothing this cycle"
+    );
+
+    // At the tip exactly: the same. The tip IS a height the node must hold.
+    let got = ask(Reply::ok(BLOCK_MISSING_ERR), vec![], 310, HASH_309, 310);
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
 }
 
@@ -423,7 +465,7 @@ fn an_unreachable_node_stops_settlement_instead_of_reading_as_zero() {
         l.local_addr().expect("addr").port()
     };
     let base = format!("http://127.0.0.1:{port}");
-    let got = block_fees(&http_client(), &base, 309, HASH_309);
+    let got = block_fees(&http_client(), &base, 309, HASH_309, 310);
     assert!(matches!(got, BlockFees::Unknown(_)), "got {got:?}");
     assert_eq!(holdback_units(309, &got), None);
 }
@@ -444,6 +486,7 @@ fn the_fee_half_of_the_holdback_is_what_keeps_it_from_being_paid_out() {
         ],
         308,
         HASH_308,
+        310,
     );
     assert_eq!(fees, BlockFees::Counted(2));
 
@@ -459,7 +502,11 @@ fn the_fee_half_of_the_holdback_is_what_keeps_it_from_being_paid_out() {
 
     // Subsidy plus fees: nothing is payable until the block matures.
     assert_eq!(
-        distributable_units(balance, holdback_units(308, &fees).expect("counted"), reserve),
+        distributable_units(
+            balance,
+            holdback_units(308, &fees).expect("counted"),
+            reserve
+        ),
         None
     );
 }

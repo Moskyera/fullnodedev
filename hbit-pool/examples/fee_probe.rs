@@ -11,7 +11,7 @@
 //!
 //! usage: fee_probe <node_base_url> <height> <our_block_hash_hex>
 
-use hbit_pool::{BlockFees, block_fees, http_client};
+use hbit_pool::{BlockFees, block_fees, find_u64, get_json, http_client};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -24,7 +24,19 @@ fn main() {
     let hash = a[3].to_lowercase();
 
     let client = http_client();
-    match block_fees(&client, &node, height, &hash) {
+    // The probe answers with the settlement's own judgement, and that judgement
+    // now reads a missing block against the node's tip: above it, waiting;
+    // at or below it, a refusal. So the probe needs the same tip the
+    // settlement would use, and a node that cannot even say its tip gets the
+    // same treatment the settlement gives it.
+    let Some(tip) = find_u64(
+        &get_json(&client, &format!("{node}/query/latest")),
+        "height",
+    ) else {
+        println!("Unknown: the node at {node} did not answer /query/latest");
+        std::process::exit(1);
+    };
+    match block_fees(&client, &node, height, &hash, tip) {
         BlockFees::Counted(u) => {
             println!("Counted({u}) units of 0.1 HAC");
         }

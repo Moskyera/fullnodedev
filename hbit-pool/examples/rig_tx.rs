@@ -60,10 +60,9 @@ fn main() {
                 // Distinct timestamps make the hashes differ. They go BACKWARDS:
                 // the node refuses a transaction stamped later than its own
                 // clock, so counting up rejects everything after the first.
-                let mut tx =
-                    TransactionType2::new_by(main.clone(), fee.clone(), base_ts.saturating_sub(i));
+                let mut tx = TransactionType2::new_by(main, fee.clone(), base_ts.saturating_sub(i));
                 let mut act = HacToTrs::new();
-                act.to = AddrOrPtr::from_addr(to.clone());
+                act.to = AddrOrPtr::from_addr(to);
                 act.hacash = amt.clone();
                 tx.push_action(Box::new(act)).expect("push action");
                 tx.fill_sign(&acc).expect("fill_sign");

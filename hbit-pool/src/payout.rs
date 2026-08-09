@@ -45,8 +45,8 @@ use hbit_pool::{
     Admission, BlockFees, GoneAction, PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PayoutRecord, PayoutTxState,
     SETTLE_RESERVE_UNITS, SubmitVerdict, WALLET_PASSWORD_ENV, acquire_settle_lock, balance,
     block_fees, chunk_tx_fee, classify_payout_tx, confirm_payout, deduct_owed, distributable_units,
-    drop_payout, find_u64, get_json, gone_action, http_client, is_payout_address,
-    load_immature_blocks, load_or_create_wallet, load_owed, load_paid_ledger, load_payout_records,
+    drop_payout, find_u64, get_json, gone_action, is_payout_address, load_immature_blocks,
+    load_or_create_wallet, load_owed, load_paid_ledger, load_payout_records,
     load_pending_payout_txs, load_pplns_credit, merge_payout_rows, mine_and_submit_block, owe_rows,
     payout_amount, pool_state_path, post_hex, save_settlement_ledger, settle_lock_path,
     submit_verdict, take_owed, verify_admitted,
@@ -73,10 +73,10 @@ Run it ONLY while hbit-pool-server is stopped, and read the dry run before you c
 usage:
   hbit-pool-payout <pool_base> <node> <chain> [wallet_file] [reserve_units] [dust_units] [--commit]
 
-  <pool_base>      Base URL of the pool server, e.g. http://127.0.0.1:9777 - the
-                   same address you started it on. It is asked for the share
-                   window; while the server is stopped, as it must be, that is
-                   read from the accounting file next to the wallet instead.
+  <pool_base>      Kept so existing commands still run, and NOT consulted for
+                   anything. The share window is read from the accounting file
+                   next to the wallet, which is the only copy this tool trusts.
+                   Pass the address you started the server on, or a dash.
 
   <node>           Base URL of YOUR OWN Hacash fullnode, already running and
                    synced. Normally http://127.0.0.1:8080 in this package.
@@ -174,7 +174,18 @@ fn main() {
             pos.len()
         ));
     }
-    let pool_base = pos[0].trim().trim_end_matches('/').to_string();
+    // Still accepted so commands and scripts written for older versions keep
+    // working, and deliberately never read. It used to name the URL this tool
+    // asked for its recipient list, which is a decision that belongs to the
+    // pool's own accounting file and to nothing reachable over a network. An
+    // argument that is silently inert is its own trap, so the run says so once.
+    let ignored_pool_base = pos[0].trim().trim_end_matches('/').to_string();
+    if !ignored_pool_base.is_empty() && ignored_pool_base != "-" {
+        println!(
+            "note: <pool_base> ({ignored_pool_base}) is accepted for compatibility and is not \
+             consulted. The share window comes from the accounting file beside the wallet."
+        );
+    }
     let node = pos[1].trim().trim_end_matches('/').to_string();
     let chain = pos[2].trim().to_string();
     // A testnet node reads its difficulty window and block time from its OWN
@@ -228,7 +239,12 @@ fn main() {
     let reserve_units = unit_arg(4, "reserve_units", SETTLE_RESERVE_UNITS);
     let dust_units = unit_arg(5, "dust_units", PAYOUT_DUST_UNITS);
 
-    let client = http_client();
+    // The same token the server sends, from the same environment variable: this
+    // tool talks to the same node, and a node bound to anything but loopback
+    // refuses to answer without it.
+    let client = hbit_pool::http_client_with_token(
+        &std::env::var(hbit_pool::NODE_API_TOKEN_ENV).unwrap_or_default(),
+    );
     println!(
         "== HBIT pool payout ({}) ==",
         if commit { "COMMIT" } else { "DRY-RUN" }
@@ -257,12 +273,13 @@ fn main() {
     // refuses a missing answer on its own, so this check is here for the
     // OPERATOR: it turns "cannot value the wallet" into "your fullnode is not
     // running at this address", which is the sentence somebody can act on.
-    if find_u64(
+    // The tip is BOUND, not merely tested: the fee reader below judges what a
+    // missing block means against this same tip, so the whole run reasons about
+    // one chain state rather than two reads that a new block could straddle.
+    let Some(tip) = find_u64(
         &get_json(&client, &format!("{node}/query/latest")),
         "height",
-    )
-    .is_none()
-    {
+    ) else {
         eprintln!(
             "REFUSING to pay: no Hacash fullnode answered at {node}, so this tool cannot read the \
              wallet's balance or what is already in flight.\n\
@@ -271,7 +288,7 @@ fn main() {
              API address."
         );
         std::process::exit(1);
-    }
+    };
     let pool_acc = load_or_create_wallet(&wallet_file);
     let pool_addr = pool_acc.readable().to_string();
     let bal = balance(&client, &node, &pool_addr);
@@ -290,6 +307,27 @@ fn main() {
     // that is only shallowly confirmed, or whose state we could not determine,
     // counts as still in flight.
     let state_file = pool_state_path(&wallet_file);
+    // The SAME gate the server applies at startup, for the same reason and with
+    // more force: this is the tool an operator reaches for AFTER the server has
+    // refused to start, and it signs real transactions off this file. Without
+    // the check here the ledger the server would not touch gets paid from
+    // anyway, and the upstream refusal is worse than useless - it just points
+    // the operator at the one path that skips it. A wallet with money and no
+    // readable ledger means stop, not "pay the whole balance to the window".
+    match hbit_pool::classify_state_file(&state_file) {
+        hbit_pool::StateFile::Fresh | hbit_pool::StateFile::Readable(_) => {}
+        hbit_pool::StateFile::Unreadable(why) => {
+            eprintln!(
+                "REFUSING to pay: {why}.\n\
+                 Nothing was paid and the file was not touched. Paying from empty accounting \
+                 would hand the current share window the entire wallet balance and forget every \
+                 debt and every payout already in flight.\n\
+                 What to do: restore the accounting file from a backup, or fix why it cannot be \
+                 read, then run this again."
+            );
+            std::process::exit(1);
+        }
+    }
     // The per-worker settlement ledger the pool server keeps. This tool writes to
     // the SAME file, so it has to carry it forward: a payout it makes that is
     // never recorded here is one no miner can ever see it was paid, and a payout
@@ -435,35 +473,30 @@ fn main() {
         }
     }
 
-    // 1) PPLNS credit. Try the live pool server first, then fall back to the
-    // accounting file it left behind - holding the settlement lock means the
-    // server is stopped, so /stats normally cannot answer at all.
+    // 1) PPLNS credit, from the pool's OWN accounting file and from nothing else.
     //
-    // `credit`, never the `workers` headcount printed beside it: a headcount read
-    // at the instant of a payout is a number one miner can own outright by
-    // sitting on its shares and dumping a whole window's worth in the second
-    // before the split. This tool signs the same transactions the server does, so
-    // it has to weigh work the same way or it becomes the way round the fix.
-    let stats = get_json(&client, &format!("{pool_base}/stats"));
-    let rows = stats
-        .get("credit")
-        .and_then(|w| w.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut counts: Vec<(String, u64)> = rows
-        .iter()
-        .filter_map(|r| {
-            let arr = r.as_array()?;
-            Some((arr.first()?.as_str()?.to_string(), arr.get(1)?.as_u64()?))
-        })
-        .collect();
-    if counts.is_empty() {
-        counts = load_pplns_credit(&state_file);
-        if !counts.is_empty() {
-            println!(
-                "(pool server not answering; using the share window recorded in {state_file})"
-            );
-        }
+    // This used to GET {pool_base}/stats first and touch the file only if that
+    // answer parsed empty. `pool_base` is argv[1]: plain HTTP, no authentication,
+    // no cross check against anything. So whatever replied on that URL chose
+    // every recipient of the whole distributable balance, and this tool signed
+    // that list with the pool wallet key. An operator typo, a stale DNS name, a
+    // process that grabbed the port after the server exited, or anyone on the
+    // path was enough.
+    //
+    // The endpoint could not even do the job it was there for. This tool holds
+    // the exclusive settlement lock for its whole run, so the pool server is by
+    // construction NOT running while it works - its own comment said as much.
+    // A /stats that answers here is therefore, on the balance of it, not the
+    // pool.
+    //
+    // `credit`, never a `workers` headcount: a headcount read at the instant of a
+    // payout is a number one miner can own outright by sitting on its shares and
+    // dumping a whole window's worth in the second before the split. This tool
+    // signs the same transactions the server does, so it has to weigh work the
+    // same way or it becomes the way round that fix.
+    let counts = load_pplns_credit(&state_file);
+    if !counts.is_empty() {
+        println!("using the share window recorded in {state_file}");
     }
     // An empty window is not enough to stop: a chunk that failed while those
     // miners' shares were in the window is still owed to them long after the
@@ -504,10 +537,13 @@ fn main() {
         if blk.fees_counted {
             continue;
         }
-        match block_fees(&client, &node, blk.height, &blk.hash) {
+        match block_fees(&client, &node, blk.height, &blk.hash, tip) {
             BlockFees::Counted(fee) => immature_units = immature_units.saturating_add(fee),
             // Never landed, or another block took that height: it credited
-            // nothing, so there are no fees of its to hold back.
+            // nothing, so there are no fees of its to hold back. A node that
+            // fails to produce a block at a height its own tip covers does NOT
+            // land here - block_txs_of turns that into Unknown, and the arm
+            // below refuses to pay on it.
             BlockFees::NotOnChain => {}
             BlockFees::Unknown(why) => {
                 eprintln!(
@@ -574,6 +610,26 @@ fn main() {
         return;
     }
 
+    // Does the reserve fund the transactions this plan needs? The reserve is
+    // subtracted ONCE from the distributable balance while the fee is paid PER
+    // transaction, so a large enough settlement signs transactions the wallet
+    // cannot fund and the node refuses the tail. The operator chose this reserve
+    // on the command line, so this refuses rather than deciding for them: the
+    // dry run above has already been read, and quietly paying a different set of
+    // people than the plan that was reviewed would be worse than stopping.
+    let (fundable, funded_chunks) = hbit_pool::reserve_funds_recipients(reserve_units);
+    if split.len() > fundable {
+        eprintln!(
+            "REFUSING to pay: this settlement needs {} transaction(s) but the reserve of              {reserve_units} unit(s) funds only {funded_chunks}, so the last ones would be              refused by the node for want of a fee.
+             Nothing was paid and nothing was changed.
+             What to do: re-run with a larger reserve_units (argument 5). It needs to be at              least {} for these {} recipient(s).",
+            hbit_pool::chunks_needed(split.len()),
+            hbit_pool::chunks_needed(split.len()).div_ceil(hbit_pool::FEE_UNITS_PER_TENTH).max(1),
+            split.len()
+        );
+        std::process::exit(1);
+    }
+
     // 3) submit one or more chunked, signed transactions.
     let main = Address::from(*pool_acc.address());
     let mut submitted: Vec<String> = Vec::new();
@@ -581,7 +637,7 @@ fn main() {
     for chunk in split.chunks(PAYOUT_CHUNK) {
         // 0.01 HAC network fee, from the reserve, built by the same helper the
         // pool server and `/terms` use.
-        let mut tx = TransactionType2::new_by(main.clone(), chunk_tx_fee(), curtimes());
+        let mut tx = TransactionType2::new_by(main, chunk_tx_fee(), curtimes());
         // Exactly what this transaction pays, so a miner can later be told what
         // it was paid and by which transaction. Only rows that really made it
         // into the transaction are recorded.
@@ -677,9 +733,10 @@ fn main() {
             }
         }
         // ret=0 only means the API took the bytes. The node validates the
-        // transaction synchronously and then inserts it into the mempool on a
-        // background task whose result it DISCARDS, so an accepted response is
-        // no evidence at all. Ask the node what it actually holds.
+        // transaction synchronously, inserts it into its mempool and relays it
+        // to its peers before it answers. That is not proof of payment - a
+        // mempool is not the chain - so ask the node what it actually holds,
+        // and read the answer knowing these bytes are already out there.
         let held = match verify_admitted(&client, &node, &txhash) {
             Admission::Held => {
                 println!(
@@ -693,17 +750,28 @@ fn main() {
                 true
             }
             Admission::Missing => {
+                // The same correction as the server settler, for the same
+                // reason. This arm used to drop the record - the only copy of
+                // the signed bytes - and put the rows back on the owed ledger,
+                // on the belief that a node which does not hold a transaction
+                // never relayed it.
+                //
+                // This node relays before it answers: submit_transaction reads
+                // `async` as false by default and nothing here sends it, so
+                // handle_new_tx runs txpool.insert_by and then
+                // p2p.broadcast_message before returning Ok. A ret=0 already
+                // means the bytes are on the wire. Losing them here is what
+                // makes the next run sign a second transaction for the same
+                // miners, and if any peer still holds the first, both can be
+                // mined and the operator pays twice.
                 all_ok = false;
                 println!(
-                    "  tx {} paying {pushed} miner(s): the API accepted it but the node does NOT \
-                     hold it - nothing was paid and nothing was relayed. These rows are now OWED \
-                     and the next settlement pays them first.",
+                    "  tx {} paying {pushed} miner(s): the node accepted it and does NOT hold it \
+                     now. It was relayed before it was lost, so it is NOT being re-signed: the \
+                     signed bytes are kept and a later run rebroadcasts the same transaction. \
+                     Nothing is counted as paid until the chain buries it.",
                     short(&txhash)
                 );
-                submitted.retain(|h| h != &txhash);
-                if let Some(rec) = drop_payout(&mut records, &txhash) {
-                    owe_rows(&mut owed, &rec.rows);
-                }
                 let _ = save_settlement_ledger(&state_file, &submitted, &records, &owed, &paid);
                 false
             }

@@ -88,7 +88,11 @@ impl PoWorkConf {
         let active = efficiency.initial_active_supervene(configured_supervene);
         let runtime = MiningRuntimeState::new(tuning.workgroups, active);
         let cnf = PoWorkConf {
-            rpcaddr: ini_must(sec, "connect", "127.0.0.1:8081"),
+            // Normalised ONCE, here, so no request site can build a URL its own
+            // way. A bare host:port stays plain HTTP, which is what every
+            // existing config has; https:// now works instead of being pasted
+            // inside another scheme.
+            rpcaddr: crate::rpc_http::base_url(&ini_must(sec, "connect", "127.0.0.1:8081")),
             api_token: ini_must(sec, "api_token", "").trim().to_string(),
             pool_worker: ini_must(sec, "pool_worker", "").trim().to_string(),
             supervene: configured_supervene,
@@ -124,7 +128,9 @@ impl PoWorkConf {
     /// Minimal config for integration tests.
     pub fn test_defaults(rpcaddr: String, supervene: u32, noncemax: u32) -> PoWorkConf {
         let mut cnf = PoWorkConf::new(&IniObj::new());
-        cnf.rpcaddr = rpcaddr;
+        // Through the same normaliser the config load uses, so a test cannot
+        // exercise a URL shape the real path can never produce.
+        cnf.rpcaddr = crate::rpc_http::base_url(&rpcaddr);
         cnf.supervene = supervene;
         cnf.noncemax = noncemax;
         cnf.useopencl = false;
@@ -146,6 +152,13 @@ pub fn poworker() {
     let config_path = sys::resolve_config_path(default_config);
     let inicnf = sys::load_config_path(&config_path);
     let cnf = PoWorkConf::new(&inicnf);
+    // Said once, at startup, where an operator will see it. Plaintext to a pool
+    // off this machine is not merely unencrypted: a pool credits a share to
+    // whatever payout address the request names, so anyone on the path can
+    // resend this rig's work under their own address and be paid for it.
+    if let Some(why) = crate::rpc_http::plaintext_warning(&cnf.rpcaddr) {
+        eprintln!("{why}");
+    }
     // Mainnet-representative (x16rs repeat=16) benchmark. Runs only when
     // HACASH_REPEAT16_BENCH_SECONDS is set to a positive integer, then exits.
     // Zero-touch when the variable is unset; see bench_mainnet_repeat16.rs.
@@ -276,7 +289,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
 
     // query pending
     let urlapi_pending = format!(
-        "http://{}/query/miner/pending?stuff=true&t={}{}",
+        "{}/query/miner/pending?stuff=true&t={}{}",
         &cnf.rpcaddr,
         sys::curtimes(),
         cnf.worker_param()
@@ -287,7 +300,8 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             Err(e) => {
                 wlogln!(
                     "Error: cannot get block data at {}: {}\n",
-                    &urlapi_pending, e
+                    &urlapi_pending,
+                    e
                 );
                 delay_return!(30);
             }
@@ -351,7 +365,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             delay_return!(1);
         }
         let urlapi_notice = format!(
-            "http://{}/query/miner/notice?wait={}&height={}&rqid={}",
+            "{}/query/miner/notice?wait={}&height={}&rqid={}",
             &cnf.rpcaddr,
             &poll_wait,
             pending_height,
@@ -368,7 +382,8 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
             Err(e) => {
                 wlogln!(
                     "Error: cannot get miner notice at {}: {}\n",
-                    &urlapi_notice, e
+                    &urlapi_notice,
+                    e
                 );
                 delay_return!(10);
             }
@@ -408,7 +423,7 @@ fn pull_pending_block_stuff(cnf: &PoWorkConf, stop_flag: &Option<Arc<AtomicBool>
 
 fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::BlockMiningResult) {
     let urlapi_success = format!(
-        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
+        "{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
         &cnf.rpcaddr,
         success.height,
         success.head_nonce,
@@ -452,7 +467,9 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
                         let snippet: String = body.chars().take(120).collect();
                         wlogln!(
                             "[submit] attempt {}/{} unrecognized response, retrying: {}",
-                            attempt, MAX_SUBMIT_ATTEMPTS, snippet
+                            attempt,
+                            MAX_SUBMIT_ATTEMPTS,
+                            snippet
                         );
                         if attempt < MAX_SUBMIT_ATTEMPTS {
                             std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
@@ -464,7 +481,8 @@ fn push_block_mining_success(cnf: &PoWorkConf, success: &block_mining_runtime::B
                 last = format!("transport error: {e}");
                 wlogln!(
                     "[submit] attempt {}/{} failed: {e}",
-                    attempt, MAX_SUBMIT_ATTEMPTS
+                    attempt,
+                    MAX_SUBMIT_ATTEMPTS
                 );
                 if attempt < MAX_SUBMIT_ATTEMPTS {
                     std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
@@ -521,7 +539,7 @@ fn network_hac_per_hps_day(cnf: &PoWorkConf) -> Option<f64> {
         return None;
     }
     let url = format!(
-        "http://{}/query/miner/pending?stuff=true&t={}",
+        "{}/query/miner/pending?stuff=true&t={}",
         &cnf.rpcaddr,
         sys::curtimes()
     );
@@ -910,8 +928,7 @@ fn run_opencl_benchmark(cnf: &PoWorkConf, config_path: &str) {
             oracle_threads: autotune_oracle_threads(),
             headers: AUTOTUNE_CORPUS_HEADERS,
             proof_thresholds: AUTOTUNE_PROOF_THRESHOLDS,
-            max_temp_c: (cnf.efficiency.max_temp_c > 0)
-                .then_some(cnf.efficiency.max_temp_c as f32),
+            max_temp_c: (cnf.efficiency.max_temp_c > 0).then_some(cnf.efficiency.max_temp_c as f32),
         };
 
         match crate::autotune16::tune(&request) {

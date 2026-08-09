@@ -49,6 +49,25 @@ else's address in it, and anyone who ran it mined into a stranger's wallet.
 $EDITOR deploy/node/hacash.config.ini      # fill in reward = your own address
 ```
 
+Set the node's API token, in the same file, and give the same value to the pool.
+Both are required and the stack will not come up without them.
+
+```bash
+TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '/+=')
+sed -i "s|^api_token = .*|api_token = $TOKEN|" deploy/node/hacash.config.ini
+export HBIT_NODE_API_TOKEN="$TOKEN"        # compose reads it from here
+```
+
+This is not optional and it is not only about access control. The pool runs in a
+different container and reaches the node across the compose network, and **the
+node refuses to serve its API at all on a non-loopback address with an empty
+token**: it prints one line and returns, while the process keeps running and
+keeps syncing, looking healthy. The healthcheck would never pass, the pool would
+wait on it for ever, and the only symptom would be a pool that never starts.
+
+Put `export HBIT_NODE_API_TOKEN=...` in your shell profile, or in a `.env` file
+beside the compose file, so a reboot does not leave the stack unable to start.
+
 Create the wallet passphrase. It is one half of the wallet; the key file the
 pool creates is the other, and neither is worth anything alone.
 
@@ -126,18 +145,41 @@ For a host without Docker. Units are in `deploy/systemd/`.
 
 ```bash
 sudo useradd --system --home-dir /var/lib/hbit --shell /usr/sbin/nologin hbit
-sudo mkdir -p /opt/hbit /var/lib/hbit/node /var/lib/hbit/pool /etc/hbit
+# /opt/hbit/bin, not /opt/hbit: that is the directory both unit files execute
+# out of, and installing one level up left every ExecStart pointing at nothing.
+sudo mkdir -p /opt/hbit/bin /var/lib/hbit/node /var/lib/hbit/pool /etc/hbit
 sudo chown -R hbit:hbit /var/lib/hbit
 
-cargo build --locked --release --bin fullnode
+# The node binary is `hacash`. It is the same program the release archives ship
+# and the same name hacash-node.service runs; building `fullnode` produced a
+# file no unit ever looked for.
+cargo build --locked --release --bin hacash
 cargo build --locked --release -p hbit-pool --bin hbit-pool-server --bin hbit-pool-payout
-sudo install -m 0755 target/release/fullnode /opt/hbit/
-sudo install -m 0755 target/release/hbit-pool-server /opt/hbit/
-sudo install -m 0755 target/release/hbit-pool-payout /opt/hbit/
-sudo install -m 0755 deploy/hbit-wait-for-node.sh /opt/hbit/
+sudo install -m 0755 target/release/hacash /opt/hbit/bin/
+sudo install -m 0755 target/release/hbit-pool-server /opt/hbit/bin/
+sudo install -m 0755 target/release/hbit-pool-payout /opt/hbit/bin/
+sudo install -m 0755 deploy/hbit-wait-for-node.sh /opt/hbit/bin/
+# The runbook both unit files point at with Documentation=. Without it,
+# "systemctl status" names a file that is not on the machine.
+sudo install -D -m 0644 docs/POOL-OPERATOR.md /opt/hbit/docs/POOL-OPERATOR.md
 
-sudo install -m 0400 -o hbit -g hbit /dev/null /etc/hbit/wallet-passphrase
+# The node config the unit names as its only argument. Nothing created it
+# before, so the node exited on every start.
+sudo install -m 0644 deploy/node/hacash.config.ini /etc/hbit/hacash.config.ini
+# On a bare host the pool is on the same machine, so the node's API belongs on
+# loopback and needs no token. (In Docker it must bind 0.0.0.0 with a token,
+# because the pool is in another container - that is what the shipped file is
+# set up for.)
+sudo sed -i 's/^bind = .*/bind = 127.0.0.1/' /etc/hbit/hacash.config.ini
+sudo sed -i 's/^api_token = .*/; api_token =/' /etc/hbit/hacash.config.ini
+# And the reward address the node refuses to start without. Use one you control.
+sudo sed -i 's/^reward =.*/reward = YOUR_HAC_ADDRESS/' /etc/hbit/hacash.config.ini
+
+# Write the passphrase FIRST, then lock the file. Creating it 0400 and then
+# writing to it cannot work: 0400 is read-only, to its owner as much as anyone.
+sudo -u hbit install -m 0600 /dev/null /etc/hbit/wallet-passphrase
 sudo -u hbit tee /etc/hbit/wallet-passphrase >/dev/null <<< 'your passphrase'
+sudo chmod 0400 /etc/hbit/wallet-passphrase
 
 sudo cp deploy/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -153,7 +195,12 @@ every environment value.
 
 Open the pool port. Keep the node's RPC closed.
 
+**Allow SSH before you enable ufw.** Its default incoming policy is deny, so
+enabling it with no SSH rule locks you out of the machine you are configuring,
+and on a VPS that means a console session or a rebuild.
+
 ```bash
+sudo ufw allow OpenSSH                  # or 22/tcp - do this FIRST
 sudo ufw allow 9777/tcp                 # miners
 sudo ufw allow 3337/tcp                 # chain p2p
 sudo ufw deny 8080/tcp                  # node RPC: never from outside
@@ -183,11 +230,23 @@ Healthy log, roughly every settle interval:
 ```
 [settle] holding back N unit(s) of block income that is not yet buried 16 deep
 [settle] submitted payout tx <hash> paying N miner(s) U units; the node holds it
-[reorg] our block N orphaned (chain holds <hash>)
+[reorg?] the chain is showing <hash> at height N where our block stands. ...
+[reorg] our block N orphaned (chain holds <hash>, buried 16 deep)
 ```
 
 Orphans are normal: it means the pool noticed one of its blocks losing a race
 and did not pay out on income that no longer exists.
+
+The two reorg lines are one event at two levels of certainty. `[reorg?]` is
+provisional: a competing hash is showing at a height where our block stands,
+which at shallow depth is usually a one-block fork that flips back. Nothing is
+decided by it and no money moves on it. `[reorg]` is final, and it is only
+printed once the competing hash is buried 16 blocks deep - the same burial a
+confirmation needs, because deciding an orphan on weaker evidence than a
+confirmation is how a hold-back got released at zero confirmations. The block's
+income stays held back for the whole of that wait, in both directions, which is
+why a fork can briefly show a hold-back larger than the wallet's own settled
+income.
 
 A payout that stays pending across several cycles gets a warning naming the
 cause. The pool mines coinbase-only blocks unless the node has transactions to

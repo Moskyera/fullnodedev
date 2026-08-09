@@ -18,7 +18,10 @@ use hbit_pool::{
 
 fn tmp(tag: &str) -> String {
     let mut p = std::env::temp_dir();
-    p.push(format!("hbit-pool-upgrade-{}-{tag}.json", std::process::id()));
+    p.push(format!(
+        "hbit-pool-upgrade-{}-{tag}.json",
+        std::process::id()
+    ));
     p.to_string_lossy().to_string()
 }
 
@@ -70,12 +73,27 @@ fn an_old_state_file_upgrades_without_losing_a_share_a_debt_or_a_payout() {
     // all landed together: credit must come back in the SAME 3:2:1 ratio the
     // old build's headcount split would have used.
     let credit = load_pplns_credit(&path);
-    assert_eq!(credit.len(), 3, "a miner was lost from the window: {credit:?}");
+    assert_eq!(
+        credit.len(),
+        3,
+        "a miner was lost from the window: {credit:?}"
+    );
     let by: std::collections::HashMap<&str, u64> =
         credit.iter().map(|(w, c)| (w.as_str(), *c)).collect();
-    assert!(by["w-a"] > 0, "an upgraded window credits nobody: {credit:?}");
-    assert_eq!(by["w-a"], 3 * by["w-c"], "3 shares must weigh 3x1: {credit:?}");
-    assert_eq!(by["w-b"], 2 * by["w-c"], "2 shares must weigh 2x1: {credit:?}");
+    assert!(
+        by["w-a"] > 0,
+        "an upgraded window credits nobody: {credit:?}"
+    );
+    assert_eq!(
+        by["w-a"],
+        3 * by["w-c"],
+        "3 shares must weigh 3x1: {credit:?}"
+    );
+    assert_eq!(
+        by["w-b"],
+        2 * by["w-c"],
+        "2 shares must weigh 2x1: {credit:?}"
+    );
     // And that is exactly the split the old build made by headcount.
     let old_counts = [("w-a", 3u64), ("w-b", 2), ("w-c", 1)];
     for (w, n) in old_counts {
@@ -181,7 +199,10 @@ fn writing_the_new_ledger_into_an_old_file_keeps_the_old_share_window_readable()
     assert_eq!(load_owed(&path), owed);
     let back = load_payout_records(&path);
     assert_eq!(back.len(), 2);
-    assert_eq!(back[0].body_hex, "", "the old record still carries no bytes");
+    assert_eq!(
+        back[0].body_hex, "",
+        "the old record still carries no bytes"
+    );
     assert_eq!(back[1].body_hex, "deadbeef");
     assert_eq!(load_paid_ledger(&path).get("w-c").expect("w-c").units, 41);
     assert_eq!(

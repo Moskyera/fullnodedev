@@ -577,7 +577,7 @@ fn classify_submit_response(body: &str) -> Option<(SubmitVerdict, String)> {
 /// verdict from a transport failure, and that function returns `()`.
 fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) -> SubmitVerdict {
     let urlapi_success = format!(
-        "http://{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
+        "{}/submit/miner/success?height={}&block_nonce={}&coinbase_nonce={}&t={}{}",
         &cnf.rpcaddr,
         success.height,
         success.head_nonce,
@@ -610,7 +610,8 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                             _ => {
                                 wlogln!(
                                     "[submit] node rejected height {}: {}",
-                                    success.height, err
+                                    success.height,
+                                    err
                                 );
                             }
                         }
@@ -624,7 +625,9 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                         let snippet: String = body.chars().take(120).collect();
                         wlogln!(
                             "[submit] attempt {}/{} unrecognized response, retrying: {}",
-                            attempt, MAX_SUBMIT_ATTEMPTS, snippet
+                            attempt,
+                            MAX_SUBMIT_ATTEMPTS,
+                            snippet
                         );
                         if attempt < MAX_SUBMIT_ATTEMPTS {
                             std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
@@ -636,7 +639,8 @@ fn submit_block_mining_success(cnf: &PoWorkConf, success: &BlockMiningResult) ->
                 last = format!("transport error: {e}");
                 wlogln!(
                     "[submit] attempt {}/{} failed: {e}",
-                    attempt, MAX_SUBMIT_ATTEMPTS
+                    attempt,
+                    MAX_SUBMIT_ATTEMPTS
                 );
                 if attempt < MAX_SUBMIT_ATTEMPTS {
                     std::thread::sleep(Duration::from_millis(500u64 * attempt as u64));
@@ -898,7 +902,9 @@ impl SubmitGate {
                 if entry.state == TemplateSubmitState::Settled {
                     wlogln!(
                         "\n[Mining] height {} {}, suppressed {} redundant winners.",
-                        key.0, entry.outcome, entry.suppressed
+                        key.0,
+                        entry.outcome,
+                        entry.suppressed
                     );
                 } else {
                     // Never settled, so these were not provably dead: they were
@@ -907,7 +913,9 @@ impl SubmitGate {
                     // redundant.
                     wlogln!(
                         "\n[Mining] height {} {}, held back {} further winners.",
-                        key.0, entry.outcome, entry.suppressed
+                        key.0,
+                        entry.outcome,
+                        entry.suppressed
                     );
                 }
             }

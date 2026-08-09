@@ -37,8 +37,44 @@ if [ "${avail_gb:-0}" -ge 10 ]; then ok "${avail_gb} GB free"; else bad "only ${
 step "3. The node config"
 if [ ! -f hacash.config.ini ]; then
 	cp hacash.config.ini.example hacash.config.ini
+	# The example is written for Docker, where the pool is in a DIFFERENT
+	# container and has to cross the network to reach the node - so it binds
+	# 0.0.0.0 and carries an api_token, because the node refuses to serve a
+	# non-loopback address without one.
+	#
+	# Here the pool is on this same machine. Loopback is the right answer and
+	# needs no token, and leaving the example's placeholder token in place would
+	# be worse than useless: the node would serve happily, the pool would send
+	# no token, every request would come back 401, and the pool would report a
+	# healthy node as down with nothing saying why.
+	sed -i 's/^[[:space:]]*bind[[:space:]]*=.*/bind = 127.0.0.1/' hacash.config.ini
+	sed -i 's/^[[:space:]]*api_token[[:space:]]*=.*/; api_token =/' hacash.config.ini
 	say "  created hacash.config.ini from the example"
+	say "        set bind = 127.0.0.1 and cleared api_token: node and pool are on"
+	say "        this one machine, so the API belongs on loopback"
 fi
+bind=$(sed -n 's/^[[:space:]]*bind[[:space:]]*=[[:space:]]*//p' hacash.config.ini | head -1)
+token=$(sed -n 's/^[[:space:]]*api_token[[:space:]]*=[[:space:]]*//p' hacash.config.ini | head -1)
+case "$bind" in
+127.0.0.1 | ::1 | localhost | "")
+	ok "the node API is on loopback (bind = ${bind:-127.0.0.1})"
+	;;
+*)
+	if [ -z "$token" ]; then
+		bad "bind = $bind is not loopback and api_token is empty"
+		say "        The node will print one line and never listen, while the process"
+		say "        keeps running and syncing. The pool would wait for it for ever."
+		say "        Set bind = 127.0.0.1, or set a long random api_token."
+		fail=1
+	else
+		bad "bind = $bind with an api_token, but this pool sends no token"
+		say "        The node will serve and answer 401 to every request the pool"
+		say "        makes, and the pool will report your healthy node as down."
+		say "        On one machine, set bind = 127.0.0.1 and leave api_token empty."
+		fail=1
+	fi
+	;;
+esac
 reward=$(sed -n 's/^[[:space:]]*reward[[:space:]]*=[[:space:]]*//p' hacash.config.ini | head -1)
 if [ -z "$reward" ]; then
 	bad "reward is empty in hacash.config.ini"

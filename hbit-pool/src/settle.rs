@@ -47,7 +47,7 @@ fn main() {
 
     let client = http_client();
 
-    // Deterministic accounts we control (public keys — testnet demo only).
+    // Deterministic accounts we control (public keys - testnet demo only).
     let sender = Account::create_by_secret_key_value([1u8; 32]).expect("sender account");
     let recipients: Vec<(Account, &str)> = vec![
         (
@@ -110,7 +110,7 @@ fn main() {
         );
     }
 
-    // (a) submit to the mempool — the pool's normal action.
+    // (a) submit to the mempool - the pool's normal action.
     let resp = post_hex(
         &client,
         &format!("{base}/submit/transaction?hexbody=true"),
@@ -160,6 +160,6 @@ fn main() {
             recipients.len()
         );
     } else {
-        println!("\nNot all recipients funded yet — check the responses above.");
+        println!("\nNot all recipients funded yet - check the responses above.");
     }
 }
