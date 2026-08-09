@@ -375,10 +375,20 @@ jobs:
             release-assets/*.zip
             release-assets/*.tar.gz
 
+      # Say WHICH product this is. With no name the action falls back to the bare
+      # tag, and this repository now publishes two things: a visitor scanning the
+      # list saw "HBIT pool v0.2.2" beside a bare "v0.5.9" and had nothing to tell
+      # them the second one was the miner. The wording matches the heading the
+      # release body already carries.
+      - name: Title
+        id: title
+        run: echo "name=HAC Miner ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
+          name: ${{ steps.title.outputs.name }}
           files: release-assets/*
           generate_release_notes: true
           body: |
