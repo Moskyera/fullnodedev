@@ -3462,6 +3462,23 @@ fn describe_claim_drift(
     ))
 }
 
+/// What `/query/miner/notice` reports, given the template this pool is serving.
+///
+/// The CHAIN TIP, which is one below the height being mined, because that is
+/// what the fullnode's own `miner_notice` returns and an unmodified miner is
+/// built against the fullnode. A miner asks with the height it is mining and
+/// reads `answer >= that` as "there is new work"; answering with the template
+/// height makes that true on every single reply, and the miner then skips the
+/// anti-spin delay it would otherwise take.
+///
+/// A pool must not need the miner to be configured differently. This one is
+/// used by ordinary Hacash miners that also point at nodes and at other pools,
+/// and the only setting a pool is entitled to change is where to connect and
+/// which address to credit.
+fn notice_height(template_height: u64) -> u64 {
+    template_height.saturating_sub(1)
+}
+
 /// Which contested heights deserve a fresh provisional notice this cycle.
 ///
 /// `sighted` is every (height, competing hash) currently showing; the state
@@ -5024,6 +5041,26 @@ fn route(
     match path {
         // ---- standard Hacash miner API: an UNMODIFIED poworker mines here ----
         "/query/miner/pending" => plock(pool).pending_cache.clone(),
+        // Answers the TIP, exactly as the fullnode's own miner_notice does, and
+        // not the template height.
+        //
+        // This pool is not what a miner is built for: an unmodified poworker is a
+        // general Hacash miner that must behave the same way here as against any
+        // node or any other pool. It asks with `height` set to the height it is
+        // MINING - the tip plus one - and treats `answer >= that` as "new work
+        // exists". The node returns `latest_block().height()`, so that comparison
+        // is false until a block really arrives, and poworker's 200ms anti-spin
+        // floor applies.
+        //
+        // Returning `tpl.height` made it ALWAYS true. Whenever this endpoint
+        // answered without parking - which is what it does when too many
+        // long-polls are already waiting, so precisely under load - the miner saw
+        // "new work", skipped its floor, and came straight back. Two requests per
+        // cycle with no delay, from every rig, exactly when the pool is already
+        // shedding.
+        //
+        // The parking condition below is unchanged and stays correct: waiting for
+        // `tpl.height > want` is waiting for the tip to reach `want`.
         "/query/miner/notice" => {
             let want: u64 = params
                 .get("height")
@@ -5038,15 +5075,14 @@ fn route(
             // immediately with the current height rather than holding another slot.
             if NOTICE_WAITERS.fetch_add(1, Relaxed) >= MAX_NOTICE_WAITERS {
                 NOTICE_WAITERS.fetch_sub(1, Relaxed);
-                let h = plock(pool).tpl.height;
-                return json!({"ret":0,"height":h}).to_string();
+                return json!({"ret":0,"height":notice_height(plock(pool).tpl.height)}).to_string();
             }
             let _ng = NoticeGuard;
             let deadline = Instant::now() + Duration::from_secs(wait);
             loop {
                 let h = plock(pool).tpl.height; // brief lock only
                 if h > want || Instant::now() >= deadline {
-                    return json!({"ret":0,"height":h}).to_string();
+                    return json!({"ret":0,"height":notice_height(h)}).to_string();
                 }
                 std::thread::sleep(Duration::from_millis(400));
             }
@@ -5591,6 +5627,47 @@ mod tests {
         // that chunk actually carries.
         deduct_owed(&mut owed, &plan);
         assert!(owed.is_empty());
+    }
+
+    #[test]
+    fn the_notice_endpoint_speaks_the_same_height_the_fullnode_does() {
+        // A miner is not built for this pool. An unmodified poworker also points
+        // at nodes and at other pools, and it must behave identically at all of
+        // them: it asks with the height it is MINING and reads `answer >= that`
+        // as "new work exists".
+        //
+        // The fullnode answers with its tip, one BELOW the height being mined,
+        // so that comparison is false until a block really arrives and the
+        // miner's 200ms anti-spin floor applies. This pool answered with the
+        // template height, making it true on every reply - so the floor was
+        // skipped every time, and worst when the pool answers without parking,
+        // which is what it does once too many long-polls are already waiting.
+        let tip = 771_596u64;
+        let template = tip + 1; // what the pool is serving work for
+        assert_eq!(
+            notice_height(template),
+            tip,
+            "the notice reports the tip, exactly as mint's miner_notice does"
+        );
+
+        // The miner's own condition, quoted from poworker:
+        //   new_work_ready = pending_height > 0 && res_hei >= pending_height
+        let pending_height = template; // the height the miner is mining
+        assert!(
+            notice_height(template) < pending_height,
+            "no new work while the chain is still at the same tip: the miner must \
+             take its anti-spin delay"
+        );
+        // A block arrives: the pool's template moves up, and only then is the
+        // miner told there is work.
+        assert!(
+            notice_height(template + 1) >= pending_height,
+            "once the chain moves, the miner is released immediately: new work is \
+             money and is never delayed"
+        );
+
+        // An empty chain must not underflow into a colossal height.
+        assert_eq!(notice_height(0), 0);
     }
 
     #[test]
