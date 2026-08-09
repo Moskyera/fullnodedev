@@ -159,11 +159,24 @@ jobs:
         with:
           subject-path: release-assets/*.tar.gz
 
+      # The tag is `pool-v0.2.0`; the title says `HBIT pool v0.2.0`. Interpolating
+      # the ref straight into the name produced "HBIT pool pool-v0.2.0".
+      - name: Title
+        id: title
+        run: echo "name=HBIT pool ${GITHUB_REF_NAME#pool-}" >> "$GITHUB_OUTPUT"
+
       - name: Publish
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: HBIT pool ${{ github.ref_name }}
+          name: ${{ steps.title.outputs.name }}
+          # A pool release must NOT become the repository's "latest". That URL
+          # can only point at one release, and github.com/<repo>/releases/latest
+          # is where a visitor and the download page's fallback links expect the
+          # MINER. The first pool release took it, and for a few minutes anyone
+          # who clicked "Download Full package" while the API was unreachable
+          # landed on server software instead.
+          make_latest: false
           files: release-assets/*
           body: |
             ## HBIT pool - Linux x86_64 - By Mosky
