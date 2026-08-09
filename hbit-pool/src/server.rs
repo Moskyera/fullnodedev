@@ -5040,7 +5040,37 @@ fn route(
 ) -> String {
     match path {
         // ---- standard Hacash miner API: an UNMODIFIED poworker mines here ----
-        "/query/miner/pending" => plock(pool).pending_cache.clone(),
+        //
+        // A halted pool says so HERE, in the words the miner already understands.
+        //
+        // While `halt_reason()` is set the pool credits no new share, so a rig
+        // that keeps hashing is burning power for nothing. It used to keep
+        // serving the cached template regardless, and the miner had no way to
+        // know: the submit path answers `{"ret":1,"kind":"degraded"}` and drops
+        // the reason, and `pool_kind_verdict` has no arm for that kind at all.
+        //
+        // poworker already knows how to stop. `upstream_stale_reason` reads an
+        // `err` containing "stale" from this endpoint and from the notice, and
+        // pauses the mining threads until work returns. Saying it that way means
+        // every miner ALREADY RELEASED does the right thing with no update and
+        // no per-pool setting: a pool is entitled to change where a miner
+        // connects and which address it credits, not how the miner is built.
+        //
+        // A block is still accepted throughout, so nothing is lost by pausing:
+        // during an accounting halt the pool cannot record who earned it, during
+        // a node halt the tip is dead anyway, and during a difficulty halt credit
+        // means nothing.
+        "/query/miner/pending" => {
+            let p = plock(pool);
+            match p.halt_reason() {
+                Some(why) => json!({
+                    "ret": 1,
+                    "err": format!("the pool is serving stale work and is crediting nothing: {why}")
+                })
+                .to_string(),
+                None => p.pending_cache.clone(),
+            }
+        }
         // Answers the TIP, exactly as the fullnode's own miner_notice does, and
         // not the template height.
         //
@@ -5062,6 +5092,16 @@ fn route(
         // The parking condition below is unchanged and stays correct: waiting for
         // `tpl.height > want` is waiting for the tip to reach `want`.
         "/query/miner/notice" => {
+            // Same answer as /query/miner/pending, because the miner reads BOTH
+            // for it and a pool that pauses on one and not the other would park
+            // a rig for the full long-poll before it learned anything.
+            if let Some(why) = plock(pool).halt_reason() {
+                return json!({
+                    "ret": 1,
+                    "err": format!("the pool is serving stale work and is crediting nothing: {why}")
+                })
+                .to_string();
+            }
             let want: u64 = params
                 .get("height")
                 .and_then(|v| v.parse().ok())
@@ -5129,7 +5169,12 @@ fn route(
             if ok {
                 json!({"ret":0,"kind":kind}).to_string()
             } else {
-                json!({"ret":1,"kind":kind}).to_string()
+                // The REASON travels with the refusal. It used to be dropped
+                // here, so a miner refused for a halted pool, a stale template
+                // or an unpayable address saw the same bare `kind` and its
+                // operator had nothing to act on.
+                let err = r.get("err").and_then(|v| v.as_str()).unwrap_or("");
+                json!({"ret":1,"kind":kind,"err":err}).to_string()
             }
         }
 
@@ -5627,6 +5672,52 @@ mod tests {
         // that chunk actually carries.
         deduct_owed(&mut owed, &plan);
         assert!(owed.is_empty());
+    }
+
+    #[test]
+    fn a_halted_pool_tells_the_miner_to_stop_in_words_it_already_understands() {
+        // A halted pool credits no new share, so a rig that keeps hashing burns
+        // power for nothing. It used to keep serving the cached template, and
+        // the miner could not tell: the submit path answers "degraded" and
+        // poworker has no arm for that kind at all.
+        //
+        // poworker DOES already stop on an `err` containing "stale", read from
+        // /query/miner/pending and /query/miner/notice. Saying it that way means
+        // every already-released miner does the right thing with no update.
+        let mut p = a_pool();
+        p.pending_cache = r#"{"ret":0,"height":771594}"#.to_string();
+        p.accounting_halt = Some("the accounting could not be written to disk".to_string());
+        let pool = Arc::new(Mutex::new(p));
+
+        for path in ["/query/miner/pending", "/query/miner/notice"] {
+            let body = route(path, &HashMap::new(), &pool, "test-peer");
+            let j: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("{path} must answer JSON: {e} in {body}"));
+            assert_eq!(j["ret"].as_i64(), Some(1), "{path}: {body}");
+            let err = j["err"].as_str().unwrap_or_default();
+
+            // THE test: poworker's own detector, quoted from app/src/poworker.rs
+            //   let err = res["err"].as_str()?;
+            //   if err.to_ascii_lowercase().contains("stale") { Some(err) }
+            assert!(
+                err.to_ascii_lowercase().contains("stale"),
+                "{path} must trip the miner's existing pause, which keys on the \
+                 word this reason has to carry: {err}"
+            );
+            assert!(
+                err.contains("could not be written to disk"),
+                "and the operator has to be told WHICH halt: {err}"
+            );
+            assert!(
+                !body.contains("771594"),
+                "{path} must not keep handing out work it will credit nothing for: {body}"
+            );
+        }
+
+        // Healthy again: the template comes back, unchanged.
+        plock(&pool).accounting_halt = None;
+        let body = route("/query/miner/pending", &HashMap::new(), &pool, "test-peer");
+        assert!(body.contains("771594"), "work resumes by itself: {body}");
     }
 
     #[test]
