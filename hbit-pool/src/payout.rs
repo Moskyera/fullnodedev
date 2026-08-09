@@ -581,13 +581,41 @@ fn main() {
             split.len()
         );
     }
-    split.extend(split_payout(left, 0, dust_units, &payable_counts));
+    // The SAME fee the pool server applies, out of the SAME constant. This used
+    // to be a literal 0, which agreed with POOL_FEE_UNITS only for as long as
+    // POOL_FEE_UNITS stayed 0: set a fee and the two settlers divide the same pot
+    // differently, so which one an operator happened to run would decide what
+    // every miner was paid - and this one would be handing out money the pool
+    // told its miners over /terms that it was keeping.
+    split.extend(split_payout(
+        left,
+        hbit_pool::POOL_FEE_UNITS,
+        dust_units,
+        &payable_counts,
+    ));
     // One action per miner: a miner that is owed AND has shares in the window is
     // paid once, and every action counts against the node's 200-action limit.
     merge_payout_rows(&mut split);
     if split.is_empty() {
         println!("split produced no payable rows (all below dust {dust_units}) - nothing to pay");
         return;
+    }
+    // The pool's own fee comes off the top of the fresh split, and split_payout
+    // pays it to nobody: it is money simply not handed out, and it stays in this
+    // wallet. The plan below is the only thing an operator reads before
+    // committing real money, so a total that is short of the distributable
+    // balance has to be named here. Unexplained, it reads either as a bug in the
+    // split or as money that went somewhere nothing names.
+    // `!= 0` rather than `> 0`: with the fee shipped at 0 clippy const-folds the
+    // ordering comparison and denies it as always false. The branch still has to
+    // be here, because the constant is the one thing an operator changes.
+    if hbit_pool::POOL_FEE_UNITS != 0 {
+        println!(
+            "\npool fee: {} unit(s) come off the top of the fresh split before it is divided, \
+             the same fee hbit-pool-server takes and /terms advertises. Nobody is paid it: it \
+             stays in this wallet.",
+            hbit_pool::POOL_FEE_UNITS
+        );
     }
     let n_tx = split.len().div_ceil(PAYOUT_CHUNK);
     let plan_units: u64 = split.iter().map(|(_, u)| *u).sum();

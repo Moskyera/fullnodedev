@@ -570,12 +570,25 @@ pub enum PayoutTxState {
     Buried(u64),
     /// The node definitively does not know this hash: it was rejected, never
     /// relayed, or dropped from the mempool. Settling again is the right move.
+    ///
+    /// Only [`NODE_TX_ABSENT`] earns this. A refusal the node reached with the
+    /// transaction already in its chain state is NOT this, and reading it as
+    /// this is what pays a miner twice.
     Gone,
     /// We could not reach the node, or could not understand its answer. This is
     /// NOT a resolution: treating it as one is exactly what opens a double-payout
     /// window, so the caller must keep the hash and skip the cycle.
     Unknown,
 }
+
+/// The one refusal from `/query/transaction` that really means the node has
+/// never heard of a hash: its mempool missed AND `state.tx_exist` missed.
+/// `mint/src/api/transaction.rs` writes it verbatim.
+///
+/// Matched WHOLE, never by prefix. "transaction not found in the block" opens
+/// with these same three words and means the opposite: that answer is only
+/// reached once `tx_exist` has already found the transaction on chain.
+const NODE_TX_ABSENT: &str = "transaction not found";
 
 /// Classify a `/query/transaction?hash=...` response. Fails SAFE: anything that
 /// is not an unambiguous verdict from the node comes back as `Unknown`, and a
@@ -590,7 +603,23 @@ pub fn classify_payout_tx(j: &Value) -> PayoutTxState {
         return PayoutTxState::Unknown;
     };
     if ret != 0 {
-        return PayoutTxState::Gone; // the node answered "transaction not found"
+        // A refusal is not automatically "I have never heard of this hash", and
+        // the difference is a second payment out of the operator's own wallet.
+        // The node's handler answers ret=1 in four places, and two of them are
+        // reached only AFTER `state.tx_exist` has already FOUND the transaction
+        // on chain: the block behind it would not load, or the block it decoded
+        // did not contain it. Both are evidence the payout IS mined. Read as
+        // Gone they run `GoneAction::Forget`, which hands the rows back to the
+        // owed ledger and pays those miners again next cycle.
+        //
+        // So only the exact absence answer is Gone. Every other refusal, and any
+        // wording this pool has never seen, is Unknown: the hash stays tracked
+        // and the cycle is skipped. That costs a delay instead of somebody's
+        // money, which is the only direction this is allowed to fail in.
+        return match top_value(j, "err").and_then(|v| v.as_str()) {
+            Some(e) if e.trim() == NODE_TX_ABSENT => PayoutTxState::Gone,
+            _ => PayoutTxState::Unknown,
+        };
     }
     let is_pending = j
         .get("data")
@@ -3714,6 +3743,66 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_that_proves_the_payout_is_on_chain_is_not_a_lost_payout() {
+        // `mint/src/api/transaction.rs` answers ret=1 in four places, and these
+        // two are reached only AFTER `state.tx_exist` has found the transaction
+        // in the chain state. They say "the payout is mined and I cannot show it
+        // to you", not "it never happened". Reading them as Gone runs
+        // GoneAction::Forget, which puts the rows back on the owed ledger and
+        // pays those miners a second time out of the operator's own wallet.
+        for err in [
+            "cannot find block by transaction ptr",
+            "transaction not found in the block",
+        ] {
+            assert_eq!(
+                classify_payout_tx(&serde_json::json!({ "ret": 1, "err": err })),
+                PayoutTxState::Unknown,
+                "{err:?} is reached past tx_exist, so that payout is on chain"
+            );
+        }
+        // The absence answer is matched WHOLE. A prefix or `contains` match
+        // folds "transaction not found in the block" straight back into Gone and
+        // silently undoes everything above.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1,"err":"transaction not found"})),
+            PayoutTxState::Gone
+        );
+        // And matched exactly, not case-insensitively. The node writes this
+        // literal in lower case; something answering in another case is not the
+        // node's handler, and the one branch that can hand rows back to the owed
+        // ledger must never be wider than the string it was written against.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1,"err":"TRANSACTION NOT FOUND"})),
+            PayoutTxState::Unknown
+        );
+        // Our own malformed request, and any wording this pool has never seen,
+        // resolve nothing. Keep the hash; do not re-owe its rows.
+        for err in [
+            "transaction hash format invalid",
+            "a future node phrases it some other way",
+        ] {
+            assert_eq!(
+                classify_payout_tx(&serde_json::json!({ "ret": 1, "err": err })),
+                PayoutTxState::Unknown,
+                "an unrecognised refusal must not decide that money was never paid"
+            );
+        }
+        // A refusal carrying no `err` at all is not a verdict either, and
+        // neither is one that hides the text somewhere other than the root:
+        // `top_value` asks where the node really puts it.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1})),
+            PayoutTxState::Unknown
+        );
+        assert_eq!(
+            classify_payout_tx(
+                &serde_json::json!({"ret":1,"data":{"err":"transaction not found"}})
+            ),
+            PayoutTxState::Unknown
+        );
+    }
+
+    #[test]
     fn an_implausible_balance_is_refused_instead_of_saturating() {
         // "1:280" used to saturate to u64::MAX, which distributable_units then
         // handed to split_payout as a payout plan for the whole u64 range.
@@ -4246,6 +4335,39 @@ mod tests {
         assert_eq!(
             payout_amount(35),
             Amount::from("35:247").expect("chain amount")
+        );
+    }
+
+    #[test]
+    fn the_manual_settler_takes_the_pool_fee_from_the_same_constant_as_the_server() {
+        // The terms above are meant to be stated ONCE, and hbit-pool-payout is
+        // named right here as one of the two things that apply them. It did not
+        // apply this one: it passed a literal 0 as the fee to split_payout, which
+        // agreed with POOL_FEE_UNITS only for as long as POOL_FEE_UNITS stayed 0.
+        // Set a fee and the two settlers divide the same pot differently, so
+        // which one an operator happened to run decides what every miner is paid.
+        //
+        // Nothing behavioural can see that while the fee is 0, so read the
+        // source: the fee the manual settler passes must NAME the constant rather
+        // than carry a copy of today's value.
+        let src = include_str!("payout.rs");
+        let (_, call) = src
+            .split_once("split_payout(")
+            .expect("hbit-pool-payout must still split the balance with split_payout");
+        let (args, _) = call
+            .split_once(')')
+            .expect("the split_payout call must still be a single expression");
+        let fee = args
+            .split(',')
+            .nth(1)
+            .map(str::trim)
+            .expect("split_payout takes the pool fee as its second argument");
+        assert!(
+            fee.contains("POOL_FEE_UNITS"),
+            "hbit-pool-payout passes `{fee}` as the pool fee instead of POOL_FEE_UNITS. \
+             A non-zero fee would then make the manual settler and the pool server pay the \
+             same share window differently, and which one an operator ran would decide what \
+             the miners got."
         );
     }
 

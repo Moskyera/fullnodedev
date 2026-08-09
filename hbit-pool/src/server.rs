@@ -177,9 +177,11 @@ const BAD_STREAK_REPEAT_MS: u64 = 300_000;
 /// something about the worker.
 ///
 /// One mainnet block interval, which comfortably covers a GPU scan pass. The pool
-/// pins one template per height and `/query/miner/notice` signals only a HEIGHT
-/// change, so a worker legitimately keeps hashing the header it was handed until
-/// its current pass ends. Nothing here decides whether the line is printed, only
+/// pins one template per height, and `/query/miner/notice` releases a parked rig
+/// on a template change but only at its next poll, so a worker legitimately keeps
+/// hashing the header it was handed until its current pass ends. This window
+/// covers the scan pass, not the notice latency, which is why it stays at a block
+/// interval. Nothing here decides whether the line is printed, only
 /// which sentence follows it: neither wording accuses the worker of anything.
 const TEMPLATE_SETTLE_MS: u64 = 300_000;
 /// Quiet time between the accepted-share summary lines on stdout.
@@ -292,7 +294,18 @@ const WORKER_BURST_MIN_SHARES: u64 = 64;
 /// Workers tracked by the rate limiter. Bounded so a flood of invented payout
 /// addresses cannot grow memory; entries that would have refilled to full are
 /// pruned first, so pruning never hands anyone credit it should not have.
+///
+/// A bound on MEMORY, not a promise about shares. With this many ids all still
+/// active there is nowhere to record the next one, and `rate_admits_share` then
+/// admits it UNTRACKED rather than refuse an honest miner work it has already
+/// paid for in power. Anyone reading this figure for a guarantee has to read
+/// that function too.
 const RATE_WORKERS: usize = 100_000;
+/// How long the "the rate limiter is open" line is suppressed after being
+/// printed, while the condition lasts. Five minutes, like the above-target
+/// streak line: an incident that runs all afternoon is a handful of lines, and
+/// an operator reading the log still sees that it has not stopped.
+const RATE_OPEN_REPEAT_MS: u64 = 300_000;
 /// Shortest passphrase the wallet layer accepts. Mirrored here only so a short
 /// one is a refusal that says what to do, instead of a panic out of the key
 /// loader with a backtrace note on it. The loader still has the final say: if
@@ -828,6 +841,15 @@ struct Pool {
     /// persisted: a restart hands everyone a full bucket, which is the same
     /// position an honest worker is always in.
     rates: HashMap<String, ShareRate>,
+    /// Shares admitted with NO budget spent, because `rates` was full of ids that
+    /// were all still active and the prune freed nothing. The limiter fails open
+    /// there on purpose, so this count is the only evidence anywhere that the
+    /// guard stopped running. Diagnostic, so not persisted: a restart empties
+    /// `rates`, and the condition either comes back or it does not.
+    rate_untracked: u64,
+    /// The `rate_untracked` count when the operator was last told, and the pool
+    /// clock at that moment. `None` until it has been said once.
+    rate_open_told: Option<(u64, u64)>,
     /// Accepted shares waiting to be reported as ONE line. Diagnostic only, so
     /// not persisted: a restart starts a fresh count and says so.
     share_log: ShareLog,
@@ -1194,6 +1216,10 @@ impl Pool {
     /// False means it is submitting faster than the share target says any
     /// hardware on this chain could FIND shares, which is what a batch of
     /// withheld shares looks like on the wire.
+    ///
+    /// True is NOT the opposite claim. Past `RATE_WORKERS` ids that are all still
+    /// active this returns true for a worker it is not tracking at all, so true
+    /// means "not caught by this" and never "inside its budget".
     fn rate_admits_share(&mut self, worker: &str, now_ms: u64) -> bool {
         let per_sec = worker_share_rate(pool_core::share_cost_bits(&self.share_target));
         let burst = worker_burst(per_sec);
@@ -1207,6 +1233,13 @@ impl Pool {
                 // Fail OPEN. Refusing an honest miner's work because a bookkeeping
                 // map is full costs it real money; the residence weighting is what
                 // actually decides the split, and it does not depend on this.
+                //
+                // Counted, because for as long as this lasts the one thing holding
+                // back a batch of withheld shares is not running and nothing else
+                // would say so. ONE integer add: the pool mutex is held here with
+                // every miner's request behind it, so the LINE is composed on the
+                // template cycle instead, in `rate_open_notice`.
+                self.rate_untracked = self.rate_untracked.saturating_add(1);
                 return true;
             }
         }
@@ -1215,6 +1248,44 @@ impl Pool {
             at_ms: now_ms,
         });
         rate_admits(st, now_ms, per_sec, burst)
+    }
+
+    /// The line owed when the per-worker budget has gone open, if one is owed.
+    ///
+    /// `rate_admits_share` admits shares it is not tracking once `rates` is full
+    /// of active ids, and that is deliberate. What is not acceptable is silence:
+    /// while it lasts, the one thing holding back a batch of withheld shares
+    /// dumped at a settlement is not running, and only the pool can see it.
+    ///
+    /// Called from the template cycle rather than from the share path. That path
+    /// holds the pool mutex with every miner's request serialized behind it, and
+    /// a `format!` plus a blocking write to stderr under that lock is exactly the
+    /// per-share println this pool already had to take back out.
+    fn rate_open_notice(&mut self, now_ms: u64) -> Option<String> {
+        let told = match self.rate_open_told {
+            None => 0,
+            Some((told, at)) => {
+                // A clock that steps BACKWARDS (an ntp correction, a resumed VM)
+                // must not silence a live incident until it catches up, so a
+                // negative span reads as due.
+                if now_ms >= at && now_ms - at < RATE_OPEN_REPEAT_MS {
+                    return None;
+                }
+                told
+            }
+        };
+        // Nothing new since the last line, or nothing has happened at all yet.
+        let more = self.rate_untracked.checked_sub(told).filter(|n| *n > 0)?;
+        let total = self.rate_untracked;
+        self.rate_open_told = Some((total, now_ms));
+        Some(format!(
+            "[shares] the per-worker rate limiter is OPEN: {more} more share(s) admitted with no \
+             budget spent, {total} in this process. All {RATE_WORKERS} tracked worker slots hold \
+             ids that are still active, so a new id has nowhere to be recorded. Those shares are \
+             still credited on purpose, because refusing honest work costs a miner real money, \
+             but until the flood of worker ids stops nothing is holding back a batch of withheld \
+             shares dumped at a settlement."
+        ))
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
@@ -1312,10 +1383,11 @@ impl Pool {
             // height reproduces the SAME 89 bytes instead of re-stamping them.
             // Without it a restart silently invalidates every worker's in-flight
             // scan pass: measured on a rig, a restart at height 350 served a
-            // stamp 68 seconds later than the one already in flight, and
-            // /query/miner/notice only signals a HEIGHT change so nothing told
-            // the workers to reload. Thousands of shares were hashed into
-            // nothing before their scan passes ended.
+            // stamp 68 seconds later than the one already in flight, and nothing
+            // told the workers to reload. A restart RE-STAMPS rather than swaps,
+            // so the template thread never sees a change and no notice fires:
+            // the parked-job wake-up covers a reorg, not this. Thousands of
+            // shares were hashed into nothing before their scan passes ended.
             "template_stamp": {
                 "height": self.tpl.height,
                 // The parent as well as the height: after a same-height reorg the
@@ -1558,10 +1630,10 @@ fn bad_streak_message(worker: &str, streak: u64, since_change_ms: u64) -> String
     if since_change_ms < TEMPLATE_SETTLE_MS {
         msg.push_str(
             " The pool has just changed its template or just restarted, which changes the \
-             header under every connected worker, and /query/miner/notice signals only a HEIGHT \
-             change - so a worker keeps hashing the header it was handed until its current scan \
-             pass ends. That alone explains this, it costs only the work already in flight, and \
-             it clears by itself. Nothing to do yet.",
+             header under every connected worker. /query/miner/notice releases a parked rig on \
+             that change, but only at the next poll, and a worker keeps hashing the header it \
+             was handed until its current scan pass ends. That alone explains this, it costs \
+             only the work already in flight, and it clears by itself. Nothing to do yet.",
         );
     } else {
         msg.push_str(
@@ -2737,6 +2809,8 @@ fn main() {
         // grounds to say anything about them.
         tpl_changed_at_ms: pool_core::now_ms(),
         rates: HashMap::new(),
+        rate_untracked: 0,
+        rate_open_told: None,
         share_log: ShareLog::default(),
     };
     if let Some(j) = &ledger {
@@ -2788,9 +2862,19 @@ fn main() {
                 // line is composed under the lock and printed off it: stdout can
                 // block, and every miner request is serialized behind this
                 // mutex.
-                let due = plock(&pool).share_log.due(pool_core::now_ms());
+                let now_ms = pool_core::now_ms();
+                let (due, open) = {
+                    let mut g = plock(&pool);
+                    (g.share_log.due(now_ms), g.rate_open_notice(now_ms))
+                };
                 if let Some(line) = due {
                     println!("{line}");
+                }
+                // The per-worker budget has stopped running for some shares. Same
+                // discipline for the same reason: composed under the lock above,
+                // written here. On stderr, with the other operator warnings.
+                if let Some(line) = open {
+                    eprintln!("{line}");
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -3356,7 +3440,18 @@ fn stats_body(pool: &Arc<Mutex<Pool>>, now: Instant) -> String {
     {
         return body.clone();
     }
-    let (height, difficulty, accepted, blocks, pending, orphaned, window, workers, credit) = {
+    let (
+        height,
+        difficulty,
+        accepted,
+        blocks,
+        pending,
+        orphaned,
+        window,
+        workers,
+        credit,
+        credit_refused,
+    ) = {
         let p = plock(pool);
         (
             p.tpl.height,
@@ -3368,6 +3463,9 @@ fn stats_body(pool: &Arc<Mutex<Pool>>, now: Instant) -> String {
             p.pplns.total(),
             p.pplns.counts(),
             p.pplns.credit(pool_core::now_ms()),
+            // Read under the SAME lock as the credit table it belongs to: it
+            // says how much credit is missing from that table.
+            p.pplns.banked_refused_ms(),
         )
     };
     let body = json!({
@@ -3386,6 +3484,13 @@ fn stats_body(pool: &Arc<Mutex<Pool>>, now: Instant) -> String {
         "credit_note": "milliseconds of share residence: how long each worker's shares \
                         have been in the payout window. Payouts are split by this, not by \
                         the `workers` headcount.",
+        // Credit the pool's per-bucket worker cap would not hold, in the same
+        // milliseconds as the table above. 0 on any honest pool. The cap has to
+        // stay - it is what stops a flood of invented payout addresses growing
+        // that map without bound - so the pool cannot keep both the bound and
+        // that credit. It keeps the number instead: a settlement that paid
+        // somebody short leaves a mark here rather than none at all.
+        "credit_refused_ms": credit_refused,
         "freshness_note": "rebuilt at most every 2 seconds. This page is for looking at: \
                            nothing that moves money reads it, and hbit-pool-payout settles \
                            from the pool's own accounting file and from nothing on a network.",
@@ -3477,6 +3582,37 @@ fn describe_claim_drift(
 /// which address to credit.
 fn notice_height(template_height: u64) -> u64 {
     template_height.saturating_sub(1)
+}
+
+/// The job the pool is serving: the height being mined and the parent it builds
+/// on. The same pair is the same header bytes, which is the rule the template
+/// thread swaps on (`t.height != p.tpl.height || t.prevhash != p.tpl.prevhash`)
+/// and the same rule the miner's own `install_block_mining_stuff` uses to decide
+/// a job is new. Nothing else in here has to agree with the miner; this does.
+type NoticeJob = (u64, Hash);
+
+/// Should a parked `/query/miner/notice` answer now?
+///
+/// `serving` is the job the pool has this instant, `parked_on` the one it had
+/// when this long-poll parked, and `want` the height the miner says it is
+/// mining.
+///
+/// The height test is the fullnode's, and it is the only one a miner reads as
+/// new work. The job test covers what that test cannot see: a same-height reorg
+/// moves the parent and leaves the height alone, so every rig parked here goes
+/// on hashing a header built on an abandoned block. Those shares are not merely
+/// wasted. The pool rebuilds every submission from the CURRENT template, so they
+/// come back above target and are refused, and the rig collects a bad streak for
+/// work this pool handed it.
+///
+/// Compared against the job THIS poll parked on, never against a "changed
+/// recently" flag. A released rig re-reads /query/miner/pending, comes back and
+/// parks on the new job, so one real change releases a given rig once. A flag
+/// would release it on every poll for as long as the flag was set, and the only
+/// thing between that and a whole fleet hammering the pool is the miner's 200ms
+/// floor. That would be worse than the wait it is meant to cure.
+fn notice_should_answer(serving: NoticeJob, parked_on: NoticeJob, want: u64) -> bool {
+    serving.0 > want || serving != parked_on
 }
 
 /// Which contested heights deserve a fresh provisional notice this cycle.
@@ -5089,8 +5225,13 @@ fn route(
         // cycle with no delay, from every rig, exactly when the pool is already
         // shedding.
         //
-        // The parking condition below is unchanged and stays correct: waiting for
-        // `tpl.height > want` is waiting for the tip to reach `want`.
+        // The parking condition keeps that height test and adds a second one.
+        // Waiting for `tpl.height > want` is waiting for the tip to reach
+        // `want`, and a SAME-height reorg never makes it true: the parent moves
+        // and the height does not. Every rig parked here used to go on hashing a
+        // header built on an abandoned block for the rest of the long-poll. See
+        // `notice_should_answer`; the reply reports the tip either way, so what
+        // an unmodified miner is told about new work does not change at all.
         "/query/miner/notice" => {
             // Same answer as /query/miner/pending, because the miner reads BOTH
             // for it and a pool that pauses on one and not the other would park
@@ -5119,10 +5260,22 @@ fn route(
             }
             let _ng = NoticeGuard;
             let deadline = Instant::now() + Duration::from_secs(wait);
+            // The job this rig is hashing, as closely as the pool can know it: a
+            // miner reads /query/miner/pending and parks here immediately after,
+            // and the notice request carries a height and nothing else, never a
+            // parent. There is no better source and there cannot be one without
+            // a modified miner.
+            let parked_on: NoticeJob = {
+                let p = plock(pool);
+                (p.tpl.height, p.tpl.prevhash)
+            };
             loop {
-                let h = plock(pool).tpl.height; // brief lock only
-                if h > want || Instant::now() >= deadline {
-                    return json!({"ret":0,"height":notice_height(h)}).to_string();
+                let serving: NoticeJob = {
+                    let p = plock(pool); // brief lock only
+                    (p.tpl.height, p.tpl.prevhash)
+                };
+                if notice_should_answer(serving, parked_on, want) || Instant::now() >= deadline {
+                    return json!({"ret":0,"height":notice_height(serving.0)}).to_string();
                 }
                 std::thread::sleep(Duration::from_millis(400));
             }
@@ -5759,6 +5912,81 @@ mod tests {
 
         // An empty chain must not underflow into a colossal height.
         assert_eq!(notice_height(0), 0);
+    }
+
+    #[test]
+    fn a_same_height_reorg_releases_a_parked_notice_long_poll() {
+        // A same-height reorg replaces the parent and leaves the height alone,
+        // so the tip test the fullnode uses can never fire for it. Every rig
+        // parked in this long-poll went on hashing a header built on an
+        // abandoned block until the poll timed out, and every share it found
+        // was then rebuilt by the pool against the NEW parent, came out above
+        // target, was refused, and counted against the rig as a bad streak: it
+        // was marked bad for doing exactly what this pool told it to do.
+        //
+        // Drive the ENDPOINT, not the predicate. A test on the predicate alone
+        // stays green when the loop is reverted, which is the whole defect.
+        let p = a_pool();
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+
+        let mut params = HashMap::new();
+        params.insert("height".to_string(), height.to_string());
+        params.insert("wait".to_string(), "3".to_string());
+
+        // Nothing has moved: the poll must HOLD. If it answers here the endpoint
+        // is not parking at all and everything below would prove nothing.
+        let held = Arc::clone(&pool);
+        let hp = params.clone();
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || route("/query/miner/notice", &hp, &held, "test-peer"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!h.is_finished(), "an unchanged job must hold the long-poll");
+        let body = h.join().expect("the long-poll thread");
+        assert!(
+            t0.elapsed() >= Duration::from_secs(3),
+            "it must wait out the poll"
+        );
+        let j: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(j["height"].as_u64(), Some(height - 1));
+
+        // Now the reorg: same height, different parent.
+        let woken = Arc::clone(&pool);
+        let wp = params.clone();
+        let t1 = Instant::now();
+        let w = std::thread::spawn(move || route("/query/miner/notice", &wp, &woken, "test-peer"));
+        std::thread::sleep(Duration::from_millis(500)); // let it park and snapshot
+        plock(&pool).tpl.prevhash = Hash::from([0xb2u8; 32]);
+        let body = w.join().expect("the long-poll thread");
+        assert!(
+            t1.elapsed() < Duration::from_secs(2),
+            "a same-height reorg is dead work and must release the rig, not \
+             leave it hashing an abandoned parent for the rest of the poll"
+        );
+
+        // ...and the answer is still the fullnode's, the tip, so an unmodified
+        // miner does NOT read it as new work. Quoted from poworker:
+        //   new_work_ready = pending_height > 0 && res_hei >= pending_height
+        // It takes its 200ms floor and re-reads /query/miner/pending, which is
+        // where the fresh parent is.
+        let j: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            j["height"].as_u64(),
+            Some(height - 1),
+            "a released rig is not told there is new work"
+        );
+
+        // The height half is load-bearing too: a miner asking about a height the
+        // pool has already passed is answered at once, never parked.
+        let mut stale = HashMap::new();
+        stale.insert("height".to_string(), (height - 1).to_string());
+        stale.insert("wait".to_string(), "3".to_string());
+        let t2 = Instant::now();
+        let _ = route("/query/miner/notice", &stale, &pool, "test-peer");
+        assert!(
+            t2.elapsed() < Duration::from_secs(1),
+            "a lagging height answers at once"
+        );
     }
 
     #[test]
@@ -6647,6 +6875,8 @@ mod tests {
             bad_streak: HashMap::new(),
             tpl_changed_at_ms: 0,
             rates: HashMap::new(),
+            rate_untracked: 0,
+            rate_open_told: None,
             share_log: ShareLog::default(),
         }
     }
@@ -7448,7 +7678,7 @@ mod tests {
     }
 
     #[test]
-    fn no_worker_may_submit_faster_than_it_could_have_hashed() {
+    fn a_tracked_worker_may_not_submit_faster_than_it_could_have_hashed() {
         // A miner that sits on its shares has a whole interval's worth to insert
         // at once. Nothing in the submission says when a share was FOUND, so the
         // only handle the pool has is that finding one costs a known number of
@@ -7504,6 +7734,91 @@ mod tests {
             "the budget has to bind on the live pool, not only in theory"
         );
         assert!(p.rate_admits_share(W_B, 1_000));
+    }
+
+    #[test]
+    fn a_full_rate_table_admits_the_share_and_says_so_once() {
+        // The limiter fails OPEN when it has nowhere left to track a worker, and
+        // that stays: refusing an honest miner's share costs it real money, and
+        // residence weighting is what decides the split anyway. What must not
+        // happen is that it goes open in SILENCE, because for as long as it lasts
+        // nothing is holding back a batch of withheld shares dumped at a
+        // settlement, and the pool is the only thing that can see it.
+        let mut p = a_pool();
+        let now = 5_000_000u64;
+
+        // A pool with room MEASURES the share and spends its budget, so nothing
+        // is owed and the counter stays at zero. Without this the test also
+        // passes for an increment on every admission, and the operator line would
+        // then fire on a healthy pool from its first share: an alarm that is
+        // always on is the silence this counter exists to end.
+        let mut healthy = a_pool();
+        assert!(healthy.rate_admits_share(W_A, now));
+        assert_eq!(
+            healthy.rate_untracked, 0,
+            "a share the limiter actually measured is not an untracked one"
+        );
+        assert_eq!(
+            healthy.rate_open_notice(now),
+            None,
+            "a pool whose limiter is running has nothing to report"
+        );
+
+        // Every slot held by an id that is still active, so the prune that runs
+        // before the cap is consulted frees nothing.
+        for i in 0..RATE_WORKERS {
+            p.rates.insert(
+                format!("flood-{i}"),
+                ShareRate {
+                    shares: 1,
+                    at_ms: now,
+                },
+            );
+        }
+        for i in 0..3 {
+            assert!(
+                p.rate_admits_share(W_A, now),
+                "share {i}: honest work is never refused because a bookkeeping map is full"
+            );
+        }
+        assert_eq!(
+            p.rates.len(),
+            RATE_WORKERS,
+            "the cap is a memory bound and the map must not grow past it"
+        );
+        assert_eq!(
+            p.rate_untracked, 3,
+            "an admission the limiter did not measure has to be counted, or nothing \
+             anywhere records that the guard stopped running"
+        );
+
+        let line = p
+            .rate_open_notice(now)
+            .expect("the operator is told the first time the limiter goes open");
+        assert!(line.contains("OPEN"), "{line}");
+        assert!(line.contains("3 in this process"), "{line}");
+        // Not one line per share: this fires on EVERY submission while it lasts,
+        // and a line each would bury the block-found notice under it.
+        assert_eq!(p.rate_open_notice(now), None);
+        assert!(p.rate_admits_share(W_B, now));
+        assert_eq!(p.rate_untracked, 4);
+        assert_eq!(p.rate_open_notice(now + RATE_OPEN_REPEAT_MS - 1), None);
+        // Still going five minutes later, so it is said again and carries the
+        // running total: an operator has to be able to see it has not stopped.
+        let again = p
+            .rate_open_notice(now + RATE_OPEN_REPEAT_MS)
+            .expect("an incident that is still going is repeated, not swallowed");
+        assert!(again.contains("4 in this process"), "{again}");
+
+        // An incident that has ENDED stops repeating. Without the "more than
+        // zero" guard this says "0 more share(s)" every five minutes forever,
+        // which is the log flood this notice was shaped to avoid rather than
+        // cause.
+        assert_eq!(
+            p.rate_open_notice(now + RATE_OPEN_REPEAT_MS * 2),
+            None,
+            "nothing has been admitted since the last line, so there is nothing to say"
+        );
     }
 
     #[test]
@@ -7928,9 +8243,10 @@ mod tests {
         // The stamp lives in the 89-byte header every worker hashes, and the pool
         // pins one template per height. Without it on disk a restart inside a
         // height invents a new stamp, so the pool serves a DIFFERENT header for the
-        // SAME height while /query/miner/notice - which signals only a height
-        // change - stays quiet. Every worker keeps hashing the dead header until
-        // its scan pass ends and earns nothing for it.
+        // SAME height while /query/miner/notice stays quiet: a restart re-stamps
+        // rather than swaps, so the template thread sees no change and the
+        // parked-job wake-up never fires. Every worker keeps hashing the dead
+        // header until its scan pass ends and earns nothing for it.
         let mut path = std::env::temp_dir();
         path.push(format!("hbit-pool-stamp-pin-{}", std::process::id()));
         let path = path.to_string_lossy().to_string();
