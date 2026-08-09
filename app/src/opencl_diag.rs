@@ -401,7 +401,11 @@ pub fn print_scan_report(scan: &OpenClScan) {
     for plat in &scan.platforms {
         wlogln!(
             "Platform {}: {}  vendor={}  version={}  AMD-APP build={}",
-            plat.index, plat.name, plat.vendor, plat.version, plat.amd_app_build
+            plat.index,
+            plat.name,
+            plat.vendor,
+            plat.version,
+            plat.amd_app_build
         );
         for dev in &plat.devices {
             let kind = if dev.is_discrete {
@@ -427,7 +431,11 @@ pub fn print_scan_report(scan: &OpenClScan) {
     if let Some(rec) = &scan.recommended {
         wlogln!(
             "Recommended: platform_id={} device_id={}  {} ({})  AMD-APP {}",
-            rec.platform_id, rec.device_id, rec.device_name, rec.device_slug, rec.amd_app_build
+            rec.platform_id,
+            rec.device_id,
+            rec.device_name,
+            rec.device_slug,
+            rec.amd_app_build
         );
     }
     if !scan.warnings.is_empty() {

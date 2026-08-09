@@ -302,9 +302,21 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read back");
         let lines: Vec<&str> = text.lines().filter(|line| line.contains(&tag)).collect();
         assert_eq!(lines.len(), 3, "got {text:?}");
-        assert!(lines[0].ends_with(&format!(" [Mining] {tag} first")), "{}", lines[0]);
-        assert!(lines[1].ends_with(&format!(" [Mining] {tag} second")), "{}", lines[1]);
-        assert!(lines[2].ends_with(&format!(" [Mining] {tag} third")), "{}", lines[2]);
+        assert!(
+            lines[0].ends_with(&format!(" [Mining] {tag} first")),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(&format!(" [Mining] {tag} second")),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].ends_with(&format!(" [Mining] {tag} third")),
+            "{}",
+            lines[2]
+        );
         // Every entry carries the time it was printed, so the panel shows a
         // measured timestamp instead of the moment it happened to read the file.
         assert_eq!(lines[0].chars().nth(4), Some('-'), "{}", lines[0]);

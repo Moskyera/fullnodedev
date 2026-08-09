@@ -93,7 +93,8 @@ fn announce_equiv(
     if prod_batches > 0 {
         let window = prod_shape.nonces();
         let ranks = gate::threshold_ranks(window, gate::SHARE_LIST_CAPACITY, prod_thresholds);
-        let (seconds, bytes) = gate::oracle_cost(window.saturating_mul(prod_batches as u64), threads);
+        let (seconds, bytes) =
+            gate::oracle_cost(window.saturating_mul(prod_batches as u64), threads);
         println!(
             "[gate] production shape {prod_shape} = {window} nonces x {prod_batches} batch(es); \
              {} count thresholds; ONE wrong hash anywhere in a window slips past them all with p = {:.2e}",

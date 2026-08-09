@@ -348,9 +348,7 @@ pub fn plan_corpus(
     let mut kept: Vec<Shape> = shapes.to_vec();
     let mut dropped = Vec::new();
     loop {
-        if let Some(segment_nonces) =
-            segment_for(&kept, min_segment_nonces, cap_segment_nonces)
-        {
+        if let Some(segment_nonces) = segment_for(&kept, min_segment_nonces, cap_segment_nonces) {
             let corpus = Corpus {
                 nonce_start,
                 headers: headers.max(1),
@@ -545,18 +543,8 @@ pub fn plan_session(
              be sized from"
         ));
     }
-    let universe = candidate_universe(
-        min_work_groups,
-        max_work_groups,
-        max_unit_size,
-        local_size,
-    );
-    let coarse = coarse_candidates(
-        min_work_groups,
-        max_work_groups,
-        max_unit_size,
-        local_size,
-    );
+    let universe = candidate_universe(min_work_groups, max_work_groups, max_unit_size, local_size);
+    let coarse = coarse_candidates(min_work_groups, max_work_groups, max_unit_size, local_size);
     if universe.is_empty() || coarse.is_empty() {
         return Err("no launch shape fits this device's limits".to_string());
     }
@@ -578,8 +566,7 @@ pub fn plan_session(
     //    the lower: the sweep has to fit the operator's budget, and the soak has
     //    to be able to settle on the corpus the sweep chose.
     let expected_passes = coarse.len() as u32 + REFINE_PASS_ALLOWANCE + FINAL_PASS_ALLOWANCE;
-    let sweep_pass_seconds =
-        budget_seconds as f64 * SWEEP_BUDGET_SHARE / expected_passes as f64;
+    let sweep_pass_seconds = budget_seconds as f64 * SWEEP_BUDGET_SHARE / expected_passes as f64;
     let soak_pass_seconds = max_soak_pass_seconds(budget_seconds) * SOAK_PASS_MARGIN;
     let pass_ceiling_seconds = sweep_pass_seconds.min(soak_pass_seconds);
 
@@ -630,8 +617,7 @@ pub fn plan_session(
         .collect();
 
     let pass_seconds = corpus.total_nonces() as f64 / probe_hps;
-    let sweep_passes =
-        candidates.len() as u32 + REFINE_PASS_ALLOWANCE + FINAL_PASS_ALLOWANCE;
+    let sweep_passes = candidates.len() as u32 + REFINE_PASS_ALLOWANCE + FINAL_PASS_ALLOWANCE;
 
     let plan = SessionPlan {
         corpus,
@@ -841,18 +827,24 @@ pub fn resolve_objective(
             if econ.power_cost_kwh <= 0.0 {
                 return (
                     Objective::ValidHashrate,
-                    Some("power_cost_kwh is not set, so electricity is free and net income is maximised by throughput"),
+                    Some(
+                        "power_cost_kwh is not set, so electricity is free and net income is maximised by throughput",
+                    ),
                 );
             }
             match econ.eur_per_hps_day() {
                 Some(_) => (Objective::NetIncome, None),
                 None if econ.hac_price <= 0.0 => (
                     Objective::ValidHashrate,
-                    Some("hac_price is not set, so revenue has no value and net income cannot be ranked; ranking on throughput instead"),
+                    Some(
+                        "hac_price is not set, so revenue has no value and net income cannot be ranked; ranking on throughput instead",
+                    ),
                 ),
                 None => (
                     Objective::ValidHashrate,
-                    Some("the network difficulty could not be read, so the value of a hash is unknown; ranking on throughput instead"),
+                    Some(
+                        "the network difficulty could not be read, so the value of a hash is unknown; ranking on throughput instead",
+                    ),
                 ),
             }
         }
@@ -907,7 +899,12 @@ impl ScoreInput {
 /// `None` means the candidate is not admissible at all: a measurement that is
 /// not finite and positive, or a shape that blows the latency ceiling.
 #[cfg(any(feature = "ocl", feature = "cuda", test))]
-pub fn score(input: &ScoreInput, objective: Objective, econ: &Economics, ceiling_ms: f64) -> Option<f64> {
+pub fn score(
+    input: &ScoreInput,
+    objective: Objective,
+    econ: &Economics,
+    ceiling_ms: f64,
+) -> Option<f64> {
     if !input.hashrate.is_finite() || input.hashrate <= 0.0 {
         return None;
     }
@@ -1122,9 +1119,9 @@ impl TempCeiling {
     /// terms: the setting they typed and what it is worth here.
     pub fn describe(self, sensor: &str) -> String {
         match self {
-            TempCeiling::NotRequested => format!(
-                "no ceiling set ([efficiency] max_temp_c = 0), sensor: {sensor}"
-            ),
+            TempCeiling::NotRequested => {
+                format!("no ceiling set ([efficiency] max_temp_c = 0), sensor: {sensor}")
+            }
             TempCeiling::Enforced { limit_c } => format!(
                 "{limit_c:.0} C ceiling from [efficiency] max_temp_c, enforced against {sensor}"
             ),
@@ -1705,7 +1702,11 @@ mod device {
     }
 
     impl Sampler {
-        pub fn start(thermal_file: &str, gpu_index: u32, vendor: crate::gpu_arch::GpuVendor) -> Sampler {
+        pub fn start(
+            thermal_file: &str,
+            gpu_index: u32,
+            vendor: crate::gpu_arch::GpuVendor,
+        ) -> Sampler {
             let readings: Arc<Mutex<Vec<Reading>>> = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
 
@@ -1765,9 +1766,8 @@ mod device {
                     let power_limit_w = backend.read_power_limit_w();
                     let sink = Arc::clone(&readings);
                     let flag = Arc::clone(&stop);
-                    let label: &'static str = Box::leak(
-                        format!("{} at 1 Hz", backend.label()).into_boxed_str(),
-                    );
+                    let label: &'static str =
+                        Box::leak(format!("{} at 1 Hz", backend.label()).into_boxed_str());
                     let handle = std::thread::spawn(move || {
                         while !flag.load(Ordering::Relaxed) {
                             let sample = backend.read_sample();
@@ -1812,15 +1812,16 @@ mod device {
             let taken: Vec<&Reading> = readings.iter().filter(|r| r.at >= from).collect();
             let mean = |pick: fn(&Reading) -> Option<f32>| -> Option<f32> {
                 let values: Vec<f32> = taken.iter().filter_map(|r| pick(r)).collect();
-                (!values.is_empty())
-                    .then(|| values.iter().sum::<f32>() / values.len() as f32)
+                (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
             };
             TelemetryWindow {
                 temp_c: mean(|r| r.temp_c),
                 peak_temp_c: taken
                     .iter()
                     .filter_map(|r| r.temp_c)
-                    .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t)))),
+                    .fold(None, |acc: Option<f32>, t| {
+                        Some(acc.map_or(t, |a| a.max(t)))
+                    }),
                 watts: mean(|r| r.watts),
                 clock_mhz: mean(|r| r.clock_mhz),
                 samples: taken.len(),
@@ -1832,7 +1833,9 @@ mod device {
             readings
                 .iter()
                 .filter_map(|r| r.temp_c)
-                .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))))
+                .fold(None, |acc: Option<f32>, t| {
+                    Some(acc.map_or(t, |a| a.max(t)))
+                })
         }
 
         /// What fraction of this card's power cap a measured draw is, where both
@@ -2071,9 +2074,8 @@ mod device {
         let mut sorted = cpu.clone();
         sorted.sort_unstable();
 
-        let launch = |target: &[u8; 32]| {
-            device.count_and_shares(shape, height, intro, nonce_start, target)
-        };
+        let launch =
+            |target: &[u8; 32]| device.count_and_shares(shape, height, intro, nonce_start, target);
 
         // 1. The whole window, counted.
         let (all_hits, _) = launch(&[0xffu8; 32])?;
@@ -2123,7 +2125,9 @@ mod device {
         }
         let offset = best_nonce.wrapping_sub(nonce_start) as u64;
         if offset >= window || cpu[offset as usize] != best_hash {
-            return Err(format!("best nonce {best_nonce} does not carry its own hash"));
+            return Err(format!(
+                "best nonce {best_nonce} does not carry its own hash"
+            ));
         }
 
         Ok(ShapeProof {
@@ -2285,9 +2289,8 @@ mod device {
         let mut hashed = 0u64;
         let mut last = None;
         for index in 0..PROBE_MAX_BATCHES {
-            let nonce_start = PROBE_NONCE_BASE.wrapping_add(
-                ((index as u64 + 1) * batch % (1u64 << 32)) as u32,
-            );
+            let nonce_start =
+                PROBE_NONCE_BASE.wrapping_add(((index as u64 + 1) * batch % (1u64 << 32)) as u32);
             last = Some((nonce_start, launch(nonce_start)?));
             hashed += batch;
             if started.elapsed().as_secs_f64() >= PROBE_SECONDS {
@@ -2479,9 +2482,11 @@ mod device {
                 #[cfg(not(feature = "ocl"))]
                 {
                     let _ = (opencl_dir, platform, device_ids);
-                    Err("this binary was built without the OpenCL backend, so it cannot tune an \
+                    Err(
+                        "this binary was built without the OpenCL backend, so it cannot tune an \
                          OpenCL device. Rebuild with --features ocl. Config unchanged"
-                        .to_string())
+                            .to_string(),
+                    )
                 }
             }
             TuneTarget::Cuda { device_index } => {
@@ -2496,15 +2501,13 @@ mod device {
                     // NotCompiled, which used to reach the operator as a driver
                     // error.
                     if !crate::x16rs_gate::cuda_kernels_available() {
-                        return Err(
-                            "this binary has the cuda feature but NO CUDA kernels: \
+                        return Err("this binary has the cuda feature but NO CUDA kernels: \
                              x16rs-cuda/build.rs did not find nvcc when it was built, so \
                              cfg(cuda_available) was never set and every device call returns \
                              `x16rs-cuda built without CUDA kernels`. Install the CUDA Toolkit, \
                              set CUDA_PATH, and rebuild with --features cuda; the build prints \
                              `Using CUDA Toolkit at ...` when it found one. Config unchanged"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
                     tune_on(
                         &crate::x16rs_gate::CudaBackend {
@@ -2516,11 +2519,13 @@ mod device {
                 #[cfg(not(feature = "cuda"))]
                 {
                     let _ = device_index;
-                    Err("this binary was built without the CUDA backend, so it cannot tune an \
+                    Err(
+                        "this binary was built without the CUDA backend, so it cannot tune an \
                          NVIDIA card. Rebuild with --features cuda (the CUDA Toolkit must be \
                          installed and CUDA_PATH set, or the build silently produces a binary \
                          with no kernels). Config unchanged"
-                        .to_string())
+                            .to_string(),
+                    )
                 }
             }
         }
@@ -2898,11 +2903,7 @@ mod device {
             .filter_map(|m| admissible(m).map(|s| (m.clone(), s)))
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let finalists: Vec<Shape> = ranked
-            .iter()
-            .take(3)
-            .map(|(m, _)| m.shape)
-            .collect();
+        let finalists: Vec<Shape> = ranked.iter().take(3).map(|(m, _)| m.shape).collect();
 
         let mut finalist_runs: Vec<FinalistRuns> = finalists
             .iter()
@@ -2926,11 +2927,9 @@ mod device {
                 }
                 for index in order {
                     let shape = finalist_runs[index].shape;
-                    let measured = devices
-                        .at(shape)
-                        .and_then(|device| {
-                            run_corpus(device, shape, &corpus, &intros, height, &sampler)
-                        });
+                    let measured = devices.at(shape).and_then(|device| {
+                        run_corpus(device, shape, &corpus, &intros, height, &sampler)
+                    });
                     match measured {
                         Ok(measured) => {
                             if let Some(reference) = reference.as_ref() {
@@ -3156,12 +3155,7 @@ mod device {
         suffix: &str,
     ) {
         let input = measured.score_input(request.estimated_watts);
-        let value = score(
-            &input,
-            objective,
-            &request.economics,
-            P95_BATCH_CEILING_MS,
-        );
+        let value = score(&input, objective, &request.economics, P95_BATCH_CEILING_MS);
         wlogln!(
             "[autotune] {}x{}x{}{}: {} | p50 {:.0}ms p95 {:.0}ms | {} {:.0}W {}C | {} = {}",
             measured.shape.work_groups,
@@ -3364,7 +3358,10 @@ wrong hash escapes with p = {:.1e}\n  \
                     outcome.watts_source.label(),
                     outcome.winner.telemetry.samples
                 ),
-                None => format!("{:.0} W estimated, this card reports none", request.estimated_watts),
+                None => format!(
+                    "{:.0} W estimated, this card reports none",
+                    request.estimated_watts
+                ),
             },
             outcome
                 .peak_temp_c
@@ -3616,9 +3613,16 @@ mod tests {
                     "{min_wg}..={max_wg} x {max_us}: shape {other:?} expands to {} pairs and its \
                      signature {} the reference's; the two forms disagree",
                     got.len(),
-                    if signatures_agree { "equals" } else { "differs from" }
+                    if signatures_agree {
+                        "equals"
+                    } else {
+                        "differs from"
+                    }
                 );
-                assert!(got == want, "shape {other:?} does not hash the reference's work");
+                assert!(
+                    got == want,
+                    "shape {other:?} does not hash the reference's work"
+                );
                 assert!(coverage_matches(&corpus, reference, *other).is_ok());
                 compared += 1;
             }
@@ -3750,7 +3754,10 @@ mod tests {
     fn the_coarse_sweep_is_half_the_grid_and_refinement_fills_the_gaps() {
         let coarse = coarse_candidates(32, 64, 192, 256);
         let universe = candidate_universe(32, 64, 192, 256);
-        assert!(coarse.len() < universe.len(), "the coarse pass must be coarse");
+        assert!(
+            coarse.len() < universe.len(),
+            "the coarse pass must be coarse"
+        );
         assert!(coarse.iter().all(|shape| universe.contains(shape)));
         // Refining around any coarse point reaches only grid points, and reaches
         // at least one the coarse pass skipped.
@@ -3901,7 +3908,12 @@ mod tests {
             ..modest
         };
         let net = |input: &ScoreInput| input.net_eur_per_day(&econ).unwrap();
-        assert!(net(&modest) > net(&greedy), "{} vs {}", net(&modest), net(&greedy));
+        assert!(
+            net(&modest) > net(&greedy),
+            "{} vs {}",
+            net(&modest),
+            net(&greedy)
+        );
         assert!(greedy.valid_hps() > modest.valid_hps());
     }
 
@@ -3981,7 +3993,10 @@ mod tests {
         let amd = TempCeiling::resolve(Some(85.0), true);
         assert_eq!(amd, TempCeiling::Enforced { limit_c: 85.0 });
         assert!(amd.is_enforceable());
-        assert!(amd.describe("AMD driver (ADL)").contains("AMD driver (ADL)"));
+        assert!(
+            amd.describe("AMD driver (ADL)")
+                .contains("AMD driver (ADL)")
+        );
 
         // And every window state is distinguishable, so no caller can read
         // "nothing was measured" as "it stayed under".
@@ -4061,7 +4076,10 @@ mod tests {
             .collect();
         let sparse_state = settle_state(&sparse, &limits);
         assert!(sparse_state.settled);
-        assert_eq!(sparse_state.absent_signals(), vec!["board power", "shader clock"]);
+        assert_eq!(
+            sparse_state.absent_signals(),
+            vec!["board power", "shader clock"]
+        );
 
         // An Intel card: nothing but a hashrate.
         let blind: Vec<SoakPass> = sparse
@@ -4113,10 +4131,10 @@ mod tests {
         // candidates, the grid is wrong and some operator's tune silently
         // measures fewer shapes than it reports.
         for (min_wg, max_wg, max_us) in [
-            (32u32, 64u32, 192u32),  // RX 9070 XT / RDNA4
-            (256, 2048, 128),        // a large AMD or NVIDIA card
-            (256, 1024, 96),         // a small discrete card
-            (256, 512, 128),         // an Intel Arc
+            (32u32, 64u32, 192u32), // RX 9070 XT / RDNA4
+            (256, 2048, 128),       // a large AMD or NVIDIA card
+            (256, 1024, 96),        // a small discrete card
+            (256, 512, 128),        // an Intel Arc
         ] {
             let universe = candidate_universe(min_wg, max_wg, max_us, 256);
             let (corpus, usable, dropped) = plan_corpus(
@@ -4231,8 +4249,7 @@ mod tests {
         use crate::gpu_arch::{ArchLimits, profile_vendor, tune_workgroups};
 
         let limits = ArchLimits::for_panel_slug(slug);
-        let shipped =
-            crate::panel_tuning::resolve_panel_tuning(slug, base_profile, vram_gb, mode);
+        let shipped = crate::panel_tuning::resolve_panel_tuning(slug, base_profile, vram_gb, mode);
         // What the probe reports, having applied CU scaling and the arch cap.
         // The VRAM clamp inside `initialize_opencl` can only lower this further,
         // and lowering it is covered by the small-CU end of the sweep.
@@ -4278,7 +4295,8 @@ mod tests {
             ] {
                 for cu in COMPUTE_UNITS {
                     let (min_wg, max_wg, max_us) = tuner_window(slug, profile, vram, mode, cu);
-                    let where_ = format!("{slug} {mode:?} {cu} CU ({min_wg}..={max_wg} x {max_us})");
+                    let where_ =
+                        format!("{slug} {mode:?} {cu} CU ({min_wg}..={max_wg} x {max_us})");
 
                     assert!(min_wg >= 1 && min_wg <= max_wg, "{where_}: inverted window");
 
@@ -4315,11 +4333,8 @@ mod tests {
                     // The top of both axes is always reachable, so no card is
                     // stopped short of its own ceiling by the grid.
                     assert!(
-                        coarse.iter().any(|s| s.work_groups == *universe
-                            .iter()
-                            .map(|u| &u.work_groups)
-                            .max()
-                            .unwrap()),
+                        coarse.iter().any(|s| s.work_groups
+                            == *universe.iter().map(|u| &u.work_groups).max().unwrap()),
                         "{where_}: the coarse sweep never reaches the top work-group count"
                     );
                     assert!(
@@ -4345,7 +4360,8 @@ mod tests {
             ] {
                 for cu in COMPUTE_UNITS {
                     let (min_wg, max_wg, max_us) = tuner_window(slug, profile, vram, mode, cu);
-                    let where_ = format!("{slug} {mode:?} {cu} CU ({min_wg}..={max_wg} x {max_us})");
+                    let where_ =
+                        format!("{slug} {mode:?} {cu} CU ({min_wg}..={max_wg} x {max_us})");
                     // Planned the way `tune` plans it, at the one rate anyone
                     // has ever measured for this kernel.
                     let plan = plan_session(
@@ -4382,9 +4398,8 @@ mod tests {
                     }
                     // A shape is only ever dropped for one of two stated
                     // reasons, and never silently.
-                    let planned = plan.candidates.len()
-                        + plan.over_ceiling.len()
-                        + plan.off_corpus.len();
+                    let planned =
+                        plan.candidates.len() + plan.over_ceiling.len() + plan.off_corpus.len();
                     let coarse = coarse_candidates(min_wg, max_wg, max_us, 256);
                     assert!(
                         planned >= coarse.len(),
@@ -4454,7 +4469,10 @@ mod tests {
             plan_window(min_wg, max_wg, max_us).0.segment_nonces
         };
         assert_eq!(quantum_for("rx9070xt", EfficiencyMode::Max, 32), 18_874_368);
-        assert_eq!(quantum_for("rtx5090", EfficiencyMode::Max, 170), 150_994_944);
+        assert_eq!(
+            quantum_for("rtx5090", EfficiencyMode::Max, 170),
+            150_994_944
+        );
     }
 
     /// Refinement may only ever ask for points the corpus was planned around,
@@ -4508,8 +4526,7 @@ mod tests {
                 EfficiencyMode::Profit,
                 EfficiencyMode::Max,
             ] {
-                let shipped =
-                    crate::panel_tuning::resolve_panel_tuning(slug, profile, vram, mode);
+                let shipped = crate::panel_tuning::resolve_panel_tuning(slug, profile, vram, mode);
                 for cu in COMPUTE_UNITS {
                     let (min_wg, max_wg, max_us) = tuner_window(slug, profile, vram, mode, cu);
                     let universe = candidate_universe(min_wg, max_wg, max_us, 256);
@@ -4734,7 +4751,12 @@ mod tests {
     /// `panel_max_unit_size` before it runs poworker, so the benchmark window is
     /// the card's whole safe range, not the shape the miner is currently set to.
     /// `tuner_window` above models the other entry point, a hand-written ini.
-    fn panel_button_window(slug: &str, base_profile: &str, vram_gb: u8, compute_units: u32) -> (u32, u32, u32) {
+    fn panel_button_window(
+        slug: &str,
+        base_profile: &str,
+        vram_gb: u8,
+        compute_units: u32,
+    ) -> (u32, u32, u32) {
         use crate::gpu_arch::{ArchLimits, profile_vendor, tune_workgroups};
 
         let limits = ArchLimits::for_panel_slug(slug);
@@ -4978,8 +5000,9 @@ mod tests {
         budget: u64,
     ) -> Option<f64> {
         bisect_required(|hps| {
-            plan_session(min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE)
-                .is_ok_and(|plan| plan.is_a_comparison() && soak_can_settle(plan.pass_seconds, budget))
+            plan_session(min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE).is_ok_and(
+                |plan| plan.is_a_comparison() && soak_can_settle(plan.pass_seconds, budget),
+            )
         })
     }
 
@@ -5089,7 +5112,7 @@ mod tests {
     /// `cargo test -- --nocapture nvidia_grid` is the audit.
     #[test]
     fn the_corpus_planner_finishes_on_every_nvidia_grid_three_ways() {
-        use crate::gpu_arch::{PANEL_GPU_PRESETS, profile_vendor, GpuVendor};
+        use crate::gpu_arch::{GpuVendor, PANEL_GPU_PRESETS, profile_vendor};
 
         // A T4 sustains 7.54 MH/s. A tune that needs more than this fraction of
         // it is a tune that cannot run on the one NVIDIA card ever measured.
@@ -5121,8 +5144,7 @@ mod tests {
                     ),
                 ];
                 for (entry, (min_wg, max_wg, max_us)) in windows {
-                    let where_ =
-                        format!("{slug} {entry} {cu} CU ({min_wg}..={max_wg} x {max_us})");
+                    let where_ = format!("{slug} {entry} {cu} CU ({min_wg}..={max_wg} x {max_us})");
                     let planner =
                         required_hps_from_the_planner(min_wg, max_wg, max_us, PANEL_BUDGET_SECONDS)
                             .unwrap_or_else(|| panic!("{where_}: no hashrate finishes a tune"));
@@ -5266,7 +5288,7 @@ mod tests {
     /// The multiprocessor counts live in one place.
     #[test]
     fn every_nvidia_panel_card_has_a_multiprocessor_count() {
-        use crate::gpu_arch::{PANEL_GPU_PRESETS, profile_vendor, GpuVendor};
+        use crate::gpu_arch::{GpuVendor, PANEL_GPU_PRESETS, profile_vendor};
         let mut named = 0;
         for (slug, profile, _) in PANEL_GPU_PRESETS {
             if profile_vendor(profile) != GpuVendor::Nvidia {
@@ -5334,16 +5356,18 @@ mod tests {
                 for hps in [0.5e6, 2.0e6, 10.0e6, 28.8e6, 120.0e6, 500.0e6] {
                     for budget in [30u64, 90, 300, 1_800] {
                         let where_ = format!("{slug} {cu} CU at {:.1} MH/s, {budget}s", hps / 1e6);
-                        match plan_session(
-                            min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE,
-                        ) {
+                        match plan_session(min_wg, max_wg, max_us, 256, hps, budget, 4, NONCE_BASE)
+                        {
                             Ok(plan) => {
                                 assert!(
                                     soak_can_settle(plan.pass_seconds, budget),
                                     "{where_}: planned a {:.1}s pass, which cannot settle",
                                     plan.pass_seconds
                                 );
-                                assert!(plan.is_a_comparison(), "{where_}: one shape is not a tune");
+                                assert!(
+                                    plan.is_a_comparison(),
+                                    "{where_}: one shape is not a tune"
+                                );
                                 assert!(
                                     plan.corpus.segments >= 1 && plan.corpus.headers >= 1,
                                     "{where_}: empty corpus"
@@ -5363,7 +5387,8 @@ mod tests {
                             // A refusal is allowed, but it has to name what the
                             // operator can do about it.
                             Err(error) => assert!(
-                                error.contains("work_groups") || error.contains("benchmark_seconds"),
+                                error.contains("work_groups")
+                                    || error.contains("benchmark_seconds"),
                                 "{where_}: refused with no remedy: {error}"
                             ),
                         }
@@ -5383,9 +5408,17 @@ mod tests {
         for (slug, profile, vram) in PANEL_GPU_PRESETS {
             let (min_wg, max_wg, max_us) = panel_button_window(slug, profile, vram, 128);
             for hps in [10.0e6, 28.8e6, 60.0e6] {
-                let plan =
-                    plan_session(min_wg, max_wg, max_us, 256, hps, PANEL_BUDGET_SECONDS, 4, NONCE_BASE)
-                        .unwrap();
+                let plan = plan_session(
+                    min_wg,
+                    max_wg,
+                    max_us,
+                    256,
+                    hps,
+                    PANEL_BUDGET_SECONDS,
+                    4,
+                    NONCE_BASE,
+                )
+                .unwrap();
                 let Some(bigger) = plan.budget_for_every_shape else {
                     continue;
                 };
@@ -5500,7 +5533,10 @@ mod tests {
             );
         }
         for shape in plan.usable.iter().chain(plan.candidates.iter()) {
-            assert!(shape.nonces() as f64 <= ceiling_nonces, "{shape:?} survived the prune");
+            assert!(
+                shape.nonces() as f64 <= ceiling_nonces,
+                "{shape:?} survived the prune"
+            );
         }
         // The prune can never empty the set: the smallest shape is kept whatever
         // the rate, so a very slow card gets a refusal with a remedy and not a
@@ -5538,9 +5574,18 @@ mod tests {
         };
         // Every mode resolves to a real objective, so nothing below is a
         // fallback to throughput for a missing price.
-        assert_eq!(resolve_objective(EfficiencyMode::Eco, &econ).0, Objective::HashesPerJoule);
-        assert_eq!(resolve_objective(EfficiencyMode::Profit, &econ).0, Objective::NetIncome);
-        assert_eq!(resolve_objective(EfficiencyMode::Max, &econ).0, Objective::ValidHashrate);
+        assert_eq!(
+            resolve_objective(EfficiencyMode::Eco, &econ).0,
+            Objective::HashesPerJoule
+        );
+        assert_eq!(
+            resolve_objective(EfficiencyMode::Profit, &econ).0,
+            Objective::NetIncome
+        );
+        assert_eq!(
+            resolve_objective(EfficiencyMode::Max, &econ).0,
+            Objective::ValidHashrate
+        );
 
         // The estimated-watts path: one number from [gpu] gpu_profile, reused
         // for every candidate because no sensor contradicts it.
@@ -5560,7 +5605,9 @@ mod tests {
             index.sort_by(|a, b| {
                 score(&candidates[*b], objective, &econ, P95_BATCH_CEILING_MS)
                     .unwrap()
-                    .total_cmp(&score(&candidates[*a], objective, &econ, P95_BATCH_CEILING_MS).unwrap())
+                    .total_cmp(
+                        &score(&candidates[*a], objective, &econ, P95_BATCH_CEILING_MS).unwrap(),
+                    )
             });
             index
         };
@@ -5578,12 +5625,30 @@ mod tests {
         };
         let frugal = candidates[2];
         assert!(
-            score(&thirsty, Objective::ValidHashrate, &econ, P95_BATCH_CEILING_MS)
-                > score(&frugal, Objective::ValidHashrate, &econ, P95_BATCH_CEILING_MS)
+            score(
+                &thirsty,
+                Objective::ValidHashrate,
+                &econ,
+                P95_BATCH_CEILING_MS
+            ) > score(
+                &frugal,
+                Objective::ValidHashrate,
+                &econ,
+                P95_BATCH_CEILING_MS
+            )
         );
         assert!(
-            score(&thirsty, Objective::HashesPerJoule, &econ, P95_BATCH_CEILING_MS)
-                < score(&frugal, Objective::HashesPerJoule, &econ, P95_BATCH_CEILING_MS),
+            score(
+                &thirsty,
+                Objective::HashesPerJoule,
+                &econ,
+                P95_BATCH_CEILING_MS
+            ) < score(
+                &frugal,
+                Objective::HashesPerJoule,
+                &econ,
+                P95_BATCH_CEILING_MS
+            ),
             "with real watts Eco must be able to prefer the slower shape"
         );
     }
@@ -5806,7 +5871,10 @@ mod tests {
             local_size: 64,
             unit_size: 32,
         };
-        assert_eq!(shared_allocation_work_groups(&[other_block], shape(256, 32)), 256);
+        assert_eq!(
+            shared_allocation_work_groups(&[other_block], shape(256, 32)),
+            256
+        );
     }
 
     /// A T4-shaped device window plans a real comparison at the shipped budget.
@@ -5836,7 +5904,10 @@ mod tests {
         for probe_hps in [3.0e6f64, 5.0e6, 7.5e6] {
             let plan = plan_session(min_wg, max_wg, max_unit, 256, probe_hps, 90, 4, NONCE_BASE)
                 .unwrap_or_else(|error| {
-                    panic!("a T4 at {:.1} MH/s must be plannable: {error}", probe_hps / 1e6)
+                    panic!(
+                        "a T4 at {:.1} MH/s must be plannable: {error}",
+                        probe_hps / 1e6
+                    )
                 });
             assert!(
                 plan.is_a_comparison(),

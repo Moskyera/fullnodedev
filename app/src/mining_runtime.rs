@@ -348,13 +348,17 @@ impl MiningRuntimeState {
             if newly_throttled || cap_changed {
                 wlogerr!(
                     "[Thermal] {:.1}C >= {:.1}C: cap work_groups to {}",
-                    temp_c, max_temp, cap
+                    temp_c,
+                    max_temp,
+                    cap
                 );
             }
             if !self.thermal_paused.swap(true, Relaxed) {
                 wlogerr!(
                     "[Thermal] CRITICAL {:.1}C >= {:.1}C: mining paused until <= {:.1}C",
-                    temp_c, critical_temp, recovery_temp
+                    temp_c,
+                    critical_temp,
+                    recovery_temp
                 );
             }
             return;
@@ -365,7 +369,9 @@ impl MiningRuntimeState {
             if !self.throttled.swap(true, Relaxed) || cap_changed {
                 wlogerr!(
                     "[Thermal] {:.1}C >= {:.1}C: cap work_groups to {}",
-                    temp_c, max_temp, cap
+                    temp_c,
+                    max_temp,
+                    cap
                 );
             }
             return;
@@ -378,7 +384,8 @@ impl MiningRuntimeState {
             if was_paused || was_throttled || old_cap > 0 {
                 wlogln!(
                     "[Thermal] Recovered at {:.1}C (<= {:.1}C): mining resumed, cap removed",
-                    temp_c, recovery_temp
+                    temp_c,
+                    recovery_temp
                 );
             }
         }
@@ -544,8 +551,8 @@ impl ThermalCadence {
 /// blanks its own gauge. This is a display window only; the safety path acts on
 /// each reading as it arrives and never consults it.
 fn temp_freshness_ms(cadence: ThermalCadence, sensor_count: usize) -> u64 {
-    let gap = u64::try_from(cadence.worst_case_sample_gap(sensor_count).as_millis())
-        .unwrap_or(u64::MAX);
+    let gap =
+        u64::try_from(cadence.worst_case_sample_gap(sensor_count).as_millis()).unwrap_or(u64::MAX);
     gap.saturating_mul(2).saturating_add(5_000).max(15_000)
 }
 
@@ -792,7 +799,8 @@ fn detect_thermal_sensors(
         // The single configured thermal_file describes the first identity only;
         // the caller has already refused to let it stand in for several GPUs.
         let file = if sensors.is_empty() { thermal_file } else { "" };
-        let Some((sensor, temp)) = crate::efficiency::detect_gpu_temp_sensor(file, gpu_index, vendor)
+        let Some((sensor, temp)) =
+            crate::efficiency::detect_gpu_temp_sensor(file, gpu_index, vendor)
         else {
             return Err(no_sensor_reason(vendor, gpu_index));
         };
@@ -1271,7 +1279,10 @@ mod tests {
         );
         // And it is derived, not guessed: the window follows the sensor count
         // because the pass does.
-        assert!(temp_freshness_ms(ThermalCadence::GUARDED, 8) > temp_freshness_ms(ThermalCadence::GUARDED, 1));
+        assert!(
+            temp_freshness_ms(ThermalCadence::GUARDED, 8)
+                > temp_freshness_ms(ThermalCadence::GUARDED, 1)
+        );
 
         let runtime = MiningRuntimeState::new(64, 0);
         runtime.set_temp_freshness_window(ThermalCadence::GUARDED, 8);
@@ -1604,8 +1615,7 @@ mod tests {
             Some(hot_stop.clone()),
         );
         let hot_at_return = hot_runtime.gpu_temp_c();
-        let hot_gated_at_return =
-            crate::efficiency::mining_is_gated(&hot_runtime, &hot_efficiency);
+        let hot_gated_at_return = crate::efficiency::mining_is_gated(&hot_runtime, &hot_efficiency);
         let hot_cap_at_return = hot_runtime.thermal_workgroups_cap();
         hot_stop.store(true, Relaxed);
 
@@ -1798,9 +1808,7 @@ mod tests {
         let hot_cap = runtime.thermal_workgroups_cap();
 
         std::fs::write(&path, "63.5\n").expect("cool the test sensor down");
-        let resumed = wait_for(Duration::from_secs(30), || {
-            !runtime.thermal_pause_active()
-        });
+        let resumed = wait_for(Duration::from_secs(30), || !runtime.thermal_pause_active());
         let cool_gated = crate::efficiency::mining_is_gated(&runtime, &efficiency);
         let cool_cap = runtime.thermal_workgroups_cap();
 
@@ -1830,7 +1838,11 @@ mod tests {
              worker loop to hash at 95.0C"
         );
         assert_eq!(hot_temp, Some(95.0), "the 95.0C sample was never published");
-        assert_eq!(hot_cap, Some(32), "no conservative work_groups cap at 95.0C");
+        assert_eq!(
+            hot_cap,
+            Some(32),
+            "no conservative work_groups cap at 95.0C"
+        );
 
         assert!(
             resumed,

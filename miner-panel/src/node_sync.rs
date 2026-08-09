@@ -234,7 +234,8 @@ mod tests {
     #[test]
     fn the_nodes_own_startup_refusal_is_recognised() {
         // The body a node inside its first 30 seconds returns.
-        let refusal = r#"{"ret":1,"err":"miner worker must be launched at least 30 secs after node start"}"#;
+        let refusal =
+            r#"{"ret":1,"err":"miner worker must be launched at least 30 secs after node start"}"#;
         assert_eq!(work_readiness_from(refusal), WorkReadiness::StartupWindow);
 
         // A node serving work. Only the first fields matter here.

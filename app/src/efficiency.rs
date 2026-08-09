@@ -724,7 +724,10 @@ pub fn apply_benchmark_pick(path: &str, pick: &BenchmarkPick) -> std::io::Result
     atomic_write_private(Path::new(path), out.as_bytes())?;
     wlogln!(
         "[benchmark] Applied gpu_profile={} (work_groups={}, unit_size={}) to {}",
-        pick.profile, pick.workgroups, pick.unitsize, path
+        pick.profile,
+        pick.workgroups,
+        pick.unitsize,
+        path
     );
     Ok(())
 }
@@ -1115,7 +1118,9 @@ enum GpuTempSensorSource {
     /// that exists on a consumer Windows install. Bound to one ADL adapter at
     /// detection time, so every later read is the same physical card.
     #[cfg(windows)]
-    AmdDriver { adapter_index: i32 },
+    AmdDriver {
+        adapter_index: i32,
+    },
 }
 
 /// A sensor source selected once for one exact GPU and reused by the monitor.
@@ -1174,8 +1179,11 @@ impl GpuTempSensorBackend {
             GpuTempSensorSource::File(_) => None,
             GpuTempSensorSource::Command { power, .. } => {
                 let query = power.as_ref()?;
-                let output =
-                    command_stdout_with_timeout(query.program, &query.args, SENSOR_COMMAND_TIMEOUT)?;
+                let output = command_stdout_with_timeout(
+                    query.program,
+                    &query.args,
+                    SENSOR_COMMAND_TIMEOUT,
+                )?;
                 parse_board_power_output(&String::from_utf8_lossy(&output))
             }
             #[cfg(windows)]
@@ -1240,8 +1248,11 @@ impl GpuTempSensorBackend {
                 power_limit: Some(query),
                 ..
             } => {
-                let output =
-                    command_stdout_with_timeout(query.program, &query.args, SENSOR_COMMAND_TIMEOUT)?;
+                let output = command_stdout_with_timeout(
+                    query.program,
+                    &query.args,
+                    SENSOR_COMMAND_TIMEOUT,
+                )?;
                 parse_board_power_output(&String::from_utf8_lossy(&output))
             }
             _ => None,
@@ -1270,7 +1281,11 @@ fn command_sensor(
 
 impl GpuTempSensorBackend {
     /// Attach the same tool's board-power query to a command sensor.
-    fn with_power_query(mut self, program: &'static str, args: Vec<String>) -> GpuTempSensorBackend {
+    fn with_power_query(
+        mut self,
+        program: &'static str,
+        args: Vec<String>,
+    ) -> GpuTempSensorBackend {
         if let GpuTempSensorSource::Command { power, .. } = &mut self.source {
             *power = Some(ToolQuery { program, args });
         }
@@ -1278,7 +1293,11 @@ impl GpuTempSensorBackend {
     }
 
     /// Attach the combined temperature/power/clock query.
-    fn with_sample_query(mut self, program: &'static str, args: Vec<String>) -> GpuTempSensorBackend {
+    fn with_sample_query(
+        mut self,
+        program: &'static str,
+        args: Vec<String>,
+    ) -> GpuTempSensorBackend {
         if let GpuTempSensorSource::Command { sample, .. } = &mut self.source {
             *sample = Some(ToolQuery { program, args });
         }
@@ -2011,9 +2030,7 @@ mod tests {
         // invented one as evidence, so the difference is not cosmetic.
         let missing = GpuTempSensorBackend {
             label: "thermal file".to_string(),
-            source: GpuTempSensorSource::File(PathBuf::from(
-                "/definitely/not/a/hwmon/temp1_input",
-            )),
+            source: GpuTempSensorSource::File(PathBuf::from("/definitely/not/a/hwmon/temp1_input")),
         };
         let sample = missing.read_sample();
         assert_eq!(sample.temp_c, None);
@@ -2087,7 +2104,12 @@ mod tests {
         };
         assert_eq!(power.program, "nvidia-smi");
         assert!(power.args.iter().any(|a| a == "--query-gpu=power.draw"));
-        assert!(power.args.iter().any(|a| a == "--format=csv,noheader,nounits"));
+        assert!(
+            power
+                .args
+                .iter()
+                .any(|a| a == "--format=csv,noheader,nounits")
+        );
         assert_eq!(
             power.args.windows(2).find(|w| w[0] == "-i").map(|w| &w[1]),
             Some(&"2".to_string())

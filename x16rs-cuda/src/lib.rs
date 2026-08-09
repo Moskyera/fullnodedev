@@ -661,7 +661,11 @@ mod driver {
         let from_runtime = if raw.is_null() {
             None
         } else {
-            Some(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+            Some(
+                unsafe { CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         };
         let hint = match err {
             35 => Some(
@@ -676,9 +680,7 @@ mod driver {
             (Some(text), Some(hint)) if !text.is_empty() => format!("{text} ({hint})"),
             (Some(text), None) if !text.is_empty() => text,
             (_, Some(hint)) => hint.to_string(),
-            (_, None) => format!(
-                "the CUDA runtime supplied no description for error {err}"
-            ),
+            (_, None) => format!("the CUDA runtime supplied no description for error {err}"),
         }
     }
 
@@ -762,9 +764,9 @@ mod driver {
         check(unsafe { cudaMemGetInfo(&mut free, &mut total) })?;
 
         let mut attrs = CudaFuncAttributes::zeroed();
-        let kernel_ok = unsafe {
-            cudaFuncGetAttributes(&mut attrs, x16rs_cuda_main as *const c_void)
-        } == CUDA_SUCCESS;
+        let kernel_ok =
+            unsafe { cudaFuncGetAttributes(&mut attrs, x16rs_cuda_main as *const c_void) }
+                == CUDA_SUCCESS;
 
         // Blocks resident per SM at the ONE block size this kernel is correct
         // at. Asking about any other size would describe a launch that cannot
@@ -801,10 +803,22 @@ mod driver {
                 CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
                 0,
             ),
-            kernel_max_threads_per_block: if kernel_ok { attrs.max_threads_per_block } else { 0 },
+            kernel_max_threads_per_block: if kernel_ok {
+                attrs.max_threads_per_block
+            } else {
+                0
+            },
             kernel_num_regs: if kernel_ok { attrs.num_regs } else { 0 },
-            kernel_static_shared_bytes: if kernel_ok { attrs.shared_size_bytes as u64 } else { 0 },
-            kernel_local_bytes_per_thread: if kernel_ok { attrs.local_size_bytes as u64 } else { 0 },
+            kernel_static_shared_bytes: if kernel_ok {
+                attrs.shared_size_bytes as u64
+            } else {
+                0
+            },
+            kernel_local_bytes_per_thread: if kernel_ok {
+                attrs.local_size_bytes as u64
+            } else {
+                0
+            },
             blocks_per_multiprocessor: if occupancy_ok { blocks } else { 0 },
         })
     }

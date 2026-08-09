@@ -276,7 +276,11 @@ mod tests {
         let now = 1_800_000_000_000u64;
         let mut text = String::new();
         for i in 0..10u64 {
-            text.push_str(&format!("{},{}\n", now - 23 * 3_600_000 + i * GRID_MS, 1.0e9));
+            text.push_str(&format!(
+                "{},{}\n",
+                now - 23 * 3_600_000 + i * GRID_MS,
+                1.0e9
+            ));
         }
         for i in 0..10u64 {
             text.push_str(&format!("{},{}\n", now - 3_600_000 + i * GRID_MS, 2.0e9));
@@ -376,9 +380,17 @@ mod tests {
             !persist_on_clock(&clock, &path, &series, now + 1_000),
             "the file is rewritten on its own interval, not every frame"
         );
-        assert!(persist_on_clock(&clock, &path, &series, now + WRITE_INTERVAL_MS));
+        assert!(persist_on_clock(
+            &clock,
+            &path,
+            &series,
+            now + WRITE_INTERVAL_MS
+        ));
 
-        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(Result::unwrap).collect();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path(), path);
         assert!(!read_file(&path, now).is_empty());
@@ -413,6 +425,9 @@ mod tests {
     fn the_history_sits_beside_the_workers_own_stats_file() {
         let path = path_beside_stats(Path::new("/miner/work/miner-stats.json"));
         assert_eq!(path.file_name().unwrap(), "miner-history.csv");
-        assert_eq!(path.parent(), Path::new("/miner/work/miner-stats.json").parent());
+        assert_eq!(
+            path.parent(),
+            Path::new("/miner/work/miner-stats.json").parent()
+        );
     }
 }

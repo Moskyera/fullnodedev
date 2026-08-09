@@ -470,7 +470,10 @@ impl EquivReport {
     /// Why `passed()` is false, in the operator's words rather than a bool.
     pub fn failure_reason(&self) -> Option<String> {
         if !self.mismatches.is_empty() {
-            return Some(format!("{} hashes differ from the CPU", self.mismatches.len()));
+            return Some(format!(
+                "{} hashes differ from the CPU",
+                self.mismatches.len()
+            ));
         }
         if self.compared == 0 {
             return Some("nothing was compared".to_string());
@@ -577,7 +580,11 @@ impl EquivReport {
                 index,
                 ALGO_NAMES[index],
                 count,
-                if *count == 0 { "   <-- NEVER TESTED" } else { "" }
+                if *count == 0 {
+                    "   <-- NEVER TESTED"
+                } else {
+                    ""
+                }
             ));
         }
         text.push_str(&self.attribute().render());
@@ -601,8 +608,22 @@ impl EquivReport {
 pub const MAX_STORED_MISMATCHES: usize = 4096;
 
 pub const ALGO_NAMES: [&str; 16] = [
-    "blake", "bmw", "groestl", "jh", "keccak", "skein", "luffa", "cubehash", "shavite", "simd",
-    "echo", "hamsi", "fugue", "shabal", "whirlpool", "sha512",
+    "blake",
+    "bmw",
+    "groestl",
+    "jh",
+    "keccak",
+    "skein",
+    "luffa",
+    "cubehash",
+    "shavite",
+    "simd",
+    "echo",
+    "hamsi",
+    "fugue",
+    "shabal",
+    "whirlpool",
+    "sha512",
 ];
 
 /// Entries the pool share list holds, on both backends.
@@ -825,7 +846,10 @@ pub trait GateDevice {
             .enumerate()
             .map(|(i, cell)| {
                 cell.ok_or_else(|| {
-                    format!("kernel never returned nonce {}", nonce_start as u64 + i as u64)
+                    format!(
+                        "kernel never returned nonce {}",
+                        nonce_start as u64 + i as u64
+                    )
                 })
             })
             .collect()
@@ -1192,10 +1216,7 @@ impl GateBackend for CudaBackend {
         let miner =
             x16rs_cuda::CudaMiner::new(self.device_index, shape.work_groups, shape.unit_size)
                 .map_err(|e| {
-                    format!(
-                        "opening CUDA device #{} at {shape}: {e}",
-                        self.device_index
-                    )
+                    format!("opening CUDA device #{} at {shape}: {e}", self.device_index)
                 })?;
         Ok(CudaGateDevice { miner, shape })
     }
@@ -1451,20 +1472,14 @@ pub fn run_equivalence(
 /// point above: the only difference between them is which three device calls
 /// [`run_equivalence_on`] ends up making.
 #[cfg(feature = "cuda")]
-pub fn run_equivalence_cuda(
-    device_index: i32,
-    params: EquivParams,
-) -> Result<EquivReport, String> {
+pub fn run_equivalence_cuda(device_index: i32, params: EquivParams) -> Result<EquivReport, String> {
     run_equivalence_on(&CudaBackend { device_index }, params)
 }
 
 /// Nonce base that keeps every (shape, height, header, batch) window disjoint.
 #[cfg(any(feature = "ocl", feature = "cuda"))]
 fn nonce_base(unit_size: u32, height: u64, header_index: u32, batch: u32) -> u32 {
-    let height_slot = GATE_HEIGHTS
-        .iter()
-        .position(|h| *h == height)
-        .unwrap_or(0) as u32;
+    let height_slot = GATE_HEIGHTS.iter().position(|h| *h == height).unwrap_or(0) as u32;
     0x0100_0000u32
         .wrapping_mul(unit_size)
         .wrapping_add(0x0010_0000u32.wrapping_mul(height_slot))
@@ -2416,7 +2431,6 @@ mod tests {
         assert!(missed_one.render().contains("NEVER TESTED"));
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // The launch-fit rules, which are what stop a measurement being attributed to a

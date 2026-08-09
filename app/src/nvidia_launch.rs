@@ -266,7 +266,9 @@ impl KernelResidency {
     }
 
     pub fn warps_per_block(self) -> u32 {
-        self.threads_per_block.max(1).div_ceil(self.warp_size.max(1))
+        self.threads_per_block
+            .max(1)
+            .div_ceil(self.warp_size.max(1))
     }
 }
 
@@ -610,12 +612,9 @@ mod tests {
         for budget in SM_BUDGETS {
             let r = residency(X16RS_BATCH_KERNEL, budget);
             assert_eq!(
-                r.blocks_per_sm,
-                1,
+                r.blocks_per_sm, 1,
                 "sm_{}{} holds {} blocks, so the wave arithmetic does not apply to it",
-                budget.compute_major,
-                budget.compute_minor,
-                r.blocks_per_sm
+                budget.compute_major, budget.compute_minor, r.blocks_per_sm
             );
             // Register bound on all of them, because the register file has been
             // 65536 since Volta and this kernel wants all of it.
@@ -713,8 +712,9 @@ mod tests {
     fn one_wave_is_already_long_enough_to_hide_a_kernel_launch() {
         let per_sm = measured_hashes_per_second_per_sm();
         // One wave on a T4 at the measured optimum.
-        let nonces =
-            MEASURED_T4_SM_COUNT as u64 * CUDA_LOCAL_SIZE as u64 * MEASURED_T4_BEST_UNIT_SIZE as u64;
+        let nonces = MEASURED_T4_SM_COUNT as u64
+            * CUDA_LOCAL_SIZE as u64
+            * MEASURED_T4_BEST_UNIT_SIZE as u64;
         let seconds = nonces as f64 / (per_sm * MEASURED_T4_SM_COUNT as f64);
         assert!(
             (seconds - 0.0869).abs() < 0.001,
@@ -875,8 +875,10 @@ mod tests {
     #[test]
     fn the_ladder_covers_exactly_the_named_nvidia_profiles() {
         for tier in 0i8..=4 {
-            let profile =
-                crate::efficiency::tier_profile_for_vendor(crate::gpu_arch::GpuVendor::Nvidia, tier);
+            let profile = crate::efficiency::tier_profile_for_vendor(
+                crate::gpu_arch::GpuVendor::Nvidia,
+                tier,
+            );
             let preset = PRESET_LADDER
                 .iter()
                 .find(|p| p.profile == profile)

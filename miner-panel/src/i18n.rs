@@ -2506,7 +2506,8 @@ mod tests {
                 s.autotune_cuda_unsupported
             );
             assert_ne!(
-                s.mode_no_power_sensor, s.autotune_cuda_unsupported,
+                s.mode_no_power_sensor,
+                s.autotune_cuda_unsupported,
                 "{} gives two different problems the same words",
                 lang.code()
             );
