@@ -1,6 +1,16 @@
 [package]
 name = "hbit-pool"
-version = "0.1.0"
+# Versioned and released INDEPENDENTLY of the miner, on `pool-v*` tags, because
+# they are different products for different people: the miner is a Windows
+# desktop program an individual runs, the pool is Linux server software an
+# operator runs on a VPS beside their own node. An operator holding other
+# people's money should not wait for a miner release to get a fix, and a miner
+# should not be re-downloaded because a pool changed.
+#
+# 0.2.0, not 0.1.1: the accounting file gained a schema, a found block now
+# records who earned it, and several payout rules changed. Nothing an older
+# build wrote is unreadable, but what this one MEANS by that file is different.
+version = "0.2.0"
 edition = "2024"
 description = "HBIT: the Hacash mining pool this project ships. Share accounting, PPLNS payout splitting and on-chain settlement, plus the feasibility spikes it grew out of."
 

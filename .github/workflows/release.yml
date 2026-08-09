@@ -110,10 +110,12 @@ jobs:
       - name: Build public free-IP pool (hac-pool)
         run: cargo build --locked --release -p miner-pool
 
-      # HBIT payout pool: hbit-pool-server, hbit-settle-spike and
-      # hbit-pool-payout hold the pool wallet and compute real payouts, so they
-      # must compile in the release pipeline even though they are not packaged
-      # (operators self-build).
+      # HBIT payout pool: built and tested here as a GATE, never packaged here.
+      # It ships on its own `pool-v*` tags through release-pool.yml, because it
+      # is server software for a different audience on a different release
+      # rhythm - an operator holding other people's money should not wait for a
+      # miner release. Building it here still stops a miner change from breaking
+      # the crate that signs payouts.
       - name: Build HBIT payout pool server (hbit-pool)
         run: cargo build --locked --release -p hbit-pool
 
@@ -140,43 +142,12 @@ jobs:
           }
           & "$env:GITHUB_WORKSPACE\scripts\pack-release.ps1" -Version $version
 
-      - name: Package HBIT pool (Windows)
-        shell: pwsh
-        run: |
-          # Packaged APART from the miner on purpose. This is server software an
-          # operator runs beside their own full node; bundling a wallet-holding
-          # binary into the miner archive would put it on every gaming PC that
-          # downloads this.
-          #
-          # Ships with NO wallet, NO config and NO address. The operator supplies
-          # all three and the pool refuses to start without them, so nothing here
-          # can pay a stranger by default.
-          $version = "manual"
-          if ($env:GITHUB_REF_TYPE -eq "tag") { $version = $env:RELEASE_REF_NAME }
-          $ws = $env:GITHUB_WORKSPACE
-          $pooldir = Join-Path $ws "dist/hbit-pool-windows-x64"
-          if (Test-Path $pooldir) { Remove-Item $pooldir -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $pooldir | Out-Null
-          foreach ($f in @("hbit-pool-server.exe", "hbit-pool-payout.exe")) {
-            Copy-Item (Join-Path $ws "target/release/$f") $pooldir
-          }
-          foreach ($f in @("POOL-OPERATOR.md", "POOL-README.md")) {
-            Copy-Item (Join-Path $ws "docs/$f") $pooldir
-          }
-          [IO.File]::WriteAllText((Join-Path $pooldir "VERSION.txt"), $version)
-          $name = if ($version -like "v*") { "hbit-pool-windows-x64-$version.zip" } else { "hbit-pool-windows-x64.zip" }
-          $poolzip = Join-Path $ws "dist/$name"
-          Compress-Archive -Path $pooldir -DestinationPath $poolzip -Force
-          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $poolzip).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText("$poolzip.sha256", "$h  $name")
-          if ((Get-Item $poolzip).Length -lt 1000) { throw "pool zip looks empty" }
-          Write-Host "packaged $name"
-
       - name: Validate Windows release ZIPs
         shell: pwsh
         run: |
-          # Miner ZIPs only. The pool ships its own archive beside these, and
-          # counting every zip would fail this build for the wrong reason the
+          # Miner ZIPs only, and now that is all this release produces: the pool
+          # moved to its own `pool-v*` tags. Matching by name rather than
+          # counting every zip keeps this from failing for the wrong reason the
           # moment another package is added.
           $zips = @(Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter "hacash-miner-*.zip" -File)
           if ($zips.Count -ne 2) { throw "Expected 2 Windows miner ZIPs, found $($zips.Count)" }
@@ -323,38 +294,6 @@ jobs:
             version="$candidate"
           fi
           bash scripts/pack-release-linux.sh "$version"
-
-          # HBIT pool, packaged apart from the miner for the same reason as on
-          # Windows: it is server software that holds a wallet, and it has no
-          # business inside an archive aimed at people's gaming PCs. Ships with
-          # no wallet, no config and no address; the pool refuses to start
-          # without them.
-          pooldir="dist/hbit-pool-linux-x86_64"
-          rm -rf "$pooldir" && mkdir -p "$pooldir/systemd"
-          cp target/release/hbit-pool-server target/release/hbit-pool-payout "$pooldir/"
-          # The full node ships WITH the pool. Without it the archive is not
-          # deployable at all: the pool gets its templates from a node and submits
-          # blocks to one, so an operator who downloaded only this would install
-          # something that cannot start. The first version of this package left it
-          # out, which is a packaging bug and not a documentation problem.
-          cp target/release/hacash "$pooldir/"
-          cp deploy/node/hacash.config.ini "$pooldir/hacash.config.ini.example"
-          cp deploy/systemd/hacash-node.service deploy/systemd/hbit-pool.service "$pooldir/systemd/"
-          cp deploy/hbit-wait-for-node.sh "$pooldir/"
-          cp deploy/README.md "$pooldir/DEPLOY.md"
-          cp docs/POOL-OPERATOR.md docs/POOL-README.md "$pooldir/"
-          cp scripts/hbit-vps-setup.sh "$pooldir/SETUP-POOL.sh"
-          chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout \
-            "$pooldir"/hacash "$pooldir"/hbit-wait-for-node.sh "$pooldir"/SETUP-POOL.sh
-          printf '%s' "$version" > "$pooldir/VERSION.txt"
-          if [[ "$version" == v* ]]; then
-            poolname="hbit-pool-linux-x86_64-$version.tar.gz"
-          else
-            poolname="hbit-pool-linux-x86_64.tar.gz"
-          fi
-          tar -czf "dist/$poolname" -C dist hbit-pool-linux-x86_64
-          (cd dist && sha256sum "$poolname" > "$poolname.sha256")
-          test -s "dist/$poolname"
 
           archives=(dist/hacash-miner-*-linux-x86_64*.tar.gz)
           test "${#archives[@]}" -eq 2
