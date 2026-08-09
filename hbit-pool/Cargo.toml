@@ -7,10 +7,15 @@ name = "hbit-pool"
 # people's money should not wait for a miner release to get a fix, and a miner
 # should not be re-downloaded because a pool changed.
 #
-# 0.2.0, not 0.1.1: the accounting file gained a schema, a found block now
-# records who earned it, and several payout rules changed. Nothing an older
-# build wrote is unreadable, but what this one MEANS by that file is different.
-version = "0.2.0"
+# 0.2.0 was the first release the pool made on its own: the accounting file
+# gained a schema, a found block began recording who earned it, and several
+# payout rules changed. Nothing an older build wrote became unreadable, but what
+# that build MEANS by the file is different, which is why it was not 0.1.1.
+#
+# 0.2.1 is a patch: a halted pool now tells miners to stop, in the words their
+# existing pause already keys on, so no rig keeps hashing for credit that will
+# never come. No file format and no payout rule moved.
+version = "0.2.1"
 edition = "2024"
 description = "HBIT: the Hacash mining pool this project ships. Share accounting, PPLNS payout splitting and on-chain settlement, plus the feasibility spikes it grew out of."
 
