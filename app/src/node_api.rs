@@ -44,17 +44,21 @@ pub fn service() -> Arc<dyn ApiService> {
 
 fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
     let height = ctx.engine.latest_block().height().uint();
+    let tip_timestamp_unix = ctx.engine.latest_block().timestamp().uint();
+    let observed_unix = sys::curtimes();
     let config = ctx.engine.config();
     let setup = protocol::setup::current_setup();
     let block_one_hash = canonical_block_one_hash(ctx);
     let funding_confirmed = confirmed_pilot_funding(ctx);
     ApiResponse::json(
-        build_capabilities(
+        build_capabilities_with_tip(
             config,
             setup.as_ref(),
             height,
             block_one_hash.as_deref(),
             funding_confirmed,
+            tip_timestamp_unix,
+            observed_unix,
         )
         .to_string(),
     )
@@ -133,6 +137,7 @@ fn has_all_action_kinds(setup: &ProtocolSetup, kinds: &[u16]) -> bool {
     kinds.iter().all(|kind| setup.has_action_kind(*kind))
 }
 
+#[cfg(test)]
 fn build_capabilities(
     config: &EngineConf,
     setup: &ProtocolSetup,
@@ -140,6 +145,28 @@ fn build_capabilities(
     block_one_hash: Option<&str>,
     funding_confirmed: bool,
 ) -> Value {
+    build_capabilities_with_tip(
+        config,
+        setup,
+        height,
+        block_one_hash,
+        funding_confirmed,
+        0,
+        0,
+    )
+}
+
+fn build_capabilities_with_tip(
+    config: &EngineConf,
+    setup: &ProtocolSetup,
+    height: u64,
+    block_one_hash: Option<&str>,
+    funding_confirmed: bool,
+    tip_timestamp_unix: u64,
+    observed_unix: u64,
+) -> Value {
+    const MAX_TIP_AGE_SECONDS: u64 = 3_600;
+    const MAX_FUTURE_SKEW_SECONDS: u64 = 120;
     let chain_id = config.chain_id;
     let next_height = height.saturating_add(1);
     let registered_transactions = setup.registered_tx_types();
@@ -182,6 +209,11 @@ fn build_capabilities(
         && height >= 2
         && block_one_hash.is_some()
         && funding_confirmed;
+    let tip_age_seconds = observed_unix.saturating_sub(tip_timestamp_unix);
+    let tip_fresh = height > 0
+        && tip_timestamp_unix > 0
+        && tip_timestamp_unix <= observed_unix.saturating_add(MAX_FUTURE_SKEW_SECONDS)
+        && tip_age_seconds <= MAX_TIP_AGE_SECONDS;
 
     // These flags describe codecs/runtime actually wired into this node process.
     // Chain-height availability remains separately represented by `actions.enabled`.
@@ -216,6 +248,13 @@ fn build_capabilities(
             "transaction_ready": transaction_ready,
             "current_height": height,
             "transaction_format_version": TRANSACTION_FORMAT_VERSION,
+        },
+        "sync": {
+            "tip_timestamp_unix": tip_timestamp_unix,
+            "observed_unix": observed_unix,
+            "tip_age_seconds": tip_age_seconds,
+            "max_tip_age_seconds": MAX_TIP_AGE_SECONDS,
+            "fresh": tip_fresh,
         },
         "istanbul": {
             "activation_height": protocol::upgrade::ONLINE_OPEN_HEIGHT,
@@ -402,6 +441,38 @@ mod node_capabilities_tests {
         ] {
             assert_eq!(features[name].as_bool(), Some(false), "feature {name}");
         }
+    }
+
+    #[test]
+    fn sync_capability_rejects_stale_and_future_tips() {
+        let config = test_config(protocol::upgrade::MAINNET_CHAIN_ID);
+        let setup = test_setup();
+        let now = 2_000_000_u64;
+        let fresh = build_capabilities_with_tip(
+            &config,
+            &setup,
+            protocol::upgrade::ONLINE_OPEN_HEIGHT,
+            None,
+            false,
+            now - 60,
+            now,
+        );
+        assert_eq!(fresh["sync"]["fresh"], true);
+        assert_eq!(fresh["sync"]["tip_age_seconds"], 60);
+
+        let stale = build_capabilities_with_tip(
+            &config,
+            &setup,
+            protocol::upgrade::ONLINE_OPEN_HEIGHT,
+            None,
+            false,
+            now - 3_601,
+            now,
+        );
+        assert_eq!(stale["sync"]["fresh"], false);
+
+        let future = build_capabilities_with_tip(&config, &setup, 1, None, false, now + 121, now);
+        assert_eq!(future["sync"]["fresh"], false);
     }
 
     #[test]
