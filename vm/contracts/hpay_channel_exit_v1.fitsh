@@ -1,0 +1,231 @@
+pragma fitsh 1.0.0
+
+contract HPAYChannelExitV1 {
+    const FUNDING = 1
+    const OPEN = 2
+    const CHALLENGING = 3
+    const FINAL = 4
+    const INITIAL_RENT_PERIODS = 100
+    const MAX_RENT_STEP = 5000
+
+    abstract PayableHAC(from_addr: address, hacash: bytes) {
+        var status = storage_load("status")
+        if status != FUNDING as u8 {
+            throw "HPAY_FUNDING_STATUS"
+        }
+        var left = storage_load("left")
+        var right = storage_load("right")
+        var amount = hac_to_zhu(hacash)
+        if amount == 0 {
+            throw "HPAY_ZERO_DEPOSIT"
+        }
+        if from_addr == left {
+            var paid = storage_load("left_paid")
+            var expected = storage_load("left_deposit")
+            if paid != 0 as u64 {
+                throw "HPAY_LEFT_ALREADY_FUNDED"
+            }
+            if amount != expected {
+                throw "HPAY_LEFT_DEPOSIT_MISMATCH"
+            }
+            storage_edit("left_paid", amount)
+        } else {
+            if from_addr != right {
+                throw "HPAY_UNKNOWN_DEPOSITOR"
+            }
+            var right_paid = storage_load("right_paid")
+            var right_expected = storage_load("right_deposit")
+            if right_paid != 0 as u64 {
+                throw "HPAY_RIGHT_ALREADY_FUNDED"
+            }
+            if amount != right_expected {
+                throw "HPAY_RIGHT_DEPOSIT_MISMATCH"
+            }
+            storage_edit("right_paid", amount)
+        }
+        if storage_load("left_paid") == storage_load("left_deposit") &&
+            storage_load("right_paid") == storage_load("right_deposit") {
+            storage_edit("status", OPEN as u8)
+        }
+        return 0
+    }
+
+    abstract PermitHAC(to_addr: address, hacash: bytes) {
+        if storage_load("status") != FINAL as u8 {
+            throw "HPAY_NOT_FINAL"
+        }
+        var amount = hac_to_zhu(hacash)
+        var left = storage_load("left")
+        var right = storage_load("right")
+        if to_addr == left {
+            if storage_load("left_claimed") != false {
+                throw "HPAY_LEFT_ALREADY_CLAIMED"
+            }
+            if amount != storage_load("left_balance") {
+                throw "HPAY_LEFT_PAYOUT_MISMATCH"
+            }
+            storage_edit("left_claimed", true)
+            return 0
+        }
+        if to_addr != right {
+            throw "HPAY_UNKNOWN_RECIPIENT"
+        }
+        if storage_load("right_claimed") != false {
+            throw "HPAY_RIGHT_ALREADY_CLAIMED"
+        }
+        if amount != storage_load("right_balance") {
+            throw "HPAY_RIGHT_PAYOUT_MISMATCH"
+        }
+        storage_edit("right_claimed", true)
+        return 0
+    }
+
+    function external init(
+        network: bytes,
+        channel_id: bytes,
+        reuse: u32,
+        left: address,
+        right: address,
+        left_deposit: u64,
+        right_deposit: u64,
+        challenge_blocks: u64,
+        rent_periods: u64
+    ) -> u32 {
+        assert size(network) == 32
+        assert size(channel_id) == 16
+        assert left != right
+        assert left_deposit > 0
+        assert right_deposit == 0
+        assert challenge_blocks > 0
+        assert rent_periods == INITIAL_RENT_PERIODS
+        assert check_signature(left)
+        assert check_signature(right)
+        var total = left_deposit + right_deposit
+        storage_new("status", FUNDING as u8, rent_periods)
+        storage_new("network", network, rent_periods)
+        storage_new("channel_id", channel_id, rent_periods)
+        storage_new("reuse", reuse, rent_periods)
+        storage_new("left", left, rent_periods)
+        storage_new("right", right, rent_periods)
+        storage_new("left_deposit", left_deposit, rent_periods)
+        storage_new("right_deposit", right_deposit, rent_periods)
+        storage_new("left_paid", 0 as u64, rent_periods)
+        storage_new("right_paid", 0 as u64, rent_periods)
+        storage_new("total", total, rent_periods)
+        storage_new("serial", 0 as u64, rent_periods)
+        storage_new("left_balance", left_deposit, rent_periods)
+        storage_new("right_balance", right_deposit, rent_periods)
+        storage_new("challenge_blocks", challenge_blocks, rent_periods)
+        storage_new("deadline", 0 as u64, rent_periods)
+        storage_new("left_claimed", false, rent_periods)
+        storage_new("right_claimed", false, rent_periods)
+        return 0
+    }
+
+    function external renew(key: bytes, periods: u64) -> u32 {
+        assert size(key) > 0
+        assert periods > 0
+        assert periods <= MAX_RENT_STEP
+        // storage_recv is the canonical existence check and is valid while a
+        // lease is recoverable. storage_stat-based preflight incorrectly
+        // rejected that exact recovery state on-chain.
+        storage_recv(key, periods)
+        storage_rent(key, periods)
+        return 0
+    }
+
+    function external channel_status() -> u8 {
+        return storage_load("status")
+    }
+
+    function bill_hash(serial: u64, left_balance: u64, right_balance: u64) -> bytes {
+        return sha3(
+            "HPAY/HVM-CHANNEL/V1" ++
+            storage_load("network") ++
+            (context_address() as bytes) ++
+            storage_load("channel_id") ++
+            (storage_load("reuse") as bytes) ++
+            (storage_load("left") as bytes) ++
+            (storage_load("right") as bytes) ++
+            (storage_load("total") as bytes) ++
+            (storage_load("challenge_blocks") as bytes) ++
+            (serial as bytes) ++
+            (left_balance as bytes) ++
+            (right_balance as bytes)
+        )
+    }
+
+    function verify_bill(
+        serial: u64,
+        left_balance: u64,
+        right_balance: u64,
+        left_sign: bytes,
+        right_sign: bytes
+    ) -> u32 {
+        assert storage_load("left_paid") == storage_load("left_deposit")
+        assert storage_load("right_paid") == storage_load("right_deposit")
+        assert serial > storage_load("serial")
+        assert left_balance + right_balance == storage_load("total")
+        var commitment = this.bill_hash(serial, left_balance, right_balance)
+        assert verify_signature(commitment, storage_load("left"), left_sign)
+        assert verify_signature(commitment, storage_load("right"), right_sign)
+        return 0
+    }
+
+    function save_bill(serial: u64, left_balance: u64, right_balance: u64) -> u32 {
+        storage_edit("serial", serial)
+        storage_edit("left_balance", left_balance)
+        storage_edit("right_balance", right_balance)
+        return 0
+    }
+
+    function external cooperative_close(
+        serial: u64,
+        left_balance: u64,
+        right_balance: u64,
+        left_sign: bytes,
+        right_sign: bytes
+    ) -> u32 {
+        assert storage_load("status") != FINAL as u8
+        this.verify_bill(serial, left_balance, right_balance, left_sign, right_sign)
+        this.save_bill(serial, left_balance, right_balance)
+        storage_edit("status", FINAL as u8)
+        return 0
+    }
+
+    function external challenge(
+        serial: u64,
+        left_balance: u64,
+        right_balance: u64,
+        left_sign: bytes,
+        right_sign: bytes
+    ) -> u32 {
+        assert storage_load("status") == OPEN as u8
+        this.verify_bill(serial, left_balance, right_balance, left_sign, right_sign)
+        this.save_bill(serial, left_balance, right_balance)
+        storage_edit("deadline", block_height() + storage_load("challenge_blocks"))
+        storage_edit("status", CHALLENGING as u8)
+        return 0
+    }
+
+    function external respond(
+        serial: u64,
+        left_balance: u64,
+        right_balance: u64,
+        left_sign: bytes,
+        right_sign: bytes
+    ) -> u32 {
+        assert storage_load("status") == CHALLENGING as u8
+        assert block_height() < storage_load("deadline")
+        this.verify_bill(serial, left_balance, right_balance, left_sign, right_sign)
+        this.save_bill(serial, left_balance, right_balance)
+        return 0
+    }
+
+    function external finalize() -> u32 {
+        assert storage_load("status") == CHALLENGING as u8
+        assert block_height() >= storage_load("deadline")
+        storage_edit("status", FINAL as u8)
+        return 0
+    }
+}

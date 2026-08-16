@@ -18,6 +18,9 @@ pub mod gpu_oom;
 #[cfg(windows)]
 pub mod gpu_temp_adl;
 pub mod hash_util;
+mod hpay_channel_exit;
+mod hpay_channel_registry;
+mod hpay_contract_deployment;
 pub mod mining_batch;
 pub mod mining_guard;
 pub mod mining_runtime;

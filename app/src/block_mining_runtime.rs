@@ -2020,13 +2020,6 @@ fn deal_block_mining_results(
             }
             queue_block_mining_success(cnf, submit_tx, gate, w);
         }
-    } else if cnf.debug == 1 {
-        // Debug mode exercises the submit path even without a genuine winner. It
-        // goes through the same gate, so it submits once per template instead of
-        // once per drain tick.
-        if admit_for_submit(gate, &most) {
-            queue_block_mining_success(cnf, submit_tx, gate, &most);
-        }
     }
     may_print_turn_to_nex_block_mining(deal_hei, Some(most_hash));
 }
@@ -2596,6 +2589,44 @@ mod tests {
         assert!(!result_meets_target(&res));
         res.target_hash = Vec::new();
         assert!(!result_meets_target(&res));
+    }
+
+    #[test]
+    fn debug_mode_never_submits_a_losing_hash() {
+        let _guard = mining_state_guard();
+        set_pending_block_stuff(900, pending_template_json(900, 0x11, 0xb1)).unwrap();
+
+        let mut cnf = PoWorkConf::test_defaults("127.0.0.1:1".to_string(), 1, 16);
+        cnf.debug = 1;
+        let mut losing = BlockMiningResult::default();
+        losing.height = 900;
+        losing.prevhash = vec![0x11u8; HASH_WIDTH];
+        losing.nonce_space = 1;
+        losing.use_secs = 0.5;
+        losing.target_hash = vec![0x0fu8; HASH_WIDTH];
+        losing.result_hash = vec![0x10u8; HASH_WIDTH];
+        losing.network_difficulty = 1;
+
+        let (result_tx, mut result_rx) = mpsc::sync_channel(1);
+        result_tx.send(Arc::new(losing)).unwrap();
+        let (submit_tx, submit_rx) = mpsc::sync_channel(1);
+        let mut most_hash = vec![255u8; HASH_WIDTH];
+        let mut tracker = HashrateTracker::default();
+        deal_block_mining_results(
+            &cnf,
+            &mut most_hash,
+            &mut result_rx,
+            1,
+            &mut tracker,
+            1,
+            &submit_tx,
+            &test_gate(),
+        );
+
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "debug mode must never bypass the proof-of-work target gate"
+        );
     }
 
     #[test]

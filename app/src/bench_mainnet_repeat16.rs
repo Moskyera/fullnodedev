@@ -38,9 +38,9 @@ pub const MAINNET_REPEAT16_HEIGHT: u64 = 800_000;
 #[cfg(any(feature = "ocl", feature = "cuda", test))]
 pub const REPEAT1_HEIGHT: u64 = 1;
 
-#[cfg(any(feature = "ocl", feature = "cuda", test))]
+#[cfg(feature = "ocl")]
 const WARMUP_BATCHES: u32 = 3;
-#[cfg(any(feature = "ocl", feature = "cuda", test))]
+#[cfg(feature = "ocl")]
 const MIN_VALID_SAMPLES: u32 = 5;
 
 /// Fully-instrumented result of one measurement run at a fixed height/repeat.

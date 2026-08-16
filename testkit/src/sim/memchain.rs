@@ -18,9 +18,9 @@ use basis::interface::{
     ActExec, Block, BlockRead, Context, Logs, State, StateOperat, Transaction, TransactionRead,
 };
 use field::{
-    AddrOrList, Address, Amount, AssetAmt, AssetSmelt, BlockHeight, BytesW1, DIAMOND_STATUS_NORMAL,
-    DiamondName, DiamondNumber, DiamondSmelt, DiamondSto, Field, Fixed8, Fixed16, Fold64, Hash,
-    Satoshi, Serialize, Timestamp, Uint1, Uint2, Uint4,
+    AddrOrList, Address, Amount, AssetAmt, AssetSmelt, BlockHeight, BytesW1, ChannelId, ChannelSto,
+    DIAMOND_STATUS_NORMAL, DiamondName, DiamondNumber, DiamondSmelt, DiamondSto, Field, Fixed8,
+    Fixed16, Fold64, Hash, Satoshi, Serialize, Timestamp, Uint1, Uint2, Uint4,
 };
 use protocol::block::BlockV1;
 use protocol::context::{ContextInst, TX_GAS_BUDGET_CAP_BYTE, decode_gas_budget};
@@ -756,12 +756,27 @@ impl MemChain {
     /// output because the chain does not infer VM return values from raw bytes.
     pub fn submit_formal_raw(&mut self, raw: &[u8], output: TxOutput) -> Ret<Hash> {
         let parsed = Self::parse_formal_type3_raw(raw)?;
+        Ok(self.submit_parsed_formal(parsed, output))
+    }
+
+    /// Submit any externally-built, signed production transaction.
+    ///
+    /// Unlike [`MemChain::submit_formal_raw`], this intentionally accepts legacy
+    /// Type2 transactions as well as Type3. It exists for protocol integration
+    /// tests that must exercise the exact wallet wire format through the real
+    /// block transaction executor.
+    pub fn submit_signed_transaction_raw(&mut self, raw: &[u8], output: TxOutput) -> Ret<Hash> {
+        let parsed = Self::parse_transaction_raw(raw)?;
+        Ok(self.submit_parsed_formal(parsed, output))
+    }
+
+    fn submit_parsed_formal(&mut self, parsed: Box<dyn Transaction>, output: TxOutput) -> Hash {
         let hash = parsed.hash();
         self.pending.push(PendingTx {
             tx: PendingTxKind::Formal(parsed),
             op: PendingOp::FormalTx { output },
         });
-        Ok(hash)
+        hash
     }
 
     pub fn build_formal_actions_raw(
@@ -1237,6 +1252,13 @@ impl MemChain {
         bal.map(|b| b.hacash).unwrap_or_default()
     }
 
+    /// Read a payment-channel record from the persistent state.
+    pub fn channel(&self, channel_id: &ChannelId) -> Option<ChannelSto> {
+        let mut state = self.state.clone_state();
+        let state_dyn: &mut dyn State = state.as_mut();
+        mint::oprate::MintState::wrap(state_dyn).channel(channel_id)
+    }
+
     pub fn satoshi(&self, addr: &Address) -> Satoshi {
         let mut state = self.state.clone_state();
         let state_dyn: &mut dyn State = state.as_mut();
@@ -1651,18 +1673,23 @@ impl MemChain {
     }
 
     fn parse_formal_type3_raw(raw: &[u8]) -> Ret<Box<dyn Transaction>> {
-        let (parsed, used) = transaction_create(raw)?;
-        if used != raw.len() {
-            return Err(format!(
-                "formal tx raw parse did not consume all bytes: used {}, total {}",
-                used,
-                raw.len()
-            ));
-        }
+        let parsed = Self::parse_transaction_raw(raw)?;
         if parsed.as_read().ty() != TransactionType3::TYPE {
             return Err(format!(
                 "formal tx raw parse expected TransactionType3, got type {}",
                 parsed.as_read().ty()
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn parse_transaction_raw(raw: &[u8]) -> Ret<Box<dyn Transaction>> {
+        let (parsed, used) = transaction_create(raw)?;
+        if used != raw.len() {
+            return Err(format!(
+                "transaction raw parse did not consume all bytes: used {}, total {}",
+                used,
+                raw.len()
             ));
         }
         Ok(parsed)

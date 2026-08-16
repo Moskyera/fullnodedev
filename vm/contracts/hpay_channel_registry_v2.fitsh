@@ -1,0 +1,339 @@
+pragma fitsh 1.0.0
+
+contract HPAYChannelRegistryV2 {
+    const FUNDING = 1
+    const OPEN = 2
+    const CHALLENGING = 3
+    const FINAL = 4
+    const INITIAL_RENT_PERIODS = 100
+    const MAX_RENT_STEP = 5000
+
+    // The deploy transaction's main signer is the only Hub identity for this
+    // registry. Construct argv is the exact 32-byte HPAY network instance.
+    abstract Construct(network: bytes) {
+        assert size(network) == 32
+        var hub = tx_main_addr()
+        assert check_signature(hub)
+        storage_new("g_network", network, INITIAL_RENT_PERIODS)
+        storage_new("g_hub", hub, INITIAL_RENT_PERIODS)
+        storage_new("g_locked", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_left_claimable", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_hub_claimable", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_open_count", 0 as u64, INITIAL_RENT_PERIODS)
+        return 0
+    }
+
+    function key(prefix: bytes, left: address) -> bytes {
+        return prefix ++ (left as bytes)
+    }
+
+    function load(prefix: bytes, left: address) {
+        return storage_load(this.key(prefix, left))
+    }
+
+    function create_channel_storage(
+        left: address,
+        channel_id: bytes,
+        reuse: u32,
+        left_deposit: u64,
+        challenge_blocks: u64,
+        rent_periods: u64
+    ) -> u32 {
+        storage_new(this.key("c_status_", left), FUNDING as u8, rent_periods)
+        storage_new(this.key("c_id_", left), channel_id, rent_periods)
+        storage_new(this.key("c_reuse_", left), reuse, rent_periods)
+        storage_new(this.key("c_deposit_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_paid_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_total_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_serial_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_left_balance_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_hub_balance_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_challenge_", left), challenge_blocks, rent_periods)
+        storage_new(this.key("c_deadline_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_left_claimed_", left), false, rent_periods)
+        return 0
+    }
+
+    function reset_channel_storage(
+        left: address,
+        channel_id: bytes,
+        reuse: u32,
+        left_deposit: u64,
+        challenge_blocks: u64
+    ) -> u32 {
+        storage_edit(this.key("c_status_", left), FUNDING as u8)
+        storage_edit(this.key("c_id_", left), channel_id)
+        storage_edit(this.key("c_reuse_", left), reuse)
+        storage_edit(this.key("c_deposit_", left), left_deposit)
+        storage_edit(this.key("c_paid_", left), 0 as u64)
+        storage_edit(this.key("c_total_", left), left_deposit)
+        storage_edit(this.key("c_serial_", left), 0 as u64)
+        storage_edit(this.key("c_left_balance_", left), left_deposit)
+        storage_edit(this.key("c_hub_balance_", left), 0 as u64)
+        storage_edit(this.key("c_challenge_", left), challenge_blocks)
+        storage_edit(this.key("c_deadline_", left), 0 as u64)
+        storage_edit(this.key("c_left_claimed_", left), false)
+        return 0
+    }
+
+    function external init(
+        channel_id: bytes,
+        reuse: u32,
+        left: address,
+        left_deposit: u64,
+        challenge_blocks: u64,
+        rent_periods: u64
+    ) -> u32 {
+        assert size(channel_id) == 16
+        assert left != storage_load("g_hub")
+        assert left_deposit > 0
+        assert challenge_blocks > 0
+        assert rent_periods == INITIAL_RENT_PERIODS
+        assert check_signature(left)
+        assert check_signature(storage_load("g_hub"))
+
+        var old_status = this.load("c_status_", left)
+        if old_status is nil {
+            assert reuse == 0
+            this.create_channel_storage(
+                left,
+                channel_id,
+                reuse,
+                left_deposit,
+                challenge_blocks,
+                rent_periods
+            )
+        } else {
+            assert old_status == FINAL as u8
+            assert this.load("c_left_claimed_", left) == true
+            assert reuse == this.load("c_reuse_", left) + 1
+            this.reset_channel_storage(left, channel_id, reuse, left_deposit, challenge_blocks)
+        }
+        return 0
+    }
+
+    abstract PayableHAC(from_addr: address, hacash: bytes) {
+        if this.load("c_status_", from_addr) != FUNDING as u8 {
+            throw "HPAY_FUNDING_STATUS"
+        }
+        var amount = hac_to_zhu(hacash) as u64
+        if amount == 0 {
+            throw "HPAY_ZERO_DEPOSIT"
+        }
+        if this.load("c_paid_", from_addr) != 0 as u64 {
+            throw "HPAY_ALREADY_FUNDED"
+        }
+        if amount != this.load("c_deposit_", from_addr) {
+            throw "HPAY_DEPOSIT_MISMATCH"
+        }
+        storage_edit(this.key("c_paid_", from_addr), amount)
+        storage_edit(this.key("c_status_", from_addr), OPEN as u8)
+        storage_edit("g_locked", storage_load("g_locked") + amount)
+        storage_edit("g_open_count", storage_load("g_open_count") + 1)
+        return 0
+    }
+
+    abstract PermitHAC(to_addr: address, hacash: bytes) {
+        var amount = hac_to_zhu(hacash) as u64
+        if amount == 0 {
+            throw "HPAY_ZERO_PAYOUT"
+        }
+        if to_addr == storage_load("g_hub") {
+            var hub_claimable = storage_load("g_hub_claimable")
+            if amount > hub_claimable {
+                throw "HPAY_HUB_PAYOUT_MISMATCH"
+            }
+            storage_edit("g_hub_claimable", hub_claimable - amount)
+            return 0
+        }
+        if this.load("c_status_", to_addr) != FINAL as u8 {
+            throw "HPAY_NOT_FINAL"
+        }
+        if this.load("c_left_claimed_", to_addr) != false {
+            throw "HPAY_LEFT_ALREADY_CLAIMED"
+        }
+        if amount != this.load("c_left_balance_", to_addr) {
+            throw "HPAY_LEFT_PAYOUT_MISMATCH"
+        }
+        storage_edit(this.key("c_left_claimed_", to_addr), true)
+        storage_edit("g_left_claimable", storage_load("g_left_claimable") - amount)
+        return 0
+    }
+
+    function bill_hash(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64
+    ) -> bytes {
+        return sha3(
+            "HPAY/HVM-CHANNEL-REGISTRY/V2" ++
+            storage_load("g_network") ++
+            (context_address() as bytes) ++
+            this.load("c_id_", left) ++
+            (this.load("c_reuse_", left) as bytes) ++
+            (left as bytes) ++
+            (storage_load("g_hub") as bytes) ++
+            (this.load("c_total_", left) as bytes) ++
+            (this.load("c_challenge_", left) as bytes) ++
+            (serial as bytes) ++
+            (left_balance as bytes) ++
+            (hub_balance as bytes)
+        )
+    }
+
+    function verify_bill(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_paid_", left) == this.load("c_deposit_", left)
+        assert serial > this.load("c_serial_", left)
+        assert left_balance + hub_balance == this.load("c_total_", left)
+        var commitment = this.bill_hash(left, serial, left_balance, hub_balance)
+        assert verify_signature(commitment, left, left_sign)
+        assert verify_signature(commitment, storage_load("g_hub"), hub_sign)
+        return 0
+    }
+
+    function save_bill(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64
+    ) -> u32 {
+        storage_edit(this.key("c_serial_", left), serial)
+        storage_edit(this.key("c_left_balance_", left), left_balance)
+        storage_edit(this.key("c_hub_balance_", left), hub_balance)
+        return 0
+    }
+
+    function settle(left: address) -> u32 {
+        var total = this.load("c_total_", left)
+        var left_balance = this.load("c_left_balance_", left)
+        var hub_balance = this.load("c_hub_balance_", left)
+        storage_edit("g_locked", storage_load("g_locked") - total)
+        storage_edit(
+            "g_left_claimable",
+            storage_load("g_left_claimable") + left_balance
+        )
+        storage_edit(
+            "g_hub_claimable",
+            storage_load("g_hub_claimable") + hub_balance
+        )
+        storage_edit("g_open_count", storage_load("g_open_count") - 1)
+        if left_balance == 0 {
+            storage_edit(this.key("c_left_claimed_", left), true)
+        }
+        storage_edit(this.key("c_status_", left), FINAL as u8)
+        return 0
+    }
+
+    function external cooperative_close(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) != FINAL as u8
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        this.settle(left)
+        return 0
+    }
+
+    function external challenge(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) == OPEN as u8
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        storage_edit(
+            this.key("c_deadline_", left),
+            block_height() + this.load("c_challenge_", left)
+        )
+        storage_edit(this.key("c_status_", left), CHALLENGING as u8)
+        return 0
+    }
+
+    function external respond(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) == CHALLENGING as u8
+        assert block_height() < this.load("c_deadline_", left)
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        return 0
+    }
+
+    function external finalize(left: address) -> u32 {
+        assert this.load("c_status_", left) == CHALLENGING as u8
+        assert block_height() >= this.load("c_deadline_", left)
+        this.settle(left)
+        return 0
+    }
+
+    function renew_one(key: bytes, periods: u64) -> u32 {
+        storage_recv(key, periods)
+        storage_rent(key, periods)
+        return 0
+    }
+
+    function external renew_registry(periods: u64) -> u32 {
+        assert periods > 0
+        assert periods <= MAX_RENT_STEP
+        this.renew_one("g_network", periods)
+        this.renew_one("g_hub", periods)
+        this.renew_one("g_locked", periods)
+        this.renew_one("g_left_claimable", periods)
+        this.renew_one("g_hub_claimable", periods)
+        this.renew_one("g_open_count", periods)
+        return 0
+    }
+
+    function external renew_channel(left: address, periods: u64) -> u32 {
+        assert periods > 0
+        assert periods <= MAX_RENT_STEP
+        this.renew_one(this.key("c_status_", left), periods)
+        this.renew_one(this.key("c_id_", left), periods)
+        this.renew_one(this.key("c_reuse_", left), periods)
+        this.renew_one(this.key("c_deposit_", left), periods)
+        this.renew_one(this.key("c_paid_", left), periods)
+        this.renew_one(this.key("c_total_", left), periods)
+        this.renew_one(this.key("c_serial_", left), periods)
+        this.renew_one(this.key("c_left_balance_", left), periods)
+        this.renew_one(this.key("c_hub_balance_", left), periods)
+        this.renew_one(this.key("c_challenge_", left), periods)
+        this.renew_one(this.key("c_deadline_", left), periods)
+        this.renew_one(this.key("c_left_claimed_", left), periods)
+        return 0
+    }
+
+    function external registry_totals() {
+        return [
+            storage_load("g_locked"),
+            storage_load("g_left_claimable"),
+            storage_load("g_hub_claimable"),
+            storage_load("g_open_count")
+        ]
+    }
+
+    function external channel_status(left: address) {
+        return this.load("c_status_", left)
+    }
+}
