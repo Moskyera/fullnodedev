@@ -11,7 +11,10 @@ use crate::hpay_channel_exit::{
     MAINNET_MIN_SAFE_HEIGHT, channel_snapshot as hpay_channel_exit_snapshot,
     evidence as hpay_channel_exit_evidence,
 };
-use crate::hpay_channel_registry::channel_snapshot as hpay_channel_registry_snapshot;
+use crate::hpay_channel_registry::{
+    channel_snapshot as hpay_channel_registry_snapshot,
+    evidence as hpay_channel_registry_exit_evidence,
+};
 use crate::{HACASH_NODE_BUILD_TIME, HACASH_NODE_VERSION};
 
 const CAPABILITIES_API_VERSION: u32 = 1;
@@ -191,6 +194,7 @@ fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
     let block_one_hash = canonical_block_one_hash(ctx);
     let funding_confirmed = confirmed_pilot_funding(ctx);
     let channel_exit_evidence = hpay_channel_exit_evidence(Some(ctx));
+    let registry_exit_evidence = hpay_channel_registry_exit_evidence(Some(ctx));
     ApiResponse::json(
         build_capabilities_with_tip_and_exit_evidence(
             config,
@@ -201,6 +205,7 @@ fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
             tip_timestamp_unix,
             observed_unix,
             channel_exit_evidence,
+            registry_exit_evidence,
         )
         .to_string(),
     )
@@ -254,12 +259,12 @@ fn network_instance_id(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CurrentNetworkInstance {
-    chain_id: u32,
-    instance_id: String,
+pub(crate) struct CurrentNetworkInstance {
+    pub(crate) chain_id: u32,
+    pub(crate) instance_id: String,
 }
 
-fn current_network_instance(ctx: &ApiExecCtx) -> Option<CurrentNetworkInstance> {
+pub(crate) fn current_network_instance(ctx: &ApiExecCtx) -> Option<CurrentNetworkInstance> {
     let config = ctx.engine.config();
     let chain_id = config.chain_id;
     let mainnet = chain_id == protocol::upgrade::MAINNET_CHAIN_ID;
@@ -354,6 +359,7 @@ fn build_capabilities_with_tip(
         tip_timestamp_unix,
         observed_unix,
         hpay_channel_exit_evidence(None),
+        hpay_channel_registry_exit_evidence(None),
     )
 }
 
@@ -366,6 +372,7 @@ fn build_capabilities_with_tip_and_exit_evidence(
     tip_timestamp_unix: u64,
     observed_unix: u64,
     channel_exit_evidence: Value,
+    registry_exit_evidence: Value,
 ) -> Value {
     const MAX_TIP_AGE_SECONDS: u64 = 3_600;
     const MAX_FUTURE_SKEW_SECONDS: u64 = 120;
@@ -440,6 +447,15 @@ fn build_capabilities_with_tip_and_exit_evidence(
     // channel to this exact contract profile. Never auto-enable the native
     // capability from deployment evidence alone.
     let channel_unilateral_exit = false;
+    // The same rule for the shared registry V2 profile, which is the profile
+    // this system actually settles on. It is deliberately a separate flag from
+    // the V1 one above: they describe different contracts, and a node that can
+    // execute one has said nothing about the other. Like V1 it is never
+    // auto-enabled from deployment evidence — the evidence document beside it
+    // is what a Hub weighs, and a `true` here would additionally assert that
+    // this node parses and executes the registry challenge/finalize/claim
+    // lifecycle.
+    let channel_registry_unilateral_exit = false;
 
     json!({
         "ret": 0,
@@ -509,6 +525,11 @@ fn build_capabilities_with_tip_and_exit_evidence(
             // exit support from the persisted challenge fields alone.
             "channel_unilateral_exit": channel_unilateral_exit,
             "channel_unilateral_exit_evidence": channel_exit_evidence,
+            // The shared-registry V2 settlement profile, reported beside V1
+            // rather than in place of it. A consumer that measures the wrong
+            // one of these two measures a contract this system does not use.
+            "channel_registry_unilateral_exit": channel_registry_unilateral_exit,
+            "channel_registry_unilateral_exit_evidence": registry_exit_evidence,
             "exact_unsigned_simulation": false,
         },
         // Registered by the mint API service in this same fullnode process.
@@ -687,6 +708,11 @@ mod node_capabilities_tests {
             "manifest_valid": true,
             "deployment_verified": true,
         });
+        let registry_evidence = json!({
+            "schema": "hpay-hvm-channel-registry-exit-evidence/2",
+            "manifest_valid": true,
+            "deployment_verified": true,
+        });
         let value = build_capabilities_with_tip_and_exit_evidence(
             &config,
             &setup,
@@ -696,6 +722,7 @@ mod node_capabilities_tests {
             now - 60,
             now,
             evidence,
+            registry_evidence,
         );
         assert_eq!(
             value["features"]["channel_unilateral_exit"].as_bool(),
@@ -704,6 +731,52 @@ mod node_capabilities_tests {
         assert_eq!(
             value["features"]["channel_unilateral_exit_evidence"]["deployment_verified"],
             true
+        );
+        assert_eq!(
+            value["features"]["channel_registry_unilateral_exit"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            value["features"]["channel_registry_unilateral_exit_evidence"]["deployment_verified"],
+            true
+        );
+    }
+
+    /// The two settlement profiles are reported side by side and never
+    /// conflated. This is the test that would have caught the defect: a
+    /// consumer reading `channel_unilateral_exit_evidence` is reading about
+    /// `hpay-hvm-channel-v1`, which is not the profile this system settles on.
+    #[test]
+    fn capabilities_report_both_settlement_profiles_distinctly() {
+        let config = test_config(protocol::upgrade::MAINNET_CHAIN_ID);
+        let setup = test_setup();
+        let value = build_capabilities(
+            &config,
+            &setup,
+            protocol::upgrade::ONLINE_OPEN_HEIGHT,
+            None,
+            false,
+        );
+        let v1 = &value["features"]["channel_unilateral_exit_evidence"];
+        let v2 = &value["features"]["channel_registry_unilateral_exit_evidence"];
+        assert_eq!(v1["settlement_profile"], "hpay-hvm-channel-v1");
+        assert_eq!(v2["settlement_profile"], "hpay-hvm-shared-registry-v2");
+        assert_ne!(v1["schema"], v2["schema"]);
+        assert_ne!(v1["bytecode_sha3"], v2["bytecode_sha3"]);
+        assert_eq!(
+            v2["bytecode_sha3"],
+            "2fa7429d9e686dd2457eeb1b4476f972c7ddd9be6a0371c9765eff2910209b04"
+        );
+        assert_eq!(v2["contract_name"], "HPAYChannelRegistryV2");
+        assert_eq!(v2["registry_key_count"], 6);
+        assert_eq!(v2["channel_key_count"], 12);
+        assert_eq!(v2["manifest_valid"], true);
+        // Nothing is deployed on Hacash mainnet. Both must say so.
+        assert_eq!(v1["deployment_verified"], false);
+        assert_eq!(v2["deployment_verified"], false);
+        assert_eq!(
+            value["features"]["channel_registry_unilateral_exit"].as_bool(),
+            Some(false)
         );
     }
 

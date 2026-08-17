@@ -906,11 +906,14 @@ fn measurement_the_wallets_reviewed_pin_against_this_contract() {
     // Copied literals, not imports: this crate must not depend on the wallet
     // to be able to say what the wallet believes.
     // crates/l2-fast-pay-hub/src/hvm_registry.rs  HPAY_REGISTRY_BYTECODE_SHA3
+    // Re-pinned 2026-08-17, when the registry's storage-lease handling was
+    // fixed and the artifact moved. A stale copy here reports DRIFTED forever
+    // and never fails, which is the one way this measurement can lie.
     const WALLET_PINNED_BYTECODE_SHA3: &str =
-        "276d8c205296cc50d06244c84d52c5a9f6f4711e0abae67f416e4fc79c9294be";
+        "2fa7429d9e686dd2457eeb1b4476f972c7ddd9be6a0371c9765eff2910209b04";
     // crates/l2-fast-pay-hub/src/hvm_registry_pilot.rs  HPAY_REGISTRY_SOURCE_SHA256
     const WALLET_PINNED_SOURCE_SHA256: &str =
-        "58ab4ba8931190a5b83f5b30a96d842281adf9d7e7069cbf8bf79a68945ae8a8";
+        "37fabe6b8ab54431864715530c0f16c89fed3b609c23c227e592cec24e2ab8b5";
 
     let compiled = vm::fitshc::compile(CONTRACT_SOURCE).unwrap().0.into_sto();
     let bytecode_sha3 = compiled.calc_edition().hash.to_hex();
@@ -940,5 +943,22 @@ fn measurement_the_wallets_reviewed_pin_against_this_contract() {
         bytecode_sha3.len(),
         64,
         "the edition hash must be a 32-byte hex digest"
+    );
+    // The manifest this node serves its own deployment evidence from has to
+    // name the same artifact, or the fullnode would be publishing evidence
+    // about a contract these scenarios did not run against.
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../contracts/hpay_channel_registry_v2.manifest.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        manifest["bytecode_sha3"].as_str(),
+        Some(bytecode_sha3.as_str()),
+        "the registry manifest must name the contract this test compiled"
+    );
+    assert_eq!(
+        manifest["source_sha256"].as_str(),
+        Some(source_sha256.as_str()),
+        "the registry manifest must name the source this test compiled"
     );
 }
