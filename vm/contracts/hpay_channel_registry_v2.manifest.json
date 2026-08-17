@@ -4,11 +4,11 @@
   "protocol_domain": "HPAY/HVM-CHANNEL-REGISTRY/V2",
   "settlement_profile": "hpay-hvm-shared-registry-v2",
   "source_file": "hpay_channel_registry_v2.fitsh",
-  "source_sha256": "58ab4ba8931190a5b83f5b30a96d842281adf9d7e7069cbf8bf79a68945ae8a8",
-  "bytecode_sha3": "276d8c205296cc50d06244c84d52c5a9f6f4711e0abae67f416e4fc79c9294be",
+  "source_sha256": "37fabe6b8ab54431864715530c0f16c89fed3b609c23c227e592cec24e2ab8b5",
+  "bytecode_sha3": "2fa7429d9e686dd2457eeb1b4476f972c7ddd9be6a0371c9765eff2910209b04",
   "required_action_kinds": [40, 41, 44],
   "initial_rent_periods": 100,
-  "maximum_renewal_step_periods": 5000,
+  "maximum_renewal_step_periods": 150,
   "deployment_model": {
     "scope": "one_registry_per_hub_and_network",
     "hub_binding": "contract_deploy_main_signer",
@@ -56,7 +56,12 @@
     "permissionless_channel_renewal": true,
     "must_renew_every_registry_key": true,
     "must_renew_every_channel_key": true,
-    "production_watchtower_required": true
+    "production_watchtower_required": true,
+    "recovery_buffer_seeded_on_funding": true,
+    "recovery_buffer_periods_at_funding": 550,
+    "minimum_reach_blocks_to_accept_custody": 50000,
+    "lapsed_lease_outcome": "dormant_and_restorable_by_permissionless_renewal",
+    "renewal_step_bounded_by_transaction_storage_gas": true
   },
   "mainnet_deployment": {
     "enabled": false,

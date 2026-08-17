@@ -13,7 +13,7 @@ use vm::{ContractAddress, VMStateRead};
 const MANIFEST: &str = include_str!("../../vm/contracts/hpay_channel_registry_v2.manifest.json");
 const SOURCE: &str = include_str!("../../vm/contracts/hpay_channel_registry_v2.fitsh");
 const EXPECTED_BYTECODE_SHA3: &str =
-    "276d8c205296cc50d06244c84d52c5a9f6f4711e0abae67f416e4fc79c9294be";
+    "2fa7429d9e686dd2457eeb1b4476f972c7ddd9be6a0371c9765eff2910209b04";
 
 const REGISTRY_KEYS: &[&str] = &[
     "g_network",

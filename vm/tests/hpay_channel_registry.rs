@@ -274,7 +274,7 @@ impl RegistryFixture {
         deploy.nonce = Uint4::from(0);
         deploy.construct_argv = BytesW2::from(network.to_vec()).unwrap();
         deploy.contract = vm::fitshc::compile(CONTRACT_SOURCE).unwrap().0.into_sto();
-        deploy.protocol_cost = Amount::unit238(2_000_000_000_000);
+        deploy.protocol_cost = Amount::unit238(20_000_000_000_000);
         let hash = chain
             .submit_formal_actions(
                 &hub,
@@ -390,7 +390,7 @@ fn one_deployment_isolates_two_channels_and_aggregates_hub_claims() {
     deploy.nonce = Uint4::from(0);
     deploy.construct_argv = BytesW2::from(network.to_vec()).unwrap();
     deploy.contract = compiled;
-    deploy.protocol_cost = Amount::unit238(2_000_000_000_000);
+    deploy.protocol_cost = Amount::unit238(20_000_000_000_000);
     let deploy_hash = chain
         .submit_formal_actions(
             &hub,

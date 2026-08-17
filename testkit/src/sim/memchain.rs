@@ -61,6 +61,14 @@ pub struct MemChain {
     next_tx_seq: u64,
     height: u64,
     last_block_hash: Hash,
+    /// The chain id every executed transaction sees in `ctx.env().chain.id`.
+    ///
+    /// Zero (mainnet) by default, which is what every existing test expects.
+    /// A test that drives externally-built wallet bytes has to be able to say
+    /// otherwise, because those transactions carry a `ChainAllow` guard naming
+    /// the private chain they were built for and that guard is checked against
+    /// exactly this field.
+    chain_id: u32,
     // Held for the lifetime of the chain: serialises tests (protocol setup is
     // global mutable state). The standard VM+mint setup is installed via
     // `enable_default_vm_setup`, which stores its scope guard in thread-local
@@ -414,6 +422,7 @@ impl MemChain {
             next_tx_seq: 1,
             height: 1,
             last_block_hash: Hash::default(),
+            chain_id: 0,
             _guard: guard,
         }
     }
@@ -431,6 +440,18 @@ impl MemChain {
 
     pub fn last_block_hash(&self) -> Hash {
         self.last_block_hash
+    }
+
+    pub fn chain_id(&self) -> u32 {
+        self.chain_id
+    }
+
+    /// Run this chain as the given chain id.
+    ///
+    /// Additive: leaving it alone keeps the mainnet id 0 every existing test
+    /// was written against.
+    pub fn set_chain_id(&mut self, chain_id: u32) {
+        self.chain_id = chain_id;
     }
 
     pub fn state_backend(&self) -> StateBackendKind {
@@ -860,7 +881,7 @@ impl MemChain {
         let old_log_len = logs_box.snapshot_len();
         let executed = block.execute_with_report(
             ChainInfo {
-                id: 0,
+                id: self.chain_id,
                 fast_sync: false,
                 diamond_form: false,
             },
@@ -935,7 +956,7 @@ impl MemChain {
         let old_log_len = logs_box.snapshot_len();
         let executed = block.execute_with_report(
             ChainInfo {
-                id: 0,
+                id: self.chain_id,
                 fast_sync: false,
                 diamond_form: false,
             },
@@ -1831,6 +1852,7 @@ impl MemChain {
         f: impl FnOnce(&mut ContextInst<'_>) -> Ret<R>,
     ) -> Ret<(R, TxOutcome)> {
         let mut env = Env::default();
+        env.chain.id = self.chain_id;
         env.block.height = self.height;
         env.tx = protocol::transaction::create_tx_info(tx);
         // Snapshot the per-tx state/logs: a fork so the persistent chain is
