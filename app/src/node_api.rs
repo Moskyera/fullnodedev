@@ -48,6 +48,7 @@ impl ApiService for NodeCapabilitiesService {
     fn routes(&self) -> Vec<ApiRoute> {
         vec![
             ApiRoute::get("/query/capabilities", query_capabilities),
+            ApiRoute::get("/query/txpool", query_txpool),
             ApiRoute::get("/query/hpay/channel-exit", query_hpay_channel_exit),
             ApiRoute::get("/query/hpay/channel-registry", query_hpay_channel_registry),
             ApiRoute::post(
@@ -185,6 +186,49 @@ fn query_hpay_channel_registry(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse
 
 pub fn service() -> Arc<dyn ApiService> {
     Arc::new(NodeCapabilitiesService)
+}
+
+/// What this node is holding but has not seen mined.
+///
+/// A wallet that submits a transaction gets back `ret: 0` and a hash, and then
+/// has no way to ask what became of it short of waiting for a block. That gap
+/// cost a real afternoon here: two correctly signed, well funded transactions
+/// sat in this pool for over an hour while their owner had no way to see them,
+/// and the only reason anybody knew the pool was working at all was a
+/// `[TxPool] tx count:` line that scrolls past in the log.
+///
+/// Groups are the minter's own pool grouping (normal and diamond-mint), read
+/// through the same `count_at` / `iter_at` the pool already exposes. Read only:
+/// it holds no lock across the response and mutates nothing.
+fn query_txpool(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
+    const POOL_GROUPS: usize = 2;
+    let pool = ctx.hnoder.txpool();
+    let mut groups = Vec::with_capacity(POOL_GROUPS);
+    let mut pending = Vec::new();
+    for group in 0..POOL_GROUPS {
+        let counted = pool.count_at(group).unwrap_or(0);
+        let mut seen = 0usize;
+        let _ = pool.iter_at(group, &mut |pkg| {
+            seen += 1;
+            pending.push(serde_json::json!({
+                "hash": pkg.hash().to_hex(),
+                "group": group,
+                "fee_purity": pkg.fpur(),
+            }));
+            true
+        });
+        groups.push(serde_json::json!({ "group": group, "count": counted, "listed": seen }));
+    }
+    ApiResponse::json(
+        serde_json::json!({
+            "ret": 0,
+            "total": pending.len(),
+            "groups": groups,
+            "pending": pending,
+            "note": "Transactions this node holds and has not seen in a block. Presence here means this node accepted it, and nothing more: it does not prove any peer took it, and it does not prove a miner will. An empty list after a submit that returned ret 0 means the transaction is already mined, was evicted, or never reached the pool.",
+        })
+        .to_string(),
+    )
 }
 
 fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
@@ -1070,6 +1114,24 @@ mod node_capabilities_tests {
         assert_eq!(ready["network"]["funding_confirmed"], true);
         assert_eq!(ready["network"]["transaction_ready"], true);
         assert_eq!(ready["network"]["instance_id"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn the_pool_a_wallet_cannot_otherwise_see_is_queryable() {
+        // A wallet that submits gets `ret: 0` and a hash, then has no way to
+        // ask what became of it. Two real transactions sat in this pool for an
+        // hour with nobody able to look, so the route has to exist and it has
+        // to be a GET, because asking what you are holding must never be a
+        // write.
+        let routes = NodeCapabilitiesService.routes();
+        let route = routes
+            .iter()
+            .find(|route| route.path == "/query/txpool")
+            .expect("/query/txpool must be registered");
+        assert!(
+            matches!(route.method, basis::interface::ApiMethod::Get),
+            "reading the pool must be a GET"
+        );
     }
 
     #[test]
