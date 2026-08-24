@@ -219,6 +219,25 @@ pub(crate) async fn do_handle_pmsg(
         );
     }
     loop {
+        // `notify_waiters` wakes only whoever is parked at that instant and
+        // stores no permit, so the writer dying while this loop is busy
+        // handling a message loses the notification for good. The reader then
+        // runs forever against a peer it can never send to: the peer stays in
+        // the tables, keeps a slot, keeps delivering blocks, and looks entirely
+        // healthy, so the connection manager never re-dials it.
+        //
+        // That is how this node came to hold three transactions in its pool for
+        // an afternoon while the network never saw one of them. Checking the
+        // flag as well as the notification closes the race in the direction
+        // that matters: a peer we cannot speak to is not a peer, and dropping
+        // it here is what lets a working connection replace it.
+        if peer.is_writer_closed() {
+            println!(
+                "[P2P] dropping {}: its writer is gone, so this node cannot send to it",
+                peer.nick()
+            );
+            break;
+        }
         let rdres = tokio::select! {
             _ = peer.close_notify.notified() => {
                 break
