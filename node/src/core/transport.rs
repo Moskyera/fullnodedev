@@ -41,16 +41,36 @@ impl TransportAdapter {
 pub(crate) async fn broadcast_unaware(p2p: &P2PManage, key: &KnowKey, ty: u16, body: Vec<u8>) {
     let mut resps = vec![];
     let peers = vec![p2p.backbones(), p2p.offshoots()].concat();
+    let candidates = peers.len();
     for peer in peers {
         if !peer.knows.check(key) {
             peer.knows.add(key.clone());
             resps.push(peer);
         }
     }
+    // A transaction accepted into the local pool and never seen again by the
+    // network gives an operator nothing to look at: the submit returns ok, the
+    // pool holds it, and whether a single byte left this process is invisible.
+    // Three transactions died that way in one afternoon here. Count what was
+    // considered, what was selected, and what the writer actually took, because
+    // the send result below is deliberately discarded and a silent failure at
+    // that line is indistinguishable from success.
+    let selected = resps.len();
     let msgbody = vec![ty.to_be_bytes().to_vec(), body].concat();
     let msgbuf = tcp_create_msg(MSG_CUSTOMER, msgbody);
+    let mut sent = 0usize;
+    let mut failed = 0usize;
     for peer in resps {
-        let _ = peer.send(&msgbuf).await;
+        match peer.send(&msgbuf).await {
+            Ok(()) => sent += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    if ty == MSG_TX_SUBMIT {
+        println!(
+            "[P2P] tx relay: {} peers considered, {} selected, {} sent, {} failed",
+            candidates, selected, sent, failed
+        );
     }
 }
 
