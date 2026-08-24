@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use basis::component::TX_ACTIONS_MAX;
 use basis::config::EngineConf;
-use basis::interface::{ApiExecCtx, ApiRequest, ApiResponse, ApiRoute, ApiService};
+use basis::interface::{
+    ApiExecCtx, ApiRequest, ApiResponse, ApiRoute, ApiService, PeerConnectivity,
+};
 use field::*;
 use protocol::setup::ProtocolSetup;
 use serde_json::{Value, json};
@@ -195,6 +197,7 @@ fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
     let funding_confirmed = confirmed_pilot_funding(ctx);
     let channel_exit_evidence = hpay_channel_exit_evidence(Some(ctx));
     let registry_exit_evidence = hpay_channel_registry_exit_evidence(Some(ctx));
+    let peers = ctx.hnoder.peer_connectivity();
     ApiResponse::json(
         build_capabilities_with_tip_and_exit_evidence(
             config,
@@ -206,6 +209,7 @@ fn query_capabilities(ctx: &ApiExecCtx, _req: ApiRequest) -> ApiResponse {
             observed_unix,
             channel_exit_evidence,
             registry_exit_evidence,
+            peers,
         )
         .to_string(),
     )
@@ -321,6 +325,43 @@ fn has_all_action_kinds(setup: &ProtocolSetup, kinds: &[u16]) -> bool {
     kinds.iter().all(|kind| setup.has_action_kind(*kind))
 }
 
+/// The peer connectivity block of the capabilities document.
+///
+/// Deliberately verbose field names. This blob gets read alone, pasted into a
+/// ticket, or parsed by something that never saw this file, and the mistake it
+/// has to survive is reading a bound listening socket as proof of reachability.
+/// `netstat` showing `0.0.0.0:3337 LISTENING` only means "ready to be called".
+/// `inbound_established` is the count of peers that actually called.
+fn peer_connectivity_report(peers: PeerConnectivity) -> Value {
+    // Never report an unmeasured zero as a measured one. If the node build
+    // cannot count peers, every count is null and the role is "unknown".
+    let count = |n: usize| -> Value {
+        match peers.measured {
+            true => json!(n),
+            false => Value::Null,
+        }
+    };
+    let role = if !peers.measured {
+        "unknown"
+    } else if peers.inbound > 0 {
+        // Someone reached us, so we accept connections and relay for others.
+        "participant"
+    } else {
+        // We dial out, pull blocks, validate for ourselves, and serve nobody.
+        "leaf"
+    };
+    json!({
+        "measured": peers.measured,
+        "total": count(peers.total),
+        "inbound_established": count(peers.inbound),
+        "outbound_established": count(peers.outbound),
+        "public": count(peers.public),
+        "inbound_proven": peers.inbound_proven(),
+        "role": role,
+        "note": "inbound_established counts remote peers that dialed this node and completed the p2p handshake. A listening socket is not a reached socket: a bound port and a green sync can both be true while inbound_established is 0, which means no peer has reached this node and it relays for nobody. Only a non zero inbound_established proves the p2p port is reachable from outside. outbound_established counts connections this node opened itself, and public counts peers we hold a dialable address for, which says nothing about us.",
+    })
+}
+
 #[cfg(test)]
 fn build_capabilities(
     config: &EngineConf,
@@ -350,6 +391,30 @@ fn build_capabilities_with_tip(
     tip_timestamp_unix: u64,
     observed_unix: u64,
 ) -> Value {
+    build_capabilities_with_peers(
+        config,
+        setup,
+        height,
+        block_one_hash,
+        funding_confirmed,
+        tip_timestamp_unix,
+        observed_unix,
+        PeerConnectivity::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_capabilities_with_peers(
+    config: &EngineConf,
+    setup: &ProtocolSetup,
+    height: u64,
+    block_one_hash: Option<&str>,
+    funding_confirmed: bool,
+    tip_timestamp_unix: u64,
+    observed_unix: u64,
+    peers: PeerConnectivity,
+) -> Value {
     build_capabilities_with_tip_and_exit_evidence(
         config,
         setup,
@@ -360,9 +425,11 @@ fn build_capabilities_with_tip(
         observed_unix,
         hpay_channel_exit_evidence(None),
         hpay_channel_registry_exit_evidence(None),
+        peers,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_capabilities_with_tip_and_exit_evidence(
     config: &EngineConf,
     setup: &ProtocolSetup,
@@ -373,6 +440,7 @@ fn build_capabilities_with_tip_and_exit_evidence(
     observed_unix: u64,
     channel_exit_evidence: Value,
     registry_exit_evidence: Value,
+    peers: PeerConnectivity,
 ) -> Value {
     const MAX_TIP_AGE_SECONDS: u64 = 3_600;
     const MAX_FUTURE_SKEW_SECONDS: u64 = 120;
@@ -489,6 +557,7 @@ fn build_capabilities_with_tip_and_exit_evidence(
             "max_tip_age_seconds": MAX_TIP_AGE_SECONDS,
             "fresh": tip_fresh,
         },
+        "peers": peer_connectivity_report(peers),
         "istanbul": {
             "activation_height": protocol::upgrade::ONLINE_OPEN_HEIGHT,
             "evaluation_height": next_height,
@@ -580,6 +649,75 @@ mod node_capabilities_tests {
             .iter()
             .map(|item| item.as_u64().unwrap())
             .collect()
+    }
+
+    fn peers_value(peers: PeerConnectivity) -> Value {
+        let config = test_config(protocol::upgrade::MAINNET_CHAIN_ID);
+        let setup = test_setup();
+        let value = build_capabilities_with_peers(
+            &config,
+            &setup,
+            protocol::upgrade::ONLINE_OPEN_HEIGHT,
+            None,
+            false,
+            0,
+            0,
+            peers,
+        );
+        value["peers"].clone()
+    }
+
+    #[test]
+    fn peer_report_calls_a_node_nobody_dialed_a_leaf() {
+        // Exactly what the live mainnet node measured: four outbound, zero in.
+        let peers = peers_value(PeerConnectivity {
+            total: 4,
+            inbound: 0,
+            outbound: 4,
+            public: 4,
+            measured: true,
+        });
+        assert_eq!(peers["measured"].as_bool(), Some(true));
+        assert_eq!(peers["total"].as_u64(), Some(4));
+        assert_eq!(peers["inbound_established"].as_u64(), Some(0));
+        assert_eq!(peers["outbound_established"].as_u64(), Some(4));
+        assert_eq!(peers["public"].as_u64(), Some(4));
+        assert_eq!(peers["inbound_proven"].as_bool(), Some(false));
+        assert_eq!(peers["role"].as_str(), Some("leaf"));
+        // The note has to say the thing the socket state does not.
+        assert!(
+            peers["note"]
+                .as_str()
+                .unwrap()
+                .contains("A listening socket is not a reached socket")
+        );
+    }
+
+    #[test]
+    fn peer_report_calls_a_node_someone_dialed_a_participant() {
+        let peers = peers_value(PeerConnectivity {
+            total: 5,
+            inbound: 1,
+            outbound: 4,
+            public: 4,
+            measured: true,
+        });
+        assert_eq!(peers["inbound_established"].as_u64(), Some(1));
+        assert_eq!(peers["outbound_established"].as_u64(), Some(4));
+        assert_eq!(peers["inbound_proven"].as_bool(), Some(true));
+        assert_eq!(peers["role"].as_str(), Some("participant"));
+    }
+
+    #[test]
+    fn peer_report_never_prints_an_unmeasured_zero_as_a_measured_one() {
+        let peers = peers_value(PeerConnectivity::default());
+        assert_eq!(peers["measured"].as_bool(), Some(false));
+        assert!(peers["total"].is_null());
+        assert!(peers["inbound_established"].is_null());
+        assert!(peers["outbound_established"].is_null());
+        assert!(peers["public"].is_null());
+        assert_eq!(peers["inbound_proven"].as_bool(), Some(false));
+        assert_eq!(peers["role"].as_str(), Some("unknown"));
     }
 
     #[test]
@@ -723,6 +861,7 @@ mod node_capabilities_tests {
             now,
             evidence,
             registry_evidence,
+            PeerConnectivity::default(),
         );
         assert_eq!(
             value["features"]["channel_unilateral_exit"].as_bool(),

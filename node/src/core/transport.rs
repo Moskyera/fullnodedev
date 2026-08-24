@@ -29,6 +29,10 @@ impl TransportAdapter {
         self.p2p.all_peer_prints()
     }
 
+    pub(super) fn peer_connectivity(&self) -> PeerConnectivity {
+        self.p2p.peer_connectivity()
+    }
+
     pub(super) fn exit(&self) {
         self.p2p.exit();
     }
