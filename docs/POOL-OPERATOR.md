@@ -62,10 +62,13 @@ export HBIT_WALLET_PASSWORD='a long passphrase you have written down'
 ```
 
 It refuses to start, with an explanation and a `What to do:` line, if the node
-is not answering, if the chain argument does not match that node, if the listen
+is not answering, if the node is not on the chain you named, if its tip is more
+than an hour old, if the chain argument does not match that node, if the listen
 address is wrong or its port is taken, if `share_bits` or `settle_secs` is not a
 number in range, or if another copy is already running on the same wallet.
-Nothing is mined and nothing is paid when it refuses.
+Nothing is mined and nothing is paid when it refuses. What it cannot tell you is
+whether the node has finished syncing: nothing in the node's API says so, and
+section 4 is what to do about that.
 
 **What a good start looks like.** Just before `listening on` it prints a
 readback. Check every line of it:
@@ -366,13 +369,47 @@ every few seconds spends the reserve for nothing, and `0` would leave the
 settlement thread spinning against the node with no pause at all. Leave it out
 unless you have a reason.
 
-### The node has to be there, and it has to be yours
+### The node has to be there, it has to be yours, and it has to be at the tip
 
-Before anything else the pool asks the node for its current block. If nothing
-answers it refuses, naming the URL it tried and where the port comes from (the
-`[server] listen` value in the node's `hacash.config.ini`, 8080 in the config
-this package ships). A node that is still syncing, or that would not hand over a
-block template, is refused the same way.
+After its own arguments, passphrase and accounting file have passed, the pool
+asks the node for its current block. If nothing answers it refuses, naming the
+URL it tried and where the port comes from (the `[server] listen` value in the
+node's `hacash.config.ini`, 8080 in the config this package ships). Then it asks
+three more things, and each one is its own refusal:
+
+- **Is this really mainnet?** With `chain` set to `mainnet` the pool reads block
+  1's `prevhash`, which is the genesis hash by construction, and compares it
+  with the genesis hash compiled into this build. It reads block 1 and not block
+  0 because the node does not serve block 0 at all. A chain that begins
+  somewhere else is refused with `this node is NOT on the chain this pool pays
+  out on`, and so is a node that will not answer for block 1: unknown is not
+  permission. This one is mainnet only, because a testnet genesis is whatever
+  the person who started that chain made it.
+- **Is the tip fresh?** A tip whose own timestamp is more than **3600 seconds**
+  old is refused, saying how many minutes of silence that is and telling you to
+  wait for the node to reach the network tip.
+- **Will the node hand over a block template?** One that answers but will not
+  give a template is refused too.
+
+**The pool cannot detect a syncing node as such, and does not claim to.** The
+node's `/query/latest` answers with a height and a diamond number and nothing
+else: no peer count, no best-known height, no sync flag. A node stalled part way
+through a sync answers all three questions above with total confidence, and the
+only one it eventually fails is the tip timestamp, once it has fallen an hour
+behind. Watch the node's own log for the sync, and do not read a clean pool
+start as proof that the node is at the network tip.
+
+Two of these questions keep being asked after the pool is up, and there they
+halt it instead of refusing to start. The tip is re-checked on every template
+cycle against a looser **7200 seconds**, and a failed write of the accounting
+file when a block is found sets a halt of its own that no template change
+clears. A halted pool credits no new share and plans no fresh payout, though
+payouts already in flight keep resolving; it reports the reason on `/terms` as
+`crediting_halt_reason`, and it tells connected miners to stop rather than let
+them burn power for credit it will not give. The node halt lifts by itself the
+moment the tip moves again; the accounting halt needs the disk fixed and the
+pool restarted. Why the two bounds differ, and what each halt does and does not
+cover, is [hbit-v2/MAINNET-SAFETY.md](hbit-v2/MAINNET-SAFETY.md).
 
 ### The listen address has to be usable
 
@@ -485,7 +522,11 @@ finding the one you are looking at.
 |---------|-------|-----|
 | `REFUSING to run: another hbit-pool-server or hbit-pool-payout already holds ...` | Both settlers running at once | Stop `hbit-pool-server`, run the tool, restart the server. Do not delete the `.settle.lock` file: it frees nothing |
 | `REFUSING to start: no Hacash fullnode answered at ...` | Node not running, still starting, or wrong URL/port | Start and sync the node; use the `[server] listen` port from its `hacash.config.ini` (8080 here) |
+| `REFUSING to start: this node is NOT on the chain this pool pays out on` | The node's chain begins at a different genesis than mainnet | Point the pool at a mainnet node, or pass the chain that node really runs as `testnet:<adjust_blocks>:<target_time>` |
+| `REFUSING to start: ... could not read block 1 from the node` | The node would not answer for block 1, so its chain cannot be identified | Let the node get past its first blocks, then start the pool again |
+| `REFUSING to start: the node's tip is block N, stamped M minute(s) ago ...` | The tip is over 3600s old, so this node has probably stopped following the chain | Wait for the node to reach the network tip, then start the pool again |
 | `REFUSING to start: the node ... would not give a block template` | Node is up but not ready to be mined on | Let it finish syncing, then start the pool again |
+| `[node] STOPPED crediting shares and STOPPED settling: ...` | A running pool's tip went 7200s without moving | Fix the node; crediting and settlement resume by themselves when the tip moves again |
 | `REFUSING to start: cannot listen on ...` | `<listen>` is not `<ip>:<port>`, or the port is taken | Use `0.0.0.0:9777` or `127.0.0.1:9777`; if the form is right, something else holds that port |
 | `wallet file ... is encrypted but no passphrase is configured` | Passphrase missing from the environment | Set `HBIT_WALLET_PASSWORD` or `HBIT_WALLET_PASSWORD_FILE` |
 | `cannot decrypt wallet file ...` | Wrong passphrase, or a corrupted file | Use the backed-up passphrase; restore the file from backup |

@@ -98,7 +98,7 @@ fn parse_ini_content(content: &str) -> Result<IniObj, String> {
             return Err(format!("line {}: key cannot be empty", num + 1));
         }
         map.entry(section.clone())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(key, value);
     }
     Ok(map)

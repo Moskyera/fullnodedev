@@ -53,7 +53,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use basis::interface::*;
@@ -65,18 +65,20 @@ use sys::{Account, curtimes};
 use hbit_pool::difficulty::ChainParams;
 use hbit_pool::pool_core::{self, Pplns, split_payout};
 use hbit_pool::{
-    Admission, BalanceAnswer, BlockFees, DEFAULT_SETTLE_SECS, GoneAction, PAYOUT_CHUNK,
-    PAYOUT_DUST_UNITS, PAYOUT_MATURITY_DEPTH, PAYOUT_UNIT, POOL_FEE_UNITS, PPLNS_WINDOW,
-    PaidLedger, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS, StampPin, SubmitVerdict,
-    Template, WALLET_PASSWORD_ENV, WALLET_PASSWORD_FILE_ENV, acquire_settle_lock, assemble_block,
-    atomic_write, balance, block_fees, block_reward_units, chunk_tx_fee, classify_payout_tx,
-    coinbase_body_hex, coinbase_with_extranonce, confirm_payout, deduct_owed, distributable_units,
-    drop_payout, fetch_pool_template, find_str, find_u64, get_json, gone_action, http_client,
-    intro_bytes, is_payout_address, load_or_create_wallet, merge_payout_rows, owe_rows,
-    owed_to_json, parse_banked_credit, parse_owed, parse_paid_ledger, parse_payout_records,
-    parse_share_order, payout_amount, pool_state_path, post_hex, pplns_horizon_ms,
-    settle_lock_path, submit_block_bytes, submit_verdict, take_owed, verify_admitted,
-    verify_chain_params,
+    Admission, BalanceAnswer, BlockFees, DEFAULT_SETTLE_SECS, GoneAction, NODE_API_TOKEN_ENV,
+    PAYOUT_CHUNK, PAYOUT_DUST_UNITS, PAYOUT_MATURITY_DEPTH, PAYOUT_UNIT, POOL_FEE_UNITS,
+    PPLNS_WINDOW, PaidLedger, PayoutRecord, PayoutTxState, SETTLE_RESERVE_UNITS, STATE_SCHEMA,
+    StampPin, StateFile, SubmitVerdict, TIP_STALE_SECS_WHILE_RUNNING, Template,
+    WALLET_PASSWORD_ENV, WALLET_PASSWORD_FILE_ENV, acquire_settle_lock, assemble_block,
+    atomic_write, balance, block_fees, block_reward_units, chunk_tx_fee, chunks_needed,
+    classify_payout_tx, classify_state_file, coinbase_body_hex, coinbase_with_extranonce,
+    confirm_payout, deduct_owed, distributable_units, drop_payout, fetch_pool_template, find_str,
+    find_u64, get_json, gone_action, http_client, http_client_with_token, intro_bytes,
+    is_payout_address, load_or_create_wallet, merge_payout_rows, owe_rows, owed_to_json,
+    parse_banked_credit, parse_owed, parse_paid_ledger, parse_payout_records, parse_share_order,
+    payout_amount, pool_state_path, post_hex, pplns_horizon_ms, reserve_funds_recipients,
+    settle_lock_path, submit_block_bytes, submit_verdict, take_owed, tip_too_old, unpayable_owed,
+    verify_admitted, verify_chain_params,
 };
 
 use serde_json::json;
@@ -175,9 +177,11 @@ const BAD_STREAK_REPEAT_MS: u64 = 300_000;
 /// something about the worker.
 ///
 /// One mainnet block interval, which comfortably covers a GPU scan pass. The pool
-/// pins one template per height and `/query/miner/notice` signals only a HEIGHT
-/// change, so a worker legitimately keeps hashing the header it was handed until
-/// its current pass ends. Nothing here decides whether the line is printed, only
+/// pins one template per height, and `/query/miner/notice` releases a parked rig
+/// on a template change but only at its next poll, so a worker legitimately keeps
+/// hashing the header it was handed until its current pass ends. This window
+/// covers the scan pass, not the notice latency, which is why it stays at a block
+/// interval. Nothing here decides whether the line is printed, only
 /// which sentence follows it: neither wording accuses the worker of anything.
 const TEMPLATE_SETTLE_MS: u64 = 300_000;
 /// Quiet time between the accepted-share summary lines on stdout.
@@ -222,6 +226,23 @@ const MONEY_REFRESH_CYCLES: u64 = 15;
 /// reaches its height. At roughly one cycle every two seconds this is about two
 /// minutes, far longer than a node needs to insert a block it accepted.
 const BLOCK_STALL_CYCLES: u32 = 60;
+/// Backoff between attempts to hand a found block to the node.
+///
+/// The pool used to submit exactly once, and the serialized bytes went out of
+/// scope on the very next line. A block is the rarest and most valuable thing
+/// this pool handles - a whole subsidy plus every fee packed into it - so one
+/// dropped connection lost it permanently, with one stderr line. The solo miner
+/// in this same workspace has retried with backoff for exactly this reason.
+///
+/// Five attempts spread over 7.5s. The winning worker's request waits for this,
+/// which is why it is bounded rather than generous: a rig that gets no answer
+/// resubmits by itself, and the pool's replay set recognises the resubmission.
+const BLOCK_SUBMIT_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(500),
+    Duration::from_millis(1_000),
+    Duration::from_millis(2_000),
+    Duration::from_millis(4_000),
+];
 /// Bounds on the automatic settlement interval. Each settlement is a signed
 /// on-chain transaction carrying a network fee, so running one every few seconds
 /// spends the reserve for nothing; `0` is worse still, because the timer thread
@@ -230,10 +251,29 @@ const BLOCK_STALL_CYCLES: u32 = 60;
 /// should say so by stopping the pool, not by typing a large number.
 const MIN_SETTLE_SECS: u64 = 30;
 const MAX_SETTLE_SECS: u64 = 86_400;
-/// The documented default share size. `usage()` quotes it, so the help text
-/// cannot describe a default the code does not use. The settlement interval's
-/// default lives beside the credit horizon it sizes, in `hbit_pool`.
-const DEFAULT_SHARE_BITS: u32 = 24;
+/// The documented default share size, and the ONE value every shipped
+/// deployment file uses. `usage()` quotes it, so the help cannot recommend a
+/// number the project does not.
+///
+/// It was 24, and the repository shipped 24 in the systemd unit while shipping
+/// 20 in docker-compose and 20 in the VPS setup script. Worse, the compose file
+/// carried the written argument AGAINST 24, so the program's own help text was
+/// recommending the value its own documentation argued against.
+///
+/// 20, and the reason is payout fairness rather than throughput. A share costs
+/// (block work - share_bits) hashes. Block work measured on this chain is 2^42,
+/// so at 24 a share costs 2^18 and an ordinary card produces roughly 27 a
+/// second; ten miners turn the whole 4096-share window over in about fifteen
+/// seconds, and a miner that drops off for half a minute loses everything it
+/// had earned. At 20 a share costs 2^22, the same pool keeps about four minutes
+/// of history, and the window stops being a lottery on connection stability.
+///
+/// Raise it only if miners report too few shares to be paid smoothly, and never
+/// past (block work - 16), which the pool enforces and explains.
+///
+/// The settlement interval's default lives beside the credit horizon it sizes,
+/// in `hbit_pool`.
+const DEFAULT_SHARE_BITS: u32 = 20;
 /// The largest hashrate the pool will believe from ONE worker id, as a power of
 /// two hashes per second. Deliberately far above any real x16rs farm: this is a
 /// ceiling on the absurd, not a throttle on big miners.
@@ -254,7 +294,18 @@ const WORKER_BURST_MIN_SHARES: u64 = 64;
 /// Workers tracked by the rate limiter. Bounded so a flood of invented payout
 /// addresses cannot grow memory; entries that would have refilled to full are
 /// pruned first, so pruning never hands anyone credit it should not have.
+///
+/// A bound on MEMORY, not a promise about shares. With this many ids all still
+/// active there is nowhere to record the next one, and `rate_admits_share` then
+/// admits it UNTRACKED rather than refuse an honest miner work it has already
+/// paid for in power. Anyone reading this figure for a guarantee has to read
+/// that function too.
 const RATE_WORKERS: usize = 100_000;
+/// How long the "the rate limiter is open" line is suppressed after being
+/// printed, while the condition lasts. Five minutes, like the above-target
+/// streak line: an incident that runs all afternoon is a handful of lines, and
+/// an operator reading the log still sees that it has not stopped.
+const RATE_OPEN_REPEAT_MS: u64 = 300_000;
 /// Shortest passphrase the wallet layer accepts. Mirrored here only so a short
 /// one is a refusal that says what to do, instead of a panic out of the key
 /// loader with a backtrace note on it. The loader still has the final say: if
@@ -266,8 +317,156 @@ static NOTICE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 static PER_IP: LazyLock<Mutex<HashMap<IpAddr, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Last printed reason (and when) for mining without the node's transactions.
 static TX_WARN: LazyLock<Mutex<Option<(String, Instant)>>> = LazyLock::new(|| Mutex::new(None));
+/// A submitted block, by the height and hash that identify it on the chain.
+type BlockKey = (u64, [u8; 32]);
 /// Submitted blocks the chain has not reached yet, and for how many cycles.
-static BLOCK_STALL: LazyLock<Mutex<HashMap<(u64, [u8; 32]), u32>>> =
+static BLOCK_STALL: LazyLock<Mutex<HashMap<BlockKey, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// How often a dropped-connection notice may repeat.
+///
+/// A full connection table fires on EVERY accept, so an unconditional line would
+/// be a log that scrolls its own explanation away during the incident it is
+/// describing. Once every thirty seconds keeps it readable and still makes the
+/// incident impossible to miss.
+const CONN_DROP_EVERY: Duration = Duration::from_secs(30);
+/// The last dropped-connection notice printed, and when.
+static CONN_DROP_LOG: LazyLock<Mutex<Option<(String, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Print a connection-drop notice unless the same one was printed recently.
+///
+/// Keyed on the TEXT, so "the table is full" and "this IP is at its limit" do
+/// not silence each other: they have different causes and different fixes.
+fn drop_notice(state: &mut Option<(String, Instant)>, now: Instant, text: &str) {
+    let repeat = match state.as_ref() {
+        Some((last, at)) => last != text || now.duration_since(*at) >= CONN_DROP_EVERY,
+        None => true,
+    };
+    if repeat {
+        eprintln!("{text}");
+        *state = Some((text.to_string(), now));
+    }
+}
+
+/// The share of the hash gate any ONE source may hold at once, as a divisor of
+/// the total. A quarter: an attacker holding their full MAX_PER_IP connections
+/// still leaves three quarters of the machine for everybody else.
+const HASH_PEER_SHARE_DIVISOR: usize = 4;
+
+/// Bounds how many x16rs verifications run at once, and how many of those one
+/// source may hold.
+///
+/// Verifying a submission is deliberately slow, it happens off the pool lock,
+/// and NOTHING bounded how many ran at the same time: a connection is a thread,
+/// MAX_CONNS is 1024, and every one of them could be computing. An
+/// unauthenticated client bought one slow hash per roughly 100-byte GET, and at
+/// scale the machine's entire hashing capacity went into verifying garbage while
+/// an honest miner's share - and the winning worker's block submission - waited
+/// behind it.
+///
+/// This does NOT refuse anything. A submission that has to wait still gets
+/// verified, because a submission may turn out to be a block and this pool never
+/// throws one away to save CPU. What it stops is a thousand CPU-bound threads
+/// thrashing one machine, and it stops any single source occupying all of it.
+///
+/// The per-source share is why this is not merely tidier. Bounding the total
+/// alone would let one IP's MAX_PER_IP connections take every permit; with a
+/// share, honest miners keep making progress while an attacker is throttled to
+/// their quarter.
+struct HashGate {
+    /// (verifications running, how many each peer is running).
+    state: Mutex<(usize, HashMap<String, usize>)>,
+    room: Condvar,
+    total: usize,
+    per_peer: usize,
+}
+
+impl HashGate {
+    fn new(total: usize) -> Self {
+        let total = total.max(2);
+        Self {
+            state: Mutex::new((0, HashMap::new())),
+            room: Condvar::new(),
+            total,
+            per_peer: (total / HASH_PEER_SHARE_DIVISOR).max(1),
+        }
+    }
+
+    /// Wait for room, then hold a permit until the returned guard is dropped.
+    fn enter(&self, peer: &str) -> HashPermit<'_> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let mine = st.1.get(peer).copied().unwrap_or(0);
+            if st.0 < self.total && mine < self.per_peer {
+                st.0 += 1;
+                *st.1.entry(peer.to_string()).or_insert(0) += 1;
+                return HashPermit {
+                    gate: self,
+                    peer: peer.to_string(),
+                };
+            }
+            st = self.room.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Releases a hash permit on scope exit, INCLUDING on an unwind: a panicking
+/// verification must not leak a permit and shrink the gate for the life of the
+/// process.
+struct HashPermit<'a> {
+    gate: &'a HashGate,
+    peer: String,
+}
+
+impl Drop for HashPermit<'_> {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0 = st.0.saturating_sub(1);
+        if let Some(c) = st.1.get_mut(&self.peer) {
+            *c -= 1;
+            if *c == 0 {
+                st.1.remove(&self.peer);
+            }
+        }
+        drop(st);
+        self.gate.room.notify_all();
+    }
+}
+
+/// One permit per core, which is what the work actually contends for.
+static HASH_GATE: LazyLock<HashGate> = LazyLock::new(|| {
+    HashGate::new(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    )
+});
+
+/// How long a rendered `/stats` body may be served again without recomputing it.
+///
+/// `/stats` is open and unauthenticated, and building it walks the whole share
+/// window and every banked credit bucket, allocates a String per worker and
+/// sorts. That used to happen under the global pool mutex on every single
+/// request, so anyone inside the per-IP allowance could serialize every miner's
+/// share submission behind their polling - and a found block needs that same
+/// mutex.
+///
+/// Two seconds is shorter than the template loop's own cycle, so the page never
+/// looks stuck, and it bounds the work to once per interval no matter how hard
+/// the endpoint is hit. Nothing money-critical reads this: `hbit-pool-payout`
+/// used to take its recipient list from here and no longer does.
+const STATS_CACHE_MS: u64 = 2_000;
+/// The last rendered `/stats` body and when it was built.
+///
+/// LOCK ORDER: this is taken BEFORE the pool mutex and never while holding it.
+/// The recompute happens with this held, so a flood of requests produces exactly
+/// one computation rather than one per waiting thread.
+static STATS_CACHE: LazyLock<Mutex<Option<(Instant, String)>>> = LazyLock::new(|| Mutex::new(None));
+/// Heights where the chain is showing a hash that is not ours, and the hash the
+/// pool last announced for that height. Both verdicts now wait for burial, so
+/// without this the operator would learn about a fork only ~16 blocks after it
+/// began; with it they hear once per competing hash, not once per cycle.
+static REORG_WATCH: LazyLock<Mutex<HashMap<u64, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Lock the pool, recovering from a poisoned mutex instead of cascading panics.
@@ -429,6 +628,26 @@ struct Immature {
     /// for, and `/submit/block` reports only that it took the block. Settlement
     /// reads it back off the node before it values anything.
     fees_counted: bool,
+    /// Who was mining when this block was found, and how much each had earned:
+    /// the PPLNS credit vector frozen at the instant of discovery.
+    ///
+    /// NOTHING IS PAID FROM THIS YET. It is recorded, persisted and reported,
+    /// and settlement still splits over the LIVE window exactly as before. This
+    /// is stage one of a change that moves money between people, and the point
+    /// of recording first is that the two answers can be compared on real blocks
+    /// before either becomes the one that pays.
+    ///
+    /// Why it has to exist at all: a block found at T is payable about eighty
+    /// minutes later, and the split is taken from whoever holds credit THEN. A
+    /// miner who connects after the block was found is paid out of it; a miner
+    /// who leaves before settlement is paid nothing for the work that found it.
+    /// The reward belongs to the miners whose work was present when the block
+    /// was found, and this is the only record of who that was - the window has
+    /// rolled over many times by the time the money moves.
+    ///
+    /// Empty means "no snapshot", which is the honest reading for every block
+    /// found before this field existed. It is never read as "nobody was mining".
+    claim: Vec<(String, u64)>,
 }
 
 /// `durable` fsyncs before the rename; the frequent debounced share-save skips it
@@ -491,6 +710,33 @@ struct Pool {
     /// cannot be taken back. Re-derived from the live target on every template
     /// change, so it also clears by itself once the difficulty recovers.
     share_halt: Option<String>,
+    /// Why this pool has stopped moving money, for a reason no template change
+    /// can clear.
+    ///
+    /// `share_halt` above is DERIVED: `recompute_share_target` rebuilds it from
+    /// the live difficulty on every template change, so it heals by itself and
+    /// anything written into it is gone within seconds. That is right for a
+    /// difficulty fall and wrong for a durable-write failure, which does not
+    /// heal because the pool noticed it.
+    ///
+    /// Set when the accounting could not be persisted. It gates the same two
+    /// things `share_halt` gates - new share credit and fresh settlement - and
+    /// deliberately does NOT gate the resolution of payouts already in flight,
+    /// which is money owed to named miners and must still reach them.
+    ///
+    /// Not persisted. A restart clears it, and if the write that set it never
+    /// succeeded then the restart also reads a state file that never learned
+    /// about the block. That hole closes when the ledger becomes durable; until
+    /// then the halt message says so in as many words.
+    accounting_halt: Option<String>,
+    /// Why the node cannot be trusted to say where the chain is, if so.
+    ///
+    /// Derived from the tip's own timestamp on every template cycle, so it heals
+    /// by itself the moment the node catches up. It has to be computed OUTSIDE
+    /// the "the template changed" branch, because the whole signature of a node
+    /// that has stopped following the chain is that nothing changes: it keeps
+    /// answering, keeps returning the same height, and looks calm.
+    node_halt: Option<String>,
     network_target: [u8; 32],
     /// Cached /query/miner/pending response for the current template, rebuilt
     /// only when the template changes so a poll never rebuilds it under the lock.
@@ -505,6 +751,11 @@ struct Pool {
     seen: HashSet<(u64, [u8; 32], u32)>,
     /// Blocks we submitted, awaiting confirmation that they stuck.
     submitted: Vec<(u64, [u8; 32])>,
+    /// Backoff schedule for handing a found block to the node. A field rather
+    /// than a bare constant so a test can drive the real submission path without
+    /// paying the real sleeps - the block path is the one place where a test
+    /// that re-implements the loop instead of calling it is worth nothing.
+    block_submit_delays: &'static [Duration],
     /// Found blocks whose income is NOT yet safe to distribute. An entry leaves
     /// only once the chain still holds OUR hash COINBASE_MATURITY_DEPTH blocks
     /// later, or immediately once the chain shows a different hash there
@@ -590,6 +841,15 @@ struct Pool {
     /// persisted: a restart hands everyone a full bucket, which is the same
     /// position an honest worker is always in.
     rates: HashMap<String, ShareRate>,
+    /// Shares admitted with NO budget spent, because `rates` was full of ids that
+    /// were all still active and the prune freed nothing. The limiter fails open
+    /// there on purpose, so this count is the only evidence anywhere that the
+    /// guard stopped running. Diagnostic, so not persisted: a restart empties
+    /// `rates`, and the condition either comes back or it does not.
+    rate_untracked: u64,
+    /// The `rate_untracked` count when the operator was last told, and the pool
+    /// clock at that moment. `None` until it has been said once.
+    rate_open_told: Option<(u64, u64)>,
     /// Accepted shares waiting to be reported as ONE line. Diagnostic only, so
     /// not persisted: a restart starts a fresh count and says so.
     share_log: ShareLog,
@@ -827,6 +1087,18 @@ impl Pool {
         .err();
     }
 
+    /// Why the pool must not credit a fresh share or settle anything, if so.
+    ///
+    /// One accessor for both halts so a third call site cannot be added that
+    /// consults only one of them. The accounting halt is reported first: it is
+    /// the one that does not heal, so it is the one an operator has to act on.
+    fn halt_reason(&self) -> Option<&str> {
+        self.accounting_halt
+            .as_deref()
+            .or(self.node_halt.as_deref())
+            .or(self.share_halt.as_deref())
+    }
+
     /// Rebuild the derived in-flight total from the payout rows.
     fn rebuild_inflight(&mut self) {
         self.inflight_units = self
@@ -944,6 +1216,10 @@ impl Pool {
     /// False means it is submitting faster than the share target says any
     /// hardware on this chain could FIND shares, which is what a batch of
     /// withheld shares looks like on the wire.
+    ///
+    /// True is NOT the opposite claim. Past `RATE_WORKERS` ids that are all still
+    /// active this returns true for a worker it is not tracking at all, so true
+    /// means "not caught by this" and never "inside its budget".
     fn rate_admits_share(&mut self, worker: &str, now_ms: u64) -> bool {
         let per_sec = worker_share_rate(pool_core::share_cost_bits(&self.share_target));
         let burst = worker_burst(per_sec);
@@ -957,6 +1233,13 @@ impl Pool {
                 // Fail OPEN. Refusing an honest miner's work because a bookkeeping
                 // map is full costs it real money; the residence weighting is what
                 // actually decides the split, and it does not depend on this.
+                //
+                // Counted, because for as long as this lasts the one thing holding
+                // back a batch of withheld shares is not running and nothing else
+                // would say so. ONE integer add: the pool mutex is held here with
+                // every miner's request behind it, so the LINE is composed on the
+                // template cycle instead, in `rate_open_notice`.
+                self.rate_untracked = self.rate_untracked.saturating_add(1);
                 return true;
             }
         }
@@ -965,6 +1248,44 @@ impl Pool {
             at_ms: now_ms,
         });
         rate_admits(st, now_ms, per_sec, burst)
+    }
+
+    /// The line owed when the per-worker budget has gone open, if one is owed.
+    ///
+    /// `rate_admits_share` admits shares it is not tracking once `rates` is full
+    /// of active ids, and that is deliberate. What is not acceptable is silence:
+    /// while it lasts, the one thing holding back a batch of withheld shares
+    /// dumped at a settlement is not running, and only the pool can see it.
+    ///
+    /// Called from the template cycle rather than from the share path. That path
+    /// holds the pool mutex with every miner's request serialized behind it, and
+    /// a `format!` plus a blocking write to stderr under that lock is exactly the
+    /// per-share println this pool already had to take back out.
+    fn rate_open_notice(&mut self, now_ms: u64) -> Option<String> {
+        let told = match self.rate_open_told {
+            None => 0,
+            Some((told, at)) => {
+                // A clock that steps BACKWARDS (an ntp correction, a resumed VM)
+                // must not silence a live incident until it catches up, so a
+                // negative span reads as due.
+                if now_ms >= at && now_ms - at < RATE_OPEN_REPEAT_MS {
+                    return None;
+                }
+                told
+            }
+        };
+        // Nothing new since the last line, or nothing has happened at all yet.
+        let more = self.rate_untracked.checked_sub(told).filter(|n| *n > 0)?;
+        let total = self.rate_untracked;
+        self.rate_open_told = Some((total, now_ms));
+        Some(format!(
+            "[shares] the per-worker rate limiter is OPEN: {more} more share(s) admitted with no \
+             budget spent, {total} in this process. All {RATE_WORKERS} tracked worker slots hold \
+             ids that are still active, so a new id has nowhere to be recorded. Those shares are \
+             still credited on purpose, because refusing honest work costs a miner real money, \
+             but until the flood of worker ids stops nothing is holding back a batch of withheld \
+             shares dumped at a settlement."
+        ))
     }
 
     /// Stable per-worker extranonce -> private search space (coinbase miner_nonce).
@@ -998,6 +1319,12 @@ impl Pool {
             return None;
         }
         let body = json!({
+            // Which build's accounting format this is. Read back by
+            // classify_state_file, which refuses at startup rather than let an
+            // older build misread a newer file and pay out money it cannot see.
+            // A file without this key reads as schema 1 - every file written
+            // before the key existed is exactly that.
+            "schema": STATE_SCHEMA,
             "window": PPLNS_WINDOW,
             // (worker, arrival time in ms). The times are not decoration: without
             // them a restart would reset every share's age to zero and hand the
@@ -1046,15 +1373,21 @@ impl Pool {
                 // income and never add the transaction fees the chain credited
                 // alongside it, which is money paid out at zero confirmations.
                 "fees_counted": e.fees_counted,
+                // Who was mining when this block was found. Persisted because a
+                // restart is the ordinary case between a block and its payout,
+                // roughly eighty minutes later, and this is the only record of
+                // it: the share window has rolled over many times by then.
+                "claim": e.claim,
             })).collect::<Vec<_>>(),
             // The header timestamp currently being served, so a restart inside a
             // height reproduces the SAME 89 bytes instead of re-stamping them.
             // Without it a restart silently invalidates every worker's in-flight
             // scan pass: measured on a rig, a restart at height 350 served a
-            // stamp 68 seconds later than the one already in flight, and
-            // /query/miner/notice only signals a HEIGHT change so nothing told
-            // the workers to reload. Thousands of shares were hashed into
-            // nothing before their scan passes ended.
+            // stamp 68 seconds later than the one already in flight, and nothing
+            // told the workers to reload. A restart RE-STAMPS rather than swaps,
+            // so the template thread never sees a change and no notice fires:
+            // the parked-job wake-up covers a reorg, not this. Thousands of
+            // shares were hashed into nothing before their scan passes ended.
             "template_stamp": {
                 "height": self.tpl.height,
                 // The parent as well as the height: after a same-height reorg the
@@ -1074,30 +1407,22 @@ impl Pool {
         })
     }
 
-    fn load_state(&mut self) {
-        let Ok(txt) = std::fs::read_to_string(&self.state_file) else {
-            return;
-        };
-        let j: serde_json::Value = match serde_json::from_str(&txt) {
-            Ok(j) => j,
-            Err(e) => {
-                // Never silently wipe accounting: preserve the corrupt file and
-                // start fresh only after loudly flagging it for the operator.
-                let bak = format!("{}.corrupt.{}", self.state_file, std::process::id());
-                let _ = std::fs::rename(&self.state_file, &bak);
-                eprintln!(
-                    "[state] file corrupt ({e}); preserved as {bak}, starting with empty accounting"
-                );
-                return;
-            }
-        };
+    /// Load accounting from an already-classified ledger document.
+    ///
+    /// It no longer reads or validates the file: `classify_state_file` did that
+    /// at startup, BEFORE any wallet could be created, and refused the process
+    /// outright on anything unreadable. That is why there is no "start empty on a
+    /// bad file" branch here any more - reaching this function at all means the
+    /// file is a JSON object this build's schema covers, so a missing key is a
+    /// real default and never a swallowed error.
+    fn load_state(&mut self, j: &serde_json::Value) {
         // A file written before shares were timed carries bare worker ids. Every
         // one of them is given the same arrival time, one horizon back, so the
         // window comes back weighing exactly what the older build weighed it at:
         // a restart must not move money between miners, in either direction.
         let horizon = self.pplns.horizon_ms();
-        let order = parse_share_order(&j, pool_core::now_ms().saturating_sub(horizon));
-        let banked = parse_banked_credit(&j);
+        let order = parse_share_order(j, pool_core::now_ms().saturating_sub(horizon));
+        let banked = parse_banked_credit(j);
         self.pplns = Pplns::restore(PPLNS_WINDOW, horizon, order, banked);
         self.accepted = j.get("accepted").and_then(|v| v.as_u64()).unwrap_or(0);
         self.blocks = j.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1147,11 +1472,32 @@ impl Pool {
                             .get("fees_counted")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // A file written before the snapshot existed carries no
+                        // `claim`, and that reads as "no snapshot" - never as
+                        // "nobody was mining". The difference matters the day
+                        // this decides a payout: an empty claim must fall back
+                        // to the old behaviour, not pay nobody.
+                        let claim = x
+                            .get("claim")
+                            .and_then(|v| v.as_array())
+                            .map(|rows| {
+                                rows.iter()
+                                    .filter_map(|r| {
+                                        let a = r.as_array()?;
+                                        Some((
+                                            a.first()?.as_str()?.to_string(),
+                                            a.get(1)?.as_u64()?,
+                                        ))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         Some(Immature {
                             height,
                             hash,
                             units,
                             fees_counted,
+                            claim,
                         })
                     })
                     .collect()
@@ -1162,9 +1508,9 @@ impl Pool {
         // paid" to zero and make the pool report a number that quietly means
         // something else, so it is restored with everything else and its start
         // time travels with it.
-        self.payout_records = parse_payout_records(&j);
-        self.owed = parse_owed(&j);
-        self.paid = parse_paid_ledger(&j);
+        self.payout_records = parse_payout_records(j);
+        self.owed = parse_owed(j);
+        self.paid = parse_paid_ledger(j);
         self.rebuild_inflight();
         let owed_units: u64 = self
             .owed
@@ -1248,10 +1594,10 @@ fn bump_bad_streak(
     if st.count < BAD_STREAK_WARN {
         return None;
     }
-    if let Some(at) = st.warned_at_ms {
-        if now_ms.saturating_sub(at) < BAD_STREAK_REPEAT_MS {
-            return None;
-        }
+    if let Some(at) = st.warned_at_ms
+        && now_ms.saturating_sub(at) < BAD_STREAK_REPEAT_MS
+    {
+        return None;
     }
     st.warned_at_ms = Some(now_ms);
     Some(st.count)
@@ -1284,10 +1630,10 @@ fn bad_streak_message(worker: &str, streak: u64, since_change_ms: u64) -> String
     if since_change_ms < TEMPLATE_SETTLE_MS {
         msg.push_str(
             " The pool has just changed its template or just restarted, which changes the \
-             header under every connected worker, and /query/miner/notice signals only a HEIGHT \
-             change - so a worker keeps hashing the header it was handed until its current scan \
-             pass ends. That alone explains this, it costs only the work already in flight, and \
-             it clears by itself. Nothing to do yet.",
+             header under every connected worker. /query/miner/notice releases a parked rig on \
+             that change, but only at the next poll, and a worker keeps hashing the header it \
+             was handed until its current scan pass ends. That alone explains this, it costs \
+             only the work already in flight, and it clears by itself. Nothing to do yet.",
         );
     } else {
         msg.push_str(
@@ -2215,7 +2561,51 @@ fn main() {
         )),
     };
 
-    let client = http_client();
+    // Every request this process makes to the node carries the token, because it
+    // rides on the client rather than on each of the twenty-odd call sites. A
+    // node bound to anything but loopback REFUSES to serve its API with an empty
+    // token, so without this a pool in a container network or on a private LAN
+    // can never reach its node at all.
+    let wallet_existed = std::path::Path::new(&wallet_file).exists();
+    // Read the ledger BEFORE a wallet can be created, and refuse rather than run
+    // with empty accounting beside one that holds money.
+    //
+    // The order matters as much as the check. load_or_create_wallet below will
+    // WRITE a key file if none is there, so the classification has to happen
+    // first: a run that is going to refuse must not leave a real-money wallet
+    // behind for the next start to inherit. Empty accounting beside a funded
+    // wallet is the failure that pays the current PPLNS window the whole balance
+    // - every owed debt forgotten, every in-flight payout's signed bytes gone,
+    // every immature hold-back dropped so a subsidy is distributed at zero
+    // confirmations.
+    let state_file_path = pool_state_path(&wallet_file);
+    let ledger: Option<serde_json::Value> = match classify_state_file(&state_file_path) {
+        StateFile::Fresh => None,
+        StateFile::Readable(j) => Some(*j),
+        StateFile::Unreadable(why) => refuse(&format!(
+            "REFUSING to start: {why}.\n\
+             {}\n\
+             This pool will not start with empty accounting: the wallet may hold miners' money, \
+             and settling on a blank ledger would pay the current share window the entire \
+             balance - forgetting every debt, every payout already in flight, and every block \
+             still maturing.\n\
+             What to do: restore the accounting file from a backup, or fix why it cannot be \
+             read (a permission change, a half-written file, a wrong path). The file has not \
+             been touched. If you have genuinely decided to start fresh - the wallet is empty \
+             and nothing is owed - move the unreadable file aside by hand and start again.",
+            if wallet_existed {
+                format!("A pool wallet already exists at {wallet_file}.")
+            } else {
+                format!(
+                    "No wallet exists at {wallet_file} yet, but a broken accounting file is \
+                     sitting where one belongs, which means this is not the clean first run it \
+                     looks like."
+                )
+            }
+        )),
+    };
+
+    let client = http_client_with_token(&std::env::var(NODE_API_TOKEN_ENV).unwrap_or_default());
     // Two different failures with two different fixes, so they get two different
     // messages: a node that is not answering at all, and a node that is answering
     // about a different chain than the one named on the command line.
@@ -2235,12 +2625,28 @@ fn main() {
     // nothing says so: the pool just mines dead work indefinitely.
     if let Err(e) = verify_chain_params(&client, &node, &params) {
         refuse(&format!(
-            "REFUSING to start: {e}\n\
-             What to do: pass the chain that node is really on as <chain>. If it is a testnet, \
-             spell out its own two settings as \
-             `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`, copied from that \
-             node's hacash.config.ini. Do not work around this: every block the pool found would \
-             be thrown away and every miner here would earn nothing."
+            // The chain-argument advice belongs ONLY to a refusal that is about
+            // the chain argument. `verify_chain_params` also refuses for reasons
+            // that have nothing to do with it - a tip too old to mine on, a node
+            // with no blocks - and appending it there tells an operator to change
+            // a setting that is already correct, directly contradicting the
+            // instruction the refusal itself just gave them. Seen in a live run:
+            // "wait for the node to reach the network tip" followed immediately
+            // by "pass the chain that node is really on".
+            //
+            // Every refusal from that function now carries its own "What to do".
+            // This one adds the chain hint only when it is the chain that is in
+            // question.
+            "REFUSING to start: {e}{}",
+            if e.contains("difficulty rule mismatch") || e.contains("pre-ASERT") {
+                "\nWhat to do: pass the chain that node is really on as <chain>. If it is a \
+                 testnet, spell out its own two settings as \
+                 `testnet:<difficulty_adjust_blocks>:<each_block_target_time>`, copied from \
+                 that node's hacash.config.ini. Do not work around this: every block the pool \
+                 found would be thrown away and every miner here would earn nothing."
+            } else {
+                ""
+            }
         ));
     }
     // Bind BEFORE creating a wallet. The commonest first-run mistakes here are a
@@ -2257,7 +2663,6 @@ fn main() {
         )),
     };
 
-    let wallet_existed = std::path::Path::new(&wallet_file).exists();
     // The ONE read of the key file this process makes. Startup is the only place
     // a wallet may be created or a failure may stop the program, because it is
     // the only place an operator is watching and no money is in flight yet.
@@ -2370,6 +2775,8 @@ fn main() {
         // `refuse` exits, so reaching here means healthy. Every later template
         // change re-derives this from the same function.
         share_halt: None,
+        accounting_halt: None,
+        node_halt: None,
         network_target,
         pending_cache: String::new(),
         workers: HashMap::new(),
@@ -2380,6 +2787,7 @@ fn main() {
         orphaned: 0,
         seen: HashSet::new(),
         submitted: Vec::new(),
+        block_submit_delays: BLOCK_SUBMIT_RETRY_DELAYS,
         immature: Vec::new(),
         unsaved: 0,
         state_seq: 0,
@@ -2401,9 +2809,13 @@ fn main() {
         // grounds to say anything about them.
         tpl_changed_at_ms: pool_core::now_ms(),
         rates: HashMap::new(),
+        rate_untracked: 0,
+        rate_open_told: None,
         share_log: ShareLog::default(),
     };
-    pool.load_state();
+    if let Some(j) = &ledger {
+        pool.load_state(j);
+    }
     if pool.paid.since == 0 {
         // A state file written before the ledger existed: start counting now
         // rather than claim a total that reaches back further than it does.
@@ -2434,7 +2846,7 @@ fn main() {
                 // The wallet valuation behind every miner's PENDING figure is
                 // refreshed here, on a slow multiple of the template cycle: it is
                 // one extra node call, and it must never happen on a request.
-                let money = tick % MONEY_REFRESH_CYCLES == 0;
+                let money = tick.is_multiple_of(MONEY_REFRESH_CYCLES);
                 tick = tick.wrapping_add(1);
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     template_cycle(&pool, &client, &node, &payout, &params, money);
@@ -2450,9 +2862,19 @@ fn main() {
                 // line is composed under the lock and printed off it: stdout can
                 // block, and every miner request is serialized behind this
                 // mutex.
-                let due = plock(&pool).share_log.due(pool_core::now_ms());
+                let now_ms = pool_core::now_ms();
+                let (due, open) = {
+                    let mut g = plock(&pool);
+                    (g.share_log.due(now_ms), g.rate_open_notice(now_ms))
+                };
                 if let Some(line) = due {
                     println!("{line}");
+                }
+                // The per-worker budget has stopped running for some shares. Same
+                // discipline for the same reason: composed under the lock above,
+                // written here. On stderr, with the other operator warnings.
+                if let Some(line) = open {
+                    eprintln!("{line}");
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -2491,6 +2913,20 @@ fn main() {
             }
         };
         if CONNS.load(Relaxed) >= MAX_CONNS {
+            // Say so. This used to be a bare `continue`: the socket closed with
+            // no answer and no line anywhere, and a /submit/miner/success
+            // carrying a found block died exactly the same way as a port scan.
+            // The miner cannot tell a refusal from a network fault either, so
+            // the ONLY evidence that a block was dropped here is this log.
+            drop_notice(
+                &mut CONN_DROP_LOG.lock().unwrap_or_else(|e| e.into_inner()),
+                Instant::now(),
+                &format!(
+                    "[accept] the connection table is FULL ({MAX_CONNS}); connections are being \
+                     dropped unanswered. A miner submitting a found block right now would be \
+                     dropped too, and would see only a closed socket."
+                ),
+            );
             continue; // drop: s closes as it goes out of scope
         }
         let ip = s.peer_addr().ok().map(|a| a.ip());
@@ -2500,6 +2936,20 @@ fn main() {
             let mut m = per_ip_lock();
             let c = m.entry(ip).or_insert(0);
             if *c >= MAX_PER_IP {
+                drop(m);
+                // Also loud, and for a sharper reason: a whole mining FARM behind
+                // one NAT is one IP here, so this fires on honest fleets as well
+                // as on abuse, and the operator is the only one who can tell
+                // which it is.
+                drop_notice(
+                    &mut CONN_DROP_LOG.lock().unwrap_or_else(|e| e.into_inner()),
+                    Instant::now(),
+                    &format!(
+                        "[accept] {ip} is at its limit of {MAX_PER_IP} connections; further ones \
+                         are dropped unanswered, including a block submission. If that is one \
+                         miner, this is abuse; if it is a farm or a NAT, they are ALL behind it."
+                    ),
+                );
                 continue; // drop this connection from a noisy IP
             }
             *c += 1;
@@ -2607,17 +3057,31 @@ fn template_cycle(
     // blocks_confirmed would over-count against the chain for good.
     let mut confirmed = Vec::new();
     let mut orphaned = Vec::new();
+    // Heights where the chain is currently showing somebody else's hash at a
+    // depth where that means nothing yet. Provisional: said out loud once per
+    // competing hash, decided by nobody.
+    let mut contested: Vec<(u64, String)> = Vec::new();
     for (h, ours) in &pending {
         match chain_hash.get(h) {
-            Some(cur) if *cur == hex::encode(ours) => {
-                if buried_deep(tip, *h) {
-                    confirmed.push((*h, *ours));
-                }
-                // Not buried yet: keep watching it, a reorg can still flip it.
+            Some(cur) if *cur == hex::encode(ours) && buried_deep(tip, *h) => {
+                confirmed.push((*h, *ours));
             }
+            // Not buried yet: keep watching it, a reorg can still flip it.
             Some(cur) => {
-                orphaned.push((*h, *ours));
-                println!("[reorg] our block {h} orphaned (chain holds {cur})");
+                // A competing hash is definitive only under the SAME burial the
+                // confirm arm demands. At depth zero it is a one-block fork, and
+                // the common fate of a one-block fork is to flip back. Tallying
+                // the orphan here used to stop the pool watching the height, so
+                // a flip-back could never be seen again.
+                if buried_deep(tip, *h) {
+                    orphaned.push((*h, *ours));
+                    println!(
+                        "[reorg] our block {h} orphaned (chain holds {cur}, buried \
+                         {COINBASE_MATURITY_DEPTH} deep)"
+                    );
+                } else {
+                    contested.push((*h, cur.clone()));
+                }
             }
             None => {} // node has not stored it yet; keep waiting
         }
@@ -2629,16 +3093,45 @@ fn template_cycle(
     let mut released: Vec<(u64, [u8; 32])> = Vec::new();
     for e in &immature {
         match chain_hash.get(&e.height) {
-            Some(cur) if *cur == hex::encode(e.hash) => {
+            Some(cur) if *cur == hex::encode(e.hash) && buried_deep(tip, e.height) => {
+                released.push((e.height, e.hash));
+            }
+            // A different hash at our height: that income never lands in the
+            // balance IF this sticks, so the hold-back would have nothing left
+            // to hold. But releasing it at depth zero was the defect that paid a
+            // whole subsidy at no confirmations. A one-block fork usually flips
+            // back; when it does, the income really is in the wallet, and a
+            // hold-back released here was gone for good because nothing re-adds
+            // one. So the release waits for the same burial a confirmation
+            // needs. The cost of waiting when the orphan is real: those units
+            // stay held for ~16 blocks during which they were never spendable
+            // anyway, because the income they describe never arrived.
+            Some(cur) => {
                 if buried_deep(tip, e.height) {
                     released.push((e.height, e.hash));
+                } else {
+                    contested.push((e.height, cur.clone()));
                 }
             }
-            // Orphaned: that income never lands in the balance, so there is
-            // nothing left to hold back.
-            Some(_) => released.push((e.height, e.hash)),
             None => {}
         }
+    }
+    // Tell the operator a fork is showing without waiting the full burial, and
+    // without printing it on every two-second cycle: once per competing hash.
+    contested.sort_unstable();
+    contested.dedup();
+    let fork_notices = {
+        let mut st = REORG_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        note_contested_heights(&mut st, &contested)
+    };
+    for (h, cur) in fork_notices {
+        eprintln!(
+            "[reorg?] the chain is showing {cur} at height {h} where our block stands. This is \
+             PROVISIONAL: nothing has been decided and no money has moved. The hold-back for \
+             that block stays held either way; if the competing hash is still there \
+             {COINBASE_MATURITY_DEPTH} blocks deep the block will be reported orphaned, and if \
+             the chain flips back it will confirm normally."
+        );
     }
     // Value the pool wallet OFF the lock, so `/earnings` can answer a PENDING
     // question without any node call at all. Balance FIRST and the hold-back
@@ -2684,6 +3177,11 @@ fn template_cycle(
     let mut shot = None;
     let mut degraded: Option<String> = None;
     let mut resumed = false;
+    let mut node_degraded: Option<String> = None;
+    // Reported once per cycle, off the lock, so the comparison never costs a
+    // miner a moment of the pool mutex.
+    let mut claim_drift: Option<String> = None;
+    let mut node_resumed = false;
     let mut tpl_changed = false;
     {
         let mut p = plock(pool);
@@ -2697,6 +3195,30 @@ fn template_cycle(
             }
         }
         if let Some(t) = fresh {
+            // Is the chain this template stands on still moving?
+            //
+            // Deliberately OUTSIDE the "the template changed" branch below,
+            // which is where a check like this wants to be written. The entire
+            // signature of a node that has stopped following the chain is that
+            // NOTHING changes: it keeps answering, keeps returning the same
+            // height, and a check that only runs on a change never runs again.
+            //
+            // The tip's own timestamp is the only evidence available here. The
+            // template's `timestamp` cannot serve: it is derived from the wall
+            // clock, so on a node stuck a week ago it still reads as now.
+            let stale = tip_too_old(
+                t.height.saturating_sub(1),
+                t.prev_timestamp,
+                curtimes(),
+                TIP_STALE_SECS_WHILE_RUNNING,
+            );
+            match (&stale, p.node_halt.is_some()) {
+                (Some(why), false) => node_degraded = Some(why.clone()),
+                (None, true) => node_resumed = true,
+                _ => {}
+            }
+            p.node_halt = stale;
+
             // Replace the template when the tip changes: either a new height, or
             // a same-height reorg (different prev-hash). At the same height and
             // same prev-hash the timestamp/difficulty are fixed, so keeping the
@@ -2748,6 +3270,21 @@ fn template_cycle(
         p.submitted
             .retain(|e| !confirmed.contains(e) && !orphaned.contains(e));
         if !released.is_empty() {
+            // A block's income is about to become payable, so this is the moment
+            // the two models can be compared on real money: who earned it when
+            // it was found, against who is holding credit now. Reported only -
+            // the split below is unchanged, and stays unchanged until this has
+            // been watched on real blocks.
+            let now_credit = p.pplns.credit(pool_core::now_ms());
+            for e in &p.immature {
+                if released
+                    .iter()
+                    .any(|(h, hx)| *h == e.height && *hx == e.hash)
+                {
+                    claim_drift = claim_drift
+                        .or_else(|| describe_claim_drift(e.height, e.units, &e.claim, &now_credit));
+                }
+            }
             // Matched on (height, hash) alone, NEVER on the whole entry: the
             // settlement thread can fold a block's transaction fees into `units`
             // between the snapshot above and this lock, and a whole-entry match
@@ -2784,6 +3321,25 @@ fn template_cycle(
         println!(
             "[share] the difficulty recovered: shares are being credited again and settlement \
              has resumed"
+        );
+    }
+    if let Some(why) = node_degraded {
+        eprintln!(
+            "[node] STOPPED crediting shares and STOPPED settling: {why}.\n\
+             Every rig pointed here is hashing a template built on that tip, and a block found \
+             on it would be worth nothing. Check that the node is still following the chain: \
+             this deployment's known failure is a history sync that finishes short of the tip \
+             and then ignores live blocks until the process is restarted. Crediting and \
+             settlement resume by themselves the moment the node catches up."
+        );
+    }
+    if let Some(drift) = claim_drift {
+        println!("{drift}");
+    }
+    if node_resumed {
+        println!(
+            "[node] the tip is moving again: shares are being credited and settlement has \
+             resumed"
         );
     }
     flush_state(shot);
@@ -2860,6 +3416,225 @@ fn note_block_stalls(
         // Exactly at the threshold: one loud line per lost block, not a stream.
         if *n == BLOCK_STALL_CYCLES {
             shout.push(*key);
+        }
+    }
+    shout
+}
+
+/// The `/stats` body, rebuilt at most once per [`STATS_CACHE_MS`].
+///
+/// Everything expensive happens here and nowhere near a miner's request path.
+/// Building this walks the whole share window and every banked credit bucket,
+/// allocates a String per worker and sorts twice; doing that under the global
+/// pool mutex on every request let one unauthenticated poller serialize every
+/// share submission - and a found block - behind it.
+///
+/// The cache lock is held across the recompute on purpose. It is taken BEFORE
+/// the pool mutex and never while holding it, so there is no cycle, and holding
+/// it means a burst of requests costs ONE computation while the rest wait for
+/// its result rather than each doing their own.
+fn stats_body(pool: &Arc<Mutex<Pool>>, now: Instant) -> String {
+    let mut cache = STATS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, body)) = cache.as_ref()
+        && now.duration_since(*at) < Duration::from_millis(STATS_CACHE_MS)
+    {
+        return body.clone();
+    }
+    let (
+        height,
+        difficulty,
+        accepted,
+        blocks,
+        pending,
+        orphaned,
+        window,
+        workers,
+        credit,
+        credit_refused,
+    ) = {
+        let p = plock(pool);
+        (
+            p.tpl.height,
+            p.tpl.difficulty,
+            p.accepted,
+            p.blocks,
+            p.submitted.len(),
+            p.orphaned,
+            p.pplns.total(),
+            p.pplns.counts(),
+            p.pplns.credit(pool_core::now_ms()),
+            // Read under the SAME lock as the credit table it belongs to: it
+            // says how much credit is missing from that table.
+            p.pplns.banked_refused_ms(),
+        )
+    };
+    let body = json!({
+        "height": height,
+        "difficulty": difficulty,
+        "accepted_shares": accepted,
+        "blocks_confirmed": blocks,
+        "blocks_pending": pending,
+        "blocks_orphaned": orphaned,
+        "share_window": window,
+        "workers": workers,
+        // What a settlement would actually split over. `workers` is the raw
+        // headcount and is for looking at only: paying by it is what lets a
+        // miner take the whole window with one burst of withheld shares.
+        "credit": credit,
+        "credit_note": "milliseconds of share residence: how long each worker's shares \
+                        have been in the payout window. Payouts are split by this, not by \
+                        the `workers` headcount.",
+        // Credit the pool's per-bucket worker cap would not hold, in the same
+        // milliseconds as the table above. 0 on any honest pool. The cap has to
+        // stay - it is what stops a flood of invented payout addresses growing
+        // that map without bound - so the pool cannot keep both the bound and
+        // that credit. It keeps the number instead: a settlement that paid
+        // somebody short leaves a mark here rather than none at all.
+        "credit_refused_ms": credit_refused,
+        "freshness_note": "rebuilt at most every 2 seconds. This page is for looking at: \
+                           nothing that moves money reads it, and hbit-pool-payout settles \
+                           from the pool's own accounting file and from nothing on a network.",
+    })
+    .to_string();
+    *cache = Some((now, body.clone()));
+    body
+}
+
+/// What a block's income would pay under each model, when they disagree.
+///
+/// `None` when there is nothing worth an operator's attention: no snapshot to
+/// compare against, or the two models would pay the same people the same way.
+///
+/// This is the whole of stage one. A block found at T is payable about eighty
+/// minutes later and is split over whoever holds credit THEN, so a miner who
+/// connected after the block was found is paid out of it and a miner who left
+/// before settlement is paid nothing for the work that found it. Changing that
+/// moves money between people, so the pool first RECORDS who earned each block
+/// and reports what the difference would have been, on real blocks, before
+/// either answer becomes the one that pays.
+fn describe_claim_drift(
+    height: u64,
+    units: u64,
+    claim: &[(String, u64)],
+    now: &[(String, u64)],
+) -> Option<String> {
+    if claim.is_empty() {
+        return None; // found before the snapshot existed: nothing to compare
+    }
+    let share = |rows: &[(String, u64)]| -> Vec<(String, u64)> {
+        let total: u128 = rows.iter().map(|(_, c)| *c as u128).sum();
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut v: Vec<(String, u64)> = rows
+            .iter()
+            .map(|(w, c)| (w.clone(), ((*c as u128 * units as u128) / total) as u64))
+            .filter(|(_, u)| *u > 0)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    };
+    let frozen = share(claim);
+    let live = share(now);
+    if frozen == live {
+        return None; // the models agree; there is nothing to warn about
+    }
+    let render = |v: &[(String, u64)]| -> String {
+        if v.is_empty() {
+            return "nobody".to_string();
+        }
+        v.iter()
+            .take(6)
+            .map(|(w, u)| format!("{w}={u}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // Named separately, because it is the number that says whether this matters.
+    let paid_but_absent: u64 = live
+        .iter()
+        .filter(|(w, _)| !claim.iter().any(|(c, _)| c == w))
+        .map(|(_, u)| *u)
+        .sum();
+    Some(format!(
+        "[claim] block {height} ({units} unit(s)) would be split differently by the two models.\n\
+         \x20 who earned it, frozen when it was found: {}\n\
+         \x20 who is credited now, and who is paid today: {}\n\
+         \x20 {paid_but_absent} unit(s) go to miners who were NOT here when this block was \
+         found. Nothing has changed: this pool still pays the second line. The first line is \
+         recorded so the difference can be seen on real blocks before it decides anything.",
+        render(&frozen),
+        render(&live)
+    ))
+}
+
+/// What `/query/miner/notice` reports, given the template this pool is serving.
+///
+/// The CHAIN TIP, which is one below the height being mined, because that is
+/// what the fullnode's own `miner_notice` returns and an unmodified miner is
+/// built against the fullnode. A miner asks with the height it is mining and
+/// reads `answer >= that` as "there is new work"; answering with the template
+/// height makes that true on every single reply, and the miner then skips the
+/// anti-spin delay it would otherwise take.
+///
+/// A pool must not need the miner to be configured differently. This one is
+/// used by ordinary Hacash miners that also point at nodes and at other pools,
+/// and the only setting a pool is entitled to change is where to connect and
+/// which address to credit.
+fn notice_height(template_height: u64) -> u64 {
+    template_height.saturating_sub(1)
+}
+
+/// The job the pool is serving: the height being mined and the parent it builds
+/// on. The same pair is the same header bytes, which is the rule the template
+/// thread swaps on (`t.height != p.tpl.height || t.prevhash != p.tpl.prevhash`)
+/// and the same rule the miner's own `install_block_mining_stuff` uses to decide
+/// a job is new. Nothing else in here has to agree with the miner; this does.
+type NoticeJob = (u64, Hash);
+
+/// Should a parked `/query/miner/notice` answer now?
+///
+/// `serving` is the job the pool has this instant, `parked_on` the one it had
+/// when this long-poll parked, and `want` the height the miner says it is
+/// mining.
+///
+/// The height test is the fullnode's, and it is the only one a miner reads as
+/// new work. The job test covers what that test cannot see: a same-height reorg
+/// moves the parent and leaves the height alone, so every rig parked here goes
+/// on hashing a header built on an abandoned block. Those shares are not merely
+/// wasted. The pool rebuilds every submission from the CURRENT template, so they
+/// come back above target and are refused, and the rig collects a bad streak for
+/// work this pool handed it.
+///
+/// Compared against the job THIS poll parked on, never against a "changed
+/// recently" flag. A released rig re-reads /query/miner/pending, comes back and
+/// parks on the new job, so one real change releases a given rig once. A flag
+/// would release it on every poll for as long as the flag was set, and the only
+/// thing between that and a whole fleet hammering the pool is the miner's 200ms
+/// floor. That would be worse than the wait it is meant to cure.
+fn notice_should_answer(serving: NoticeJob, parked_on: NoticeJob, want: u64) -> bool {
+    serving.0 > want || serving != parked_on
+}
+
+/// Which contested heights deserve a fresh provisional notice this cycle.
+///
+/// `sighted` is every (height, competing hash) currently showing; the state
+/// remembers what was last announced per height. A height announces again only
+/// when the competing hash CHANGES - a fork extending is the same fork, a new
+/// hash is new news. Heights no longer sighted are pruned, so a fork that flips
+/// back and later re-forks announces again rather than being remembered as old.
+fn note_contested_heights(
+    state: &mut HashMap<u64, String>,
+    sighted: &[(u64, String)],
+) -> Vec<(u64, String)> {
+    state.retain(|h, _| sighted.iter().any(|(sh, _)| sh == h));
+    let mut shout = Vec::new();
+    for (h, cur) in sighted {
+        let known = state
+            .get(h)
+            .is_some_and(|prev| prev.eq_ignore_ascii_case(cur));
+        if !known {
+            state.insert(*h, cur.clone());
+            shout.push((*h, cur.clone()));
         }
     }
     shout
@@ -2974,11 +3749,17 @@ impl SettleTally {
 /// Drop a payout hash the node definitively does not hold from the shared
 /// pending ledger, and put what it was going to pay onto the owed ledger.
 ///
-/// Safe ONLY for a definitive "the node never took it" - `Admission::Missing`, or
-/// a non-zero `ret` from the node's own validator. The node inserts into its
-/// mempool before it relays, so a transaction it never inserted was never
-/// broadcast either and cannot come back from a peer to be paid twice. A TIMEOUT
-/// is not that verdict and must never come here.
+/// Safe ONLY for a definitive "the node never took it": a non-zero `ret` from
+/// the node's own validator, which refuses before `handle_new_tx` reaches either
+/// the mempool insert or the peer broadcast, so those bytes cannot come back
+/// from a peer to be paid twice.
+///
+/// `Admission::Missing` USED to come here and must never come here again. It is
+/// not that verdict. It arrives after a ret=0, and on this node a ret=0 already
+/// means inserted and relayed, so Missing means the node lost a transaction it
+/// had already put on the wire. Dropping the record there destroys the only copy
+/// of the signed bytes and the next cycle signs a second transaction for the
+/// same miners. A TIMEOUT is not that verdict either.
 ///
 /// The rows do not simply return to the pot. They name the miners this chunk was
 /// for, and the next cycle would otherwise re-split that money over the whole
@@ -3037,11 +3818,19 @@ fn fold_block_fees(
 ///
 /// A block the node says is NOT on the chain is not a refusal. It credited
 /// nothing at all, so it has no fees to hold back, and the confirmation loop
-/// releases its entry once another block takes that height.
+/// releases its entry once another block takes that height. But "no block at a
+/// height at or below the node's own tip" is not that answer - it is a node
+/// failing to produce a block it must hold - and `block_txs_of` turns exactly
+/// that case into a refusal.
+///
+/// `tip` is the tip this settlement cycle already proved the node alive with,
+/// passed rather than re-read so the fee verdicts are judged against the same
+/// chain state as everything else in the cycle.
 fn count_immature_fees(
     pool: &Arc<Mutex<Pool>>,
     client: &reqwest::blocking::Client,
     node: &str,
+    tip: u64,
 ) -> Option<u64> {
     // Off the lock: this is one node call per block, plus one per transaction in
     // it, and every miner request is serialized behind this mutex.
@@ -3055,7 +3844,7 @@ fn count_immature_fees(
     };
     let mut counted: Vec<(u64, [u8; 32], u64)> = Vec::new();
     for (height, hash) in uncounted {
-        match block_fees(client, node, height, &hex::encode(hash)) {
+        match block_fees(client, node, height, &hex::encode(hash), tip) {
             BlockFees::Counted(fee) => counted.push((height, hash, fee)),
             BlockFees::NotOnChain => {}
             BlockFees::Unknown(why) => {
@@ -3520,7 +4309,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
     // miner's last payout would have read "in flight" until the chain recovered,
     // and a failed chunk's rows would not have reached the owed ledger either.
     // Nothing under here has valued a wallet or signed anything yet.
-    let halted = plock(pool).share_halt.clone();
+    let halted = plock(pool).halt_reason().map(str::to_string);
     if let Some(why) = halted {
         eprintln!(
             "[settle] payouts already in flight were resolved, but NOTHING FRESH is being \
@@ -3565,7 +4354,7 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
     // it happens here rather than on the confirmation loop's own clock so there
     // is no window in which a block has landed, its fees are in the balance, and
     // this settlement has not looked for them yet.
-    let Some(immature_units) = count_immature_fees(pool, &client, &node) else {
+    let Some(immature_units) = count_immature_fees(pool, &client, &node, tip) else {
         // The pool knows there is income it cannot value. Miners are told their
         // pending figure is STALE rather than paid out of a number that is
         // missing a block's fees.
@@ -3611,6 +4400,28 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
     // twice for the same window and the miners who were paid nothing would fund
     // it.
     let (mut plan, left) = take_owed(&owed, distributable);
+    // Money the pool is holding for a named miner whose address it cannot pay.
+    // It is no longer taken off the top - that starved every other miner, every
+    // cycle, for ever - so nothing is stuck behind it; but nothing pays it
+    // either, and that must be said out loud rather than left to show up as a
+    // balance that keeps climbing.
+    let stuck = unpayable_owed(&owed);
+    if !stuck.is_empty() {
+        let total: u64 = stuck.iter().map(|(_, u)| *u).sum();
+        eprintln!(
+            "[settle] {} owed row(s) totalling {total} unit(s) name an address this pool \
+             cannot pay, so they are being passed over rather than allowed to consume the \
+             balance. They are still on the ledger and no other miner is short because of \
+             them. First: {}",
+            stuck.len(),
+            stuck
+                .iter()
+                .take(3)
+                .map(|(w, u)| format!("{w} ({u})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let owed_now: u64 = plan.iter().map(|(_, u)| *u).sum();
     if owed_now > 0 {
         println!(
@@ -3634,13 +4445,55 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
         return;
     }
 
+    // Does the reserve actually fund the transactions this plan needs?
+    //
+    // The reserve is subtracted ONCE, up in `distributable_units`, while the fee
+    // is paid PER transaction. Nothing compared the two, so a settlement large
+    // enough to be cut into more chunks than the reserve covers would sign and
+    // submit transactions the wallet cannot fund, and the node would refuse the
+    // tail with no explanation the operator could act on.
+    //
+    // The rows that will not fit are NOT dropped and NOT silently re-split next
+    // cycle over whoever happens to be in the window then. They go on the owed
+    // ledger, which is the machinery this pool already uses for a chunk that
+    // failed: named debts to named miners, paid before anything else next time.
+    // The tail is TRUNCATED and nothing else is touched, which is correct for
+    // both kinds of row and is why nothing is written here.
+    //
+    // A row that came from `owed` is still on the owed ledger: `take_owed` only
+    // READ it, and `deduct_owed` runs later against the rows a chunk actually
+    // carried. Truncating it means it is simply not deducted, so it stays a
+    // named debt and is paid first next cycle, by itself.
+    //
+    // A row from the fresh split has not been promised to anyone yet. Its money
+    // stays in the wallet and is part of next cycle's distributable balance,
+    // which is exactly what already happens to a share that rounds below the
+    // dust threshold.
+    //
+    // Re-owing the tail was the obvious move and it is wrong: the owed rows are
+    // still in that ledger, so it would count them twice.
+    let (fundable, funded_chunks) = reserve_funds_recipients(SETTLE_RESERVE_UNITS);
+    if plan.len() > fundable {
+        let wanted = chunks_needed(plan.len());
+        let dropped = plan.len() - fundable;
+        eprintln!(
+            "[settle] this settlement needs {wanted} transaction(s) but the reserve of \
+             {SETTLE_RESERVE_UNITS} unit(s) funds only {funded_chunks}, so the last ones would \
+             be refused by the node for want of a fee. Paying the first {fundable} recipient(s) \
+             this cycle and leaving {dropped} for the next one. Nobody has lost anything: a \
+             debt stays a debt and unsplit income stays in the wallet. Raise the reserve if \
+             this repeats."
+        );
+        plan.truncate(fundable);
+    }
+
     let main = Address::from(*acc.address());
     let mut tally = SettleTally::default();
     for chunk in plan.chunks(PAYOUT_CHUNK) {
         // 0.01 HAC network fee, funded by the reserve. Built from the same helper
         // `/terms` quotes, so the fee a miner is told about is the fee the
         // transaction carries.
-        let mut tx = TransactionType2::new_by(main.clone(), chunk_tx_fee(), curtimes());
+        let mut tx = TransactionType2::new_by(main, chunk_tx_fee(), curtimes());
         // Exactly what this transaction pays, in the order it pays it. Only rows
         // that made it into the transaction are here: a recipient the pool had to
         // skip must never appear in anyone's accounting as money in flight.
@@ -3751,11 +4604,15 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
                 continue;
             }
         }
-        // ret=0 only means the API took the bytes. The node validates
-        // synchronously and then inserts into the mempool on a background task
-        // whose result it DISCARDS, so a transaction that fails there is
-        // reported as accepted and simply never exists. Ask the node what it
-        // actually holds before counting a single unit as sent.
+        // ret=0 means this node validated the transaction, inserted it into its
+        // mempool and relayed it to its peers: mint/src/api/submit_transaction.rs
+        // defaults `async` to false and this pool never sends it, so
+        // handle_new_tx runs to completion before the answer comes back.
+        //
+        // It is still not proof of payment. A mempool is not the chain, and the
+        // node can lose the transaction afterwards. Ask what it actually holds
+        // before counting a single unit as sent, and read the answer knowing
+        // that these bytes are already out there.
         match verify_admitted(&client, &node, &txhash) {
             Admission::Held => {
                 println!(
@@ -3776,14 +4633,40 @@ fn settle_once(pool: &Arc<Mutex<Pool>>) {
                 tally.record(ChunkOutcome::Delivered, pushed, chunk_units);
             }
             Admission::Missing => {
+                // This used to call owe_back_failed_payout, which DELETES the
+                // record and with it body_hex - the only copy of the signed
+                // bytes - and put the rows back on the owed ledger. Its stated
+                // justification was that the node inserts before it relays, so a
+                // transaction it does not hold was never broadcast and cannot
+                // come back from a peer.
+                //
+                // That is false against this node. mint/src/api/submit_transaction.rs
+                // reads `async` as false by default and this pool never sends it,
+                // so the sync path runs, and node/src/core/protocol.rs finishes
+                // handle_new_tx with txpool.insert_by(...) and THEN
+                // p2p.broadcast_message(...) before it returns Ok. A ret=0 from
+                // this node therefore means inserted AND relayed to peers.
+                //
+                // So Missing does not mean "never took it". It means "took it,
+                // relayed it, and no longer has it": a mempool eviction under
+                // load, or a restart inside this few-second window. Peers may
+                // still hold those bytes and a miner may still mine them. Sign a
+                // second transaction for the same rows and both can confirm, and
+                // the operator pays those miners twice out of the pool wallet.
+                //
+                // The bytes stay. `gone_action` keys on them, so a later cycle
+                // rebroadcasts the SAME transaction rather than signing a new
+                // one, and the pending ledger keeps this hash so no fresh
+                // settlement is planned until it resolves either way.
                 eprintln!(
-                    "[settle] payout tx {short} was accepted by the API but the node does NOT \
-                     hold it ({pushed} recipients, {chunk_units} units): nothing was paid and \
-                     nothing was relayed. These rows are now OWED and the next cycle pays them \
-                     before it splits anything else."
+                    "[settle] payout tx {short} was accepted by the node and the node does NOT \
+                     hold it now ({pushed} recipients, {chunk_units} units). It was relayed \
+                     before it was lost, so it may still be in the network and it is NOT being \
+                     re-signed. The signed bytes are kept and rebroadcast; nothing is counted as \
+                     paid until the chain buries it. No fresh payout is planned while it is \
+                     unresolved."
                 );
-                owe_back_failed_payout(pool, &txhash);
-                tally.record(ChunkOutcome::Failed, pushed, chunk_units);
+                tally.record(ChunkOutcome::Unresolved, pushed, chunk_units);
             }
             Admission::Unresolved => {
                 eprintln!(
@@ -3819,6 +4702,7 @@ fn handle_submission(
     height: u64,
     coinbase_nonce: [u8; 32],
     block_nonce: u32,
+    peer: &str,
 ) -> serde_json::Value {
     // No route may seat an unpayable key in the PPLNS window. The window is a
     // fixed 4096 shares shared by everyone, so a key that is filtered out at
@@ -3835,7 +4719,7 @@ fn handle_submission(
     }
     let key = (height, coinbase_nonce, block_nonce);
     // Phase 1 - brief lock: reject stale/duplicate early and snapshot the inputs.
-    let (tpl, share_target, network_target, client, node) = {
+    let (tpl, share_target, network_target, client, node, block_delays) = {
         let p = plock(pool);
         if height != p.tpl.height {
             return json!({"ok":false,"kind":"stale","height":p.tpl.height});
@@ -3849,14 +4733,25 @@ fn handle_submission(
             p.network_target,
             p.client.clone(),
             p.node.clone(),
+            p.block_submit_delays,
         )
     };
 
     // Phase 2 - no lock: rebuild exactly what the worker hashed and evaluate the
     // (deliberately slow) x16rs PoW hash without blocking any other request.
+    //
+    // Off the pool lock, but NOT unbounded. Every connection is a thread and
+    // MAX_CONNS is 1024, so without the gate a thousand of these could run at
+    // once and one unauthenticated client could buy a slow hash per small GET
+    // until the machine's whole capacity went into verifying garbage. The gate
+    // makes a submission WAIT, never refuses it: any of them may turn out to be
+    // a block, and that cannot be known before this hash.
     let cb = coinbase_with_extranonce(&tpl, &coinbase_nonce);
     let intro = intro_bytes(&tpl, &cb, block_nonce);
-    let hash = pool_core::hash_of(tpl.height, &intro);
+    let hash = {
+        let _permit = HASH_GATE.enter(peer);
+        pool_core::hash_of(tpl.height, &intro)
+    };
     if !pool_core::beats(&hash, &share_target) {
         // The pool never trusts a worker's own header: it rebuilds one from
         // (height, coinbase_nonce, block_nonce) and hashes THAT, so a worker
@@ -3895,10 +4790,8 @@ fn handle_submission(
         // A solution that beats the NETWORK target is a whole block and is never
         // dropped for this: it cost a block's work whatever the share target says,
         // and throwing it away would cost the pool the entire reward.
-        if !is_block {
-            if let Some(why) = &p.share_halt {
-                return json!({"ok": false, "kind": "degraded", "err": why});
-            }
+        if !is_block && let Some(why) = p.halt_reason() {
+            return json!({"ok": false, "kind": "degraded", "err": why});
         }
         // The rate limiter exists to bound the replay set, not to throw money
         // away: a submission that beats the NETWORK target is a whole block
@@ -3953,11 +4846,27 @@ fn handle_submission(
             // the packed transactions are opaque bytes and /submit/block does
             // not report it - so it starts uncounted and settlement reads it
             // back off the node before it values anything.
+            // Freeze WHO earned this block, here, under the same lock that
+            // records the block itself and inside the same durable snapshot.
+            // It has to be this instant: settlement runs about eighty minutes
+            // later and the share window will have rolled over many times, so
+            // there is no way to reconstruct it afterwards. The winning share
+            // is already in the window - `pplns.record` ran a few lines above -
+            // so the miner that found the block is counted in its own claim.
+            //
+            // This costs a walk of the window under the lock, which the share
+            // path deliberately never does. A block is rare, this path already
+            // takes a durable snapshot and submits over the network, and the
+            // alternative is not knowing who earned it.
+            //
+            // NOTHING IS PAID FROM THIS YET.
+            let claim = p.pplns.credit(at_ms);
             p.immature.push(Immature {
                 height: solved,
                 hash,
                 units: block_reward_units(solved),
                 fees_counted: false,
+                claim,
             });
             (
                 Commit::Block(block_found_line(worker, solved, &hash)),
@@ -3968,7 +4877,12 @@ fn handle_submission(
 
     // Phase 3b - no lock: persist the accounting (fsync on a block) before the
     // block goes out, so a crash right after submitting still knows about it.
-    flush_state(shot);
+    //
+    // The settlement path has always honoured this answer and stops on a false.
+    // The block path threw it away, and a block is the one place where the write
+    // carries something the pool cannot reconstruct: the hold-back that keeps
+    // the next settlement from distributing a whole subsidy at 0 confirmations.
+    let durable = flush_state(shot);
 
     match commit {
         Commit::Share { accepted, line } => {
@@ -3986,42 +4900,147 @@ fn handle_submission(
         Commit::Block(notice) => println!("{notice}"),
     }
 
+    // Only a block reaches here, and only a block makes this fatal.
+    //
+    // The block is still submitted below. It is irreplaceable, the chain does
+    // not care what this pool managed to write to disk, and refusing to submit
+    // would turn a bookkeeping failure into a certain loss of the whole reward.
+    // What stops instead is the movement of money.
+    if !durable {
+        let why = format!(
+            "the accounting could not be written to disk when block {height} was found, so \
+             that block's hold-back exists in memory only"
+        );
+        eprintln!(
+            "[block] ACCOUNTING HALTED. {why}. The block itself is being submitted normally. \
+             No new share will be credited and no fresh payout will be planned until this pool \
+             is restarted with a writable state file; payouts already in flight keep resolving. \
+             Fix the disk first: a restart BEFORE the write succeeds reads a state file that \
+             never learned about height {height}, and the pool would then distribute that \
+             block's income at 0 confirmations."
+        );
+        plock(pool).accounting_halt = Some(why);
+    }
+
     // Phase 4 - no lock: serialize and submit the winning block. This is where
     // the node's packed transactions are carried into the block: OUR coinbase in
     // slot 0, then every transaction the node packed for this height, with a
     // merkle root folded from the node's own sibling list.
     let block_bytes = assemble_block(&tpl, &cb, block_nonce);
     let packed = tpl.txs.bodies.len();
-    let submit = submit_block_bytes(&client, &node, &block_bytes);
+    let size = block_bytes.len();
     // The submit answer used to go only into the JSON the winning worker reads,
     // so an outright refusal - a whole block reward - never reached the operator.
-    if block_submit_refused(&submit) {
-        eprintln!(
-            "[block] the node REFUSED our block at height {height} ({packed} packed tx(s), {} \
-             bytes): {submit}. That block's entire reward is lost.",
-            block_bytes.len()
-        );
-    } else {
-        println!(
-            "[block] submitted height {height} carrying {packed} packed tx(s) ({} bytes): \
-             {submit}",
-            block_bytes.len()
-        );
+    let (verdict, submit, attempts) = submit_block_with_retries(
+        || submit_block_bytes(&client, &node, &block_bytes),
+        block_delays,
+    );
+    match verdict {
+        BlockSubmitVerdict::Queued => println!(
+            "[block] submitted height {height} carrying {packed} packed tx(s) ({size} bytes) on \
+             attempt {attempts}: {submit}"
+        ),
+        BlockSubmitVerdict::Refused => eprintln!(
+            "[block] the node REFUSED our block at height {height} ({packed} packed tx(s), \
+             {size} bytes): {submit}. That block's entire reward is lost."
+        ),
+        // Deliberately not called a loss. Nobody refused this block; the pool
+        // could not read an answer. It may well be on the chain, and saying
+        // "lost" here would teach an operator to distrust the line that IS a
+        // loss. `note_block_stalls` reports in about two minutes if the tip
+        // never reaches this height.
+        BlockSubmitVerdict::Unresolved => eprintln!(
+            "[block] UNRESOLVED at height {height} after {attempts} attempt(s) ({packed} packed \
+             tx(s), {size} bytes): {submit}. The node gave no readable verdict, so this block \
+             may or may not have landed. Watch for a stall warning on this height."
+        ),
     }
-    json!({"ok":true,"kind":"block","solved_height":height,"submit":submit})
+    json!({
+        "ok": true,
+        "kind": "block",
+        "solved_height": height,
+        "submit": submit,
+        "verdict": match verdict {
+            BlockSubmitVerdict::Queued => "queued",
+            BlockSubmitVerdict::Refused => "refused",
+            BlockSubmitVerdict::Unresolved => "unresolved",
+        },
+        "attempts": attempts,
+    })
 }
 
-/// Did `/submit/block` refuse the block outright?
+/// What `/submit/block` said about our block.
 ///
-/// The node validates asynchronously, so `ret:0` means only "parsed and queued"
-/// and is NOT proof of acceptance - `note_block_stalls` is what catches a later
-/// silent refusal. But `ret:1`, a transport failure, or an unparseable answer
-/// are definitive, and each one costs a whole block reward.
-fn block_submit_refused(resp: &str) -> bool {
+/// This used to be a bool, and the state it was missing cost blocks. A timeout,
+/// a proxy's HTML error page and an empty body all failed to parse, and the one
+/// bool reported all three to the operator as "that block's entire reward is
+/// lost" - when the node may never have seen the bytes at all, and a second
+/// attempt would have landed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockSubmitVerdict {
+    /// The node parsed the block and queued it. Validation on this endpoint is
+    /// asynchronous (`/submit/block` hardcodes it), so this is NOT proof the
+    /// block stuck; `note_block_stalls` is what catches a later silent refusal.
+    Queued,
+    /// The node's own answer said no. Resubmitting identical bytes earns an
+    /// identical answer, so this is the one verdict that is worth no retry.
+    Refused,
+    /// Nothing is known. Transport failure, timeout, proxy error page, empty
+    /// body, or JSON carrying no `ret`. The block may or may not be at the node.
+    /// This must never be reported as a loss and must never end the retries.
+    Unresolved,
+}
+
+/// Read one `/submit/block` answer.
+fn classify_block_submit(resp: &str) -> BlockSubmitVerdict {
     match serde_json::from_str::<serde_json::Value>(resp) {
-        Ok(j) => find_u64(&j, "ret") != Some(0),
-        Err(_) => true,
+        Ok(j) => match find_u64(&j, "ret") {
+            Some(0) => BlockSubmitVerdict::Queued,
+            Some(_) => BlockSubmitVerdict::Refused,
+            // Parsed as JSON but carries no verdict at all. Reading that as a
+            // refusal is exactly what turned a proxy's JSON error body into a
+            // "reward lost" line for a block nobody had refused.
+            None => BlockSubmitVerdict::Unresolved,
+        },
+        Err(_) => BlockSubmitVerdict::Unresolved,
     }
+}
+
+/// Hand a found block to the node, retrying for as long as the answer says
+/// nothing. Returns the verdict, the last answer seen, and how many attempts it
+/// took, so the operator log can distinguish "refused" from "never got through".
+///
+/// Only the FIRST attempt's refusal is taken as definitive. A refusal that
+/// arrives after an unresolved attempt is ambiguous: the most likely reason a
+/// node refuses a block it did not refuse a moment ago is that it already holds
+/// it, and reporting that as a lost reward would be a false alarm on the one
+/// event an operator has to be able to trust.
+fn submit_block_with_retries(
+    submit: impl Fn() -> String,
+    delays: &[Duration],
+) -> (BlockSubmitVerdict, String, u32) {
+    let mut last = submit();
+    let first = classify_block_submit(&last);
+    if first != BlockSubmitVerdict::Unresolved {
+        return (first, last, 1);
+    }
+    let mut attempts = 1u32;
+    for delay in delays {
+        std::thread::sleep(*delay);
+        let resp = submit();
+        attempts += 1;
+        match classify_block_submit(&resp) {
+            BlockSubmitVerdict::Queued => return (BlockSubmitVerdict::Queued, resp, attempts),
+            // Ambiguous, see above: keep the answer for the log, keep the
+            // verdict unresolved, and stop - the node has spoken twice now and
+            // another identical POST is not going to say anything new.
+            BlockSubmitVerdict::Refused => {
+                return (BlockSubmitVerdict::Unresolved, resp, attempts);
+            }
+            BlockSubmitVerdict::Unresolved => last = resp,
+        }
+    }
+    (BlockSubmitVerdict::Unresolved, last, attempts)
 }
 
 /// Should the per-height share rate limiter refuse this submission?
@@ -4157,8 +5176,73 @@ fn route(
 ) -> String {
     match path {
         // ---- standard Hacash miner API: an UNMODIFIED poworker mines here ----
-        "/query/miner/pending" => plock(pool).pending_cache.clone(),
+        //
+        // A halted pool says so HERE, in the words the miner already understands.
+        //
+        // While `halt_reason()` is set the pool credits no new share, so a rig
+        // that keeps hashing is burning power for nothing. It used to keep
+        // serving the cached template regardless, and the miner had no way to
+        // know: the submit path answers `{"ret":1,"kind":"degraded"}` and drops
+        // the reason, and `pool_kind_verdict` has no arm for that kind at all.
+        //
+        // poworker already knows how to stop. `upstream_stale_reason` reads an
+        // `err` containing "stale" from this endpoint and from the notice, and
+        // pauses the mining threads until work returns. Saying it that way means
+        // every miner ALREADY RELEASED does the right thing with no update and
+        // no per-pool setting: a pool is entitled to change where a miner
+        // connects and which address it credits, not how the miner is built.
+        //
+        // A block is still accepted throughout, so nothing is lost by pausing:
+        // during an accounting halt the pool cannot record who earned it, during
+        // a node halt the tip is dead anyway, and during a difficulty halt credit
+        // means nothing.
+        "/query/miner/pending" => {
+            let p = plock(pool);
+            match p.halt_reason() {
+                Some(why) => json!({
+                    "ret": 1,
+                    "err": format!("the pool is serving stale work and is crediting nothing: {why}")
+                })
+                .to_string(),
+                None => p.pending_cache.clone(),
+            }
+        }
+        // Answers the TIP, exactly as the fullnode's own miner_notice does, and
+        // not the template height.
+        //
+        // This pool is not what a miner is built for: an unmodified poworker is a
+        // general Hacash miner that must behave the same way here as against any
+        // node or any other pool. It asks with `height` set to the height it is
+        // MINING - the tip plus one - and treats `answer >= that` as "new work
+        // exists". The node returns `latest_block().height()`, so that comparison
+        // is false until a block really arrives, and poworker's 200ms anti-spin
+        // floor applies.
+        //
+        // Returning `tpl.height` made it ALWAYS true. Whenever this endpoint
+        // answered without parking - which is what it does when too many
+        // long-polls are already waiting, so precisely under load - the miner saw
+        // "new work", skipped its floor, and came straight back. Two requests per
+        // cycle with no delay, from every rig, exactly when the pool is already
+        // shedding.
+        //
+        // The parking condition keeps that height test and adds a second one.
+        // Waiting for `tpl.height > want` is waiting for the tip to reach
+        // `want`, and a SAME-height reorg never makes it true: the parent moves
+        // and the height does not. Every rig parked here used to go on hashing a
+        // header built on an abandoned block for the rest of the long-poll. See
+        // `notice_should_answer`; the reply reports the tip either way, so what
+        // an unmodified miner is told about new work does not change at all.
         "/query/miner/notice" => {
+            // Same answer as /query/miner/pending, because the miner reads BOTH
+            // for it and a pool that pauses on one and not the other would park
+            // a rig for the full long-poll before it learned anything.
+            if let Some(why) = plock(pool).halt_reason() {
+                return json!({
+                    "ret": 1,
+                    "err": format!("the pool is serving stale work and is crediting nothing: {why}")
+                })
+                .to_string();
+            }
             let want: u64 = params
                 .get("height")
                 .and_then(|v| v.parse().ok())
@@ -4172,15 +5256,26 @@ fn route(
             // immediately with the current height rather than holding another slot.
             if NOTICE_WAITERS.fetch_add(1, Relaxed) >= MAX_NOTICE_WAITERS {
                 NOTICE_WAITERS.fetch_sub(1, Relaxed);
-                let h = plock(pool).tpl.height;
-                return json!({"ret":0,"height":h}).to_string();
+                return json!({"ret":0,"height":notice_height(plock(pool).tpl.height)}).to_string();
             }
             let _ng = NoticeGuard;
             let deadline = Instant::now() + Duration::from_secs(wait);
+            // The job this rig is hashing, as closely as the pool can know it: a
+            // miner reads /query/miner/pending and parks here immediately after,
+            // and the notice request carries a height and nothing else, never a
+            // parent. There is no better source and there cannot be one without
+            // a modified miner.
+            let parked_on: NoticeJob = {
+                let p = plock(pool);
+                (p.tpl.height, p.tpl.prevhash)
+            };
             loop {
-                let h = plock(pool).tpl.height; // brief lock only
-                if h > want || Instant::now() >= deadline {
-                    return json!({"ret":0,"height":h}).to_string();
+                let serving: NoticeJob = {
+                    let p = plock(pool); // brief lock only
+                    (p.tpl.height, p.tpl.prevhash)
+                };
+                if notice_should_answer(serving, parked_on, want) || Instant::now() >= deadline {
+                    return json!({"ret":0,"height":notice_height(serving.0)}).to_string();
                 }
                 std::thread::sleep(Duration::from_millis(400));
             }
@@ -4211,8 +5306,10 @@ fn route(
                 })
                 .to_string();
             };
-            let _ = peer; // no longer used for attribution on the paid path
-            let r = handle_submission(pool, &worker, height, cn, block_nonce);
+            // Not attribution - credit comes from `worker` and nothing else.
+            // This is the share of the verification gate this source may hold,
+            // so one host cannot spend the whole machine on hashing garbage.
+            let r = handle_submission(pool, &worker, height, cn, block_nonce, peer);
             let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             // Nothing is printed here any more. This route used to print one
@@ -4225,7 +5322,12 @@ fn route(
             if ok {
                 json!({"ret":0,"kind":kind}).to_string()
             } else {
-                json!({"ret":1,"kind":kind}).to_string()
+                // The REASON travels with the refusal. It used to be dropped
+                // here, so a miner refused for a halted pool, a stale template
+                // or an unpayable address saw the same bare `kind` and its
+                // operator had nothing to act on.
+                let err = r.get("err").and_then(|v| v.as_str()).unwrap_or("");
+                json!({"ret":1,"kind":kind,"err":err}).to_string()
             }
         }
 
@@ -4290,47 +5392,9 @@ fn route(
                     }
                 }
             };
-            handle_submission(pool, &worker, height, en, nonce).to_string()
+            handle_submission(pool, &worker, height, en, nonce, peer).to_string()
         }
-        "/stats" => {
-            // Copy the numbers out, then RELEASE the lock before building the
-            // body. /stats is open and unauthenticated, and serializing up to
-            // PPLNS_WINDOW worker rows under the global mutex would let anyone
-            // stall every miner's /work, /share and /submit by polling it.
-            let (height, difficulty, accepted, blocks, pending, orphaned, window, workers, credit) = {
-                let p = plock(pool);
-                (
-                    p.tpl.height,
-                    p.tpl.difficulty,
-                    p.accepted,
-                    p.blocks,
-                    p.submitted.len(),
-                    p.orphaned,
-                    p.pplns.total(),
-                    p.pplns.counts(),
-                    p.pplns.credit(pool_core::now_ms()),
-                )
-            };
-            json!({
-                "height": height,
-                "difficulty": difficulty,
-                "accepted_shares": accepted,
-                "blocks_confirmed": blocks,
-                "blocks_pending": pending,
-                "blocks_orphaned": orphaned,
-                "share_window": window,
-                "workers": workers,
-                // What a settlement would actually split over. `workers` is the
-                // raw headcount and is for looking at only: paying by it is what
-                // lets a miner take the whole window with one burst of withheld
-                // shares. hbit-pool-payout reads THIS.
-                "credit": credit,
-                "credit_note": "milliseconds of share residence: how long each worker's shares \
-                                have been in the payout window. Payouts are split by this, not by \
-                                the `workers` headcount.",
-            })
-            .to_string()
-        }
+        "/stats" => stats_body(pool, Instant::now()),
 
         // The pool's terms, READ OUT OF the code that enforces them. Nothing here
         // is a number somebody typed into a description: change what the pool
@@ -4353,7 +5417,7 @@ fn route(
                     p.share_factor,
                     p.share_factor_achieved,
                     p.share_cost_bits,
-                    p.share_halt.clone(),
+                    p.halt_reason().map(str::to_string),
                     p.tpl.difficulty,
                     p.settle_secs,
                 )
@@ -4521,7 +5585,7 @@ mod tests {
         assert_eq!(refreshed_money(&refused, 0), None);
         // This is the line template_cycle runs on the result: `None` leaves the
         // last figure the pool could stand behind in place and marks it STALE.
-        assert!(!refreshed_money(&down, 0).is_some());
+        assert!(refreshed_money(&down, 0).is_none());
 
         // A wallet the node really reports as empty is a DIFFERENT answer, and
         // the pool must keep standing behind it. Refusing "0:0" as unreadable
@@ -4731,7 +5795,7 @@ mod tests {
 
         // B's chunk failed: its rows become a debt to B, not money in the pot.
         let mut owed: Vec<(String, u64)> = Vec::new();
-        owe_rows(&mut owed, &[owed_to_b.clone()]);
+        owe_rows(&mut owed, std::slice::from_ref(&owed_to_b));
         assert_eq!(owed, vec![(W_B.to_string(), 50)]);
 
         // Next cycle. A's 50 really left the wallet, so 50 is distributable and
@@ -4761,6 +5825,493 @@ mod tests {
         // that chunk actually carries.
         deduct_owed(&mut owed, &plan);
         assert!(owed.is_empty());
+    }
+
+    #[test]
+    fn a_halted_pool_tells_the_miner_to_stop_in_words_it_already_understands() {
+        // A halted pool credits no new share, so a rig that keeps hashing burns
+        // power for nothing. It used to keep serving the cached template, and
+        // the miner could not tell: the submit path answers "degraded" and
+        // poworker has no arm for that kind at all.
+        //
+        // poworker DOES already stop on an `err` containing "stale", read from
+        // /query/miner/pending and /query/miner/notice. Saying it that way means
+        // every already-released miner does the right thing with no update.
+        let mut p = a_pool();
+        p.pending_cache = r#"{"ret":0,"height":771594}"#.to_string();
+        p.accounting_halt = Some("the accounting could not be written to disk".to_string());
+        let pool = Arc::new(Mutex::new(p));
+
+        for path in ["/query/miner/pending", "/query/miner/notice"] {
+            let body = route(path, &HashMap::new(), &pool, "test-peer");
+            let j: serde_json::Value = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("{path} must answer JSON: {e} in {body}"));
+            assert_eq!(j["ret"].as_i64(), Some(1), "{path}: {body}");
+            let err = j["err"].as_str().unwrap_or_default();
+
+            // THE test: poworker's own detector, quoted from app/src/poworker.rs
+            //   let err = res["err"].as_str()?;
+            //   if err.to_ascii_lowercase().contains("stale") { Some(err) }
+            assert!(
+                err.to_ascii_lowercase().contains("stale"),
+                "{path} must trip the miner's existing pause, which keys on the \
+                 word this reason has to carry: {err}"
+            );
+            assert!(
+                err.contains("could not be written to disk"),
+                "and the operator has to be told WHICH halt: {err}"
+            );
+            assert!(
+                !body.contains("771594"),
+                "{path} must not keep handing out work it will credit nothing for: {body}"
+            );
+        }
+
+        // Healthy again: the template comes back, unchanged.
+        plock(&pool).accounting_halt = None;
+        let body = route("/query/miner/pending", &HashMap::new(), &pool, "test-peer");
+        assert!(body.contains("771594"), "work resumes by itself: {body}");
+    }
+
+    #[test]
+    fn the_notice_endpoint_speaks_the_same_height_the_fullnode_does() {
+        // A miner is not built for this pool. An unmodified poworker also points
+        // at nodes and at other pools, and it must behave identically at all of
+        // them: it asks with the height it is MINING and reads `answer >= that`
+        // as "new work exists".
+        //
+        // The fullnode answers with its tip, one BELOW the height being mined,
+        // so that comparison is false until a block really arrives and the
+        // miner's 200ms anti-spin floor applies. This pool answered with the
+        // template height, making it true on every reply - so the floor was
+        // skipped every time, and worst when the pool answers without parking,
+        // which is what it does once too many long-polls are already waiting.
+        let tip = 771_596u64;
+        let template = tip + 1; // what the pool is serving work for
+        assert_eq!(
+            notice_height(template),
+            tip,
+            "the notice reports the tip, exactly as mint's miner_notice does"
+        );
+
+        // The miner's own condition, quoted from poworker:
+        //   new_work_ready = pending_height > 0 && res_hei >= pending_height
+        let pending_height = template; // the height the miner is mining
+        assert!(
+            notice_height(template) < pending_height,
+            "no new work while the chain is still at the same tip: the miner must \
+             take its anti-spin delay"
+        );
+        // A block arrives: the pool's template moves up, and only then is the
+        // miner told there is work.
+        assert!(
+            notice_height(template + 1) >= pending_height,
+            "once the chain moves, the miner is released immediately: new work is \
+             money and is never delayed"
+        );
+
+        // An empty chain must not underflow into a colossal height.
+        assert_eq!(notice_height(0), 0);
+    }
+
+    #[test]
+    fn a_same_height_reorg_releases_a_parked_notice_long_poll() {
+        // A same-height reorg replaces the parent and leaves the height alone,
+        // so the tip test the fullnode uses can never fire for it. Every rig
+        // parked in this long-poll went on hashing a header built on an
+        // abandoned block until the poll timed out, and every share it found
+        // was then rebuilt by the pool against the NEW parent, came out above
+        // target, was refused, and counted against the rig as a bad streak: it
+        // was marked bad for doing exactly what this pool told it to do.
+        //
+        // Drive the ENDPOINT, not the predicate. A test on the predicate alone
+        // stays green when the loop is reverted, which is the whole defect.
+        let p = a_pool();
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+
+        let mut params = HashMap::new();
+        params.insert("height".to_string(), height.to_string());
+        params.insert("wait".to_string(), "3".to_string());
+
+        // Nothing has moved: the poll must HOLD. If it answers here the endpoint
+        // is not parking at all and everything below would prove nothing.
+        let held = Arc::clone(&pool);
+        let hp = params.clone();
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || route("/query/miner/notice", &hp, &held, "test-peer"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!h.is_finished(), "an unchanged job must hold the long-poll");
+        let body = h.join().expect("the long-poll thread");
+        assert!(
+            t0.elapsed() >= Duration::from_secs(3),
+            "it must wait out the poll"
+        );
+        let j: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(j["height"].as_u64(), Some(height - 1));
+
+        // Now the reorg: same height, different parent.
+        let woken = Arc::clone(&pool);
+        let wp = params.clone();
+        let t1 = Instant::now();
+        let w = std::thread::spawn(move || route("/query/miner/notice", &wp, &woken, "test-peer"));
+        std::thread::sleep(Duration::from_millis(500)); // let it park and snapshot
+        plock(&pool).tpl.prevhash = Hash::from([0xb2u8; 32]);
+        let body = w.join().expect("the long-poll thread");
+        assert!(
+            t1.elapsed() < Duration::from_secs(2),
+            "a same-height reorg is dead work and must release the rig, not \
+             leave it hashing an abandoned parent for the rest of the poll"
+        );
+
+        // ...and the answer is still the fullnode's, the tip, so an unmodified
+        // miner does NOT read it as new work. Quoted from poworker:
+        //   new_work_ready = pending_height > 0 && res_hei >= pending_height
+        // It takes its 200ms floor and re-reads /query/miner/pending, which is
+        // where the fresh parent is.
+        let j: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            j["height"].as_u64(),
+            Some(height - 1),
+            "a released rig is not told there is new work"
+        );
+
+        // The height half is load-bearing too: a miner asking about a height the
+        // pool has already passed is answered at once, never parked.
+        let mut stale = HashMap::new();
+        stale.insert("height".to_string(), (height - 1).to_string());
+        stale.insert("wait".to_string(), "3".to_string());
+        let t2 = Instant::now();
+        let _ = route("/query/miner/notice", &stale, &pool, "test-peer");
+        assert!(
+            t2.elapsed() < Duration::from_secs(1),
+            "a lagging height answers at once"
+        );
+    }
+
+    #[test]
+    fn a_dropped_connection_is_announced_without_flooding_the_log() {
+        // Both connection-table refusals were a bare `continue`: the socket
+        // closed with no answer and no line anywhere. A /submit/miner/success
+        // carrying a found block died exactly like a port scan, and the miner
+        // could not tell a refusal from a network fault either - so nothing
+        // recorded that a block had been dropped.
+        //
+        // It cannot be unconditional either: a full table fires on every accept,
+        // and a line per accept scrolls its own explanation away during the
+        // incident it describes.
+        let mut st: Option<(String, Instant)> = None;
+        let t0 = Instant::now();
+        let full = "[accept] the connection table is FULL";
+        let noisy = "[accept] 10.0.0.7 is at its limit";
+
+        drop_notice(&mut st, t0, full);
+        assert_eq!(st.as_ref().map(|(s, _)| s.as_str()), Some(full));
+
+        // The same cause a moment later stays quiet.
+        drop_notice(&mut st, t0 + Duration::from_secs(1), full);
+        assert_eq!(st.as_ref().map(|(_, at)| *at), Some(t0), "not reprinted");
+
+        // A DIFFERENT cause is not silenced by the first: they have different
+        // fixes, and an operator needs to know which is happening.
+        drop_notice(&mut st, t0 + Duration::from_secs(2), noisy);
+        assert_eq!(st.as_ref().map(|(s, _)| s.as_str()), Some(noisy));
+
+        // And the same cause repeats once the interval has passed, so a lasting
+        // incident keeps saying so.
+        drop_notice(
+            &mut st,
+            t0 + Duration::from_secs(2) + CONN_DROP_EVERY,
+            noisy,
+        );
+        assert_eq!(
+            st.as_ref().map(|(_, at)| *at),
+            Some(t0 + Duration::from_secs(2) + CONN_DROP_EVERY),
+            "a continuing incident is repeated, not silently forgotten"
+        );
+    }
+
+    #[test]
+    fn a_settlement_the_reserve_cannot_fund_is_cut_down_and_nothing_is_lost() {
+        // B5, through the real settle_once. The reserve is subtracted ONCE while
+        // the network fee is paid PER transaction, and nothing compared them: a
+        // plan cut into more chunks than the reserve funds signed transactions
+        // the wallet could not pay for, and the node refused the tail.
+        //
+        // What must be true after the cut: the debts that did not fit are STILL
+        // debts. Re-owing them here was the obvious move and would have counted
+        // them twice, because take_owed only reads the ledger - deduct_owed is
+        // what removes a row, and it runs against the rows a chunk carried.
+        let (fundable, _) = reserve_funds_recipients(SETTLE_RESERVE_UNITS);
+        let over = fundable + 25;
+
+        let (node, seen) = a_stub_node_answering(vec![
+            (
+                "/query/balance",
+                r#"{"ret":0,"list":[{"hacash":"90000:248"}]}"#,
+            ),
+            ("/submit/transaction", r#"{"ret":0}"#),
+            ("/query/transaction", r#"{"ret":0,"pending":true}"#),
+        ]);
+        let mut p = a_pool();
+        p.node = node;
+        p.matured = Some(Matured {
+            units: 900_000,
+            at: 1_500,
+        });
+        // More named debts than the reserve can fund transactions for. Real
+        // payable addresses, or the payable filter would remove them for an
+        // unrelated reason and the test would prove nothing.
+        let owed: Vec<(String, u64)> = (0..over)
+            .map(|i| (a_wallet_address(i as u64), 1u64))
+            .collect();
+        p.owed = owed.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        settle_once(&pool);
+
+        let g = plock(&pool);
+        let still_owed: u64 = g.owed.iter().map(|(_, u)| *u).sum();
+        // EXACTLY the tail, in units and not in rows. `owe_rows` merges by
+        // address, so re-owing a deferred row does not add a row - it doubles an
+        // amount. Counting rows misses that entirely, which is how the first
+        // version of this test passed against the very mistake it exists to
+        // catch: the tail being written back onto a ledger it had never left.
+        assert_eq!(
+            still_owed,
+            (over - fundable) as u64,
+            "the debts that did not fit must still be owed, once each: {} row(s) totalling \
+             {still_owed} unit(s), from {over} rows of 1 unit with {fundable} funded",
+            g.owed.len()
+        );
+        // The node was asked to take transactions, so the cut did not turn into
+        // "pay nobody" - which would be a permanent freeze rather than a fix.
+        let asked = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            asked.iter().any(|p| p.starts_with("/submit/transaction")),
+            "the funded part still had to be paid: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_found_block_records_who_earned_it_and_still_pays_the_old_way() {
+        // A1, stage one. The pool now writes down who was mining when a block
+        // was found. Nothing is paid from it: this test pins BOTH halves, because
+        // "we recorded it" and "we changed who gets paid" are very different
+        // promises and only the first one is being made yet.
+        let mut p = a_pool();
+        p.network_target = [0xff; 32]; // this submission is a block
+        let now = pool_core::now_ms();
+        // Two miners with real residence, so the frozen claim is not trivial.
+        p.pplns.record(W_A, now.saturating_sub(60_000));
+        p.pplns.record(W_B, now.saturating_sub(20_000));
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+
+        let r = handle_submission(&pool, W_A, height, [0x91u8; 32], 1, "test-peer");
+        assert_eq!(r["kind"].as_str(), Some("block"), "{r}");
+
+        let g = plock(&pool);
+        let e = g.immature.first().expect("the block is held back");
+        assert!(
+            !e.claim.is_empty(),
+            "a found block has to record who earned it: the window will have rolled over \
+             many times by the time this money is payable, and there is no way to \
+             reconstruct it afterwards"
+        );
+        assert!(
+            e.claim.iter().any(|(w, _)| w == W_A),
+            "including the miner that found it: its share is already in the window"
+        );
+        assert!(
+            e.claim.iter().any(|(w, _)| w == W_B),
+            "and everyone else who was mining at that instant: {:?}",
+            e.claim
+        );
+    }
+
+    #[test]
+    fn the_two_payout_models_are_compared_but_only_one_of_them_pays() {
+        // The report is the whole of stage one, so it has to be right about
+        // WHICH model is in force. Saying it the wrong way round would tell an
+        // operator their pool had changed when it had not.
+        let claim = vec![(W_A.to_string(), 100u64)];
+        // Nobody from the claim is still here: the money goes entirely to a
+        // miner who was not present when the block was found. This is the case
+        // the whole change exists for.
+        let now = vec![(W_B.to_string(), 100u64)];
+
+        let drift = describe_claim_drift(800_000, 10, &claim, &now)
+            .expect("two models that pay different people must be reported");
+        assert!(drift.contains(W_A), "the earner is named: {drift}");
+        assert!(drift.contains(W_B), "and who is paid today: {drift}");
+        assert!(
+            drift.contains("10 unit(s) go to miners who were NOT here"),
+            "the number that says whether it matters: {drift}"
+        );
+        assert!(
+            drift.contains("still pays the second line"),
+            "and it must be unmistakable that nothing has changed yet: {drift}"
+        );
+
+        // Agreement is silence: an operator must not be trained to skim this.
+        assert!(describe_claim_drift(800_000, 10, &claim, &claim).is_none());
+        // No snapshot is not a disagreement. Blocks found before this existed
+        // have nothing to compare against, and reporting them as drift would be
+        // inventing a fact.
+        assert!(describe_claim_drift(800_000, 10, &[], &now).is_none());
+    }
+
+    #[test]
+    fn one_source_cannot_take_the_whole_verification_gate() {
+        // A8. Verifying a submission is deliberately slow and nothing bounded
+        // how many ran at once: every connection is a thread, MAX_CONNS is 1024,
+        // and an unauthenticated client bought one slow hash per small GET. At
+        // scale the machine's whole capacity went into verifying garbage while
+        // an honest miner's share, and the winning worker's block, waited.
+        //
+        // Bounding the TOTAL alone would not have been enough: one IP is allowed
+        // MAX_PER_IP = 24 connections, so it could still hold every permit. The
+        // share is what keeps honest miners moving.
+        let gate = HashGate::new(8);
+        assert_eq!(gate.total, 8);
+        assert_eq!(gate.per_peer, 2, "a quarter of the machine, not all of it");
+
+        let noisy: Vec<HashPermit<'_>> =
+            (0..gate.per_peer).map(|_| gate.enter("10.0.0.1")).collect();
+        {
+            let st = gate.state.lock().expect("gate");
+            assert_eq!(st.0, gate.per_peer);
+        }
+        // That source is now at its share. An honest miner from elsewhere must
+        // still get in immediately - this is the whole point.
+        let honest = gate.enter("10.0.0.2");
+        {
+            let st = gate.state.lock().expect("gate");
+            assert_eq!(st.0, gate.per_peer + 1, "the honest source was admitted");
+        }
+
+        // The noisy source asking for one more must WAIT, not be refused: a
+        // submission that waits is still verified, and any of them may be a
+        // block. Proven by the fact that it only completes once a permit is
+        // released.
+        let done = Arc::new(AtomicUsize::new(0));
+        let g = &gate;
+        std::thread::scope(|s| {
+            let flag = done.clone();
+            s.spawn(move || {
+                let _p = g.enter("10.0.0.1");
+                flag.fetch_add(1, Relaxed);
+            });
+            // Give the waiter a moment to prove it is blocked rather than slow.
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                done.load(Relaxed),
+                0,
+                "a source over its share must wait for room"
+            );
+            drop(noisy); // release the share
+        });
+        assert_eq!(done.load(Relaxed), 1, "and then it proceeds, never refused");
+
+        drop(honest);
+        let st = gate.state.lock().expect("gate");
+        assert_eq!(st.0, 0, "every permit is released, including on scope exit");
+        assert!(
+            st.1.is_empty(),
+            "and the per-source table does not leak rows"
+        );
+    }
+
+    #[test]
+    fn polling_stats_cannot_hold_the_lock_every_miner_needs() {
+        // A7. Building this body walks the whole share window and every banked
+        // bucket, allocates a String per worker and sorts twice. That used to
+        // happen under the global pool mutex on EVERY request, so one
+        // unauthenticated poller inside its per-IP allowance could serialize
+        // every miner's share submission behind it - and a found block needs
+        // that same mutex.
+        //
+        // The proof is direct: the pool lock is HELD for the whole of the second
+        // call, so if that call needed it at all it would deadlock or block for
+        // ever. It returns the cached body instead.
+        let mut p = a_pool();
+        for i in 0..64 {
+            p.pplns
+                .record(W_A, pool_core::now_ms().saturating_sub(1_000 + i));
+            p.pplns
+                .record(W_B, pool_core::now_ms().saturating_sub(2_000 + i));
+        }
+        let pool = Arc::new(Mutex::new(p));
+
+        let t0 = Instant::now();
+        let first = stats_body(&pool, t0);
+        assert!(first.contains("credit"), "the first call really builds it");
+
+        let served_while_locked = {
+            // Every miner's request path is now blocked on this guard.
+            let _held = plock(&pool);
+            stats_body(&pool, t0 + Duration::from_millis(STATS_CACHE_MS - 1))
+        };
+        assert_eq!(
+            served_while_locked, first,
+            "a request inside the cache window must be served without the pool lock at all"
+        );
+
+        // And it does go stale, or the page would freeze at whatever it first
+        // showed and an operator would be reading history.
+        let later = stats_body(&pool, t0 + Duration::from_millis(STATS_CACHE_MS + 1));
+        assert!(later.contains("credit"));
+    }
+
+    #[test]
+    fn a_debt_the_pool_cannot_address_does_not_tax_every_other_miner_for_ever() {
+        // B6. An owed row whose address the pool cannot pay used to be allocated
+        // to off the TOP of every cycle, and then dropped by the chunk builder
+        // when it could not turn the address into an action - so it never
+        // reached `rows`, `deduct_owed` never cleared it, and it came back next
+        // cycle. Not a stall: a permanent tax. Every honest miner was short by
+        // that amount every cycle, for ever, and once the dead amount reached
+        // the distributable total nobody was paid at all.
+        const DEAD: &str = "not-an-address";
+        let owed = vec![(DEAD.to_string(), 40u64), (W_A.to_string(), 10)];
+
+        let (plan, left) = take_owed(&owed, 50);
+        assert_eq!(
+            plan,
+            vec![(W_A.to_string(), 10)],
+            "only the debt the pool can actually pay is allocated to"
+        );
+        assert_eq!(
+            left, 40,
+            "the 40 units behind the dead row stay available to everyone else \
+             instead of being taken off the top and then not spent"
+        );
+
+        // The debt is passed over, NOT forgotten: it is still on the ledger, and
+        // it is named so an operator hears it from a log rather than from the
+        // wallet balance quietly climbing.
+        assert_eq!(unpayable_owed(&owed), vec![(DEAD.to_string(), 40)]);
+
+        // And the whole point: the rest of the money reaches real miners.
+        let counts = vec![(W_B.to_string(), 1u64)];
+        let mut full = plan.clone();
+        full.extend(plan_settlement(left, &counts));
+        merge_payout_rows(&mut full);
+        assert_eq!(
+            full,
+            vec![(W_A.to_string(), 10), (W_B.to_string(), 40)],
+            "the 40 units are split over the window instead of vanishing"
+        );
+
+        // A dead row that is alone must not swallow the cycle either.
+        let only_dead = vec![(DEAD.to_string(), 40u64)];
+        let (plan, left) = take_owed(&only_dead, 50);
+        assert!(plan.is_empty());
+        assert_eq!(
+            left, 50,
+            "nobody is starved by a debt that can never be paid"
+        );
     }
 
     #[test]
@@ -4993,7 +6544,10 @@ mod tests {
             !msg.contains("when another miner packs it"),
             "a block this pool mines can carry the payout: {msg}"
         );
-        assert!(msg.contains("4 transaction(s) packed from the node"), "{msg}");
+        assert!(
+            msg.contains("4 transaction(s) packed from the node"),
+            "{msg}"
+        );
         // What IS observable: how long, and what it is waiting on.
         assert!(msg.contains("in 5 block(s) / 1500s"), "{msg}");
         assert!(
@@ -5261,6 +6815,18 @@ mod tests {
         Arc::new(Account::create_by_secret_key_value([0x11u8; 32]).expect("a valid test key"))
     }
 
+    /// The `n`th distinct REAL payout address. Real, because the settlement
+    /// filters unpayable keys out, so made-up strings would be removed for a
+    /// reason that has nothing to do with what a test is asking about.
+    fn a_wallet_address(n: u64) -> String {
+        let mut key = [0x22u8; 32];
+        key[24..].copy_from_slice(&n.wrapping_add(1).to_be_bytes());
+        Account::create_by_secret_key_value(key)
+            .expect("a valid test key")
+            .readable()
+            .to_string()
+    }
+
     /// A pool with no node, no disk and no listener: enough to exercise the
     /// accounting the endpoints read.
     fn a_pool() -> Pool {
@@ -5280,6 +6846,8 @@ mod tests {
             share_factor_achieved: 24,
             share_cost_bits: 16,
             share_halt: None,
+            accounting_halt: None,
+            node_halt: None,
             pending_cache: String::new(),
             workers: HashMap::new(),
             next_en: 0,
@@ -5289,6 +6857,9 @@ mod tests {
             orphaned: 0,
             seen: HashSet::new(),
             submitted: Vec::new(),
+            // No sleeping in tests. Every test that wants the retry loop itself
+            // sets its own schedule.
+            block_submit_delays: &[],
             immature: Vec::new(),
             unsaved: 0,
             state_seq: 0,
@@ -5304,6 +6875,8 @@ mod tests {
             bad_streak: HashMap::new(),
             tpl_changed_at_ms: 0,
             rates: HashMap::new(),
+            rate_untracked: 0,
+            rate_open_told: None,
             share_log: ShareLog::default(),
         }
     }
@@ -5610,7 +7183,7 @@ mod tests {
         p.pplns
             .record(W_B, pool_core::now_ms().saturating_sub(60_000));
         let pool = Arc::new(Mutex::new(p));
-        let r = handle_submission(&pool, W_A, height, [0x11u8; 32], 7);
+        let r = handle_submission(&pool, W_A, height, [0x11u8; 32], 7, "test-peer");
         assert_eq!(r["ok"].as_bool(), Some(false), "{r}");
         assert_eq!(r["kind"].as_str(), Some("degraded"), "{r}");
         assert_eq!(
@@ -5636,9 +7209,7 @@ mod tests {
             "a halted pool must not even value its wallet: {asked:?}"
         );
         assert!(
-            !asked
-                .iter()
-                .any(|p| p.starts_with("/submit/transaction")),
+            !asked.iter().any(|p| p.starts_with("/submit/transaction")),
             "a halted pool must not submit anything: {asked:?}"
         );
         {
@@ -5715,9 +7286,7 @@ mod tests {
             "a halted pool must not value its wallet: {asked:?}"
         );
         assert!(
-            !asked
-                .iter()
-                .any(|p| p.starts_with("/submit/transaction")),
+            !asked.iter().any(|p| p.starts_with("/submit/transaction")),
             "a halted pool must not submit anything: {asked:?}"
         );
     }
@@ -5797,7 +7366,10 @@ mod tests {
         let mut p = a_pool();
         p.node = node;
         let rec = a_payout("aa11", 1_000, false, &[(W_A, 25)]);
-        assert!(!rec.node_holds, "this is the record a timed-out submit leaves");
+        assert!(
+            !rec.node_holds,
+            "this is the record a timed-out submit leaves"
+        );
         p.payout_records.push(rec);
         p.settle_pending_txs.push("aa11".to_string());
         p.rebuild_inflight();
@@ -5820,6 +7392,76 @@ mod tests {
             "nothing is owed while the payout is still in flight"
         );
         assert_eq!(g.inflight_units, 25);
+    }
+
+    #[test]
+    fn a_payout_the_node_accepted_and_then_lost_is_never_re_signed() {
+        // A2. The node took these bytes and relayed them before it answered:
+        // mint/src/api/submit_transaction.rs defaults `async` to false, this pool
+        // never sends it, and node/src/core/protocol.rs finishes handle_new_tx
+        // with txpool.insert_by(...) and THEN p2p.broadcast_message(...) before
+        // returning Ok.
+        //
+        // So when the node no longer has the transaction seconds later, it is not
+        // "never took it". It is "took it, put it on the wire, and lost it" - a
+        // mempool eviction, or a restart inside this window. The old code deleted
+        // the record, and with it the only copy of the signed bytes, and put the
+        // rows back on the owed ledger. The next cycle signed a SECOND
+        // transaction for the same miners: different timestamp, different hash,
+        // replay protection by hash alone. If any peer still held the first, both
+        // are mineable and the operator pays those miners twice.
+        let (node, _seen) = a_stub_node_answering(vec![
+            (
+                "/query/balance",
+                r#"{"ret":0,"list":[{"hacash":"12:248"}]}"#,
+            ),
+            // The API takes the bytes: validated, inserted, relayed.
+            ("/submit/transaction", r#"{"ret":0}"#),
+            // And moments later the node does not have it.
+            (
+                "/query/transaction",
+                r#"{"ret":1,"err":"transaction not found"}"#,
+            ),
+        ]);
+        let mut p = a_pool();
+        p.node = node;
+        // Something to split, and something to split it from.
+        p.pplns
+            .record(W_A, pool_core::now_ms().saturating_sub(60_000));
+        p.matured = Some(Matured {
+            units: 1_000,
+            at: 1_500,
+        });
+        let pool = Arc::new(Mutex::new(p));
+
+        settle_once(&pool);
+
+        let g = plock(&pool);
+        let rec = g.payout_records.first().expect(
+            "the signed payout record must survive: it is the only copy of bytes that \
+                     are already on the network, and losing it is what makes the next cycle \
+                     sign a second transaction for the same money",
+        );
+        assert!(
+            !rec.body_hex.is_empty(),
+            "the signed bytes are what a later cycle rebroadcasts instead of re-signing"
+        );
+        assert!(
+            g.owed.is_empty(),
+            "these rows must NOT go back on the owed ledger: they are already payable by a \
+             transaction that is out there, and owing them again is how they get paid twice. \
+             owed was {:?}",
+            g.owed
+        );
+        assert!(
+            g.settle_pending_txs.contains(&rec.hash),
+            "the hash stays in the pending ledger so no fresh settlement is planned while it \
+             is unresolved"
+        );
+        assert!(
+            g.paid.get(W_A).is_none(),
+            "and nothing is called paid: the chain has not buried anything"
+        );
     }
 
     #[test]
@@ -6036,7 +7678,7 @@ mod tests {
     }
 
     #[test]
-    fn no_worker_may_submit_faster_than_it_could_have_hashed() {
+    fn a_tracked_worker_may_not_submit_faster_than_it_could_have_hashed() {
         // A miner that sits on its shares has a whole interval's worth to insert
         // at once. Nothing in the submission says when a share was FOUND, so the
         // only handle the pool has is that finding one costs a known number of
@@ -6095,6 +7737,91 @@ mod tests {
     }
 
     #[test]
+    fn a_full_rate_table_admits_the_share_and_says_so_once() {
+        // The limiter fails OPEN when it has nowhere left to track a worker, and
+        // that stays: refusing an honest miner's share costs it real money, and
+        // residence weighting is what decides the split anyway. What must not
+        // happen is that it goes open in SILENCE, because for as long as it lasts
+        // nothing is holding back a batch of withheld shares dumped at a
+        // settlement, and the pool is the only thing that can see it.
+        let mut p = a_pool();
+        let now = 5_000_000u64;
+
+        // A pool with room MEASURES the share and spends its budget, so nothing
+        // is owed and the counter stays at zero. Without this the test also
+        // passes for an increment on every admission, and the operator line would
+        // then fire on a healthy pool from its first share: an alarm that is
+        // always on is the silence this counter exists to end.
+        let mut healthy = a_pool();
+        assert!(healthy.rate_admits_share(W_A, now));
+        assert_eq!(
+            healthy.rate_untracked, 0,
+            "a share the limiter actually measured is not an untracked one"
+        );
+        assert_eq!(
+            healthy.rate_open_notice(now),
+            None,
+            "a pool whose limiter is running has nothing to report"
+        );
+
+        // Every slot held by an id that is still active, so the prune that runs
+        // before the cap is consulted frees nothing.
+        for i in 0..RATE_WORKERS {
+            p.rates.insert(
+                format!("flood-{i}"),
+                ShareRate {
+                    shares: 1,
+                    at_ms: now,
+                },
+            );
+        }
+        for i in 0..3 {
+            assert!(
+                p.rate_admits_share(W_A, now),
+                "share {i}: honest work is never refused because a bookkeeping map is full"
+            );
+        }
+        assert_eq!(
+            p.rates.len(),
+            RATE_WORKERS,
+            "the cap is a memory bound and the map must not grow past it"
+        );
+        assert_eq!(
+            p.rate_untracked, 3,
+            "an admission the limiter did not measure has to be counted, or nothing \
+             anywhere records that the guard stopped running"
+        );
+
+        let line = p
+            .rate_open_notice(now)
+            .expect("the operator is told the first time the limiter goes open");
+        assert!(line.contains("OPEN"), "{line}");
+        assert!(line.contains("3 in this process"), "{line}");
+        // Not one line per share: this fires on EVERY submission while it lasts,
+        // and a line each would bury the block-found notice under it.
+        assert_eq!(p.rate_open_notice(now), None);
+        assert!(p.rate_admits_share(W_B, now));
+        assert_eq!(p.rate_untracked, 4);
+        assert_eq!(p.rate_open_notice(now + RATE_OPEN_REPEAT_MS - 1), None);
+        // Still going five minutes later, so it is said again and carries the
+        // running total: an operator has to be able to see it has not stopped.
+        let again = p
+            .rate_open_notice(now + RATE_OPEN_REPEAT_MS)
+            .expect("an incident that is still going is repeated, not swallowed");
+        assert!(again.contains("4 in this process"), "{again}");
+
+        // An incident that has ENDED stops repeating. Without the "more than
+        // zero" guard this says "0 more share(s)" every five minutes forever,
+        // which is the log flood this notice was shaped to avoid rather than
+        // cause.
+        assert_eq!(
+            p.rate_open_notice(now + RATE_OPEN_REPEAT_MS * 2),
+            None,
+            "nothing has been admitted since the last line, so there is nothing to say"
+        );
+    }
+
+    #[test]
     fn a_burst_of_withheld_shares_cannot_take_an_honest_miners_payout() {
         // End to end through the pool's own accounting, at the point where money
         // is decided. "honest" mines the interval and sends its shares in as it
@@ -6145,6 +7872,9 @@ mod tests {
             difficulty: 0x2000_0000,
             target: [0xff; 32],
             coinbase_addr: Address::default(),
+            // A tip stamped NOW, so the default fixture is a healthy chain and
+            // a test that wants a stalled node has to say so.
+            prev_timestamp: curtimes(),
             txs: Arc::new(txs),
         }
     }
@@ -6355,8 +8085,10 @@ mod tests {
         // on the share hot path under the pool lock, so it is bounded, and past
         // the bound the headcount says it is a floor instead of under-reporting
         // the fleet.
-        let mut fleet = ShareLog::default();
-        fleet.last_ms = Some(t0);
+        let mut fleet = ShareLog {
+            last_ms: Some(t0),
+            ..Default::default()
+        };
         for i in 0..(SHARE_LOG_WORKERS + 50) {
             assert_eq!(fleet.note(&format!("worker-{i:04}"), 4322, t0), None);
         }
@@ -6379,8 +8111,10 @@ mod tests {
 
         // And a clock that steps BACKWARDS (ntp correction, a VM resumed from a
         // snapshot) must not silence the pool until it catches up.
-        let mut stepped = ShareLog::default();
-        stepped.last_ms = Some(t0);
+        let mut stepped = ShareLog {
+            last_ms: Some(t0),
+            ..Default::default()
+        };
         assert_eq!(stepped.note(W_A, 4322, t0 + 1), None);
         let back = stepped
             .note(W_A, 4322, t0 - 3_600_000)
@@ -6404,12 +8138,16 @@ mod tests {
         let pool = Arc::new(Mutex::new(p));
         let shares = 16u32;
         for n in 0..shares {
-            let r = handle_submission(&pool, W_A, height, [0x22u8; 32], n);
+            let r = handle_submission(&pool, W_A, height, [0x22u8; 32], n, "test-peer");
             assert_eq!(r["kind"].as_str(), Some("share"), "{r}");
         }
         {
             let g = plock(&pool);
-            assert_eq!(g.accepted, u64::from(shares), "every share is still credited");
+            assert_eq!(
+                g.accepted,
+                u64::from(shares),
+                "every share is still credited"
+            );
             assert!(
                 g.share_log.pending > 0,
                 "the share path is not folding anything into a summary: it is back to \
@@ -6427,7 +8165,7 @@ mod tests {
             g.network_target = [0xff; 32];
         }
         let before = plock(&pool).share_log.pending;
-        let r = handle_submission(&pool, W_A, height, [0x22u8; 32], shares);
+        let r = handle_submission(&pool, W_A, height, [0x22u8; 32], shares, "test-peer");
         assert_eq!(r["kind"].as_str(), Some("block"), "{r}");
         let g = plock(&pool);
         assert_eq!(
@@ -6505,9 +8243,10 @@ mod tests {
         // The stamp lives in the 89-byte header every worker hashes, and the pool
         // pins one template per height. Without it on disk a restart inside a
         // height invents a new stamp, so the pool serves a DIFFERENT header for the
-        // SAME height while /query/miner/notice - which signals only a height
-        // change - stays quiet. Every worker keeps hashing the dead header until
-        // its scan pass ends and earns nothing for it.
+        // SAME height while /query/miner/notice stays quiet: a restart re-stamps
+        // rather than swaps, so the template thread sees no change and the
+        // parked-job wake-up never fires. Every worker keeps hashing the dead
+        // header until its scan pass ends and earns nothing for it.
         let mut path = std::env::temp_dir();
         path.push(format!("hbit-pool-stamp-pin-{}", std::process::id()));
         let path = path.to_string_lossy().to_string();
@@ -6589,16 +8328,591 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_block_submission_is_recognised_as_a_refusal() {
-        // A refusal costs a whole block reward, and it used to reach nobody but
-        // the winning worker's JSON response.
-        assert!(!block_submit_refused(r#"{"ret":0,"ok":true}"#));
-        assert!(block_submit_refused(
-            r#"{"ret":1,"err":"block parse failed"}"#
-        ));
-        assert!(block_submit_refused("http_error: connection refused"));
-        assert!(block_submit_refused("<html>502 Bad Gateway</html>"));
-        assert!(block_submit_refused(""));
+    fn a_block_submission_answer_is_read_as_three_states_not_two() {
+        use BlockSubmitVerdict::*;
+        // The node spoke and said yes.
+        assert_eq!(classify_block_submit(r#"{"ret":0,"ok":true}"#), Queued);
+        // The node spoke and said no. This one really is a lost reward.
+        assert_eq!(
+            classify_block_submit(r#"{"ret":1,"err":"block parse failed"}"#),
+            Refused
+        );
+        // Nobody said anything. These four used to be indistinguishable from a
+        // refusal, and each one was announced to the operator as a whole block
+        // reward gone while the node may never have seen the bytes.
+        assert_eq!(
+            classify_block_submit("http_error: connection refused"),
+            Unresolved
+        );
+        assert_eq!(
+            classify_block_submit("<html>502 Bad Gateway</html>"),
+            Unresolved
+        );
+        assert_eq!(classify_block_submit(""), Unresolved);
+        // Valid JSON from something that is not the node - a proxy, a load
+        // balancer, a captive portal - carries no verdict at all.
+        assert_eq!(
+            classify_block_submit(r#"{"error":"upstream timeout"}"#),
+            Unresolved
+        );
+    }
+
+    #[test]
+    fn an_unreadable_answer_is_retried_and_a_spoken_verdict_is_not() {
+        use std::cell::Cell;
+        const NO_WAIT: &[Duration] = &[Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
+        // A node that is simply unreachable is asked again, every time.
+        let n = Cell::new(0u32);
+        let (v, _, attempts) = submit_block_with_retries(
+            || {
+                n.set(n.get() + 1);
+                "http_error: connection refused".to_string()
+            },
+            NO_WAIT,
+        );
+        assert_eq!(v, BlockSubmitVerdict::Unresolved);
+        assert_eq!(attempts, 4, "one attempt plus one per delay");
+        assert_eq!(n.get(), 4);
+
+        // A dropped connection followed by an answer: the block lands. This is
+        // the whole point of the change - the old code lost this block.
+        let n = Cell::new(0u32);
+        let (v, _, attempts) = submit_block_with_retries(
+            || {
+                n.set(n.get() + 1);
+                if n.get() < 3 {
+                    String::new()
+                } else {
+                    r#"{"ret":0}"#.to_string()
+                }
+            },
+            NO_WAIT,
+        );
+        assert_eq!(v, BlockSubmitVerdict::Queued);
+        assert_eq!(attempts, 3);
+
+        // A node that answers "no" is believed the first time and not pestered:
+        // identical bytes earn an identical answer.
+        let n = Cell::new(0u32);
+        let (v, _, attempts) = submit_block_with_retries(
+            || {
+                n.set(n.get() + 1);
+                r#"{"ret":1,"err":"nope"}"#.to_string()
+            },
+            NO_WAIT,
+        );
+        assert_eq!(v, BlockSubmitVerdict::Refused);
+        assert_eq!(attempts, 1);
+        assert_eq!(n.get(), 1, "a refusal must not be retried");
+    }
+
+    #[test]
+    fn a_refusal_that_follows_silence_is_not_announced_as_a_lost_reward() {
+        use std::cell::Cell;
+        const NO_WAIT: &[Duration] = &[Duration::ZERO];
+        // First POST is lost on the wire; the node may well have taken the block
+        // anyway. The second POST is then refused - and the likeliest reason a
+        // node refuses a block it did not refuse a moment ago is that it already
+        // holds it. Calling that a lost reward teaches the operator to distrust
+        // the line that IS a loss, so it stays unresolved.
+        let n = Cell::new(0u32);
+        let (v, last, attempts) = submit_block_with_retries(
+            || {
+                n.set(n.get() + 1);
+                if n.get() == 1 {
+                    "http_error: timed out".to_string()
+                } else {
+                    r#"{"ret":1,"err":"block already exists"}"#.to_string()
+                }
+            },
+            NO_WAIT,
+        );
+        assert_eq!(v, BlockSubmitVerdict::Unresolved);
+        assert_eq!(attempts, 2);
+        assert!(
+            last.contains("already exists"),
+            "the operator still sees what the node said"
+        );
+    }
+
+    #[test]
+    fn the_real_submission_path_retries_a_found_block_and_never_calls_it_lost() {
+        // Through handle_submission itself, not a re-implementation of it. The
+        // block path had no test that reached the submit at all, which is how a
+        // single unretried POST for the most valuable event in the pool survived
+        // review: every test pinned the idea and none pinned the code.
+        const TWICE: &[Duration] = &[Duration::ZERO, Duration::ZERO];
+        let mut p = a_pool();
+        // `node` is empty in a_pool, so every POST fails to build a URL: the
+        // node is never spoken to and every answer is unreadable.
+        p.network_target = [0xff; 32];
+        p.block_submit_delays = TWICE;
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+        let r = handle_submission(&pool, W_A, height, [0x33u8; 32], 1, "test-peer");
+
+        assert_eq!(r["kind"].as_str(), Some("block"), "{r}");
+        assert_eq!(
+            r["verdict"].as_str(),
+            Some("unresolved"),
+            "an unreadable answer is not a refusal, and reporting it as one told the \
+             operator a block was lost that nobody had refused: {r}"
+        );
+        assert_eq!(
+            r["attempts"].as_u64(),
+            Some(3),
+            "the retry schedule has to be reached from the real path, not just from a \
+             unit test of the loop: {r}"
+        );
+        // The accounting still happened exactly once, whatever the node said.
+        let g = plock(&pool);
+        assert_eq!(
+            g.submitted.len(),
+            1,
+            "the block is tracked for confirmation"
+        );
+        assert_eq!(
+            g.immature.len(),
+            1,
+            "its income is held back from settlement"
+        );
+    }
+
+    /// A stub mainnet chain whose tip is at `tip_height`, stamped `tip_unix`.
+    ///
+    /// Enough for `template_cycle` to build a real template: the tip, the tip's
+    /// intro, and the ASERT anchor's intro. Everything else is refused, which
+    /// leaves the packed transaction set empty and is not what these tests are
+    /// about.
+    fn a_stub_chain(tip_height: u64, tip_unix: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a stub chain");
+        let base = format!("http://{}", listener.local_addr().expect("stub address"));
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let Ok(mut s) = s else { continue };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = if path.starts_with("/query/latest") {
+                    format!(r#"{{"ret":0,"height":{tip_height}}}"#)
+                } else if path.starts_with("/query/block/intro") {
+                    let h: u64 = path
+                        .split("height=")
+                        .nth(1)
+                        .and_then(|s| s.split('&').next())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    // The anchor keeps its own (old, real) stamp; the tip carries
+                    // whatever this test is asking about.
+                    let ts = if h == tip_height {
+                        tip_unix
+                    } else {
+                        1_600_000_000
+                    };
+                    format!(
+                        r#"{{"ret":0,"hash":"{:064x}","height":{h},"timestamp":{ts},"difficulty":520093695}}"#,
+                        h
+                    )
+                } else {
+                    r#"{"ret":1,"errmsg":"stub refuses everything else"}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn a_node_that_stopped_following_the_chain_halts_the_pool_from_the_real_template_cycle() {
+        // Through `template_cycle` itself. The check has to sit OUTSIDE the "the
+        // template changed" branch, and the only way to prove it does is to run
+        // the cycle against a node whose template never changes - which is
+        // exactly what a stalled node is.
+        let now = curtimes();
+        let stalled = now - 3 * 3600; // three hours of silence
+        let node = a_stub_chain(800_000, stalled);
+        let mut p = a_pool();
+        p.node = node.clone();
+        let payout = p.payout.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        template_cycle(
+            &pool,
+            &http_client(),
+            &node,
+            &payout,
+            &ChainParams::mainnet(),
+            false,
+        );
+
+        let why = plock(&pool).node_halt.clone().expect(
+            "a tip three hours old means this node is not following the chain, and every \
+             template built on it is worthless work for the rigs pointed here",
+        );
+        assert!(why.contains("800000"), "name the tip: {why}");
+
+        // And it really binds the money path, not just a field.
+        let height = {
+            let mut g = plock(&pool);
+            // The cycle above rebuilt the share target from the stub chain's real
+            // difficulty, so accept anything: this test is about the halt, not
+            // about the arithmetic of a share.
+            g.share_target = [0xff; 32];
+            g.network_target = [0u8; 32]; // an ordinary share, not a block
+            g.tpl.height
+        };
+        let r = handle_submission(&pool, W_A, height, [0x77u8; 32], 1, "test-peer");
+        assert_eq!(r["kind"].as_str(), Some("degraded"), "{r}");
+        assert_eq!(plock(&pool).accepted, 0, "nothing was credited");
+    }
+
+    #[test]
+    fn a_node_that_is_keeping_up_is_not_halted_and_a_recovery_clears_it() {
+        let now = curtimes();
+        let node = a_stub_chain(800_000, now - 120); // two minutes: healthy
+        let mut p = a_pool();
+        p.node = node.clone();
+        // Start already halted, so this proves the derivation CLEARS as well as
+        // sets. A halt that only ever latches would leave an operator restarting
+        // a pool that is already fine.
+        p.node_halt = Some("stale from a previous cycle".to_string());
+        let payout = p.payout.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        template_cycle(
+            &pool,
+            &http_client(),
+            &node,
+            &payout,
+            &ChainParams::mainnet(),
+            false,
+        );
+
+        assert!(
+            plock(&pool).node_halt.is_none(),
+            "the tip is two minutes old: this node is keeping up"
+        );
+    }
+
+    /// The 32-byte hash the stub chain reports for height `h`, so a test can
+    /// make a block that IS ours on that chain.
+    fn stub_chain_hash(h: u64) -> [u8; 32] {
+        let mut hx = [0u8; 32];
+        hx[24..].copy_from_slice(&h.to_be_bytes());
+        hx
+    }
+
+    #[test]
+    fn a_one_block_fork_neither_releases_the_hold_back_nor_calls_the_block_orphaned() {
+        // A4, through the real template_cycle. The chain shows somebody else's
+        // hash at our height at depth ZERO. The old code released the hold-back
+        // and tallied the orphan immediately - and a one-block fork usually
+        // flips back. When it did, the income really was in the wallet, the
+        // pool no longer knew to hold it, and the next settlement distributed a
+        // whole subsidy plus fees at no confirmations.
+        let now = curtimes();
+        let tip = 800_000u64;
+        let node = a_stub_chain(tip, now - 120);
+        let mut p = a_pool();
+        p.node = node.clone();
+        let ours = [0xAAu8; 32]; // not what the stub chain shows there
+        p.submitted.push((tip, ours));
+        p.immature.push(Immature {
+            height: tip,
+            hash: ours,
+            units: 100,
+            fees_counted: false,
+            claim: Vec::new(),
+        });
+        let payout = p.payout.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        template_cycle(
+            &pool,
+            &http_client(),
+            &node,
+            &payout,
+            &ChainParams::mainnet(),
+            false,
+        );
+
+        let g = plock(&pool);
+        assert_eq!(
+            g.immature.len(),
+            1,
+            "a competing hash at depth zero decides nothing: the hold-back stays until the \
+             fork is buried as deep as a confirmation would need to be"
+        );
+        assert_eq!(g.orphaned, 0, "and the block is not tallied orphaned");
+        assert_eq!(
+            g.submitted.len(),
+            1,
+            "and the pool keeps watching the height, or a flip-back could never be seen"
+        );
+    }
+
+    #[test]
+    fn a_competing_hash_buried_sixteen_deep_is_a_real_orphan_and_releases_the_hold_back() {
+        // The other side of the same gate: once the competing hash is buried
+        // COINBASE_MATURITY_DEPTH deep, the orphan is as final as a
+        // confirmation would be. The income never landed, so the hold-back has
+        // nothing left to hold and keeping it would understate what settlement
+        // may pay forever.
+        let now = curtimes();
+        let tip = 810_000u64;
+        let h = tip - COINBASE_MATURITY_DEPTH;
+        let node = a_stub_chain(tip, now - 120);
+        let mut p = a_pool();
+        p.node = node.clone();
+        let ours = [0xBBu8; 32];
+        p.submitted.push((h, ours));
+        p.immature.push(Immature {
+            height: h,
+            hash: ours,
+            units: 100,
+            fees_counted: false,
+            claim: Vec::new(),
+        });
+        let payout = p.payout.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        template_cycle(
+            &pool,
+            &http_client(),
+            &node,
+            &payout,
+            &ChainParams::mainnet(),
+            false,
+        );
+
+        let g = plock(&pool);
+        assert!(
+            g.immature.is_empty(),
+            "a buried orphan releases its hold-back"
+        );
+        assert_eq!(g.orphaned, 1, "and is tallied");
+        assert!(g.submitted.is_empty(), "and stops being watched");
+    }
+
+    #[test]
+    fn our_own_block_buried_sixteen_deep_still_confirms_and_releases() {
+        // The gate must not have broken the ordinary happy path.
+        let now = curtimes();
+        let tip = 820_000u64;
+        let h = tip - COINBASE_MATURITY_DEPTH;
+        let node = a_stub_chain(tip, now - 120);
+        let mut p = a_pool();
+        p.node = node.clone();
+        let ours = stub_chain_hash(h); // exactly what the stub chain shows
+        p.submitted.push((h, ours));
+        p.immature.push(Immature {
+            height: h,
+            hash: ours,
+            units: 100,
+            fees_counted: false,
+            claim: Vec::new(),
+        });
+        let payout = p.payout.clone();
+        let pool = Arc::new(Mutex::new(p));
+
+        template_cycle(
+            &pool,
+            &http_client(),
+            &node,
+            &payout,
+            &ChainParams::mainnet(),
+            false,
+        );
+
+        let g = plock(&pool);
+        assert_eq!(g.blocks, 1, "a buried block of ours confirms");
+        assert!(
+            g.immature.is_empty(),
+            "and its hold-back is released for settlement"
+        );
+        assert!(g.submitted.is_empty());
+        assert_eq!(g.orphaned, 0);
+    }
+
+    #[test]
+    fn the_provisional_fork_notice_is_said_once_per_competing_hash() {
+        let mut st = HashMap::new();
+        let a = hex::encode([0xCDu8; 32]);
+        let b = hex::encode([0xEFu8; 32]);
+
+        // First sighting: announced.
+        let out = note_contested_heights(&mut st, &[(700, a.clone())]);
+        assert_eq!(out, vec![(700, a.clone())]);
+        // Same fork next cycle: silence. The loop runs every two seconds and a
+        // notice repeated on every cycle is a notice nobody reads.
+        assert!(note_contested_heights(&mut st, &[(700, a.clone())]).is_empty());
+        // The competing hash CHANGES: that is new news.
+        let out = note_contested_heights(&mut st, &[(700, b.clone())]);
+        assert_eq!(out, vec![(700, b.clone())]);
+        // The fork resolves (height no longer sighted), then re-forks with the
+        // hash it had before: announced again, not remembered as old news.
+        assert!(note_contested_heights(&mut st, &[]).is_empty());
+        let out = note_contested_heights(&mut st, &[(700, b.clone())]);
+        assert_eq!(out, vec![(700, b)]);
+    }
+
+    #[test]
+    fn a_tip_in_the_future_is_clock_skew_and_not_a_reason_to_stop_paying_anyone() {
+        assert_eq!(tip_too_old(9, 2_000, 1_000, 60), None);
+        // Exactly at the limit is still fine; one second past it is not.
+        assert_eq!(tip_too_old(9, 1_000, 1_060, 60), None);
+        assert!(tip_too_old(9, 1_000, 1_061, 60).is_some());
+    }
+
+    #[test]
+    fn an_accounting_halt_outranks_the_derived_one_and_a_template_change_cannot_clear_it() {
+        const DISK: &str = "the accounting could not be written to disk";
+        let mut p = a_pool();
+        assert_eq!(p.halt_reason(), None, "a healthy pool is not halted");
+
+        p.share_halt = Some("a share costs no work on this chain".to_string());
+        assert_eq!(p.halt_reason(), Some("a share costs no work on this chain"));
+
+        p.accounting_halt = Some(DISK.to_string());
+        assert_eq!(
+            p.halt_reason(),
+            Some(DISK),
+            "the halt that does NOT heal by itself is the one an operator has to act on, \
+             so it is the one reported"
+        );
+
+        // This is the entire reason for a second field. `share_halt` is derived:
+        // every template change rebuilds it from the live difficulty, so a
+        // durable-write failure written into it would be erased within seconds
+        // by the chain simply getting better.
+        p.recompute_share_target();
+        assert_eq!(
+            p.accounting_halt.as_deref(),
+            Some(DISK),
+            "a template change must not clear an accounting halt"
+        );
+        assert_eq!(p.halt_reason(), Some(DISK));
+    }
+
+    #[test]
+    fn a_block_whose_accounting_cannot_be_written_halts_the_money_and_still_ships_the_block() {
+        let mut p = a_pool();
+        // A directory that does not exist, so `atomic_write` really fails and
+        // `flush_state` really returns false. Nothing here is simulated.
+        let dead = std::env::temp_dir()
+            .join("hbit-no-such-directory-a41f")
+            .join("pool.state.json");
+        p.state_file = dead.to_string_lossy().into_owned();
+        // PERSIST is process-global and every other test in this binary shares
+        // it. Start well past anything they can have recorded, or this snapshot
+        // is waved through as already-landed and never attempts the write.
+        p.state_seq = 9_000_000;
+        p.network_target = [0xff; 32];
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+
+        let r = handle_submission(&pool, W_A, height, [0x44u8; 32], 3, "test-peer");
+        assert_eq!(
+            r["kind"].as_str(),
+            Some("block"),
+            "the block is irreplaceable and the chain does not care what this pool wrote to \
+             disk: a bookkeeping failure must not become a certain loss of the reward: {r}"
+        );
+
+        let g = plock(&pool);
+        assert_eq!(g.immature.len(), 1, "the hold-back exists, in memory only");
+        let why = g.accounting_halt.clone().expect(
+            "a block whose hold-back never reached disk has to stop this pool moving money: \
+             a restart would read a state file that never learned about the block, and the \
+             next settlement would distribute a whole subsidy at 0 confirmations",
+        );
+        assert!(
+            why.contains(&height.to_string()),
+            "the operator has to be told WHICH block: {why}"
+        );
+    }
+
+    #[test]
+    fn an_accounting_halt_refuses_ordinary_shares_but_never_a_block() {
+        let mut p = a_pool();
+        p.network_target = [0u8; 32]; // nothing here reaches the network target
+        p.accounting_halt = Some("disk full".to_string());
+        let height = p.tpl.height;
+        let pool = Arc::new(Mutex::new(p));
+
+        let r = handle_submission(&pool, W_A, height, [0x55u8; 32], 1, "test-peer");
+        assert_eq!(r["kind"].as_str(), Some("degraded"), "{r}");
+        assert_eq!(
+            r["err"].as_str(),
+            Some("disk full"),
+            "a miner is told why, so it can stop burning power: {r}"
+        );
+        assert_eq!(plock(&pool).accepted, 0, "and nothing was credited");
+
+        // A block is exempt for the same reason it is exempt from every other
+        // shedding rule in this function: it is a whole reward, it is the
+        // operator's money rather than a miner's credit, and the halt exists to
+        // stop money going OUT.
+        plock(&pool).network_target = [0xff; 32];
+        let r = handle_submission(&pool, W_A, height, [0x56u8; 32], 2, "test-peer");
+        assert_eq!(
+            r["kind"].as_str(),
+            Some("block"),
+            "a halted pool must still take a block: {r}"
+        );
+    }
+
+    #[test]
+    fn an_accounting_halt_stops_fresh_settlement_and_still_resolves_what_is_in_flight() {
+        // The same contract the difficulty halt has, through the same accessor:
+        // resolving is not paying. A miner whose payout is already on the chain
+        // must still be credited as PAID, while nothing new is valued or signed.
+        let (node, seen) = a_stub_node_answering(vec![(
+            "/query/transaction",
+            r#"{"ret":0,"confirm":6}"#, // buried at exactly the maturity depth
+        )]);
+        let mut p = a_pool();
+        p.node = node;
+        p.accounting_halt = Some("the accounting could not be written to disk".to_string());
+        p.payout_records
+            .push(a_payout("bb22", 1_000, true, &[(W_A, 25)]));
+        p.settle_pending_txs.push("bb22".to_string());
+        p.rebuild_inflight();
+        p.pplns
+            .record(W_B, pool_core::now_ms().saturating_sub(60_000));
+        p.matured = Some(Matured {
+            units: 1_000,
+            at: 1_500,
+        });
+        let pool = Arc::new(Mutex::new(p));
+
+        settle_once(&pool);
+
+        let g = plock(&pool);
+        assert_eq!(
+            g.paid.get(W_A).map(|r| r.units),
+            Some(25),
+            "money already owed and already on the chain still has to reach its miner"
+        );
+        assert!(g.settle_pending_txs.is_empty(), "and stop being tracked");
+        let asked = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            !asked.iter().any(|p| p.starts_with("/query/balance")),
+            "a halted pool must not even value its wallet: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|p| p.starts_with("/submit/transaction")),
+            "and must not sign or submit anything fresh: {asked:?}"
+        );
     }
 
     #[test]
@@ -6640,6 +8954,7 @@ mod tests {
             hash: [hash; 32],
             units: block_reward_units(height),
             fees_counted: false,
+            claim: Vec::new(),
         }
     }
 
@@ -6672,7 +8987,10 @@ mod tests {
         // file, in the exact shape `state_shot` and `PayoutRecord::to_json` used
         // to emit, loaded by the code that replaces them.
         let mut path = std::env::temp_dir();
-        path.push(format!("hbit-pool-restart-{}.state.json", std::process::id()));
+        path.push(format!(
+            "hbit-pool-restart-{}.state.json",
+            std::process::id()
+        ));
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let old = json!({
@@ -6704,9 +9022,22 @@ mod tests {
         });
         std::fs::write(&path, old.to_string()).expect("write the old state file");
 
+        // Through the real gate, the same way startup reads it: an old file with
+        // no `schema` key is schema 1 and must classify Readable.
+        let j = match classify_state_file(&path) {
+            StateFile::Readable(j) => *j,
+            other => panic!(
+                "an old state file must be readable, not refused: {}",
+                match other {
+                    StateFile::Fresh => "classified Fresh".to_string(),
+                    StateFile::Unreadable(why) => why,
+                    StateFile::Readable(_) => unreachable!(),
+                }
+            ),
+        };
         let mut p = a_pool();
         p.state_file = path.clone();
-        p.load_state();
+        p.load_state(&j);
 
         // The window comes back whole, and weighing what the old build weighed
         // it at: 2 shares to 1, which is the split that build would have paid.
@@ -6752,6 +9083,9 @@ mod tests {
                 hash: [0xab; 32],
                 units: 30,
                 fees_counted: false,
+                // The old file this test is about has no claim, and reading
+                // that as an empty one is the point: no snapshot, not "nobody".
+                claim: Vec::new(),
             }]
         );
 
@@ -6771,7 +9105,10 @@ mod tests {
         );
         assert_eq!(back["owed"].as_array().map(|a| a.len()), Some(0));
         assert_eq!(back["immature"][0]["fees_counted"].as_bool(), Some(false));
-        assert_eq!(back["credit_horizon_ms"].as_u64(), Some(p.pplns.horizon_ms()));
+        assert_eq!(
+            back["credit_horizon_ms"].as_u64(),
+            Some(p.pplns.horizon_ms())
+        );
         assert_eq!(back["paid"]["rows"][0]["units"].as_u64(), Some(41));
         let _ = std::fs::remove_file(&path);
     }
@@ -6833,10 +9170,15 @@ mod tests {
             assert!(u.contains(arg), "usage never explains {arg}:\n{u}");
         }
         // A command that really works, with the required arguments in place.
+        // The share size is read from the constant rather than typed here, so
+        // the example cannot drift from the value the project recommends - which
+        // is exactly what happened when the constant said 24 and two of the three
+        // shipped deployment files said 20.
         assert!(
-            u.contains(
-                "hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 24 mainnet"
-            ),
+            u.contains(&format!(
+                "hbit-pool-server http://127.0.0.1:8080 pool-wallet.key 0.0.0.0:9777 \
+                 {DEFAULT_SHARE_BITS} mainnet"
+            )),
             "usage has no working example:\n{u}"
         );
         // The bounds and defaults are read from the constants that enforce them,

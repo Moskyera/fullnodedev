@@ -42,6 +42,15 @@ pub struct MiningRuntimeState {
     /// what a pass on this rig can cost, so the window and the rate readings can
     /// actually arrive at can never contradict each other.
     gpu_temp_fresh_ms: AtomicU64,
+    /// Total board power really measured across every GPU in this rig, in
+    /// hundredths of a watt. 0 means no card measured it, which is not the same
+    /// fact as a card drawing nothing and must never reach the panel as a zero:
+    /// the operator's bill would read as free.
+    gpu_power_w100: AtomicU32,
+    /// Wall clock of that reading. Shares the temperature's freshness window
+    /// because it is taken in the same monitor pass, from the same sensor, at
+    /// the same cadence. 0 = never read.
+    gpu_power_unix_ms: AtomicU64,
 }
 
 pub(crate) struct MiningThreadGuard {
@@ -73,6 +82,8 @@ impl MiningRuntimeState {
             // Before a monitor starts there is nothing to be stale, so the
             // narrowest cadence with a single sensor is the safe placeholder.
             gpu_temp_fresh_ms: AtomicU64::new(temp_freshness_ms(ThermalCadence::GUARDED, 1)),
+            gpu_power_w100: AtomicU32::new(0),
+            gpu_power_unix_ms: AtomicU64::new(0),
         })
     }
 
@@ -103,6 +114,39 @@ impl MiningRuntimeState {
     pub fn gpu_temp_c(&self) -> Option<f32> {
         let hundredths = self.gpu_temp_c100.load(Relaxed);
         let taken_at = self.gpu_temp_unix_ms.load(Relaxed);
+        if hundredths == 0 || taken_at == 0 {
+            return None;
+        }
+        if crate::mining_stats::unix_ms_now().saturating_sub(taken_at)
+            > self.gpu_temp_fresh_ms.load(Relaxed)
+        {
+            return None;
+        }
+        Some(hundredths as f32 / 100.0)
+    }
+
+    /// Publish the rig's total measured board power, in watts. Anything outside
+    /// the window a board draw can fall in is dropped rather than published, on
+    /// the same rule the temperature above applies, and for the same reason: a
+    /// number that is not a measurement must not be able to look like one.
+    pub fn record_gpu_board_power_w(&self, watts: f32) {
+        let Some(watts) = crate::mining_stats::sensor_board_power_w(Some(watts)) else {
+            return;
+        };
+        self.gpu_power_w100
+            .store((watts * 100.0).round() as u32, Relaxed);
+        self.gpu_power_unix_ms
+            .store(crate::mining_stats::unix_ms_now(), Relaxed);
+    }
+
+    /// The GPU board power this process measured, or `None` when no card has
+    /// answered recently. Never 0, for the same reason `gpu_temp_c` is never 0:
+    /// where there is no measurement the caller has to fall back to its
+    /// configured estimate and say so, and a zero would instead be published as
+    /// a rig that costs nothing to run.
+    pub fn gpu_board_power_w(&self) -> Option<f32> {
+        let hundredths = self.gpu_power_w100.load(Relaxed);
+        let taken_at = self.gpu_power_unix_ms.load(Relaxed);
         if hundredths == 0 || taken_at == 0 {
             return None;
         }
@@ -304,13 +348,17 @@ impl MiningRuntimeState {
             if newly_throttled || cap_changed {
                 wlogerr!(
                     "[Thermal] {:.1}C >= {:.1}C: cap work_groups to {}",
-                    temp_c, max_temp, cap
+                    temp_c,
+                    max_temp,
+                    cap
                 );
             }
             if !self.thermal_paused.swap(true, Relaxed) {
                 wlogerr!(
                     "[Thermal] CRITICAL {:.1}C >= {:.1}C: mining paused until <= {:.1}C",
-                    temp_c, critical_temp, recovery_temp
+                    temp_c,
+                    critical_temp,
+                    recovery_temp
                 );
             }
             return;
@@ -321,7 +369,9 @@ impl MiningRuntimeState {
             if !self.throttled.swap(true, Relaxed) || cap_changed {
                 wlogerr!(
                     "[Thermal] {:.1}C >= {:.1}C: cap work_groups to {}",
-                    temp_c, max_temp, cap
+                    temp_c,
+                    max_temp,
+                    cap
                 );
             }
             return;
@@ -334,7 +384,8 @@ impl MiningRuntimeState {
             if was_paused || was_throttled || old_cap > 0 {
                 wlogln!(
                     "[Thermal] Recovered at {:.1}C (<= {:.1}C): mining resumed, cap removed",
-                    temp_c, recovery_temp
+                    temp_c,
+                    recovery_temp
                 );
             }
         }
@@ -382,14 +433,28 @@ impl MiningRuntimeState {
 
 /// What one sensor pass costs.
 ///
-/// A pass probes every selected GPU, one after another, and each probe is a
-/// subprocess (or, with `thermal_file`, one file read). A probe that answers
-/// costs milliseconds; a probe that stalls is bounded by SENSOR_COMMAND_TIMEOUT
-/// (2s) plus the bounded kill of a process that ignored it, which is the 2.5s
-/// per GPU used here. So a healthy 8-GPU rig finishes a pass in well under a
-/// second and a sick one spends 20s in it, and every interval below is chosen
-/// against that number rather than against a hoped-for one.
-const SENSOR_PASS_WORST_CASE_PER_GPU: Duration = Duration::from_millis(2_500);
+/// A pass probes every selected GPU, one after another, and asks it up to two
+/// questions: its temperature, and its board draw. Each question is a subprocess
+/// (or, with `thermal_file` or the AMD display driver, a file read or a library
+/// call). A probe that answers costs milliseconds; a probe that stalls is
+/// bounded by SENSOR_COMMAND_TIMEOUT (2s) plus the bounded kill of a process
+/// that ignored it, which is 2.5s each, so 5s per GPU in the worst case. A
+/// healthy 8-GPU rig finishes a pass in well under a second and a sick one
+/// spends 40s in it, and every interval below is chosen against that number
+/// rather than against a hoped-for one.
+///
+/// It was 2.5s while only the AMD display driver could answer with watts, which
+/// costs no subprocess at all, so the power half of a pass was free everywhere
+/// else: `read_board_power_w` returned `None` for every command source without
+/// spawning anything. Wiring `nvidia-smi --query-gpu=power.draw` gives an NVIDIA
+/// rig a real second subprocess per card, and a bound that did not follow it
+/// would understate a slow rig's own sampling period and blank a working gauge
+/// between two good samples. Two probes' worth is charged for every GPU rather
+/// than only for the ones that really ask twice: this is the ceiling used to
+/// decide how old a published reading may get, and paying a little too much for
+/// an AMD rig only widens a display window, while paying too little would hide a
+/// reading that the rig is still producing.
+const SENSOR_PASS_WORST_CASE_PER_GPU: Duration = Duration::from_millis(5_000);
 
 fn worst_case_pass(sensor_count: usize) -> Duration {
     let sensors = u32::try_from(sensor_count.max(1)).unwrap_or(u32::MAX);
@@ -417,11 +482,18 @@ const THERMAL_MIN_IDLE: Duration = Duration::from_millis(2_500);
 const THERMAL_POLL_INTERVAL: Duration = Duration::from_millis(2_500);
 
 /// Reporting-only cadence (`max_temp_c == 0`, the shipped default). This is a
-/// number on a screen, not a safety input. 30s is comfortably longer than the
-/// worst-case pass above (~20s on an 8-GPU rig), keeps the duty cycle low on a
-/// healthy rig (sub-second pass, then idle), and still refreshes the gauge
-/// twice a minute, which is faster than a GPU changes temperature in any way an
+/// number on a screen, not a safety input. 30s keeps the duty cycle low on a
+/// healthy rig (sub-second pass, then idle) and still refreshes the gauge twice
+/// a minute, which is faster than a GPU changes temperature in any way an
 /// operator who set no limit needs to watch.
+///
+/// It is no longer longer than the worst-case pass on a large rig: eight cards
+/// whose every probe times out is 40s of pass against a 30s interval. That case
+/// is a rig whose sensors have all stopped answering, and it is bounded by
+/// THERMAL_MIN_IDLE exactly as the guarded path is, so the loop degrades to
+/// pass-then-2.5s-idle rather than to back-to-back spawns. Stated rather than
+/// papered over: the interval is chosen for the healthy rig, and the floor is
+/// what protects the sick one.
 const THERMAL_REPORTING_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How the monitor spaces one sensor pass from the next.
@@ -479,8 +551,8 @@ impl ThermalCadence {
 /// blanks its own gauge. This is a display window only; the safety path acts on
 /// each reading as it arrives and never consults it.
 fn temp_freshness_ms(cadence: ThermalCadence, sensor_count: usize) -> u64 {
-    let gap = u64::try_from(cadence.worst_case_sample_gap(sensor_count).as_millis())
-        .unwrap_or(u64::MAX);
+    let gap =
+        u64::try_from(cadence.worst_case_sample_gap(sensor_count).as_millis()).unwrap_or(u64::MAX);
     gap.saturating_mul(2).saturating_add(5_000).max(15_000)
 }
 
@@ -621,6 +693,15 @@ fn run_thermal_monitor(
         // still cannot spawn its next subprocess immediately.
         let pass_started = Instant::now();
         let reading = hottest_sensor_reading(sensors);
+        // Power is read in the same pass and published on its own. It is
+        // deliberately not routed through `handle_thermal_sample`: a missing
+        // temperature is a safety event that can pause a rig, while a missing
+        // power reading only means the gauge ages out and the panel goes back
+        // to saying "estimate". Merging the two would let a card that reports
+        // heat but not watts trip the safety path.
+        if let Some(watts) = total_board_power_reading(sensors) {
+            runtime.record_gpu_board_power_w(watts);
+        }
         handle_thermal_sample(
             runtime,
             reading,
@@ -640,6 +721,29 @@ fn hottest_sensor_reading(sensors: &[crate::efficiency::GpuTempSensorBackend]) -
         hottest = Some(hottest.map_or(temp, |current| current.max(temp)));
     }
     hottest
+}
+
+/// What the whole rig's GPUs are drawing, in watts, as a SUM and not a maximum.
+///
+/// Temperature takes the hottest card because the hottest card is the one that
+/// will throttle or die. Power takes every card added together, because the
+/// question it answers is what the meter is spinning at, and eight cards each
+/// drawing 250 W cost eight times as much as one.
+///
+/// One card that cannot report power makes the whole total `None`, on purpose. A
+/// sum over the subset that answered is not the rig's draw, it is a fraction of
+/// it wearing the same label, and understating the bill is exactly the failure
+/// this whole change exists to end. Better an honest fallback to the configured
+/// estimate for the rig than a measurement that is quietly missing a card.
+fn total_board_power_reading(sensors: &[crate::efficiency::GpuTempSensorBackend]) -> Option<f32> {
+    if sensors.is_empty() {
+        return None;
+    }
+    let mut total = 0.0f32;
+    for sensor in sensors {
+        total += sensor.read_board_power_w()?;
+    }
+    Some(total)
 }
 
 /// How many times to retry spawning the thermal monitor thread before giving up
@@ -695,7 +799,8 @@ fn detect_thermal_sensors(
         // The single configured thermal_file describes the first identity only;
         // the caller has already refused to let it stand in for several GPUs.
         let file = if sensors.is_empty() { thermal_file } else { "" };
-        let Some((sensor, temp)) = crate::efficiency::detect_gpu_temp_sensor(file, gpu_index, vendor)
+        let Some((sensor, temp)) =
+            crate::efficiency::detect_gpu_temp_sensor(file, gpu_index, vendor)
         else {
             return Err(no_sensor_reason(vendor, gpu_index));
         };
@@ -741,6 +846,9 @@ fn spawn_reporting_only_thermal_monitor(
                 }
             };
             monitor_runtime.record_gpu_temperature(initial);
+            if let Some(watts) = total_board_power_reading(&sensors) {
+                monitor_runtime.record_gpu_board_power_w(watts);
+            }
             run_thermal_monitor(
                 &monitor_runtime,
                 &sensors,
@@ -826,6 +934,9 @@ pub fn start_thermal_monitor(
     };
 
     runtime.record_gpu_temperature(initial_hottest);
+    if let Some(watts) = total_board_power_reading(&sensors) {
+        runtime.record_gpu_board_power_w(watts);
+    }
     runtime.observe_thermal_temperature(
         eff.max_temp_c,
         eff.throttle_workgroups,
@@ -976,6 +1087,146 @@ mod tests {
         assert_eq!(runtime.gpu_temp_c(), Some(67.5));
     }
 
+    /// Run the whole production path against the real card and print what it
+    /// publishes: sensor detection, the monitor thread, the freshness window,
+    /// and the snapshot the panel reads. Ignored by default because it needs an
+    /// AMD GPU present; it is the verification step for the power sensor and is
+    /// meant to be run twice, once with the card idle and once under load, so
+    /// the published watts can be seen to move.
+    ///
+    ///   cargo test --release --features ocl -p app --lib \
+    ///       report_real_board_power -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a real AMD GPU; run by hand at two load levels"]
+    fn report_real_board_power() {
+        use crate::efficiency::{EfficiencyConf, EfficiencyMode};
+
+        let eff = EfficiencyConf {
+            mode: EfficiencyMode::Profit,
+            power_cost_kwh: 0.25,
+            gpu_watts: 350.0,
+            cpu_watts_per_thread: 8.0,
+            hac_price: 0.0,
+            dynamic_supervene: false,
+            supervene_min: 0,
+            supervene_max: 0,
+            oom_fallback: true,
+            // 0 = reporting-only, which is the shipped default and the path a
+            // panel operator is actually on.
+            max_temp_c: 0,
+            throttle_workgroups: 0,
+            thermal_file: String::new(),
+            idle_start_hour: 255,
+            idle_end_hour: 255,
+            pause_if_unprofitable: false,
+            benchmark_seconds: 0,
+            benchmark_fine_sweep: false,
+            thermal_gpu_index: 0,
+            stats_file: String::new(),
+        };
+        let runtime = MiningRuntimeState::new(48, 0);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        start_thermal_monitor(
+            &runtime,
+            &eff,
+            48,
+            &[(crate::gpu_arch::GpuVendor::Amd, 0)],
+            Some(stop.clone()),
+        );
+
+        // The reporting-only monitor detects on its own thread, so wait for the
+        // first reading rather than assuming one is there.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runtime.gpu_board_power_w().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let measured = runtime.gpu_board_power_w();
+        let stats = crate::mining_stats::build_mining_stats(
+            1_000_000.0,
+            0.5,
+            0.01,
+            &eff,
+            "amd_profit",
+            0,
+            768_000,
+            false,
+            48,
+            48,
+            0,
+            48,
+            1_000_000.0,
+            0.0,
+            runtime.gpu_temp_c(),
+            measured,
+        );
+        println!(
+            "measured board power = {:?} W, temperature = {:?} C\n\
+             published: watts = {:.1} ({}), kH/J = {:.3}, cost = {:.4} EUR/d",
+            stats.gpu_board_power_w,
+            stats.gpu_temp_c,
+            stats.watts,
+            if stats.watts_measured {
+                "measured"
+            } else {
+                "estimate"
+            },
+            stats.kh_per_j,
+            stats.daily_cost_eur,
+        );
+        stop.store(true, Relaxed);
+        assert!(
+            measured.is_some(),
+            "no AMD card reported board power; this test needs one"
+        );
+    }
+
+    #[test]
+    fn a_runtime_that_never_read_a_power_sensor_reports_no_power() {
+        let runtime = MiningRuntimeState::new(64, 0);
+        assert_eq!(runtime.gpu_board_power_w(), None);
+        // Zero is the dangerous one. A card that is drawing power never reads
+        // zero, so a zero is an unsupported sensor, and publishing it would put
+        // free electricity into the operator's cost figure.
+        for impossible in [0.0, -5.0, f32::NAN, f32::INFINITY, 100_000.0] {
+            runtime.record_gpu_board_power_w(impossible);
+            assert_eq!(runtime.gpu_board_power_w(), None, "{impossible}");
+        }
+        runtime.record_gpu_board_power_w(256.5);
+        assert_eq!(runtime.gpu_board_power_w(), Some(256.5));
+    }
+
+    #[test]
+    fn a_power_sensor_that_went_silent_stops_being_quoted() {
+        // Same staleness rule as the temperature, and it shares the temperature's
+        // window because both are read in one monitor pass.
+        let runtime = MiningRuntimeState::new(64, 0);
+        runtime.record_gpu_board_power_w(240.0);
+        assert_eq!(runtime.gpu_board_power_w(), Some(240.0));
+        let taken_at = runtime.gpu_power_unix_ms.load(Relaxed);
+        let window = runtime.gpu_temp_fresh_ms.load(Relaxed);
+        runtime
+            .gpu_power_unix_ms
+            .store(taken_at - window - 1, Relaxed);
+        assert_eq!(runtime.gpu_board_power_w(), None);
+    }
+
+    #[test]
+    fn a_rig_total_above_one_board_is_a_reading_not_an_error() {
+        // Four cards at 256 W. The per-board window lives at the sensor; what
+        // reaches the runtime is already a sum and must survive.
+        let runtime = MiningRuntimeState::new(64, 0);
+        runtime.record_gpu_board_power_w(1_024.0);
+        assert_eq!(runtime.gpu_board_power_w(), Some(1_024.0));
+    }
+
+    #[test]
+    fn one_card_without_a_power_sensor_voids_the_whole_rig_total() {
+        // A partial sum is not the rig's draw; it is a fraction of it wearing
+        // the same label, and it would understate the bill. `None` sends the
+        // caller back to its configured estimate, which at least says what it is.
+        assert_eq!(total_board_power_reading(&[]), None);
+    }
+
     #[test]
     fn a_sensor_that_went_silent_stops_being_quoted() {
         let runtime = MiningRuntimeState::new(64, 0);
@@ -995,15 +1246,19 @@ mod tests {
     fn freshness_window_follows_the_poll_cadence() {
         // One constant that can contradict the interval is what let a 15s window
         // expire on every single sample of a slower loop.
-        assert_eq!(temp_freshness_ms(ThermalCadence::GUARDED, 1), 20_000);
+        //
+        // One guarded GPU: a worst-case pass is 5s (a temperature probe and a
+        // power probe, 2.5s each), the gap to the next published value is
+        // 5 + 2.5 + 5 = 12.5s, and the window is two of those plus 5s of slack.
+        assert_eq!(temp_freshness_ms(ThermalCadence::GUARDED, 1), 30_000);
         assert!(
             temp_freshness_ms(ThermalCadence::REPORTING, 1)
                 > 2 * THERMAL_REPORTING_POLL_INTERVAL.as_millis() as u64
         );
         let runtime = MiningRuntimeState::new(64, 0);
-        assert_eq!(runtime.gpu_temp_fresh_ms.load(Relaxed), 20_000);
+        assert_eq!(runtime.gpu_temp_fresh_ms.load(Relaxed), 30_000);
         runtime.set_temp_freshness_window(ThermalCadence::REPORTING, 1);
-        assert_eq!(runtime.gpu_temp_fresh_ms.load(Relaxed), 70_000);
+        assert_eq!(runtime.gpu_temp_fresh_ms.load(Relaxed), 75_000);
     }
 
     #[test]
@@ -1024,7 +1279,10 @@ mod tests {
         );
         // And it is derived, not guessed: the window follows the sensor count
         // because the pass does.
-        assert!(temp_freshness_ms(ThermalCadence::GUARDED, 8) > temp_freshness_ms(ThermalCadence::GUARDED, 1));
+        assert!(
+            temp_freshness_ms(ThermalCadence::GUARDED, 8)
+                > temp_freshness_ms(ThermalCadence::GUARDED, 1)
+        );
 
         let runtime = MiningRuntimeState::new(64, 0);
         runtime.set_temp_freshness_window(ThermalCadence::GUARDED, 8);
@@ -1086,10 +1344,43 @@ mod tests {
     fn a_worst_case_pass_is_counted_per_gpu() {
         assert_eq!(worst_case_pass(0), SENSOR_PASS_WORST_CASE_PER_GPU);
         assert_eq!(worst_case_pass(1), SENSOR_PASS_WORST_CASE_PER_GPU);
-        assert_eq!(worst_case_pass(8), Duration::from_secs(20));
+        assert_eq!(worst_case_pass(8), Duration::from_secs(40));
         // Nothing here may overflow into a tiny window on an absurd rig.
-        assert!(worst_case_pass(usize::MAX) >= Duration::from_secs(20));
+        assert!(worst_case_pass(usize::MAX) >= Duration::from_secs(40));
         assert!(temp_freshness_ms(ThermalCadence::GUARDED, usize::MAX) >= 90_000);
+    }
+
+    /// The pass bound covers BOTH questions a pass asks a card.
+    ///
+    /// Wiring `nvidia-smi --query-gpu=power.draw` turned the power half of a
+    /// pass from a free `None` into a second bounded subprocess per NVIDIA card.
+    /// A bound still sized for one probe would be half the truth, and the
+    /// freshness window derived from it would blank a gauge that the rig is
+    /// still feeding.
+    #[test]
+    fn the_pass_bound_pays_for_the_power_probe_as_well_as_the_temperature_probe() {
+        // One bounded probe: the 2s command timeout plus the bounded kill.
+        let one_probe = Duration::from_millis(2_500);
+        assert_eq!(
+            SENSOR_PASS_WORST_CASE_PER_GPU,
+            one_probe * 2,
+            "a pass asks each card for its temperature and for its watts"
+        );
+
+        // Eight NVIDIA cards whose every probe times out: sixteen probes.
+        let sick_nvidia_pass = one_probe * 16;
+        assert!(
+            worst_case_pass(8) >= sick_nvidia_pass,
+            "the bound must not be exceeded by the case it exists to bound"
+        );
+
+        // And the window built on it survives two of those passes, which is the
+        // property the whole constant exists for.
+        let window = temp_freshness_ms(ThermalCadence::GUARDED, 8);
+        assert!(
+            window > 2 * sick_nvidia_pass.as_millis() as u64,
+            "a guarded window of {window}ms must survive two worst-case passes"
+        );
     }
 
     #[test]
@@ -1324,8 +1615,7 @@ mod tests {
             Some(hot_stop.clone()),
         );
         let hot_at_return = hot_runtime.gpu_temp_c();
-        let hot_gated_at_return =
-            crate::efficiency::mining_is_gated(&hot_runtime, &hot_efficiency);
+        let hot_gated_at_return = crate::efficiency::mining_is_gated(&hot_runtime, &hot_efficiency);
         let hot_cap_at_return = hot_runtime.thermal_workgroups_cap();
         hot_stop.store(true, Relaxed);
 
@@ -1518,9 +1808,7 @@ mod tests {
         let hot_cap = runtime.thermal_workgroups_cap();
 
         std::fs::write(&path, "63.5\n").expect("cool the test sensor down");
-        let resumed = wait_for(Duration::from_secs(30), || {
-            !runtime.thermal_pause_active()
-        });
+        let resumed = wait_for(Duration::from_secs(30), || !runtime.thermal_pause_active());
         let cool_gated = crate::efficiency::mining_is_gated(&runtime, &efficiency);
         let cool_cap = runtime.thermal_workgroups_cap();
 
@@ -1550,7 +1838,11 @@ mod tests {
              worker loop to hash at 95.0C"
         );
         assert_eq!(hot_temp, Some(95.0), "the 95.0C sample was never published");
-        assert_eq!(hot_cap, Some(32), "no conservative work_groups cap at 95.0C");
+        assert_eq!(
+            hot_cap,
+            Some(32),
+            "no conservative work_groups cap at 95.0C"
+        );
 
         assert!(
             resumed,

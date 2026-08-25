@@ -1,0 +1,479 @@
+pragma fitsh 1.0.0
+
+contract HPAYChannelRegistryV2 {
+    const FUNDING = 1
+    const OPEN = 2
+    const CHALLENGING = 3
+    const FINAL = 4
+    const INITIAL_RENT_PERIODS = 100
+
+    // Chain storage parameters this contract has to live inside, from
+    // `SpaceCap::new` (vm/src/rt/cap.rs): storage_period = 100 blocks,
+    // storage_recv_max_periods = 3000. A key's dormant window therefore tops
+    // out at 300000 blocks and asking for more is a hard runtime error, so
+    // every `storage_recv` below is clamped to the headroom that is left.
+    const BLOCKS_PER_PERIOD = 100
+    const RECOVER_CAP_BLOCKS = 300000
+
+    // MAX_RENT_STEP is bounded by one transaction's gas budget (storage bucket
+    // GasExtra::storage_limit = 111911, vm/src/rt/gas.rs), not by the rent
+    // rules. `renew_channel` touches twelve keys: measured on chain, 200
+    // periods is the last step that executes and 250 dies with OutOfGas, so
+    // this advertises 150 and keeps real margin under the cliff. The 5000 it
+    // used to advertise was unreachable by 25x, and asking for it produced
+    // OutOfGas rather than a refusal a caller could read.
+    const MAX_RENT_STEP = 150
+
+    // Bought for every channel key at the moment the contract takes custody of
+    // real coin, so that a lapsed lease leaves the record dormant and
+    // restorable instead of deleted.
+    const FUNDING_RECOVER_PERIODS = 550
+
+    // Below this the live lease is topped back up before custody starts, so a
+    // channel funded long after it was opened is still usable.
+    const MIN_FUNDED_LIVE_BLOCKS = 5000
+
+    // Custody is refused outright unless the arbitration record will stay
+    // reachable - live or dormant-restorable - for at least this long.
+    const MIN_FUNDED_REACH_BLOCKS = 50000
+
+    // The deploy transaction's main signer is the only Hub identity for this
+    // registry. Construct argv is the exact 32-byte HPAY network instance.
+    abstract Construct(network: bytes) {
+        assert size(network) == 32
+        var hub = tx_main_addr()
+        assert check_signature(hub)
+        storage_new("g_network", network, INITIAL_RENT_PERIODS)
+        storage_new("g_hub", hub, INITIAL_RENT_PERIODS)
+        storage_new("g_locked", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_left_claimable", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_hub_claimable", 0 as u64, INITIAL_RENT_PERIODS)
+        storage_new("g_open_count", 0 as u64, INITIAL_RENT_PERIODS)
+        // g_hub and g_network are read by PermitHAC, so if the registry's own
+        // keys are deleted every channel's payout dies with them, however well
+        // tended the channel keys are. Give them a dormant window too.
+        this.stock_recovery("g_network", FUNDING_RECOVER_PERIODS)
+        this.stock_recovery("g_hub", FUNDING_RECOVER_PERIODS)
+        this.stock_recovery("g_locked", FUNDING_RECOVER_PERIODS)
+        this.stock_recovery("g_left_claimable", FUNDING_RECOVER_PERIODS)
+        this.stock_recovery("g_hub_claimable", FUNDING_RECOVER_PERIODS)
+        this.stock_recovery("g_open_count", FUNDING_RECOVER_PERIODS)
+        return 0
+    }
+
+    function key(prefix: bytes, left: address) -> bytes {
+        return prefix ++ (left as bytes)
+    }
+
+    function load(prefix: bytes, left: address) {
+        return storage_load(this.key(prefix, left))
+    }
+
+    // -----------------------------------------------------------------------
+    // Storage lease. `storage_new` mints a key with a recovery buffer of
+    // exactly zero (`ValueSto::new(chei, data, live_credit, 0)`,
+    // vm/src/field/state.rs), so an untended key does not go dormant - it is
+    // deleted outright the moment its live credit runs out, and `storage_rent`
+    // then answers StorageKeyNotFind forever. For a registry that is holding
+    // somebody's deposit that is not an expiry, it is destruction: the coin
+    // stays in the contract account while every route to it - challenge,
+    // finalize and the PermitHAC gate on the Action 14 payout - reads a
+    // channel key that no longer exists.
+    // -----------------------------------------------------------------------
+
+    /// Live blocks left on a key, or 0 once it is gone.
+    function live_blocks(key: bytes) -> u64 {
+        var stat = storage_stat(key)
+        if stat is nil {
+            return 0 as u64
+        }
+        return item_get(stat, 0) as u64
+    }
+
+    /// Live blocks plus dormant-but-restorable blocks: how long anybody still
+    /// has to reach whatever this key is guarding. 0 means gone for good.
+    function reach_blocks(key: bytes) -> u64 {
+        var stat = storage_stat(key)
+        if stat is nil {
+            return 0 as u64
+        }
+        return (item_get(stat, 0) as u64) + (item_get(stat, 1) as u64)
+    }
+
+    /// Recovery periods this key can still be sold, clamped to the chain cap.
+    /// Asking `storage_recv` for more than the headroom is a hard error that
+    /// would abort the whole call, which would eventually turn a saturated
+    /// recovery buffer into a permanently un-renewable channel.
+    function recover_headroom_periods(key: bytes) -> u64 {
+        var stat = storage_stat(key)
+        if stat is nil {
+            return 0 as u64
+        }
+        var have = item_get(stat, 1) as u64
+        if have + BLOCKS_PER_PERIOD > RECOVER_CAP_BLOCKS {
+            return 0 as u64
+        }
+        return (RECOVER_CAP_BLOCKS - have) / BLOCKS_PER_PERIOD
+    }
+
+    /// Buy the key a dormant window, never more than the chain allows.
+    function stock_recovery(key: bytes, periods: u64) -> u32 {
+        var head = this.recover_headroom_periods(key)
+        if head == 0 as u64 {
+            return 0
+        }
+        var want = periods
+        if want > head {
+            want = head
+        }
+        storage_recv(key, want)
+        return 0
+    }
+
+    /// Make one key survivable before the contract takes custody behind it.
+    function fortify_one(key: bytes) -> u32 {
+        if this.live_blocks(key) < MIN_FUNDED_LIVE_BLOCKS {
+            storage_rent(key, INITIAL_RENT_PERIODS)
+        }
+        this.stock_recovery(key, FUNDING_RECOVER_PERIODS)
+        return 0
+    }
+
+    function fortify_channel_storage(left: address) -> u32 {
+        this.fortify_one(this.key("c_status_", left))
+        this.fortify_one(this.key("c_id_", left))
+        this.fortify_one(this.key("c_reuse_", left))
+        this.fortify_one(this.key("c_deposit_", left))
+        this.fortify_one(this.key("c_paid_", left))
+        this.fortify_one(this.key("c_total_", left))
+        this.fortify_one(this.key("c_serial_", left))
+        this.fortify_one(this.key("c_left_balance_", left))
+        this.fortify_one(this.key("c_hub_balance_", left))
+        this.fortify_one(this.key("c_challenge_", left))
+        this.fortify_one(this.key("c_deadline_", left))
+        this.fortify_one(this.key("c_left_claimed_", left))
+        return 0
+    }
+
+    function create_channel_storage(
+        left: address,
+        channel_id: bytes,
+        reuse: u32,
+        left_deposit: u64,
+        challenge_blocks: u64,
+        rent_periods: u64
+    ) -> u32 {
+        storage_new(this.key("c_status_", left), FUNDING as u8, rent_periods)
+        storage_new(this.key("c_id_", left), channel_id, rent_periods)
+        storage_new(this.key("c_reuse_", left), reuse, rent_periods)
+        storage_new(this.key("c_deposit_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_paid_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_total_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_serial_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_left_balance_", left), left_deposit, rent_periods)
+        storage_new(this.key("c_hub_balance_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_challenge_", left), challenge_blocks, rent_periods)
+        storage_new(this.key("c_deadline_", left), 0 as u64, rent_periods)
+        storage_new(this.key("c_left_claimed_", left), false, rent_periods)
+        return 0
+    }
+
+    function reset_channel_storage(
+        left: address,
+        channel_id: bytes,
+        reuse: u32,
+        left_deposit: u64,
+        challenge_blocks: u64
+    ) -> u32 {
+        storage_edit(this.key("c_status_", left), FUNDING as u8)
+        storage_edit(this.key("c_id_", left), channel_id)
+        storage_edit(this.key("c_reuse_", left), reuse)
+        storage_edit(this.key("c_deposit_", left), left_deposit)
+        storage_edit(this.key("c_paid_", left), 0 as u64)
+        storage_edit(this.key("c_total_", left), left_deposit)
+        storage_edit(this.key("c_serial_", left), 0 as u64)
+        storage_edit(this.key("c_left_balance_", left), left_deposit)
+        storage_edit(this.key("c_hub_balance_", left), 0 as u64)
+        storage_edit(this.key("c_challenge_", left), challenge_blocks)
+        storage_edit(this.key("c_deadline_", left), 0 as u64)
+        storage_edit(this.key("c_left_claimed_", left), false)
+        return 0
+    }
+
+    function external init(
+        channel_id: bytes,
+        reuse: u32,
+        left: address,
+        left_deposit: u64,
+        challenge_blocks: u64,
+        rent_periods: u64
+    ) -> u32 {
+        assert size(channel_id) == 16
+        assert left != storage_load("g_hub")
+        assert left_deposit > 0
+        assert challenge_blocks > 0
+        assert rent_periods == INITIAL_RENT_PERIODS
+        assert check_signature(left)
+        assert check_signature(storage_load("g_hub"))
+
+        var old_status = this.load("c_status_", left)
+        if old_status is nil {
+            assert reuse == 0
+            this.create_channel_storage(
+                left,
+                channel_id,
+                reuse,
+                left_deposit,
+                challenge_blocks,
+                rent_periods
+            )
+        } else {
+            assert old_status == FINAL as u8
+            assert this.load("c_left_claimed_", left) == true
+            assert reuse == this.load("c_reuse_", left) + 1
+            this.reset_channel_storage(left, channel_id, reuse, left_deposit, challenge_blocks)
+        }
+        return 0
+    }
+
+    abstract PayableHAC(from_addr: address, hacash: bytes) {
+        if this.load("c_status_", from_addr) != FUNDING as u8 {
+            throw "HPAY_FUNDING_STATUS"
+        }
+        var amount = hac_to_zhu(hacash) as u64
+        if amount == 0 {
+            throw "HPAY_ZERO_DEPOSIT"
+        }
+        if this.load("c_paid_", from_addr) != 0 as u64 {
+            throw "HPAY_ALREADY_FUNDED"
+        }
+        if amount != this.load("c_deposit_", from_addr) {
+            throw "HPAY_DEPOSIT_MISMATCH"
+        }
+        storage_edit(this.key("c_paid_", from_addr), amount)
+        storage_edit(this.key("c_status_", from_addr), OPEN as u8)
+        storage_edit("g_locked", storage_load("g_locked") + amount)
+        storage_edit("g_open_count", storage_load("g_open_count") + 1)
+        // Taking custody and paying for the record that describes it are the
+        // same act. Refuse the coin rather than accept it behind an
+        // arbitration record that is about to be deleted with it inside.
+        this.fortify_channel_storage(from_addr)
+        if this.reach_blocks(this.key("c_status_", from_addr)) < MIN_FUNDED_REACH_BLOCKS {
+            throw "HPAY_LEASE_TOO_SHORT"
+        }
+        if this.reach_blocks("g_hub") < MIN_FUNDED_REACH_BLOCKS {
+            throw "HPAY_REGISTRY_LEASE_TOO_SHORT"
+        }
+        return 0
+    }
+
+    abstract PermitHAC(to_addr: address, hacash: bytes) {
+        var amount = hac_to_zhu(hacash) as u64
+        if amount == 0 {
+            throw "HPAY_ZERO_PAYOUT"
+        }
+        if to_addr == storage_load("g_hub") {
+            var hub_claimable = storage_load("g_hub_claimable")
+            if amount > hub_claimable {
+                throw "HPAY_HUB_PAYOUT_MISMATCH"
+            }
+            storage_edit("g_hub_claimable", hub_claimable - amount)
+            return 0
+        }
+        if this.load("c_status_", to_addr) != FINAL as u8 {
+            throw "HPAY_NOT_FINAL"
+        }
+        if this.load("c_left_claimed_", to_addr) != false {
+            throw "HPAY_LEFT_ALREADY_CLAIMED"
+        }
+        if amount != this.load("c_left_balance_", to_addr) {
+            throw "HPAY_LEFT_PAYOUT_MISMATCH"
+        }
+        storage_edit(this.key("c_left_claimed_", to_addr), true)
+        storage_edit("g_left_claimable", storage_load("g_left_claimable") - amount)
+        return 0
+    }
+
+    function bill_hash(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64
+    ) -> bytes {
+        return sha3(
+            "HPAY/HVM-CHANNEL-REGISTRY/V2" ++
+            storage_load("g_network") ++
+            (context_address() as bytes) ++
+            this.load("c_id_", left) ++
+            (this.load("c_reuse_", left) as bytes) ++
+            (left as bytes) ++
+            (storage_load("g_hub") as bytes) ++
+            (this.load("c_total_", left) as bytes) ++
+            (this.load("c_challenge_", left) as bytes) ++
+            (serial as bytes) ++
+            (left_balance as bytes) ++
+            (hub_balance as bytes)
+        )
+    }
+
+    function verify_bill(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_paid_", left) == this.load("c_deposit_", left)
+        assert serial > this.load("c_serial_", left)
+        assert left_balance + hub_balance == this.load("c_total_", left)
+        var commitment = this.bill_hash(left, serial, left_balance, hub_balance)
+        assert verify_signature(commitment, left, left_sign)
+        assert verify_signature(commitment, storage_load("g_hub"), hub_sign)
+        return 0
+    }
+
+    function save_bill(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64
+    ) -> u32 {
+        storage_edit(this.key("c_serial_", left), serial)
+        storage_edit(this.key("c_left_balance_", left), left_balance)
+        storage_edit(this.key("c_hub_balance_", left), hub_balance)
+        return 0
+    }
+
+    function settle(left: address) -> u32 {
+        var total = this.load("c_total_", left)
+        var left_balance = this.load("c_left_balance_", left)
+        var hub_balance = this.load("c_hub_balance_", left)
+        storage_edit("g_locked", storage_load("g_locked") - total)
+        storage_edit(
+            "g_left_claimable",
+            storage_load("g_left_claimable") + left_balance
+        )
+        storage_edit(
+            "g_hub_claimable",
+            storage_load("g_hub_claimable") + hub_balance
+        )
+        storage_edit("g_open_count", storage_load("g_open_count") - 1)
+        if left_balance == 0 {
+            storage_edit(this.key("c_left_claimed_", left), true)
+        }
+        storage_edit(this.key("c_status_", left), FINAL as u8)
+        return 0
+    }
+
+    function external cooperative_close(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) != FINAL as u8
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        this.settle(left)
+        return 0
+    }
+
+    function external challenge(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) == OPEN as u8
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        storage_edit(
+            this.key("c_deadline_", left),
+            block_height() + this.load("c_challenge_", left)
+        )
+        storage_edit(this.key("c_status_", left), CHALLENGING as u8)
+        return 0
+    }
+
+    function external respond(
+        left: address,
+        serial: u64,
+        left_balance: u64,
+        hub_balance: u64,
+        left_sign: bytes,
+        hub_sign: bytes
+    ) -> u32 {
+        assert this.load("c_status_", left) == CHALLENGING as u8
+        assert block_height() < this.load("c_deadline_", left)
+        this.verify_bill(left, serial, left_balance, hub_balance, left_sign, hub_sign)
+        this.save_bill(left, serial, left_balance, hub_balance)
+        return 0
+    }
+
+    function external finalize(left: address) -> u32 {
+        assert this.load("c_status_", left) == CHALLENGING as u8
+        assert block_height() >= this.load("c_deadline_", left)
+        this.settle(left)
+        return 0
+    }
+
+    /// Renewal has to work on a DORMANT key, not just a live one: that is the
+    /// whole point of the recovery buffer. `storage_rent` restores a dormant
+    /// key to active, and `stock_recovery` refuses to overrun the chain's
+    /// recovery cap - the bare `storage_recv(key, periods)` this used to do
+    /// aborted the entire call once the buffer saturated, which would have
+    /// made a well tended channel permanently un-renewable.
+    function renew_one(key: bytes, periods: u64) -> u32 {
+        this.stock_recovery(key, periods)
+        storage_rent(key, periods)
+        return 0
+    }
+
+    function external renew_registry(periods: u64) -> u32 {
+        assert periods > 0
+        assert periods <= MAX_RENT_STEP
+        this.renew_one("g_network", periods)
+        this.renew_one("g_hub", periods)
+        this.renew_one("g_locked", periods)
+        this.renew_one("g_left_claimable", periods)
+        this.renew_one("g_hub_claimable", periods)
+        this.renew_one("g_open_count", periods)
+        return 0
+    }
+
+    function external renew_channel(left: address, periods: u64) -> u32 {
+        assert periods > 0
+        assert periods <= MAX_RENT_STEP
+        this.renew_one(this.key("c_status_", left), periods)
+        this.renew_one(this.key("c_id_", left), periods)
+        this.renew_one(this.key("c_reuse_", left), periods)
+        this.renew_one(this.key("c_deposit_", left), periods)
+        this.renew_one(this.key("c_paid_", left), periods)
+        this.renew_one(this.key("c_total_", left), periods)
+        this.renew_one(this.key("c_serial_", left), periods)
+        this.renew_one(this.key("c_left_balance_", left), periods)
+        this.renew_one(this.key("c_hub_balance_", left), periods)
+        this.renew_one(this.key("c_challenge_", left), periods)
+        this.renew_one(this.key("c_deadline_", left), periods)
+        this.renew_one(this.key("c_left_claimed_", left), periods)
+        return 0
+    }
+
+    function external registry_totals() {
+        return [
+            storage_load("g_locked"),
+            storage_load("g_left_claimable"),
+            storage_load("g_hub_claimable"),
+            storage_load("g_open_count")
+        ]
+    }
+
+    function external channel_status(left: address) {
+        return this.load("c_status_", left)
+    }
+}

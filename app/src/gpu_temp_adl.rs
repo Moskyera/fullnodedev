@@ -22,7 +22,8 @@
 //!   ADL2_Main_Control_Create           ~10 ms, once
 //!   ADL2_New_QueryPMLogData_Get        0.2 to 1.1 ms per read
 //!   sensors: edge 60 C, memory 68 C, hotspot 84 C, fan 1032 rpm,
-//!            activity 99%, gfx clock 3302 MHz, gfx voltage 1123 mV
+//!            activity 99%, gfx clock 3302 MHz, gfx voltage 1123 mV,
+//!            board power 256 W
 //!   ADL2_OverdriveN_Temperature_Get    ADL_ERR_NOT_SUPPORTED (-8)
 //!   ADL2_Overdrive6_Temperature_Get    ADL_ERR_NOT_SUPPORTED (-8)
 //!
@@ -38,6 +39,31 @@
 //! temperature indices next to them trustworthy. A sensor whose `supported`
 //! flag is clear, or whose value is outside a plausible range, is dropped by the
 //! caller rather than reported.
+//!
+//! Board power (index 73) was pinned down the same way, by dumping every
+//! non-zero slot at three load levels on this card:
+//!
+//!   state                       idx 19  idx 1      idx 73   idx 58
+//!   idle desktop                2-7%    58-137MHz    46 W      5
+//!   x16rs_gate, 3 work groups   99%     3383 MHz    120 W      5
+//!   x16rs_gate, 48 work groups  99%     3312 MHz    256 W      5
+//!
+//! Index 73 is the only slot that separates those three states in watts, and its
+//! neighbours in the enum land where the enum says: index 40 reads 4 and index
+//! 41 reads 16 on a card in a PCIe gen 4 x16 slot, which is `ADL_PMLOG_BUS_SPEED`
+//! and `ADL_PMLOG_BUS_LANES` exactly. Index 58 was the other candidate and it is
+//! flat at 5 through all three states, so it is the throttler percentage the
+//! enum says it is, not a power. The numbers are whole watts, not milliwatts and
+//! not hundredths: 256 at full tilt is what a 304 W-rated RX 9070 XT actually
+//! draws on this workload, and a hundredths reading would have been 2.56 W.
+//!
+//! What index 73 measures is TOTAL BOARD power, the figure on the electricity
+//! bill, not the GPU die alone. `ADL_PMLOG_ASIC_POWER` (23) and
+//! `ADL_PMLOG_GFX_POWER` (30) are the die-only figures and neither is supported
+//! on this card and driver: both read `supported = 0`. Nothing here silently
+//! falls back to them, because die-only power is tens of watts below board power
+//! and quoting one as the other would understate the operator's cost. Where
+//! board power is absent, this module reports no power at all.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -73,6 +99,17 @@ const PMLOG_SENSOR_COUNT: usize = 256;
 const PMLOG_TEMPERATURE_EDGE: usize = 8;
 const PMLOG_TEMPERATURE_MEM: usize = 9;
 const PMLOG_TEMPERATURE_HOTSPOT: usize = 27;
+
+/// `ADL_PMLOG_BOARD_POWER`: whole watts drawn by the whole graphics board, the
+/// 12V rails and the memory and the VRM losses included. Deliberately not
+/// `ADL_PMLOG_ASIC_POWER` (23) or `ADL_PMLOG_GFX_POWER` (30), which are the die
+/// alone and read tens of watts lower. See the module header.
+const PMLOG_BOARD_POWER: usize = 73;
+
+/// `ADL_PMLOG_CLK_GFXCLK`: shader clock in MHz. Confirmed in the same dump the
+/// module header quotes: 58-137 MHz on an idle desktop against 3383 MHz under
+/// the miner, which is the only slot that moves that way.
+const PMLOG_GFX_CLOCK: usize = 1;
 
 /// `AdapterInfo` from `adl_structures.h`. The last five fields are Windows-only
 /// in the header and this file is Windows-only, so all of them are present. The
@@ -153,6 +190,27 @@ fn plausible_temp(value: c_int) -> Option<f32> {
     (value > 0.0 && value < 120.0).then_some(value)
 }
 
+/// The widest window a graphics board's total draw can honestly fall in.
+///
+/// One definition, in `efficiency`, shared with the `nvidia-smi` power path so
+/// that a driver reading and a command reading are judged by the same rule and
+/// cannot drift apart. Kept here as a name because this module's callers are
+/// about ADL slots, not about the panel's economics.
+pub(crate) fn plausible_board_power_w(value: f32) -> Option<f32> {
+    crate::efficiency::plausible_board_power_w(value)
+}
+
+/// A shader clock a GPU can really be running at.
+///
+/// The floor is 1 MHz rather than something comfortable because this card idles
+/// at 58 MHz and a deep-idle reading is still a reading; only an exact zero,
+/// which is what an unsupported slot holds, is refused. The ceiling is far above
+/// any shipping part, so it excludes a slot holding kHz or a different quantity
+/// entirely rather than excluding a fast card.
+pub(crate) fn plausible_gfx_clock_mhz(value: f32) -> Option<f32> {
+    (value.is_finite() && value > 0.0 && value < 10_000.0).then_some(value)
+}
+
 impl Adl {
     fn load() -> Option<Mutex<Adl>> {
         // SAFETY: every pointer below is either checked for null before use or
@@ -216,7 +274,11 @@ impl Adl {
         }
     }
 
-    fn temperature(&self, adapter_index: i32) -> Option<f32> {
+    /// One PMLog query. Every reader below goes through this, so a caller that
+    /// wants several sensors reads them from ONE driver call and therefore from
+    /// one instant, instead of stitching together readings taken milliseconds
+    /// apart while the clocks move.
+    fn query(&self, adapter_index: i32) -> Option<PmLogDataOutput> {
         // SAFETY: the output struct is fully owned here and ADL only writes into
         // it. A bad adapter index is refused by the library with a non-zero
         // return (measured: -5 for an index that does not exist, -8 for an
@@ -226,17 +288,62 @@ impl Adl {
             if (self.query_pmlog)(self.context, adapter_index as c_int, &mut out) != ADL_OK {
                 return None;
             }
-            [
-                PMLOG_TEMPERATURE_EDGE,
-                PMLOG_TEMPERATURE_MEM,
-                PMLOG_TEMPERATURE_HOTSPOT,
-            ]
-            .into_iter()
-            .filter(|index| out.sensors[*index].supported != 0)
-            .filter_map(|index| plausible_temp(out.sensors[index].value))
-            .reduce(f32::max)
+            Some(out)
         }
     }
+
+    fn temperature(&self, adapter_index: i32) -> Option<f32> {
+        self.query(adapter_index)?.temperature()
+    }
+
+    /// Total board power in watts, or `None` where this card does not measure it.
+    ///
+    /// One sensor, not a maximum over several: unlike temperature, where the
+    /// hottest of the three is the one that matters, there is exactly one number
+    /// that is the board's draw, and reducing over candidates would silently
+    /// promote a die-only figure whenever the board figure went missing.
+    fn board_power_w(&self, adapter_index: i32) -> Option<f32> {
+        self.query(adapter_index)?.board_power_w()
+    }
+}
+
+impl PmLogDataOutput {
+    fn slot(&self, index: usize) -> Option<c_int> {
+        let slot = self.sensors[index];
+        (slot.supported != 0).then_some(slot.value)
+    }
+
+    fn temperature(&self) -> Option<f32> {
+        [
+            PMLOG_TEMPERATURE_EDGE,
+            PMLOG_TEMPERATURE_MEM,
+            PMLOG_TEMPERATURE_HOTSPOT,
+        ]
+        .into_iter()
+        .filter_map(|index| self.slot(index))
+        .filter_map(plausible_temp)
+        .reduce(f32::max)
+    }
+
+    fn board_power_w(&self) -> Option<f32> {
+        plausible_board_power_w(self.slot(PMLOG_BOARD_POWER)? as f32)
+    }
+
+    fn gfx_clock_mhz(&self) -> Option<f32> {
+        plausible_gfx_clock_mhz(self.slot(PMLOG_GFX_CLOCK)? as f32)
+    }
+}
+
+/// One instant of a card's telemetry, all of it from a single driver query.
+///
+/// Every field is optional on purpose. A slot this driver does not support is
+/// absent, never zero: a zero clock or a zero draw would be read downstream as a
+/// measurement of an idle card rather than as the absence of a sensor.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct AdlSample {
+    pub temp_c: Option<f32>,
+    pub board_power_w: Option<f32>,
+    pub gfx_clock_mhz: Option<f32>,
 }
 
 fn adl() -> Option<&'static Mutex<Adl>> {
@@ -284,6 +391,35 @@ pub fn temperature_c(adapter_index: i32) -> Option<f32> {
     let adl = adl()?;
     let adl = adl.lock().unwrap_or_else(|error| error.into_inner());
     adl.temperature(adapter_index)
+}
+
+/// Total board power in watts for one adapter that `reporting_gpus` bound to.
+///
+/// `None` on a card whose driver does not publish it, which is the whole point:
+/// a caller that gets nothing here has to say so and fall back to its configured
+/// estimate, rather than publish a zero that reads as a card drawing no power.
+pub fn board_power_w(adapter_index: i32) -> Option<f32> {
+    let adl = adl()?;
+    let adl = adl.lock().unwrap_or_else(|error| error.into_inner());
+    adl.board_power_w(adapter_index)
+}
+
+/// Temperature, board power and shader clock for one adapter, from a single
+/// driver query.
+///
+/// The auto-tuner needs all three at once to decide whether the card has settled
+/// into a steady state. Reading them one call at a time would cost three driver
+/// round trips per sample and would compare a temperature to a clock taken at a
+/// different instant, which is exactly the thing a settling test must not do.
+pub fn sample(adapter_index: i32) -> Option<AdlSample> {
+    let adl = adl()?;
+    let adl = adl.lock().unwrap_or_else(|error| error.into_inner());
+    let out = adl.query(adapter_index)?;
+    Some(AdlSample {
+        temp_c: out.temperature(),
+        board_power_w: out.board_power_w(),
+        gfx_clock_mhz: out.gfx_clock_mhz(),
+    })
 }
 
 /// Why there is no ADL temperature, in words an operator can act on.
@@ -355,10 +491,95 @@ mod tests {
     }
 
     #[test]
+    fn an_adapter_index_that_cannot_exist_yields_no_power() {
+        // Same rule as the temperature above, and it matters more here: the zero
+        // sitting in an unread output buffer is a perfectly formatted watt value
+        // that would go straight into an operator's cost figure.
+        assert_eq!(board_power_w(i32::MAX), None);
+        assert_eq!(board_power_w(-1), None);
+    }
+
+    #[test]
+    fn a_card_that_answers_at_all_answers_with_a_board_power_in_range() {
+        // On a machine with no AMD driver this loop is empty and the test is
+        // trivially true, which is the same shape the temperature test uses.
+        // On the AMD box it is the real assertion: whatever the card reports has
+        // to survive the plausibility window rather than be published raw.
+        for gpu in reporting_gpus() {
+            if let Some(watts) = board_power_w(gpu.adapter_index) {
+                assert!(
+                    watts > 0.0 && watts < 1000.0,
+                    "{} reported {watts} W, which is not a board draw",
+                    gpu.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implausible_sensor_values_are_not_board_power() {
+        // Zero is what an unsupported slot holds, so it must never become a
+        // reading; a board drawing nothing is not a state a running card is in.
+        assert_eq!(plausible_board_power_w(0.0), None);
+        assert_eq!(plausible_board_power_w(-5.0), None);
+        assert_eq!(plausible_board_power_w(1000.0), None);
+        assert_eq!(plausible_board_power_w(f32::NAN), None);
+        assert_eq!(plausible_board_power_w(f32::INFINITY), None);
+        // The three states this card was actually measured in.
+        assert_eq!(plausible_board_power_w(46.0), Some(46.0));
+        assert_eq!(plausible_board_power_w(120.0), Some(120.0));
+        assert_eq!(plausible_board_power_w(256.0), Some(256.0));
+    }
+
+    #[test]
     fn implausible_sensor_values_are_not_temperatures() {
         assert_eq!(plausible_temp(0), None);
         assert_eq!(plausible_temp(-40), None);
         assert_eq!(plausible_temp(120), None);
         assert_eq!(plausible_temp(60), Some(60.0));
+    }
+
+    #[test]
+    fn implausible_sensor_values_are_not_clocks() {
+        // Zero is the unsupported slot again. A deep-idle 58 MHz is a real
+        // reading on this card and must survive, or the settling test would see
+        // an idle card as a card with no clock sensor at all.
+        assert_eq!(plausible_gfx_clock_mhz(0.0), None);
+        assert_eq!(plausible_gfx_clock_mhz(-1.0), None);
+        assert_eq!(plausible_gfx_clock_mhz(10_000.0), None);
+        assert_eq!(plausible_gfx_clock_mhz(f32::NAN), None);
+        assert_eq!(plausible_gfx_clock_mhz(58.0), Some(58.0));
+        assert_eq!(plausible_gfx_clock_mhz(3383.0), Some(3383.0));
+    }
+
+    #[test]
+    fn one_sample_agrees_with_the_single_sensor_readers() {
+        // The sampler is a second path to the same slots. If it ever disagreed
+        // with the readers the rest of the miner publishes, the auto-tuner would
+        // be settling on numbers nobody else can see.
+        assert_eq!(sample(i32::MAX), None);
+        for gpu in reporting_gpus() {
+            let Some(sample) = sample(gpu.adapter_index) else {
+                panic!("{} answered reporting_gpus but not sample", gpu.name);
+            };
+            assert!(
+                sample.temp_c.is_some(),
+                "{} is in reporting_gpus, so it has a temperature",
+                gpu.name
+            );
+            // Not equality: these are two queries taken moments apart and the
+            // card is live. Same sensor, same order of magnitude, same units.
+            if let (Some(one), Some(two)) = (sample.board_power_w, board_power_w(gpu.adapter_index))
+            {
+                assert!(
+                    (one - two).abs() < 200.0,
+                    "{} reported {one} W then {two} W from the same slot",
+                    gpu.name
+                );
+            }
+            if let Some(clock) = sample.gfx_clock_mhz {
+                assert!(clock > 0.0 && clock < 10_000.0);
+            }
+        }
     }
 }

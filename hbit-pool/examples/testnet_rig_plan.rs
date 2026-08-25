@@ -146,9 +146,14 @@ fn main() {
 
     println!("== HBIT local-chain rig plan ==");
     println!("hashrate            = {mhs} MH/s (x16rs repeat=1)");
-    println!("difficulty_adjust_blocks = {adjust_blocks}  -> ASERT anchors at height {}", p.asert_height);
+    println!(
+        "difficulty_adjust_blocks = {adjust_blocks}  -> ASERT anchors at height {}",
+        p.asert_height
+    );
     println!("anchor difficulty   = {anchor_bits} leading zero bits (fixed constant 0xe9cfffff)");
-    println!("pool needs          >= {POOL_MIN_NETWORK_BITS} network bits (share_bits 18 + share cost 16)");
+    println!(
+        "pool needs          >= {POOL_MIN_NETWORK_BITS} network bits (share_bits 18 + share cost 16)"
+    );
     println!("simulation window   = {}\n", hms(max_secs));
 
     // Equilibrium: a block at B bits takes 2^B/hashrate seconds, so the chain
@@ -201,7 +206,10 @@ fn report(tt: u64, eq: f64, o: &Outcome) {
     println!("each_block_target_time = {tt}s   (equilibrium ~{eq:.2} bits)");
     match (o.reach_secs, o.reach_height) {
         (Some(s), Some(h)) => {
-            println!("reaches {POOL_MIN_NETWORK_BITS} bits after {} of mining, at height {h}", hms(s));
+            println!(
+                "reaches {POOL_MIN_NETWORK_BITS} bits after {} of mining, at height {h}",
+                hms(s)
+            );
             println!(
                 "stays in the {POOL_MIN_NETWORK_BITS}..{BAND_MAX_BITS} band for {} of the simulated window",
                 hms(o.band_secs)

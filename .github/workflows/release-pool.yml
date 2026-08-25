@@ -1,0 +1,232 @@
+name: Release HBIT pool
+
+# The pool ships on its OWN tags, `pool-v*`, and never on a miner tag.
+#
+# They are different products for different people. The miner is a Windows
+# desktop program an individual runs on their gaming PC; the pool is Linux
+# server software an operator runs on a VPS beside their own full node, holding
+# other people's money. An operator should not wait for a miner release to get a
+# fix to the thing that pays their miners, and nobody should re-download a miner
+# because a pool changed.
+#
+# `v*` and `pool-v*` cannot collide: GitHub matches the whole ref, and a tag
+# beginning `pool-` never matches a pattern beginning `v`.
+on:
+  push:
+    tags:
+      - "pool-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RELEASE_REF_NAME: ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: Build and package (Ubuntu x86_64)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-pool-linux
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
+
+      - name: Build the pool and the node it needs
+        run: |
+          cargo build --locked --release -p hbit-pool
+          # The full node ships WITH the pool. The pool gets its templates from a
+          # node and submits blocks to one, so an archive without it installs
+          # something that cannot start.
+          cargo build --locked --release --bin hacash
+
+      - name: Test the pool
+        run: |
+          cargo test --locked -p hbit-pool
+          cargo test --locked -p basis --lib
+          cargo test --locked -p sys
+
+      # The gate that guards the money path, scoped to this crate. --no-deps is
+      # load-bearing: clippy lints path dependencies by default, and `field`
+      # carries a deny-by-default lint that is consensus code and not ours to
+      # change.
+      - name: Lint the pool
+        run: cargo clippy --locked --no-deps -p hbit-pool --all-targets -- -D warnings
+
+      - name: Package
+        run: |
+          version="manual"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            candidate="$RELEASE_REF_NAME"
+            if [[ ! "$candidate" =~ ^pool-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Refusing unsafe or non-SemVer pool tag: $candidate"
+              exit 1
+            fi
+            version="$candidate"
+          fi
+
+          # The archive name keeps the prefix the download page looks for. Only
+          # the version part changes, so an existing page keeps working.
+          pooldir="dist/hbit-pool-linux-x86_64"
+          rm -rf "$pooldir" && mkdir -p "$pooldir/systemd"
+          cp target/release/hbit-pool-server target/release/hbit-pool-payout "$pooldir/"
+          cp target/release/hacash "$pooldir/"
+          cp deploy/node/hacash.config.ini "$pooldir/hacash.config.ini.example"
+          cp deploy/systemd/hacash-node.service deploy/systemd/hbit-pool.service "$pooldir/systemd/"
+          cp deploy/hbit-wait-for-node.sh "$pooldir/"
+          cp deploy/README.md "$pooldir/DEPLOY.md"
+          cp docs/POOL-OPERATOR.md docs/POOL-README.md "$pooldir/"
+          # Kept under its repository name: POOL-OPERATOR.md links into it with a
+          # relative path, and the archive is flat, so renaming the directory
+          # here silently breaks that link for everyone who reads the shipped copy.
+          cp -r docs/hbit-v2 "$pooldir/hbit-v2"
+          cp scripts/hbit-vps-setup.sh "$pooldir/SETUP-POOL.sh"
+          chmod u+x "$pooldir"/hbit-pool-server "$pooldir"/hbit-pool-payout \
+            "$pooldir"/hacash "$pooldir"/hbit-wait-for-node.sh "$pooldir"/SETUP-POOL.sh
+          printf '%s' "$version" > "$pooldir/VERSION.txt"
+
+          name="hbit-pool-linux-x86_64-$version.tar.gz"
+          tar -czf "dist/$name" -C dist hbit-pool-linux-x86_64
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          test -s "dist/$name"
+
+      - name: Verify the archive is deployable
+        run: |
+          # Every claim the operator docs make about this archive, checked here
+          # rather than discovered on somebody's VPS.
+          d=dist/hbit-pool-linux-x86_64
+          for f in hbit-pool-server hbit-pool-payout hacash hbit-wait-for-node.sh SETUP-POOL.sh; do
+            test -x "$d/$f" || { echo "missing or not executable: $f"; exit 1; }
+          done
+          for f in hacash.config.ini.example DEPLOY.md POOL-OPERATOR.md POOL-README.md \
+                   hbit-v2/MAINNET-SAFETY.md \
+                   systemd/hacash-node.service systemd/hbit-pool.service; do
+            test -f "$d/$f" || { echo "missing: $f"; exit 1; }
+          done
+          # Ships with NO wallet, NO address and NO config: an archive that
+          # carried any of those would pay a stranger by default.
+          test -z "$(find "$d" -name '*.key' -o -name '*wallet*' -o -name '*.state.json')" \
+            || { echo "the archive carries wallet material"; exit 1; }
+          grep -Eq '^[[:space:]]*reward[[:space:]]*=[[:space:]]*$' "$d/hacash.config.ini.example" \
+            || { echo "the shipped node config must have an EMPTY reward"; exit 1; }
+          ./"$d"/hbit-pool-server --help > /dev/null
+          ./"$d"/hbit-pool-payout --help > /dev/null
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hbit-pool-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/pool-v')
+    needs: [build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      # Runs BEFORE the release is created: a package that cannot be attested
+      # must never reach an operator. The .sha256 beside the archive only detects
+      # a corrupt download; the attestation is signed by GitHub and is the only
+      # tamper-evident check.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release-assets/*.tar.gz
+
+      # The tag is `pool-v0.2.0`; the title says `HBIT pool v0.2.0`. Interpolating
+      # the ref straight into the name produced "HBIT pool pool-v0.2.0".
+      - name: Title
+        id: title
+        run: echo "name=HBIT pool ${GITHUB_REF_NAME#pool-}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.title.outputs.name }}
+          # A pool release must NOT become the repository's "latest". That URL
+          # can only point at one release, and github.com/<repo>/releases/latest
+          # is where a visitor and the download page's fallback links expect the
+          # MINER. The first pool release took it, and for a few minutes anyone
+          # who clicked "Download Full package" while the API was unreachable
+          # landed on server software instead.
+          make_latest: false
+          files: release-assets/*
+          body: |
+            ## HBIT pool - Linux x86_64 - By Mosky
+
+            Server software for a pool operator. This is **not** the miner: it
+            runs on a VPS or a mini PC beside your own full node, and it pays
+            miners with PPLNS. Individual miners want the
+            [miner releases](https://github.com/${{ github.repository }}/releases?q=v&expanded=true)
+            instead.
+
+            The pool is versioned and released on its own, so a fix to the thing
+            that holds your miners' money does not wait for a miner release.
+
+            ### Install
+
+            ```
+            tar xzf hbit-pool-linux-x86_64-*.tar.gz
+            cd hbit-pool-linux-x86_64
+            ./SETUP-POOL.sh
+            ```
+
+            `SETUP-POOL.sh` checks what it can before you start: that the node
+            config exists and its `reward` is yours, that the node API is on
+            loopback or has a token, and that nothing in the archive is going to
+            pay a stranger. Read `DEPLOY.md` for the systemd and Docker paths and
+            `POOL-OPERATOR.md` for the runbook.
+
+            ### Check the download before you run it
+
+            This software holds a wallet and signs payouts. Verify the build
+            provenance first: it is the only check that detects tampering,
+            because the signature is produced by GitHub and not by whoever serves
+            the file.
+
+            ```
+            gh attestation verify <file> --repo ${{ github.repository }}
+            ```
+
+            The `.sha256` file detects a truncated or corrupted download only. It
+            is NOT tamper protection: it is published from the same place as the
+            archive.
+
+            ### What is NOT proven
+
+            The pool has run against a live mainnet node and accepted real
+            shares. It has never found a block on mainnet, so block discovery
+            through hold-back, maturity and payout has not executed against the
+            real chain. `hbit-v2/` in the archive states what is and is not
+            implemented, in the same words.

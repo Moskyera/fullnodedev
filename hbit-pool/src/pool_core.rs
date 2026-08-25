@@ -1,4 +1,4 @@
-//! pool_core — the pool's off-node accounting brain. No consensus, no node
+//! pool_core - the pool's off-node accounting brain. No consensus, no node
 //! changes. Ties the two proven on-chain halves together: workers submit shares
 //! (validated here) -> PPLNS accounting -> exact payout split -> the proven
 //! batched settlement transfer.
@@ -158,6 +158,45 @@ pub struct Pplns {
     /// already earned, and destroying other people's credit on demand is exactly
     /// what a burst of withheld shares does.
     banked: VecDeque<(u64, HashMap<String, u64>)>,
+    /// Milliseconds of banked credit the [`BANK_WORKERS_MAX`] cap would not
+    /// hold, counted for the life of this process.
+    ///
+    /// The cap has to stay: it is what stops a flood of invented payout
+    /// addresses growing that map without bound. But credit it turns away was
+    /// earned by a named miner, and dropping it hands that miner's cut of the
+    /// next settlement to everyone else. The cap sits far above any honest
+    /// population, so refusing anything at all is already an event; refusing it
+    /// with no record was the real defect, because nothing then told the
+    /// operator a payout had been paid short. Anything but 0 says it has.
+    banked_refused_ms: u64,
+}
+
+/// Cap a banked bucket at [`BANK_WORKERS_MAX`], returning the credit it could
+/// not hold.
+///
+/// WHICH miners a full bucket turns away must not be an accident of how the file
+/// happened to be ordered. `banked_snapshot` writes each bucket's rows sorted by
+/// worker id, so the plain `take` this replaces deleted the banked credit of the
+/// alphabetically-LAST miners on every restart and split it over everyone else,
+/// with nothing anywhere to say so. The smallest credits go instead, and what
+/// went is returned to be counted.
+///
+/// Only ever called on the restore path. Sorting a full bucket is 65,536 rows,
+/// which is nothing once at startup and would be intolerable per share under the
+/// pool's global lock.
+fn cap_bucket(map: &mut HashMap<String, u64>) -> u64 {
+    if map.len() <= BANK_WORKERS_MAX {
+        return 0;
+    }
+    let mut kept: Vec<(String, u64)> = std::mem::take(map).into_iter().collect();
+    // Largest credit first, ties broken by worker id so the same file always
+    // produces the same pool.
+    kept.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let refused = kept
+        .drain(BANK_WORKERS_MAX..)
+        .fold(0u64, |acc, (_, ms)| acc.saturating_add(ms));
+    *map = kept.into_iter().collect();
+    refused
 }
 
 impl Pplns {
@@ -168,6 +207,7 @@ impl Pplns {
             order: VecDeque::new(),
             counts: HashMap::new(),
             banked: VecDeque::new(),
+            banked_refused_ms: 0,
         }
     }
 
@@ -224,16 +264,33 @@ impl Pplns {
         if fresh {
             self.banked.push_back((bucket, HashMap::new()));
         }
+        // Recorded after the bucket borrow ends: the counter lives on the pool,
+        // not in the bucket.
+        let mut refused = 0u64;
         if let Some((_, rows)) = self.banked.back_mut() {
             match rows.get_mut(worker) {
                 Some(v) => *v = v.saturating_add(earned),
                 None => {
                     if rows.len() < BANK_WORKERS_MAX {
                         rows.insert(worker.to_string(), earned);
+                    } else {
+                        // The bucket is full, so this miner's evicted share keeps
+                        // nothing of what it earned and the settlement splits it
+                        // over everyone else. The cap stays: it is the only thing
+                        // between this map and a flood of invented addresses. But
+                        // the loss goes on the record instead of vanishing.
+                        //
+                        // The smallest row is deliberately NOT hunted down and
+                        // replaced here the way `cap_bucket` does it on restore.
+                        // That is a scan of 65,536 rows under the pool's global
+                        // lock on EVERY share, and the same flood that fills the
+                        // bucket would be triggering that scan for free.
+                        refused = earned;
                     }
                 }
             }
         }
+        self.banked_refused_ms = self.banked_refused_ms.saturating_add(refused);
     }
 
     fn bucket_ms(&self) -> u64 {
@@ -328,6 +385,14 @@ impl Pplns {
         self.horizon_ms
     }
 
+    /// Milliseconds of banked credit the worker cap turned away since this
+    /// process started. 0 on any honest pool, and read out so that a payout paid
+    /// short is something an operator can see rather than something the
+    /// accounting swallowed.
+    pub fn banked_refused_ms(&self) -> u64 {
+        self.banked_refused_ms
+    }
+
     /// Number of shares currently in the window.
     pub fn total(&self) -> u64 {
         self.order.len() as u64
@@ -402,9 +467,19 @@ impl Pplns {
     ) -> Self {
         let mut p = Self::new(window, horizon_ms);
         let keep = p.window;
+        // The instant this snapshot was taken: the newest arrival in it. The
+        // shares trimmed below are being evicted right now, and what they earned
+        // is measured against that instant, exactly as `record` measures against
+        // the arrival that evicts them.
+        let anchor = order.iter().map(|(_, at)| *at).max().unwrap_or(0);
         // Newest first, pushed to the FRONT, so the surviving tail comes back in
         // the order it was accepted in.
-        for (w, at) in order.into_iter().rev().take(keep) {
+        let mut trimmed: Vec<(String, u64)> = Vec::new();
+        for (i, (w, at)) in order.into_iter().rev().enumerate() {
+            if i >= keep {
+                trimmed.push((w, at));
+                continue;
+            }
             p.order.push_front((w.clone(), at));
             match p.counts.get_mut(&w) {
                 Some(c) => *c += 1,
@@ -413,14 +488,35 @@ impl Pplns {
                 }
             }
         }
+        // BANK what was trimmed, the way `record` banks what it evicts.
+        //
+        // This used to drop it. `record` banks precisely so that eviction cannot
+        // destroy credit - the comment there says a miner able to push 4096
+        // shares in at once would otherwise wipe out everyone else's accrued
+        // credit for free - and restore quietly did the opposite. A file holding
+        // more shares than this build's window (written when the window was
+        // larger, or by an operator's hand) lost every share past the constant
+        // AND everything those shares had earned, which is money moved from the
+        // miners who were there to the miners who remain. A restart is not
+        // allowed to move money between people.
+        //
+        // Banked at `anchor` because that is when the eviction happens, so the
+        // bucket expires one horizon after the snapshot rather than one horizon
+        // after whenever the pool was restarted.
+        for (w, since) in trimmed {
+            let earned = anchor.saturating_sub(since).min(p.horizon_ms);
+            p.bank(&w, earned, anchor);
+        }
         let width = p.bucket_ms();
         for (at_ms, rows) in banked {
             let bucket = at_ms / width;
             let mut map: HashMap<String, u64> = HashMap::new();
-            for (w, ms) in rows.into_iter().take(BANK_WORKERS_MAX) {
+            for (w, ms) in rows {
                 let e = map.entry(w).or_insert(0);
                 *e = e.saturating_add(ms);
             }
+            let refused = cap_bucket(&mut map);
+            p.banked_refused_ms = p.banked_refused_ms.saturating_add(refused);
             // Keep the persisted order: expiry pops from the front, so a bucket
             // out of sequence would drop credit that is still current.
             match p.banked.back() {
@@ -431,6 +527,14 @@ impl Pplns {
                             *e = e.saturating_add(ms);
                         }
                     }
+                    // This merge is the one path that can push a bucket past the
+                    // cap from a file THIS build wrote: two persisted buckets
+                    // falling in one bucket index are folded together with no
+                    // bound of their own. Capped here as well, or `bank` would
+                    // spend the rest of the run refusing every share into an
+                    // oversized bucket it can never shrink.
+                    let over = p.banked.back_mut().map_or(0, |(_, b)| cap_bucket(b));
+                    p.banked_refused_ms = p.banked_refused_ms.saturating_add(over);
                 }
                 _ => p.banked.push_back((bucket, map)),
             }
@@ -447,7 +551,7 @@ impl Pplns {
 }
 
 /// Split `reward_units` (smallest integer units) among workers by share count
-/// using the largest-remainder method (exact — no unit created or lost), after
+/// using the largest-remainder method (exact - no unit created or lost), after
 /// taking `fee_units` off the top. Workers whose payout is below `dust_units`
 /// are dropped (their remainder stays with the pool). Returns (worker, units).
 pub fn split_payout(
@@ -492,6 +596,125 @@ mod tests {
     /// The horizon the pool really runs, so a test about a settlement-interval
     /// change uses the interval->horizon map the server uses.
     use crate::pplns_horizon_ms;
+
+    #[test]
+    fn a_restart_that_trims_the_window_does_not_move_money_between_miners() {
+        // B9. `record` banks what it evicts, precisely so eviction cannot destroy
+        // credit. `restore` dropped it. A file holding more shares than this
+        // build's window - written when the window was larger, or edited by hand -
+        // lost every share past the constant AND everything those shares had
+        // earned. That credit belongs to named miners, and dropping it hands
+        // their money to whoever is still in the window. A restart must not do
+        // that in either direction.
+        let horizon = 600_000u64;
+        let t = 1_000_000u64;
+
+        // Six shares in the file: A mined early and is about to be trimmed,
+        // B mined late and survives.
+        let order = vec![
+            ("A".to_string(), t),
+            ("A".to_string(), t + 1_000),
+            ("A".to_string(), t + 2_000),
+            ("B".to_string(), t + 100_000),
+            ("B".to_string(), t + 101_000),
+            ("B".to_string(), t + 102_000),
+        ];
+        // A window of two: four of those six are evicted on restore.
+        let p = Pplns::restore(2, horizon, order.clone(), Vec::new());
+        let credit = p.credit(t + 102_000);
+        let a = credit
+            .iter()
+            .find(|(w, _)| w == "A")
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        assert!(
+            a > 0,
+            "the miner whose shares were trimmed still earned them: {credit:?}"
+        );
+
+        // And the whole point: trimming must not change the split. Restoring the
+        // same file into a window big enough to hold all six has to credit the
+        // same people the same way.
+        let whole = Pplns::restore(16, horizon, order, Vec::new());
+        let want = whole.credit(t + 102_000);
+        let got = credit;
+        let total_want: u64 = want.iter().map(|(_, c)| *c).sum();
+        let total_got: u64 = got.iter().map(|(_, c)| *c).sum();
+        assert_eq!(
+            total_got, total_want,
+            "the same file must be worth the same credit whatever window it is \
+             restored into: trimmed {got:?} against whole {want:?}"
+        );
+        for (w, c) in &want {
+            assert_eq!(
+                got.iter().find(|(x, _)| x == w).map(|(_, c)| *c),
+                Some(*c),
+                "worker {w} is credited differently after a trim: {got:?} against {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn banked_credit_the_worker_cap_turns_away_is_counted_never_silently_dropped() {
+        // One banked bucket holds at most BANK_WORKERS_MAX workers, so a flood of
+        // invented payout addresses cannot grow it without bound. The cap stays.
+        // What it must not do is make a named miner's earned credit disappear
+        // with no record: that credit is money, and dropping it hands the miner's
+        // cut of the next settlement to everyone else.
+        //
+        // It was dropped in two places. `restore` enforced the cap with `take`,
+        // which keeps whatever the file listed FIRST, and `banked_snapshot`
+        // writes the rows sorted by worker id, so a restart deleted the banked
+        // credit of the alphabetically-last miners. `bank` simply skipped the
+        // insert once the live bucket was full.
+        let horizon = 600_000u64;
+        let at = 1_700_000_000_000u64; // a real clock, well inside its bucket
+        let over = 4usize;
+        // One bucket's rows as a state file carries them: ascending worker ids,
+        // with the credit RISING down the list, so the miners `take` threw away
+        // are precisely the ones holding the most.
+        let mut rows: Vec<(String, u64)> = (0..BANK_WORKERS_MAX + over)
+            .map(|i| (format!("w{i:07}"), 1_000 + i as u64))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let richest = rows.last().cloned().expect("the file has rows");
+        assert_eq!(richest, ("w0065539".to_string(), 66_539));
+
+        let mut p = Pplns::restore(1, horizon, Vec::new(), vec![(at, rows)]);
+
+        // The cap was applied, so the map is still bounded ...
+        let (_, kept) = p.banked_snapshot().first().cloned().expect("one bucket");
+        assert_eq!(kept.len(), BANK_WORKERS_MAX);
+        // ... and it fell on the four SMALLEST credits, not on whoever the file
+        // happened to list last.
+        assert_eq!(
+            p.credit_share(&richest.0, at).0,
+            richest.1,
+            "the cap picked its victim by worker id: the miner holding the most \
+             banked credit in the bucket lost all of it on a restart"
+        );
+        assert_eq!(p.credit_share("w0000000", at).0, 0);
+        // 1000 + 1001 + 1002 + 1003: what the four dropped rows were worth.
+        assert_eq!(
+            p.banked_refused_ms(),
+            4_006,
+            "credit the cap refused on restore is not on the record"
+        );
+
+        // And the same on the live path: the restored bucket is full, so the
+        // next eviction into it is refused too, and that refusal is counted.
+        p.record("evicted", at + 1);
+        p.record("other", at + 2); // evicts "evicted" after 1ms of residence
+        assert_eq!(
+            p.banked_refused_ms(),
+            4_007,
+            "credit the cap refused on an eviction is not on the record"
+        );
+        assert_eq!(p.credit_share("evicted", at + 2).0, 0);
+        // Still bounded: a refusal never grows the map.
+        let (_, after) = p.banked_snapshot().first().cloned().expect("one bucket");
+        assert_eq!(after.len(), BANK_WORKERS_MAX);
+    }
 
     #[test]
     fn shift_left_saturating_multiplies_and_saturates() {
@@ -762,7 +985,10 @@ mod tests {
         // by the ratio of the two bucket widths, so credit banked a second ago
         // read as decades old and was expired on the spot.
         let h120 = pplns_horizon_ms(120);
-        assert!(bucket_ms + 1_000 < h120, "the test must not sit on the edge");
+        assert!(
+            bucket_ms + 1_000 < h120,
+            "the test must not sit on the edge"
+        );
         let shorter = Pplns::restore(1, h120, order.clone(), banked.clone());
         assert_eq!(
             shorter.credit_share("gone", now).0,

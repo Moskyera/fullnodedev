@@ -205,7 +205,7 @@ impl ArchLimits {
         }
     }
 
-    /// RDNA4 / RX 9070 XT — validated conservative launch and OOM treatment.
+    /// RDNA4 / RX 9070 XT, validated conservative launch and OOM treatment.
     pub fn is_experimental(&self) -> bool {
         !self.oom_ramp_to_base && self.oom_floor_wg == 32
     }
@@ -236,8 +236,32 @@ impl ArchLimits {
     }
 
     /// Panel preset slug → max unit_size (live gfx1201/RDNA4 stable path).
+    ///
+    /// 192 for gfx1201, and the number is measured rather than chosen.
+    ///
+    /// The kernel is latency bound on this card, not busy: 256 VGPRs, spill to
+    /// scratch, tables read from `__constant`, LDS unused. It is starved of work
+    /// in flight, and `unit_size` feeds it far more cheaply than `work_groups`
+    /// does. At a matched batch of 3,145,728 nonces, 64 groups x 192 units gives
+    /// 28.80 MH/s against 25.85 for 256 groups x 48, so the same nonces arranged
+    /// the other way are worth about 11% less.
+    ///
+    /// Against the shipping 48 x 256 x 48 this is 19.13 -> 28.80 MH/s, +50.4% on
+    /// a 0.5% noise floor, bracketed by opening and closing controls that agreed
+    /// to 0.26%. Byte equivalence was proven at the new shape before the number
+    /// was believed: 1,638,950 hashes compared against the CPU oracle, zero
+    /// mismatches, every one of the 16 algorithms about 20,600 rounds.
+    ///
+    /// Note the shipped 48 was pathological. 32 CUs host 2 groups each, so 48
+    /// and 96 leave a half empty scheduling tail while 64, 128 and 192 divide
+    /// evenly, which is why the sweep dips at 96 and not elsewhere.
+    ///
+    /// `is_experimental()` is true only for gfx1201, and `workgroups_cap` holds
+    /// groups at 64 there, so the largest batch this permits is 64 x 256 x 192 =
+    /// 113 MB of device state. It cannot reach the multi gigabyte allocations a
+    /// raised work-group cap would.
     pub fn max_unit_size(&self) -> u32 {
-        if self.is_experimental() { 64 } else { 128 }
+        if self.is_experimental() { 192 } else { 128 }
     }
 
     pub fn panel_max_unit_size(panel_slug: &str) -> u32 {
@@ -272,6 +296,50 @@ impl ArchLimits {
 pub fn panel_min_work_groups(gpu_slug: &str) -> u32 {
     ArchLimits::for_panel_slug(gpu_slug).panel_min_wg
 }
+
+/// Every card the panel can be set to, as (slug, shipped base profile, VRAM GB).
+///
+/// The panel owns the labels and the watts; this is the part the tuning code
+/// needs, kept here so that limits, panel resolution and the auto-tuner can all
+/// be tested over the same list instead of three lists that drift. The panel's
+/// own preset table is asserted equal to this one, so adding a card there
+/// without adding it here fails a test rather than shipping an untested card.
+///
+/// "none" is deliberately absent: it is the no-GPU entry and has no limits.
+pub const PANEL_GPU_PRESETS: [(&str, &str, u8); 19] = [
+    ("rx6600", "amd_balanced", 8),
+    ("rx7600", "amd_balanced", 8),
+    ("rx6700xt", "amd_performance", 12),
+    ("rx6800xt", "amd_performance", 16),
+    ("rx7900xt", "amd_performance", 20),
+    ("rx7900xtx", "amd_max", 24),
+    ("rx9070xt", "amd_balanced", 16),
+    ("rtx3060", "nvidia_balanced", 8),
+    ("rtx4060", "nvidia_balanced", 8),
+    ("rtx3070", "nvidia_profit", 12),
+    ("rtx4070", "nvidia_performance", 12),
+    ("rtx4090", "nvidia_max", 24),
+    ("rtx5060", "nvidia_balanced", 8),
+    ("rtx5070", "nvidia_performance", 12),
+    ("rtx5080", "nvidia_performance", 16),
+    ("rtx5090", "nvidia_max", 32),
+    ("arc_a380", "intel_balanced", 6),
+    ("arc_a750", "intel_performance", 8),
+    ("arc_a770", "intel_performance", 16),
+];
+
+/// Every architecture slug `arch_slug()` can hand `ArchLimits::for_slug`, one
+/// per family the detection code names, plus the generic fallback shape.
+///
+/// Used by the tests that have to prove a change was confined to one card.
+pub const KNOWN_ARCH_SLUGS: [&str; 22] = [
+    // AMD, as the OpenCL driver reports them.
+    "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1101", "gfx1102", "gfx1030", "gfx1031",
+    "gfx1032", "gfx1010", "gfx906", "gfx900", // Intel Arc, from the model table.
+    "arca770", "arca750", "arca580", "arca380", "arca310",
+    // NVIDIA and AMD board names, from the token table.
+    "rtx5090", "rtx4090", "rtx3060", "rx7900", "rx6600",
+];
 
 /// Sanitize device name for use in binary cache filenames.
 pub fn safe_device_filename(device_name: &str) -> String {
@@ -386,5 +454,107 @@ mod tests {
         assert!(ArchLimits::needs_amd_queue_finish("gfx1201", false));
         assert!(!ArchLimits::needs_amd_queue_finish("gfx1100", false));
         assert!(ArchLimits::needs_amd_queue_finish("gfx1100", true));
+    }
+
+    /// The raised unit_size ceiling was measured on one card and must stay on it.
+    ///
+    /// 192 is the RX 9070 XT's measured optimum. It was never measured anywhere
+    /// else, and on a card with a different register file or a different LDS
+    /// budget it is a guess that costs VRAM and batch latency. Every other slug
+    /// keeps 128, which is what every build before this one used.
+    #[test]
+    fn the_raised_unit_size_ceiling_is_gfx1201_only() {
+        assert_eq!(ArchLimits::for_slug("gfx1201").max_unit_size(), 192);
+        assert_eq!(ArchLimits::panel_max_unit_size("rx9070xt"), 192);
+
+        for slug in KNOWN_ARCH_SLUGS {
+            let expected = if slug == "gfx1201" { 192 } else { 128 };
+            assert_eq!(
+                ArchLimits::for_slug(slug).max_unit_size(),
+                expected,
+                "arch slug {slug}"
+            );
+        }
+        for (slug, _, _) in PANEL_GPU_PRESETS {
+            let expected = if slug == "rx9070xt" { 192 } else { 128 };
+            assert_eq!(
+                ArchLimits::panel_max_unit_size(slug),
+                expected,
+                "panel slug {slug}"
+            );
+        }
+        // An unrecognised card is not experimental either.
+        assert_eq!(ArchLimits::panel_max_unit_size("some_future_card"), 128);
+        assert_eq!(ArchLimits::for_slug("").max_unit_size(), 128);
+    }
+
+    /// Everything `is_experimental()` gates is likewise one card's: the 32 work
+    /// group floor, the 64 work group cap, the refusal to ramp back to base
+    /// after an OOM, and the queue drain after every batch.
+    #[test]
+    fn the_experimental_limits_are_gfx1201_only() {
+        for slug in KNOWN_ARCH_SLUGS {
+            let limits = ArchLimits::for_slug(slug);
+            if slug == "gfx1201" {
+                assert!(limits.is_experimental(), "{slug}");
+                assert_eq!(limits.panel_min_wg, 32);
+                assert_eq!(limits.workgroups_cap(4096, 1), 64);
+                assert!(ArchLimits::needs_amd_queue_finish(slug, false));
+            } else {
+                assert!(!limits.is_experimental(), "{slug}");
+                assert_eq!(limits.panel_min_wg, 256, "{slug}");
+                assert_eq!(limits.oom_floor_wg, 512, "{slug}");
+                assert!(limits.oom_ramp_to_base, "{slug}");
+                assert_eq!(limits.workgroups_cap(4096, 1), 4096, "{slug}");
+                assert!(!ArchLimits::needs_amd_queue_finish(slug, false), "{slug}");
+            }
+        }
+        for (slug, _, _) in PANEL_GPU_PRESETS {
+            assert_eq!(
+                ArchLimits::for_panel_slug(slug).is_experimental(),
+                slug == "rx9070xt",
+                "panel slug {slug}"
+            );
+        }
+    }
+
+    /// `vram_gb` is a live input only on the fallback path. Every named preset
+    /// carries its own hard ceiling, so a wrong VRAM reading cannot move it.
+    #[test]
+    fn vram_moves_the_ceiling_only_for_cards_with_no_preset() {
+        for (slug, _, vram) in PANEL_GPU_PRESETS {
+            let at_its_own = ArchLimits::panel_max_work_groups(slug, vram);
+            for other in [0u8, 2, 4, 6, 8, 12, 16, 24, 32, 48, 255] {
+                assert_eq!(
+                    ArchLimits::panel_max_work_groups(slug, other),
+                    at_its_own,
+                    "{slug} moved when told it had {other} GB"
+                );
+            }
+        }
+    }
+
+    /// The fallback path is the only one that reads VRAM, and it has to
+    /// discriminate: a 4 GB card and a 24 GB card must not get one ceiling.
+    #[test]
+    fn the_vram_fallback_separates_a_small_card_from_a_large_one() {
+        let at = |gb: u8| ArchLimits::panel_max_work_groups("some_future_card", gb);
+        assert!(
+            at(4) < at(24),
+            "4 GB and 24 GB both got {} work groups",
+            at(4)
+        );
+        assert_eq!(at(4), 1024);
+        assert_eq!(at(24), 3072);
+        assert_eq!(at(32), 4096);
+        // Monotone, so more memory is never punished.
+        let mut previous = 0;
+        for gb in 0u8..=64 {
+            let now = at(gb);
+            assert!(now >= previous, "{gb} GB dropped to {now} from {previous}");
+            previous = now;
+        }
+        // And the spread is real rather than cosmetic.
+        assert!(at(64) >= at(4) * 4);
     }
 }

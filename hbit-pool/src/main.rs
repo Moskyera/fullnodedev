@@ -1,5 +1,5 @@
 //! P1.0 feasibility spike: assemble a coinbase-only block OFF-NODE whose
-//! coinbase pays a CHOSEN address, CPU-mine it, and submit via /submit/block —
+//! coinbase pays a CHOSEN address, CPU-mine it, and submit via /submit/block -
 //! proving the node accepts an externally-chosen coinbase with no node change.
 //! Run against a fresh local testnet (chain_id != 0).
 //!

@@ -47,6 +47,19 @@ checksum is **not** proof the file is genuine; the attestation is.
 | **HAC** | `poworker` | OpenCL (AMD/NVIDIA/Intel) and/or **CUDA** (NVIDIA) |
 | **HACD** | `diaworker` | CPU only (no OpenCL/CUDA) |
 
+- **HACD nonce rate jumps, and the "best so far" string gets weaker. Both are expected.**
+  `diaworker` now runs the sha3-only half of the difficulty check *before* the 17+
+  rounds of x16rs. A nonce that fails it can never mint a diamond for any x16rs
+  hash, so its rounds are skipped: measured **8.3x** at diamond 133,700, **26x** at
+  210,000, **60x** at 300,000, and the gain keeps rising with the diamond number.
+  Below 42,000 the check passes everything and costs nothing. The consequence you
+  see is that the two diamond strings in the status line (`... | AAAA -> BBBB.`)
+  are now drawn only from the ~11% of nonces that got past the check, so they show
+  fewer leading zeros than they used to. Those strings are **display only**; the
+  set of diamonds actually found and submitted is unchanged, which is what
+  `a_failing_gate_forbids_every_possible_x16rs_hash` (app/src/hash_util.rs) and
+  `the_prefilter_never_skips_a_nonce_that_could_have_minted` (app/src/diaworker.rs)
+  assert on every build.
 - OpenCL: **[docs/MINING-AMD.md](docs/MINING-AMD.md)**, **[docs/MINING-LINUX.md](docs/MINING-LINUX.md)**
 - CUDA: **[docs/MINING-NVIDIA-CUDA.md](docs/MINING-NVIDIA-CUDA.md)** (T4 Colab validated)
 - Public free-IP pool: **`hac-pool`** - **[docs/PUBLIC-POOL.md](docs/PUBLIC-POOL.md)**

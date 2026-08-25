@@ -22,19 +22,90 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 pub fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
+    http_client_with_token("")
+}
+
+/// Environment variable carrying the node's `[server] api_token`.
+///
+/// An environment variable and not a command-line argument, because an argument
+/// is visible in `ps` and in `docker inspect` to every user on the box, and this
+/// token is what stands between the LAN and an unauthenticated miner API.
+pub const NODE_API_TOKEN_ENV: &str = "HBIT_NODE_API_TOKEN";
+
+/// A client that presents `api_token` on every request to the node.
+///
+/// The token rides on the CLIENT as a default header rather than on each call,
+/// so no call site can forget it: there are more than twenty, spread over the
+/// settlement path, the template loop and the manual payout tool, and one that
+/// forgot would read a 401 as "the node is down" and stall the pool.
+///
+/// An empty token adds no header at all, which is exactly the behaviour every
+/// existing loopback deployment already has.
+///
+/// This matters because the node refuses to serve its API at all when it is
+/// bound to a non-loopback address with an empty token
+/// (`server/src/server/server.rs`: it prints one line and returns, while the
+/// process keeps running and syncing). A pool that talks to its node across a
+/// container network or a private LAN therefore CANNOT work without this.
+pub fn http_client_with_token(api_token: &str) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .expect("http client")
+        // reqwest's default builder detects a system proxy, which on this build
+        // means HTTP_PROXY and friends out of the environment. The node is the
+        // operator's own machine, usually on loopback, and this client carries
+        // /submit/block - a whole subsidy plus every packed fee - and
+        // /submit/transaction, which carries SIGNED payout bytes. An inherited
+        // variable, from a shell profile or a container image nobody wrote,
+        // would put a third party on that path silently. There is no deployment
+        // in which the pool should reach its own node through a proxy.
+        .no_proxy()
+        // Separate from the total timeout: a host that accepts and then says
+        // nothing would otherwise hold a template-loop or settlement thread for
+        // the whole 20 seconds before the pool learns it has no node.
+        .connect_timeout(std::time::Duration::from_secs(5));
+    let token = api_token.trim();
+    if !token.is_empty() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(token) {
+            // Same header name the miner sends (app/src/rpc_http.rs), because it
+            // is the same node API being authenticated to.
+            headers.insert("x-api-token", v);
+            builder = builder.default_headers(headers);
+        } else {
+            // A token with bytes a header cannot carry would silently become no
+            // token at all, and the pool would then read every 401 as a node
+            // outage for as long as it ran.
+            eprintln!(
+                "[node] the api_token in {NODE_API_TOKEN_ENV} contains characters that cannot \
+                 be sent in an HTTP header, so NO token is being sent. If your node binds a \
+                 non-loopback address it will refuse to answer, and this pool will report it \
+                 as down. Use a token of printable ASCII."
+            );
+        }
+    }
+    builder.build().expect("http client")
+}
+
+/// The transport-failure document `get_json` returns, built with a real JSON
+/// encoder rather than by pasting the error into a string literal.
+///
+/// Formatting it by hand meant any quote or backslash in the error text produced
+/// a body that was not JSON at all, which then fell back to a bare
+/// `Value::String` and lost the `http_error` key every classifier looks for. It
+/// still failed safe, by accident rather than by design, and the accident stops
+/// being safe the moment a classifier grows a bare-string branch.
+fn transport_failure(e: &impl std::fmt::Display) -> Value {
+    serde_json::json!({ "http_error": e.to_string() })
 }
 
 pub fn get_json(client: &reqwest::blocking::Client, url: &str) -> Value {
-    let text = client
-        .get(url)
-        .send()
-        .and_then(|r| r.text())
-        .unwrap_or_else(|e| format!("{{\"http_error\":\"{e}\"}}"));
-    serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text))
+    match client.get(url).send() {
+        Ok(r) => match r.text() {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            Err(e) => transport_failure(&e),
+        },
+        Err(e) => transport_failure(&e),
+    }
 }
 
 pub fn post_hex(client: &reqwest::blocking::Client, url: &str, body: &str) -> String {
@@ -45,6 +116,26 @@ pub fn post_hex(client: &reqwest::blocking::Client, url: &str, body: &str) -> St
         .send()
         .and_then(|r| r.text())
         .unwrap_or_else(|e| format!("http_error: {e}"))
+}
+
+/// A key at the ROOT of a node answer, and nowhere else.
+///
+/// The counterpart to [`find_value`], which searches the whole document. Money
+/// fields read through the searching version answer the question "does this key
+/// exist anywhere in here", which is a question a captive portal, a proxy error
+/// page or an unrelated endpoint can also answer yes to. These ask where the
+/// value actually is.
+pub fn top_value<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    v.as_object()?.get(key)
+}
+
+/// [`top_value`] as a number, keeping [`find_u64`]'s string coercion: the node
+/// really does render some numeric fields as JSON strings.
+pub fn top_u64(v: &Value, key: &str) -> Option<u64> {
+    top_value(v, key).and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
+    })
 }
 
 pub fn find_u64(v: &Value, key: &str) -> Option<u64> {
@@ -140,13 +231,39 @@ pub fn balance_answer(j: &Value) -> BalanceAnswer {
     if !j.is_object() {
         return BalanceAnswer::NoAnswer(excerpt(&j.to_string()));
     }
+    // A ROOT `ret`, and it must be there. This used to be
+    // `find_u64(j, "ret").is_some_and(|r| r != 0)`, which fell straight through
+    // when the answer carried no `ret` at all - and the fall-through was a
+    // whole-document search for `hacash`, so ANY json containing that key
+    // anywhere became a balance this pool would pay against.
+    // `{"list":[{"hacash":"999999:248"}]}` was a Reported balance: a captive
+    // portal, a misrouted service or a stale cache could hand the settlement a
+    // number the node never said, and the split is computed from it.
+    let Some(ret) = top_u64(j, "ret") else {
+        return BalanceAnswer::Refused(excerpt(&j.to_string()));
+    };
     // The node answered, and its answer is "no": a bad address, too many
     // addresses, an unreadable state. There is no balance in it to pay on.
-    if find_u64(j, "ret").is_some_and(|r| r != 0) {
+    if ret != 0 {
         return BalanceAnswer::Refused(excerpt(&j.to_string()));
     }
-    match find_str(j, "hacash") {
-        Some(s) if !s.trim().is_empty() => BalanceAnswer::Reported(s),
+    // `list[0].hacash`, by its real path. The recursion reached the same place
+    // by accident, taking whichever nested `hacash` sorted first - serde_json's
+    // Map here is a BTreeMap, so "first" meant alphabetical key order and not
+    // document order.
+    let Some(rows) = top_value(j, "list").and_then(|v| v.as_array()) else {
+        return BalanceAnswer::Refused(excerpt(&j.to_string()));
+    };
+    // Exactly one. Every caller asks about ONE address - the pool's own wallet -
+    // so a reply carrying several is not an answer to the question that was
+    // asked, and taking the first of them would be guessing which is the wallet.
+    // The node accepts up to 200 addresses in one query, so this is a real shape
+    // it can produce.
+    if rows.len() != 1 {
+        return BalanceAnswer::Refused(excerpt(&j.to_string()));
+    }
+    match rows[0].get("hacash").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => BalanceAnswer::Reported(s.to_string()),
         // ret=0 with no `hacash` is a shape this pool does not recognise. The
         // node always emits the field, so its absence means we are not talking
         // to one - never that the wallet is empty.
@@ -314,7 +431,13 @@ pub enum BlockTxs {
 /// Split out from [`block_fees`] so the decision - price it, ignore it, or stop
 /// settling - is testable without a node. Fails SAFE: only an answer that really
 /// carries our block's transaction list is [`BlockTxs::Ours`].
-pub fn block_txs_of(j: &Value, our_hash_hex: &str) -> BlockTxs {
+///
+/// `height` is the height that was asked about and `tip` is the node's own tip
+/// as THIS cycle already proved it: they decide what a refusal means, and the
+/// answer is different on each side of the tip. The tip is a parameter rather
+/// than a fresh read so the verdict is judged against the same chain state the
+/// rest of the cycle is using; a tip re-read here could have moved.
+pub fn block_txs_of(j: &Value, our_hash_hex: &str, height: u64, tip: u64) -> BlockTxs {
     // get_json encodes a transport failure as {"http_error": "..."} and a
     // non-JSON body as a bare string. Neither is the node speaking.
     if !j.is_object() || j.get("http_error").is_some() {
@@ -324,8 +447,28 @@ pub fn block_txs_of(j: &Value, our_hash_hex: &str) -> BlockTxs {
         return BlockTxs::Unknown(excerpt(&j.to_string()));
     };
     if ret != 0 {
-        // The node is up and has no block at that height: ours was refused, or
-        // has not been inserted yet. Either way it has credited nothing.
+        // The node produced no block at that height. What that means depends on
+        // where the height stands against the node's own tip.
+        //
+        // Above the tip it is the ordinary case: our block was just found and
+        // the node has not inserted it yet, or it was refused. Nothing has been
+        // credited, so there is nothing to hold and waiting is right.
+        //
+        // AT or BELOW the tip it is not an answer at all. The node's own tip
+        // says it holds a block at this height, and it just failed to produce
+        // it: a block-store read failure, or a reorg between the tip read and
+        // this one. Our block may well be canonical there, in which case its
+        // fee income is already sitting in the wallet with nothing holding it
+        // back. Reading this as "no fees" is how that income got distributed at
+        // zero confirmations, so it refuses instead, and the cycle settles
+        // nothing until the node can say.
+        if height <= tip {
+            return BlockTxs::Unknown(format!(
+                "the node's tip is {tip} but it produced no block at height {height}: \
+                 {}",
+                excerpt(&j.to_string())
+            ));
+        }
         return BlockTxs::NotOnChain;
     }
     let Some(hash) = find_str(j, "hash") else {
@@ -383,12 +526,13 @@ pub fn block_fees(
     node: &str,
     height: u64,
     our_hash_hex: &str,
+    tip: u64,
 ) -> BlockFees {
     let j = get_json(
         client,
         &format!("{node}/query/block/intro?height={height}&tx_hash_list=true"),
     );
-    let hashes = match block_txs_of(&j, our_hash_hex) {
+    let hashes = match block_txs_of(&j, our_hash_hex, height, tip) {
         BlockTxs::Ours(hs) => hs,
         BlockTxs::NotOnChain => return BlockFees::NotOnChain,
         BlockTxs::Unknown(why) => return BlockFees::Unknown(why),
@@ -426,12 +570,25 @@ pub enum PayoutTxState {
     Buried(u64),
     /// The node definitively does not know this hash: it was rejected, never
     /// relayed, or dropped from the mempool. Settling again is the right move.
+    ///
+    /// Only [`NODE_TX_ABSENT`] earns this. A refusal the node reached with the
+    /// transaction already in its chain state is NOT this, and reading it as
+    /// this is what pays a miner twice.
     Gone,
     /// We could not reach the node, or could not understand its answer. This is
     /// NOT a resolution: treating it as one is exactly what opens a double-payout
     /// window, so the caller must keep the hash and skip the cycle.
     Unknown,
 }
+
+/// The one refusal from `/query/transaction` that really means the node has
+/// never heard of a hash: its mempool missed AND `state.tx_exist` missed.
+/// `mint/src/api/transaction.rs` writes it verbatim.
+///
+/// Matched WHOLE, never by prefix. "transaction not found in the block" opens
+/// with these same three words and means the opposite: that answer is only
+/// reached once `tx_exist` has already found the transaction on chain.
+const NODE_TX_ABSENT: &str = "transaction not found";
 
 /// Classify a `/query/transaction?hash=...` response. Fails SAFE: anything that
 /// is not an unambiguous verdict from the node comes back as `Unknown`, and a
@@ -446,7 +603,23 @@ pub fn classify_payout_tx(j: &Value) -> PayoutTxState {
         return PayoutTxState::Unknown;
     };
     if ret != 0 {
-        return PayoutTxState::Gone; // the node answered "transaction not found"
+        // A refusal is not automatically "I have never heard of this hash", and
+        // the difference is a second payment out of the operator's own wallet.
+        // The node's handler answers ret=1 in four places, and two of them are
+        // reached only AFTER `state.tx_exist` has already FOUND the transaction
+        // on chain: the block behind it would not load, or the block it decoded
+        // did not contain it. Both are evidence the payout IS mined. Read as
+        // Gone they run `GoneAction::Forget`, which hands the rows back to the
+        // owed ledger and pays those miners again next cycle.
+        //
+        // So only the exact absence answer is Gone. Every other refusal, and any
+        // wording this pool has never seen, is Unknown: the hash stays tracked
+        // and the cycle is skipped. That costs a delay instead of somebody's
+        // money, which is the only direction this is allowed to fail in.
+        return match top_value(j, "err").and_then(|v| v.as_str()) {
+            Some(e) if e.trim() == NODE_TX_ABSENT => PayoutTxState::Gone,
+            _ => PayoutTxState::Unknown,
+        };
     }
     let is_pending = j
         .get("data")
@@ -624,6 +797,84 @@ fn read_state_json(state_file: &str) -> Option<Value> {
     j.is_object().then_some(j)
 }
 
+/// The accounting schema this build reads and writes.
+///
+/// Bumped ONLY when a change would make an older reader lose or misread money:
+/// a key that changes meaning, or a new key carrying money an older reader would
+/// default away and therefore pay out a second time. Adding an OPTIONAL key that
+/// every existing reader already defaults to the safe value does NOT bump it,
+/// which is why `owed` and `fees_counted` were added without a bump.
+///
+/// A file with no `schema` key is schema 1: every file written before the key
+/// existed really is schema 1, and reads correctly under this build.
+pub const STATE_SCHEMA: u64 = 1;
+
+/// What the accounting file at a path turns out to be.
+pub enum StateFile {
+    /// No file there. A first run, or an operator who deliberately cleared it.
+    /// Starting with empty accounting is correct: there is nothing to lose.
+    Fresh,
+    /// A file this build understands. The parsed document is inside.
+    Readable(Box<Value>),
+    /// A file is present and this build must NOT run on it. The string says why,
+    /// in words an operator can act on. Beside a funded wallet this is the
+    /// difference between "pay the current window twice" and "stop and be told".
+    Unreadable(String),
+}
+
+/// Decide whether the accounting file may be read, WITHOUT reading it into the
+/// pool. Separated from loading so the money rule - refuse to run empty beside a
+/// funded wallet - is one testable decision both the server and the manual tool
+/// make the same way.
+///
+/// Fails CLOSED. Anything short of "a JSON object this build's schema covers" is
+/// `Unreadable`: a permission error, a non-UTF8 file, a truncated write, valid
+/// JSON that is not an object (`null`, `[]`, `42`), or a schema from the future.
+/// Every one of those used to leave the pool running with zero owed, zero paid,
+/// zero in flight - the exact state that distributes the whole wallet to the
+/// live window.
+pub fn classify_state_file(state_file: &str) -> StateFile {
+    let bytes = match std::fs::read(state_file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Fresh,
+        Err(e) => {
+            return StateFile::Unreadable(format!(
+                "the accounting file {state_file} exists but could not be read ({e})"
+            ));
+        }
+    };
+    let Ok(txt) = String::from_utf8(bytes) else {
+        return StateFile::Unreadable(format!(
+            "the accounting file {state_file} is not UTF-8 text; it is not a ledger this pool \
+             wrote"
+        ));
+    };
+    let j: Value = match serde_json::from_str(&txt) {
+        Ok(j) => j,
+        Err(e) => {
+            return StateFile::Unreadable(format!(
+                "the accounting file {state_file} is not valid JSON ({e}); a truncated or \
+                 partial write looks exactly like this"
+            ));
+        }
+    };
+    if !j.is_object() {
+        return StateFile::Unreadable(format!(
+            "the accounting file {state_file} is JSON but not an object, so none of its money \
+             fields can be read"
+        ));
+    }
+    let schema = j.get("schema").and_then(|v| v.as_u64()).unwrap_or(1);
+    if schema > STATE_SCHEMA {
+        return StateFile::Unreadable(format!(
+            "the accounting file {state_file} was written by a newer build (schema {schema}; \
+             this build reads up to {STATE_SCHEMA}). Reading it with an older build could pay \
+             out money the newer format tracks and this one cannot see"
+        ));
+    }
+    StateFile::Readable(Box::new(j))
+}
+
 /// The shared pending-payout ledger. A missing or corrupt file reads as an empty
 /// ledger (the server rewrites that file wholesale and reports the corruption).
 pub fn load_pending_payout_txs(state_file: &str) -> Vec<String> {
@@ -740,10 +991,20 @@ pub fn load_pplns_credit(state_file: &str) -> Vec<(String, u64)> {
     let Some(j) = read_state_json(state_file) else {
         return Vec::new();
     };
-    let window = j
-        .get("window")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(PPLNS_WINDOW as u64) as usize;
+    // The window the file claims, but never a value this build will not settle
+    // on. `Pplns::new` clamps with `.max(1)`, so a file saying `"window": 0`
+    // restored a window of ONE SHARE and handed this tool's whole fresh split to
+    // whichever miner submitted last. Anything absent, zero, or larger than this
+    // build's own window reads as this build's window - which is the honest
+    // answer, because that is the window the shares in the file were accepted
+    // under as far as this binary can tell.
+    //
+    // Clamping DOWN is only safe because `Pplns::restore` now banks what it
+    // trims. Before that it silently dropped the overflow and the credit with it.
+    let window = match j.get("window").and_then(|v| v.as_u64()) {
+        Some(w) if w >= 1 && w <= PPLNS_WINDOW as u64 => w as usize,
+        _ => PPLNS_WINDOW,
+    };
     // The horizon the SERVER was running, so the manual tool splits money the
     // same way the automatic settlement would have.
     let horizon = j
@@ -790,10 +1051,11 @@ pub fn load_pplns_credit(state_file: &str) -> Vec<(String, u64)> {
 /// before shares were stamped), because there is nothing to anchor to and the
 /// fallback stamp one horizon back then weighs every share alike, as it must.
 pub fn credit_anchor_ms(j: &Value, now_ms: u64) -> u64 {
-    let newest_share = j
-        .get("order")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.iter().filter_map(|x| x.as_array()?.get(1)?.as_u64()).max());
+    let newest_share = j.get("order").and_then(|v| v.as_array()).and_then(|a| {
+        a.iter()
+            .filter_map(|x| x.as_array()?.get(1)?.as_u64())
+            .max()
+    });
     let newest_bank = j
         .get("banked")
         .and_then(|v| v.as_array())
@@ -910,6 +1172,41 @@ pub const PAYOUT_DUST_UNITS: u64 = 1;
 /// Recipients per settlement transaction. The node enforces TX_ACTIONS_MAX = 200
 /// actions, so stay safely under it: a large payout is chunked, never rejected.
 pub const PAYOUT_CHUNK: usize = 190;
+
+/// The network fee of one settlement transaction, in the same units of 0.1 HAC
+/// the rest of the money path uses.
+///
+/// [`chunk_tx_fee`] is `Amount::coin(1, 246)`, one step finer than
+/// [`PAYOUT_UNIT`] = 247, so a chunk costs a TENTH of a unit. Kept as a
+/// numerator over [`FEE_UNITS_PER_TENTH`] rather than as a rounded integer,
+/// because rounding a tenth up to a whole unit would overstate a small
+/// settlement's cost tenfold and rounding it down to zero would tell the pool
+/// its payouts are free.
+pub const CHUNK_FEE_TENTHS: u64 = 1;
+/// Tenths of a unit in a unit. See [`CHUNK_FEE_TENTHS`].
+pub const FEE_UNITS_PER_TENTH: u64 = 10;
+
+/// How many settlement transactions `recipients` will be cut into.
+pub fn chunks_needed(recipients: usize) -> u64 {
+    recipients.div_ceil(PAYOUT_CHUNK) as u64
+}
+
+/// The most recipients the fee reserve can actually fund, and what it costs.
+///
+/// The reserve is subtracted ONCE, in [`distributable_units`], while the fee is
+/// paid per transaction: a settlement large enough to be cut into more chunks
+/// than the reserve covers signs transactions the wallet cannot fund, and the
+/// node refuses the tail. At `SETTLE_RESERVE_UNITS` = 5 (0.5 HAC) and a tenth of
+/// a unit per chunk that is 50 chunks, which is 9500 recipients - far away, and
+/// nothing anywhere checked it, so the pool would have discovered it by having
+/// payouts refused with no idea why.
+///
+/// Returns `(fundable_recipients, chunks_the_reserve_funds)`.
+pub fn reserve_funds_recipients(reserve_units: u64) -> (usize, u64) {
+    let chunks = reserve_units.saturating_mul(FEE_UNITS_PER_TENTH) / CHUNK_FEE_TENTHS;
+    let recipients = (chunks as usize).saturating_mul(PAYOUT_CHUNK);
+    (recipients, chunks)
+}
 
 /* ---------------------------------------------------------------------------
  * Per-worker settlement ledger.
@@ -1304,10 +1601,21 @@ pub fn deduct_owed(owed: &mut Vec<(String, u64)>, rows: &[(String, u64)]) {
 /// Owed rows are taken in order and partially where the balance runs out, so one
 /// large debt cannot starve while smaller ones keep being paid around it. What is
 /// not taken stays on the ledger for the next cycle.
+///
+/// A row whose address this pool cannot pay is passed OVER rather than allocated
+/// to. It used to take its full amount off the top of every cycle, and then the
+/// chunk builder skipped it when it could not turn the address into an action -
+/// so it never entered `rows`, `deduct_owed` never cleared it, and it was owed
+/// again next cycle. That is not a stall, it is a permanent tax: every honest
+/// miner was short by exactly that amount, every cycle, for ever, and if the
+/// dead row's amount reached the distributable total nobody was paid at all.
+/// The debt is not forgotten - it stays on the ledger, and `unpayable_owed`
+/// names it so the operator hears it from a log rather than from the balance
+/// quietly climbing.
 pub fn take_owed(owed: &[(String, u64)], distributable: u64) -> (Vec<(String, u64)>, u64) {
     let mut left = distributable;
     let mut rows: Vec<(String, u64)> = Vec::new();
-    for (w, u) in owed {
+    for (w, u) in owed.iter().filter(|(w, _)| is_payout_address(w)) {
         if left == 0 {
             break;
         }
@@ -1319,6 +1627,18 @@ pub fn take_owed(owed: &[(String, u64)], distributable: u64) -> (Vec<(String, u6
         rows.push((w.clone(), pay));
     }
     (rows, left)
+}
+
+/// Debts the pool is holding for a named miner it cannot address, and how much.
+///
+/// These no longer consume the distributable balance (see [`take_owed`]), so
+/// nothing is stuck behind them - but nothing pays them either, and an operator
+/// must not have to infer that from the wallet drifting upward.
+pub fn unpayable_owed(owed: &[(String, u64)]) -> Vec<(String, u64)> {
+    owed.iter()
+        .filter(|(w, u)| *u > 0 && !is_payout_address(w))
+        .cloned()
+        .collect()
 }
 
 /// Fold rows paying the same address into one action, keeping first-seen order.
@@ -2388,18 +2708,18 @@ fn windows_verify_owner_only(path: &str, name: &str, sid: &str) -> std::io::Resu
         };
         aces += 1;
         if !principal.eq_ignore_ascii_case(name) && !principal.eq_ignore_ascii_case(sid) {
-            if let Some(resolved) = windows_sid_of(principal) {
-                if WINDOWS_OS_PRINCIPAL_SIDS.contains(&resolved.as_str()) {
-                    // Said out loud rather than passed over silently: the
-                    // operator should know exactly who else can read the key.
-                    eprintln!(
-                        "[wallet] NOTE: {path} is also readable by `{principal}` ({resolved}). \
+            if let Some(resolved) = windows_sid_of(principal)
+                && WINDOWS_OS_PRINCIPAL_SIDS.contains(&resolved.as_str())
+            {
+                // Said out loud rather than passed over silently: the
+                // operator should know exactly who else can read the key.
+                eprintln!(
+                    "[wallet] NOTE: {path} is also readable by `{principal}` ({resolved}). \
                          That is the operating system itself and cannot be excluded; anything \
                          able to act as it already controls this machine. No other account can \
                          read the file."
-                    );
-                    continue;
-                }
+                );
+                continue;
             }
             return Err(std::io::Error::other(format!(
                 "{path} is still accessible to `{principal}`"
@@ -2456,12 +2776,19 @@ pub struct Template {
     pub height: u64,
     pub prevhash: Hash,
     pub timestamp: u64,
-    /// Header `difficulty` field (u32) — must equal what the node recomputes.
+    /// Header `difficulty` field (u32) - must equal what the node recomputes.
     pub difficulty: u32,
     /// The exact PoW target for this block. NOT interchangeable with
     /// u32_to_hash(difficulty): on the from_big path it is more precise.
     pub target: [u8; 32],
     pub coinbase_addr: Address,
+    /// Timestamp of the block this one builds on, i.e. of the node's tip.
+    ///
+    /// NOT `timestamp` above, which is the stamp of the block being built and is
+    /// derived from the wall clock: on a node that stopped following the chain
+    /// it still reads as now, so it can never reveal that the node is stuck.
+    /// This one is the chain's own last heartbeat.
+    pub prev_timestamp: u64,
     /// The transactions the node packed for this height, empty when the node
     /// would not tell us. Behind an `Arc` because the pool clones a whole
     /// template on every single share submission while holding its global lock,
@@ -2589,6 +2916,7 @@ pub fn fetch_template_pinned(
         difficulty: diff_num,
         target,
         coinbase_addr: coinbase,
+        prev_timestamp: prev_ts,
         // Callers that mine a block of their own choosing (the spike tools) want
         // exactly the transactions they pass in. `fetch_pool_template` is what
         // attaches the node's packed set for the pool.
@@ -2762,7 +3090,7 @@ pub fn fetch_pool_template(
 ) -> Option<(Template, Option<String>)> {
     let live = current.map(|t| StampPin {
         height: t.height,
-        prevhash: t.prevhash.clone(),
+        prevhash: t.prevhash,
         timestamp: t.timestamp,
     });
     let pin = live.as_ref().or(pin);
@@ -2792,6 +3120,82 @@ pub fn fetch_pool_template(
 /// the node's OWN tip from its stored data and compare against what it stored:
 /// an exact match is the only proof that the parameters in force here are the
 /// ones the node validates with.
+/// How stale the node's tip may be at STARTUP before this pool refuses to run.
+///
+/// MEASURED, not modelled. Over the 200 blocks ending at mainnet height 771596:
+///
+/// ```text
+///   median gap        212 s
+///   mean gap          320 s   (the target is 300)
+///   99th percentile  1740 s
+///   largest gap      2013 s   (33.5 minutes)
+///   gaps over 1800 s    1 of 200   (0.5%)
+///   gaps over 2700 s    0 of 200
+///   gaps over 3600 s    0 of 200
+/// ```
+///
+/// This was 1800, on a Poisson estimate that said six targets would be exceeded
+/// about once a day. The real chain exceeds it once in two hundred blocks, and
+/// the first live restart of this pool hit exactly that: a healthy node, a
+/// 32-minute gap, and a refusal to start. An operator restarting has no reason
+/// to accept a one-in-two-hundred chance of being told their node is broken when
+/// it is not, and under systemd that refusal becomes a restart loop.
+///
+/// A pool that starts against a node which really has stopped following the
+/// chain mines a fork, sees its own blocks buried sixteen deep THERE, releases
+/// the hold-back and signs real payouts against income the real chain never
+/// paid. That is what this guards, and an hour still catches it long before the
+/// running bound would.
+///
+/// One node cannot distinguish "the chain is quiet" from "this node is stuck":
+/// both look like an old tip that is not moving. The threshold is the whole of
+/// the answer available here, so it is set from what the chain actually does.
+pub const TIP_STALE_SECS_AT_START: u64 = 3_600;
+
+/// The same question asked of a pool that is already running and holding money.
+///
+/// Twenty four targets. A healthy chain exceeds this by chance about once in
+/// 10^11 blocks, which is never, and that is the point: a false halt here stops
+/// crediting miners who are hashing a template that is still perfectly valid.
+/// Slower to notice, and it will not punish anyone for the chain being quiet.
+pub const TIP_STALE_SECS_WHILE_RUNNING: u64 = 7_200;
+
+/// Why the node's tip is too old to mine on, or `None` when it is fine.
+///
+/// A tip dated in the future is clock skew rather than the future, so it counts
+/// as zero seconds behind: this must never halt a pool over an ntp correction.
+pub fn tip_too_old(
+    tip_height: u64,
+    tip_unix: u64,
+    now_unix: u64,
+    limit_secs: u64,
+) -> Option<String> {
+    let behind = now_unix.saturating_sub(tip_unix);
+    if behind <= limit_secs {
+        return None;
+    }
+    let mins = behind / 60;
+    let blocks = behind / 300;
+    Some(format!(
+        "the node's tip is block {tip_height}, stamped {mins} minute(s) ago, which is about \
+         {blocks} mainnet block(s) of silence. Either the whole chain has stopped, or - far \
+         more likely - this node has stopped following it. A pool cannot tell the difference \
+         from one node, so it assumes the dangerous one: every template built on this tip \
+         would be mined against a chain the network has already moved past"
+    ))
+}
+
+/// The mainnet genesis block hash as lowercase hex, taken from the node's own
+/// constant rather than restated here.
+///
+/// This is the pool's only unforgeable statement about which chain it is on. It
+/// is deliberately a function over `mint::genesis`, not a literal: a literal
+/// typed from memory into a second file is exactly how a pool ends up verifying
+/// itself against its own mistake.
+pub fn mainnet_genesis_hex() -> String {
+    mint::genesis::genesis_block_hash().to_hex()
+}
+
 pub fn verify_chain_params(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -2801,8 +3205,63 @@ pub fn verify_chain_params(
     let Some(tip) = find_u64(&latest, "height") else {
         return Err("could not read the chain tip from the node".to_string());
     };
+    let intro = |h: u64| get_json(client, &format!("{base}/query/block/intro?height={h}"));
+
+    // IDENTITY FIRST, before anything derived from the chain's own numbers.
+    //
+    // Every check below this point asks the node about its own tip and verifies
+    // the answer is self-consistent. A node on a different chain passes all of
+    // them effortlessly, because it is perfectly consistent with itself: its
+    // difficulty really does follow from its own previous block. The one
+    // question no other chain can answer the same way is where its chain began.
+    //
+    // Without this, a pool pointed at the wrong node mines a chain nobody else
+    // is on, watches its own blocks get buried 16 deep THERE, releases the
+    // hold-back and signs real payouts against income the real chain never
+    // credited. The wallet is real; the income is not.
+    //
+    // Read from BLOCK 1, not block 0. This node does not serve the genesis block
+    // at all: `/query/block/intro?height=0` answers "cannot find block", and so
+    // does a lookup by its hash, because `height` defaults to 0 in that handler
+    // and zero is indistinguishable from "no height given". Block 1's `prevhash`
+    // IS the genesis hash by construction, and it is served.
+    //
+    // That was found by pointing this pool at a real mainnet node. The first
+    // version asked for height 0 and was tested against a stub that answered it,
+    // so seven tests agreed with each other about a shape the real node never
+    // produces.
+    if params.is_mainnet() {
+        if tip < 1 {
+            return Err(
+                "this node has no blocks at all, so there is nothing to identify the chain by. \
+                 A mainnet node has 700000 or more; wait for it to sync"
+                    .to_string(),
+            );
+        }
+        let first = intro(1);
+        let Some(theirs) = find_str(&first, "prevhash") else {
+            return Err(format!(
+                "could not read block 1 from the node, so the chain it is running cannot be \
+                 identified, and this pool will not pay miners out of a wallet it cannot tie \
+                 to mainnet. The node answered: {first}"
+            ));
+        };
+        let ours = mainnet_genesis_hex();
+        if !theirs.eq_ignore_ascii_case(&ours) {
+            return Err(format!(
+                "this node is NOT on the chain this pool pays out on. Its chain begins at \
+                 {theirs}; mainnet begins at {ours}. Point the pool at a mainnet node, or pass \
+                 the chain the node is really running as `testnet:<difficulty_adjust_blocks>:\
+                 <each_block_target_time>`"
+            ));
+        }
+    }
+
     if tip == 0 {
-        return Ok(()); // empty chain: the node has stored nothing to compare to
+        // Empty chain: nothing has been mined, so there is no tip to check the
+        // difficulty rule against. On mainnet the identity check above has
+        // already run, so this is no longer the blanket pass it used to be.
+        return Ok(());
     }
     if tip > params.bootstrap_max && tip < params.asert_height {
         return Err(format!(
@@ -2812,11 +3271,22 @@ pub fn verify_chain_params(
             params.asert_height
         ));
     }
-    let intro = |h: u64| get_json(client, &format!("{base}/query/block/intro?height={h}"));
     let b = intro(tip);
     let (Some(ts), Some(stored)) = (find_u64(&b, "timestamp"), find_u64(&b, "difficulty")) else {
         return Err(format!("could not read block {tip} from the node"));
     };
+    // Right chain, wrong place on it. The identity check above proves only that
+    // the node knows what mainnet is, not that it is anywhere near the end of
+    // it, and a node stalled part-way through a sync answers every question so
+    // far with perfect confidence. This is the documented failure mode of this
+    // deployment: history sync finishes short of the tip and then ignores live
+    // blocks until the process is restarted.
+    if let Some(why) = tip_too_old(tip, ts, curtimes(), TIP_STALE_SECS_AT_START) {
+        return Err(format!(
+            "{why}. Wait for the node to reach the network tip and start the pool again"
+        ));
+    }
+
     let prev_diff = if tip > 1 {
         match find_u64(&intro(tip - 1), "difficulty") {
             Some(d) => d as u32,
@@ -2861,8 +3331,7 @@ pub fn coinbase_with_extranonce(
     tpl: &Template,
     extranonce: &[u8; 32],
 ) -> mint::TransactionCoinbase {
-    let mut cb =
-        mint::create_coinbase_tx(tpl.height, coinbase_message(), tpl.coinbase_addr.clone());
+    let mut cb = mint::create_coinbase_tx(tpl.height, coinbase_message(), tpl.coinbase_addr);
     let en = Hash::from_hex(hex::encode(extranonce).as_bytes()).expect("extranonce");
     cb.extend = mint::CoinbaseExtend::must(mint::CoinbaseExtendDataV1 {
         miner_nonce: en,
@@ -2886,7 +3355,7 @@ fn build_intro(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -> Bl
             version: Uint1::from(1),
             height: BlockHeight::from(tpl.height),
             timestamp: Timestamp::from(tpl.timestamp),
-            prevhash: tpl.prevhash.clone(),
+            prevhash: tpl.prevhash,
             mrklroot: calculate_mrkl_prelude_update(cb.hash_with_fee(), &tpl.txs.mrklrts),
             transaction_count: Uint4::from(tpl.txs.block_tx_count()),
         },
@@ -2903,7 +3372,7 @@ pub fn intro_bytes(tpl: &Template, cb: &mint::TransactionCoinbase, nonce: u32) -
     build_intro(tpl, cb, nonce).serialize()
 }
 
-/// Hex of the serialized coinbase tx — the `coinbase_body` a worker receives.
+/// Hex of the serialized coinbase tx - the `coinbase_body` a worker receives.
 /// Its optional `extend` block must be present or the worker's own
 /// `set_mining_nonce` becomes a silent no-op (all threads would then share one
 /// coinbase hash); `create_coinbase_tx` always emits it.
@@ -2954,7 +3423,7 @@ pub fn mine_and_submit_block(
             "{\"ok\":false,\"err\":\"could not fetch a template from the node\"}".to_string(),
         );
     };
-    let cbtx = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr.clone());
+    let cbtx = mint::create_coinbase_tx(tpl.height, Fixed16::default(), tpl.coinbase_addr);
 
     let mut trshxs: Vec<Hash> = vec![cbtx.hash_with_fee()];
     let mut transactions = DynVecTransaction::default();
@@ -2972,7 +3441,7 @@ pub fn mine_and_submit_block(
             version: Uint1::from(1),
             height: BlockHeight::from(tpl.height),
             timestamp: Timestamp::from(tpl.timestamp),
-            prevhash: tpl.prevhash.clone(),
+            prevhash: tpl.prevhash,
             mrklroot: calculate_mrklroot(&trshxs),
             transaction_count: Uint4::from(count),
         },
@@ -3019,6 +3488,92 @@ mod tests {
     use super::*;
 
     use protocol::action::HacToTrs;
+
+    #[test]
+    fn the_fee_reserve_is_measured_against_the_transactions_it_has_to_fund() {
+        // B5. The reserve is subtracted ONCE, in distributable_units, while the
+        // network fee is paid PER transaction. Nothing compared the two, so a
+        // settlement cut into more chunks than the reserve covers signed
+        // transactions the wallet could not fund and the node refused the tail -
+        // with nothing anywhere saying why.
+
+        // The arithmetic, stated once so it cannot drift: chunk_tx_fee is
+        // Amount::coin(1, 246) and PAYOUT_UNIT is 247, one step coarser, so a
+        // chunk costs a TENTH of a unit. The shipped reserve is 5 units.
+        assert_eq!(CHUNK_FEE_TENTHS, 1);
+        assert_eq!(FEE_UNITS_PER_TENTH, 10);
+        let (recipients, chunks) = reserve_funds_recipients(SETTLE_RESERVE_UNITS);
+        assert_eq!(chunks, 50, "0.5 HAC at 0.01 HAC a transaction");
+        assert_eq!(
+            recipients,
+            50 * PAYOUT_CHUNK,
+            "which is 9500 recipients: far away, and nothing checked it"
+        );
+
+        // Chunking is the same ceiling division the settlement uses.
+        assert_eq!(chunks_needed(0), 0);
+        assert_eq!(chunks_needed(1), 1);
+        assert_eq!(chunks_needed(PAYOUT_CHUNK), 1);
+        assert_eq!(
+            chunks_needed(PAYOUT_CHUNK + 1),
+            2,
+            "one over is a second tx"
+        );
+
+        // A reserve of nothing funds nothing. This must not read as "unlimited",
+        // which is what an unchecked plan effectively assumed.
+        assert_eq!(reserve_funds_recipients(0), (0, 0));
+
+        // And it scales the way an operator would expect when they raise it.
+        let (bigger, _) = reserve_funds_recipients(SETTLE_RESERVE_UNITS * 2);
+        assert_eq!(bigger, 2 * recipients);
+    }
+
+    #[test]
+    fn an_unreadable_ledger_is_refused_and_only_a_real_object_is_read() {
+        let base = tmp_path("classify");
+
+        // No file: a first run, and starting empty is correct.
+        let missing = format!("{base}.missing");
+        assert!(matches!(classify_state_file(&missing), StateFile::Fresh));
+
+        // A JSON object: readable, whatever money it does or does not carry.
+        let good = format!("{base}.good");
+        std::fs::write(&good, r#"{"schema":1,"owed":[]}"#).expect("write");
+        assert!(matches!(classify_state_file(&good), StateFile::Readable(_)));
+
+        // A file with NO schema key is schema 1 - every file written before the
+        // key existed is exactly that, and must still load.
+        let legacy = format!("{base}.legacy");
+        std::fs::write(&legacy, r#"{"accepted":5}"#).expect("write");
+        assert!(matches!(
+            classify_state_file(&legacy),
+            StateFile::Readable(_)
+        ));
+
+        // Every one of these used to leave the pool running with empty
+        // accounting - zero owed, zero paid, zero in flight - which distributes
+        // the whole wallet to the current window. All must be Unreadable now.
+        for (tag, body) in [
+            ("truncated", r#"{"owed":[["addr",1"#), // a half-written file
+            ("array", "[]"),
+            ("null", "null"),
+            ("number", "42"),
+            ("string", r#""text""#),
+            ("future", r#"{"schema":9999,"owed":[]}"#),
+        ] {
+            let p = format!("{base}.{tag}");
+            std::fs::write(&p, body).expect("write");
+            assert!(
+                matches!(classify_state_file(&p), StateFile::Unreadable(_)),
+                "{tag} ({body}) must be refused, not read as empty accounting"
+            );
+            let _ = std::fs::remove_file(&p);
+        }
+        for p in [missing, good, legacy] {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 
     /// A scratch path under the system temp dir, unique per test and per run.
     fn tmp_path(tag: &str) -> String {
@@ -3188,6 +3743,66 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_that_proves_the_payout_is_on_chain_is_not_a_lost_payout() {
+        // `mint/src/api/transaction.rs` answers ret=1 in four places, and these
+        // two are reached only AFTER `state.tx_exist` has found the transaction
+        // in the chain state. They say "the payout is mined and I cannot show it
+        // to you", not "it never happened". Reading them as Gone runs
+        // GoneAction::Forget, which puts the rows back on the owed ledger and
+        // pays those miners a second time out of the operator's own wallet.
+        for err in [
+            "cannot find block by transaction ptr",
+            "transaction not found in the block",
+        ] {
+            assert_eq!(
+                classify_payout_tx(&serde_json::json!({ "ret": 1, "err": err })),
+                PayoutTxState::Unknown,
+                "{err:?} is reached past tx_exist, so that payout is on chain"
+            );
+        }
+        // The absence answer is matched WHOLE. A prefix or `contains` match
+        // folds "transaction not found in the block" straight back into Gone and
+        // silently undoes everything above.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1,"err":"transaction not found"})),
+            PayoutTxState::Gone
+        );
+        // And matched exactly, not case-insensitively. The node writes this
+        // literal in lower case; something answering in another case is not the
+        // node's handler, and the one branch that can hand rows back to the owed
+        // ledger must never be wider than the string it was written against.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1,"err":"TRANSACTION NOT FOUND"})),
+            PayoutTxState::Unknown
+        );
+        // Our own malformed request, and any wording this pool has never seen,
+        // resolve nothing. Keep the hash; do not re-owe its rows.
+        for err in [
+            "transaction hash format invalid",
+            "a future node phrases it some other way",
+        ] {
+            assert_eq!(
+                classify_payout_tx(&serde_json::json!({ "ret": 1, "err": err })),
+                PayoutTxState::Unknown,
+                "an unrecognised refusal must not decide that money was never paid"
+            );
+        }
+        // A refusal carrying no `err` at all is not a verdict either, and
+        // neither is one that hides the text somewhere other than the root:
+        // `top_value` asks where the node really puts it.
+        assert_eq!(
+            classify_payout_tx(&serde_json::json!({"ret":1})),
+            PayoutTxState::Unknown
+        );
+        assert_eq!(
+            classify_payout_tx(
+                &serde_json::json!({"ret":1,"data":{"err":"transaction not found"}})
+            ),
+            PayoutTxState::Unknown
+        );
+    }
+
+    #[test]
     fn an_implausible_balance_is_refused_instead_of_saturating() {
         // "1:280" used to saturate to u64::MAX, which distributable_units then
         // handed to split_payout as a payout plan for the whole u64 range.
@@ -3245,6 +3860,45 @@ mod tests {
         let odd = serde_json::json!({"ret":0,"list":[{"diamond":0}]});
         assert!(matches!(balance_answer(&odd), BalanceAnswer::Refused(_)));
         assert_eq!(balance_answer(&odd).units(), None);
+
+        // NO `ret` at all. This is the one that used to be believed: the check
+        // was `find_u64(j,"ret").is_some_and(|r| r != 0)`, so a missing ret fell
+        // through to a whole-document search for `hacash`, and ANY json carrying
+        // that key anywhere became a balance the settlement would split. A
+        // captive portal, a misrouted service or a stale cache could hand the
+        // pool a number the node never said.
+        let no_ret = serde_json::json!({"list":[{"hacash":"999999:248"}]});
+        assert!(
+            matches!(balance_answer(&no_ret), BalanceAnswer::Refused(_)),
+            "a body with no root ret is not the node answering: {:?}",
+            balance_answer(&no_ret)
+        );
+        assert_eq!(balance_answer(&no_ret).units(), None);
+
+        // A `ret` that is not at the root does not count either: the envelope is
+        // what says the node is speaking, and finding the word somewhere inside
+        // a document is not the same thing.
+        let buried = serde_json::json!({"data":{"ret":0},"list":[{"hacash":"999999:248"}]});
+        assert!(matches!(balance_answer(&buried), BalanceAnswer::Refused(_)));
+
+        // More than one row. Every caller asks about ONE address - the pool's
+        // own wallet - so an answer carrying several is not an answer to the
+        // question asked, and taking the first would be guessing which is ours.
+        let many = serde_json::json!({
+            "ret":0,
+            "list":[{"hacash":"1:248"},{"hacash":"999999:248"}]
+        });
+        assert!(matches!(balance_answer(&many), BalanceAnswer::Refused(_)));
+        assert_eq!(balance_answer(&many).units(), None);
+
+        // A transport error whose text carries a quote still produces a document
+        // with the http_error key. Built by hand, this was a body that was not
+        // JSON at all, which fell back to a bare string and lost the key.
+        let quoted = transport_failure(&r#"connect to "node": refused \ hard"#);
+        assert!(
+            matches!(balance_answer(&quoted), BalanceAnswer::NoAnswer(_)),
+            "a quoted error text must still be a transport failure: {quoted}"
+        );
 
         // A wallet holding nothing. The node renders it "0:0", and that IS a
         // balance: settlement must go on treating it as a real, actionable zero,
@@ -3369,13 +4023,17 @@ mod tests {
         let j = |s: &str| serde_json::from_str::<Value>(s).expect("json");
         let ours = "aa".repeat(32);
         let theirs = "bb".repeat(32);
+        // Heights for the tip rule: 500 is a block the node has not reached
+        // (tip 400), so a refusal there is ordinary waiting.
         // Our block, with two transactions to price.
         assert_eq!(
             block_txs_of(
                 &j(&format!(
                     r#"{{"ret":0,"hash":"{ours}","tx_hash_list":["11","22"]}}"#
                 )),
-                &ours
+                &ours,
+                500,
+                400
             ),
             BlockTxs::Ours(vec!["11".to_string(), "22".to_string()])
         );
@@ -3384,25 +4042,51 @@ mod tests {
         assert_eq!(
             block_txs_of(
                 &j(&format!(r#"{{"ret":0,"hash":"{ours}","tx_hash_list":[]}}"#)),
-                &ours
+                &ours,
+                500,
+                400
             ),
             BlockTxs::Ours(vec![])
         );
-        // Another block won that height, or the chain has not reached it: it
-        // credited this pool nothing, so there are no fees to hold back.
+        // Another block won that height: the node ANSWERED, and the chain
+        // credited this pool nothing there, so there are no fees to hold back.
+        // Definitive whichever side of the tip the height is on.
         assert_eq!(
             block_txs_of(
                 &j(&format!(
                     r#"{{"ret":0,"hash":"{theirs}","tx_hash_list":[]}}"#
                 )),
-                &ours
+                &ours,
+                300,
+                400
             ),
             BlockTxs::NotOnChain
         );
+        // No block at a height ABOVE the node's tip: ordinary waiting, our
+        // block simply has not been inserted yet.
         assert_eq!(
-            block_txs_of(&j(r#"{"ret":1,"err":"cannot find block"}"#), &ours),
+            block_txs_of(
+                &j(r#"{"ret":1,"err":"cannot find block"}"#),
+                &ours,
+                500,
+                400
+            ),
             BlockTxs::NotOnChain
         );
+        // The SAME refusal at a height the node's own tip covers is NOT an
+        // answer: the node must hold a block there and could not produce it.
+        // Our block may be canonical at that height with its fee income already
+        // sitting in the wallet, so this has to stop settlement, not price the
+        // fees at zero. Both at the tip exactly and below it.
+        for h in [400u64, 300] {
+            assert!(
+                matches!(
+                    block_txs_of(&j(r#"{"ret":1,"err":"cannot find block"}"#), &ours, h, 400),
+                    BlockTxs::Unknown(_)
+                ),
+                "a refusal at height {h} under tip 400 was read as an answer"
+            );
+        }
         // Everything else is UNKNOWN, and the caller must stop settling. Reading
         // any of these as "no fees" pays a block's fee income out at zero
         // confirmations, and an orphan then leaves the operator funding it.
@@ -3413,12 +4097,15 @@ mod tests {
             &format!(r#"{{"ret":0,"hash":"{ours}","tx_hash_list":[7]}}"#),
         ] {
             assert!(
-                matches!(block_txs_of(&j(not_an_answer), &ours), BlockTxs::Unknown(_)),
+                matches!(
+                    block_txs_of(&j(not_an_answer), &ours, 500, 400),
+                    BlockTxs::Unknown(_)
+                ),
                 "{not_an_answer} was treated as an answer"
             );
         }
         assert!(matches!(
-            block_txs_of(&Value::String("<html>502</html>".into()), &ours),
+            block_txs_of(&Value::String("<html>502</html>".into()), &ours, 500, 400),
             BlockTxs::Unknown(_)
         ));
 
@@ -3652,6 +4339,39 @@ mod tests {
     }
 
     #[test]
+    fn the_manual_settler_takes_the_pool_fee_from_the_same_constant_as_the_server() {
+        // The terms above are meant to be stated ONCE, and hbit-pool-payout is
+        // named right here as one of the two things that apply them. It did not
+        // apply this one: it passed a literal 0 as the fee to split_payout, which
+        // agreed with POOL_FEE_UNITS only for as long as POOL_FEE_UNITS stayed 0.
+        // Set a fee and the two settlers divide the same pot differently, so
+        // which one an operator happened to run decides what every miner is paid.
+        //
+        // Nothing behavioural can see that while the fee is 0, so read the
+        // source: the fee the manual settler passes must NAME the constant rather
+        // than carry a copy of today's value.
+        let src = include_str!("payout.rs");
+        let (_, call) = src
+            .split_once("split_payout(")
+            .expect("hbit-pool-payout must still split the balance with split_payout");
+        let (args, _) = call
+            .split_once(')')
+            .expect("the split_payout call must still be a single expression");
+        let fee = args
+            .split(',')
+            .nth(1)
+            .map(str::trim)
+            .expect("split_payout takes the pool fee as its second argument");
+        assert!(
+            fee.contains("POOL_FEE_UNITS"),
+            "hbit-pool-payout passes `{fee}` as the pool fee instead of POOL_FEE_UNITS. \
+             A non-zero fee would then make the manual settler and the pool server pay the \
+             same share window differently, and which one an operator ran would decide what \
+             the miners got."
+        );
+    }
+
+    #[test]
     fn settle_lock_is_exclusive_across_holders() {
         let wallet = tmp_path("lock-wallet.key");
         let lock = settle_lock_path(&wallet);
@@ -3715,6 +4435,7 @@ mod tests {
             height: 1234,
             prevhash: leaf(9),
             timestamp: 1_700_000_000,
+            prev_timestamp: 1_699_999_700,
             difficulty: LOWEST_DIFFICULTY,
             target: [0xff; 32],
             coinbase_addr: Address::default(),

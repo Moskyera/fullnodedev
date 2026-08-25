@@ -2,7 +2,7 @@
 //! pool can build templates the node accepts at REAL (mainnet) heights.
 //!
 //! This mirrors mint/src/check/difficulty_asert.rs exactly. Every detail below
-//! is load-bearing — a value that is off by one means the node rejects the
+//! is load-bearing - a value that is off by one means the node rejects the
 //! block:
 //!   * the exponent uses i128 `/` (truncates TOWARD ZERO, not floor)
 //!   * num_shifts uses an arithmetic shift (floor) and the fraction is derived
@@ -48,6 +48,19 @@ impl ChainParams {
             bootstrap_max: 0,
         }
     }
+    /// Is this the one chain whose genesis block is a fixed, known quantity?
+    ///
+    /// Derived from `mainnet()` rather than restating its numbers, so a change
+    /// there cannot leave a second copy behind saying something else. A testnet
+    /// genesis depends on whoever started that chain, so nothing can be verified
+    /// against it and the caller must not pretend otherwise.
+    pub fn is_mainnet(&self) -> bool {
+        let m = Self::mainnet();
+        self.asert_height == m.asert_height
+            && self.target_time == m.target_time
+            && self.bootstrap_max == m.bootstrap_max
+    }
+
     /// Non-mainnet: ASERT anchors at window+2 and heights <= window+1 bootstrap.
     pub fn testnet(adjust_blocks: u64, target_time: u64) -> Self {
         Self {
@@ -114,7 +127,7 @@ pub fn next_difficulty(
     assert!(
         height > p.asert_height,
         "height {height} is in the pre-ASERT (legacy/LWMA) range, which this \
-         off-node builder does not implement — a pool only mines at the tip"
+         off-node builder does not implement - a pool only mines at the tip"
     );
 
     let time_delta = timestamp as i128 - anchor_time as i128;

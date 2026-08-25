@@ -500,6 +500,45 @@ mod transaction_build_tests {
             Some("create_transaction_invalid_gas_max")
         );
     }
+
+    #[test]
+    fn included_transaction_info_binds_the_exact_block_hash() {
+        let _guard = install_protocol_setup();
+        let req = ApiRequest {
+            query: HashMap::from([("body".to_owned(), "true".to_owned())]),
+            body: json!({
+                "tx_type": 3,
+                "main_address": "1AVRuFXNFi3rdMrPH4hdqSgFrEBnWisWaS",
+                "fee": "1:244",
+                "gas_max": 17,
+                "actions": []
+            })
+            .to_string()
+            .into_bytes(),
+            ..ApiRequest::default()
+        };
+        let response = transaction_build_inner(&req);
+        let built: Value = serde_json::from_slice(&response.body).unwrap();
+        let bytes = hex::decode(built["body"].as_str().unwrap()).unwrap();
+        let (transaction, _) = protocol::transaction::transaction_create(&bytes).unwrap();
+        let block = BlockV1::default();
+
+        let rendered = render_tx_info(
+            transaction.as_read(),
+            Some(block.as_read()),
+            block.height().uint(),
+            "fin",
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            rendered["block"]["hash"].as_str(),
+            Some(block.hash().to_hex().as_str())
+        );
+    }
 }
 
 fn transaction_check(_ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
@@ -713,6 +752,7 @@ fn render_tx_info(
         data.insert(
             "block".to_owned(),
             json!({
+                "hash": blkobj.hash().to_hex(),
                 "height": txblkhei,
                 "timestamp": blkobj.timestamp().uint(),
             }),

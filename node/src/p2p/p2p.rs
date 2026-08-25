@@ -101,6 +101,29 @@ impl P2PManage {
         prints
     }
 
+    /// Peer counts over the same snapshot `all_peer_prints` walks, but keeping
+    /// the flags that `nick()` throws away. `is_cntome` is set only for a peer
+    /// that dialed US, so it is the inbound signal.
+    pub fn peer_connectivity(&self) -> PeerConnectivity {
+        let peersnap = self.peer_snapshot();
+        let mut conn = PeerConnectivity {
+            measured: true,
+            ..PeerConnectivity::default()
+        };
+        for p in peersnap.backbones.iter().chain(peersnap.offshoots.iter()) {
+            conn.total += 1;
+            if p.is_cntome {
+                conn.inbound += 1;
+            } else {
+                conn.outbound += 1;
+            }
+            if p.is_public {
+                conn.public += 1;
+            }
+        }
+        conn
+    }
+
     pub(crate) async fn insert(&self, peer: Arc<Peer>) -> Ret<Vec<Arc<Peer>>> {
         let (backtx, backrx) = tokio::sync::oneshot::channel();
         if self.peertabletx.send(PeerTableCmd::Insert(peer, backtx)).await.is_err() {

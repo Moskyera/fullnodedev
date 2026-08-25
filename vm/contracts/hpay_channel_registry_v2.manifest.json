@@ -1,0 +1,74 @@
+{
+  "schema": "hpay-hvm-channel-registry-manifest/2",
+  "contract_name": "HPAYChannelRegistryV2",
+  "protocol_domain": "HPAY/HVM-CHANNEL-REGISTRY/V2",
+  "settlement_profile": "hpay-hvm-shared-registry-v2",
+  "source_file": "hpay_channel_registry_v2.fitsh",
+  "source_sha256": "37fabe6b8ab54431864715530c0f16c89fed3b609c23c227e592cec24e2ab8b5",
+  "bytecode_sha3": "2fa7429d9e686dd2457eeb1b4476f972c7ddd9be6a0371c9765eff2910209b04",
+  "required_action_kinds": [40, 41, 44],
+  "initial_rent_periods": 100,
+  "maximum_renewal_step_periods": 150,
+  "deployment_model": {
+    "scope": "one_registry_per_hub_and_network",
+    "hub_binding": "contract_deploy_main_signer",
+    "network_binding": "exact_32_byte_constructor_argument",
+    "per_channel_contract_deploy": false
+  },
+  "channel_model": {
+    "maximum_active_channels_per_left_address": 1,
+    "channel_identity": "left_address_channel_id_reuse",
+    "first_reuse": 0,
+    "next_reuse": "exact_previous_plus_one",
+    "right_party": "registry_hub",
+    "right_hub_deposit": "exactly_zero",
+    "left_deposit": "positive"
+  },
+  "registry_storage_keys": [
+    "g_network",
+    "g_hub",
+    "g_locked",
+    "g_left_claimable",
+    "g_hub_claimable",
+    "g_open_count"
+  ],
+  "channel_storage_prefixes": [
+    "c_status_",
+    "c_id_",
+    "c_reuse_",
+    "c_deposit_",
+    "c_paid_",
+    "c_total_",
+    "c_serial_",
+    "c_left_balance_",
+    "c_hub_balance_",
+    "c_challenge_",
+    "c_deadline_",
+    "c_left_claimed_"
+  ],
+  "payout_model": {
+    "left_claim": "exact_once_per_finalized_channel",
+    "hub_claim": "partial_or_full_from_aggregate_claimable",
+    "hub_credit_timing": "finalization"
+  },
+  "lease_policy": {
+    "permissionless_registry_renewal": true,
+    "permissionless_channel_renewal": true,
+    "must_renew_every_registry_key": true,
+    "must_renew_every_channel_key": true,
+    "production_watchtower_required": true,
+    "recovery_buffer_seeded_on_funding": true,
+    "recovery_buffer_periods_at_funding": 550,
+    "minimum_reach_blocks_to_accept_custody": 50000,
+    "lapsed_lease_outcome": "dormant_and_restorable_by_permissionless_renewal",
+    "renewal_step_bounded_by_transaction_storage_gas": true
+  },
+  "mainnet_deployment": {
+    "enabled": false,
+    "contract_address": null,
+    "deployment_tx_hash": null,
+    "deployment_height": null,
+    "independently_verified": false,
+    "external_audit_complete": false
+  }
+}

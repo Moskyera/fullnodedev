@@ -1,6 +1,30 @@
 [package]
 name = "hbit-pool"
-version = "0.1.0"
+# Versioned and released INDEPENDENTLY of the miner, on `pool-v*` tags, because
+# they are different products for different people: the miner is a Windows
+# desktop program an individual runs, the pool is Linux server software an
+# operator runs on a VPS beside their own node. An operator holding other
+# people's money should not wait for a miner release to get a fix, and a miner
+# should not be re-downloaded because a pool changed.
+#
+# 0.2.0 was the first release the pool made on its own: the accounting file
+# gained a schema, a found block began recording who earned it, and several
+# payout rules changed. Nothing an older build wrote became unreadable, but what
+# that build MEANS by the file is different, which is why it was not 0.1.1.
+#
+# 0.2.1 is a patch: a halted pool now tells miners to stop, in the words their
+# existing pause already keys on, so no rig keeps hashing for credit that will
+# never come. No file format and no payout rule moved.
+#
+# 0.2.2 is a patch too, and the reason to take it is that 0.2.1 could pay a
+# miner twice. A node refusal reached with the transaction already on chain was
+# read as "that payout is lost", which put its rows back on the owed ledger. It
+# also stops losing banked credit by worker id on restart, stops the per-worker
+# rate limiter failing open in silence, and releases a rig parked on a
+# same-height reorg instead of leaving it hashing an abandoned parent. The
+# accounting file is unchanged in both directions, so 0.2.1 and 0.2.2 read each
+# other's state; only /stats gains a field.
+version = "0.2.2"
 edition = "2024"
 description = "HBIT: the Hacash mining pool this project ships. Share accounting, PPLNS payout splitting and on-chain settlement, plus the feasibility spikes it grew out of."
 

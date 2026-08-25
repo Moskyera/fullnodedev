@@ -32,6 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use app::efficiency::{EfficiencyMode, MiningStatsSnapshot};
+use app::gpu_arch::{GpuVendor, profile_vendor};
 use config::{
     BenchmarkConfigBackup, PanelSettings, apply_benchmark_ini, apply_loaded_ini,
     commit_benchmark_backup, create_benchmark_backup, interrupted_benchmark_backup, load_panel_ini,
@@ -100,6 +101,20 @@ struct OpenClProbeResult {
     status: opencl_status::OpenClStatus,
     /// `None` when thermal protection is disabled or no usable GPU exists.
     thermal_available: Option<bool>,
+    /// Which vendor was asked, and whether anything on this machine reports that
+    /// GPU's power draw. `None` when there was no usable GPU to ask about.
+    ///
+    /// It decides whether Eco, Profit balance and Maximum hashrate are three
+    /// choices or one: with no per-candidate watt figure the tuner divides every
+    /// shape by the same configured constant, so all three rank identically and
+    /// an operator who picks Eco is handed Max. That is worth a line next to the
+    /// picker, and this is what tells the picker.
+    ///
+    /// The vendor is carried with the answer because the answer is only about
+    /// that vendor: an AMD card measured through the display driver says nothing
+    /// about the Intel card the operator switched the picker to a second later.
+    /// A mismatch means the panel has not asked yet, and it says nothing.
+    power_measured: Option<(GpuVendor, bool)>,
 }
 
 struct MinerApp {
@@ -181,6 +196,10 @@ struct MinerApp {
     tab: usize,
     logo_texture: Option<egui::TextureHandle>,
     opencl_status: opencl_status::OpenClStatus,
+    /// What the last probe found out about a GPU's power sensor, and which
+    /// vendor it asked. `None` until a probe has answered, which is why the mode
+    /// picker says nothing rather than guessing before then.
+    power_measured: Option<(GpuVendor, bool)>,
     opencl_probe_rx: Option<Receiver<OpenClProbeResult>>,
     pending_opencl_action: Option<OpenClAction>,
     auto_select_detected_gpu: bool,
@@ -257,8 +276,23 @@ impl MinerApp {
             &mut use_cuda,
             currency,
         );
-        if mining_kind == MiningKind::Hacd && cpus[cpu_idx].supervene == 0 {
-            cpu_idx = cpus.iter().position(|p| p.supervene > 0).unwrap_or(cpu_idx);
+        if mining_kind == MiningKind::Hacd {
+            // The thread count above came from `poworker.config.ini`, which is
+            // the only file the rest of these settings live in. A HACD operator's
+            // thread count is written to `diaworker.config.ini` and was never
+            // read back, so every restart threw the choice away and the panel
+            // showed a number the diamond miner was not running. Read the file
+            // this mode actually writes.
+            if let Some(sv) = load_panel_ini(&dia_config_path).supervene {
+                if let Some(i) = presets::cpu_idx_for_supervene(&cpus, sv) {
+                    cpu_idx = i;
+                }
+            }
+            if cpus[cpu_idx].supervene == 0 {
+                // The smallest rung was the old substitute and it is the wrong
+                // one: a diamond miner that must pick something picks the machine.
+                cpu_idx = presets::hacd_default_idx(&cpus).unwrap_or(cpu_idx);
+            }
         }
         let mode = match mode_idx {
             0 => EfficiencyMode::Eco,
@@ -399,6 +433,7 @@ impl MinerApp {
             last_worker_log: String::new(),
             logo_texture,
             opencl_status,
+            power_measured: None,
             opencl_probe_rx: None,
             pending_opencl_action: None,
             auto_select_detected_gpu: !gpu_configured_in_ini,
@@ -499,7 +534,20 @@ impl MinerApp {
     }
 
     fn cpu_label(&self, idx: usize) -> &str {
-        self.cpu_presets[idx].label
+        &self.cpu_presets[idx].label
+    }
+
+    /// CPU threads the panel will really write for the currently selected
+    /// worker. Not always the picker's raw number: see
+    /// `config::effective_supervene`. Every place that shows the operator a
+    /// thread count goes through here, so the dashboard cannot claim one number
+    /// while the config file holds another.
+    fn configured_cpu_threads(&self) -> u32 {
+        config::effective_supervene(
+            self.cpu_presets[self.cpu_idx].supervene,
+            self.gpu_presets[self.gpu_idx].slug,
+            self.mining_kind == MiningKind::Hacd,
+        )
     }
 
     fn gpu_label(&self, idx: usize) -> &str {
@@ -606,7 +654,7 @@ impl MinerApp {
             MiningKind::Hacd => self.hacd_wallet.clone(),
         };
         if kind == MiningKind::Hacd && self.cpu_presets[self.cpu_idx].supervene == 0 {
-            if let Some(idx) = self.cpu_presets.iter().position(|p| p.supervene > 0) {
+            if let Some(idx) = presets::hacd_default_idx(&self.cpu_presets) {
                 self.cpu_idx = idx;
             }
         }
@@ -630,24 +678,36 @@ impl MinerApp {
         let platform_id = self.platform_id;
         let device_id = self.device_id;
         let thermal_required = self.max_temp_c > 0;
+        // The vendor decides which sensor could answer at all: AMD through the
+        // display driver or rocm-smi/amd-smi, NVIDIA through nvidia-smi, Intel
+        // through nothing. Taken from the chosen preset, which is the same thing
+        // `write_poworker_config` writes into `gpu_profile`.
+        let vendor = profile_vendor(self.gpu_presets[self.gpu_idx].profile);
         let (tx, rx) = mpsc::channel();
         let spawn_result = thread::Builder::new()
             .name("hacash-opencl-probe".to_string())
             .spawn(move || {
                 let status = opencl_status::load_opencl_status(&work_dir);
+                let sensor_device = if status.selection_is_usable(platform_id, device_id) {
+                    device_id
+                } else {
+                    status.recommended_device.unwrap_or(device_id)
+                };
                 let thermal_available = if thermal_required && status.has_usable_device() {
-                    let thermal_device = if status.selection_is_usable(platform_id, device_id) {
-                        device_id
-                    } else {
-                        status.recommended_device.unwrap_or(device_id)
-                    };
-                    Some(app::efficiency::read_thermal_c_with_gpu("", thermal_device).is_some())
+                    Some(app::efficiency::read_thermal_c_with_gpu("", sensor_device).is_some())
                 } else {
                     None
                 };
+                let power_measured = status.has_usable_device().then(|| {
+                    (
+                        vendor,
+                        app::efficiency::board_power_is_measurable("", sensor_device, vendor),
+                    )
+                });
                 let _ = tx.send(OpenClProbeResult {
                     status,
                     thermal_available,
+                    power_measured,
                 });
             });
         match spawn_result {
@@ -695,6 +755,11 @@ impl MinerApp {
         require_start_checks: bool,
     ) -> Result<(), String> {
         let status = result.status;
+        // Recorded whatever the rest of this validation decides, including on
+        // the error paths below: whether the card reports watts is a fact about
+        // the machine, and the mode picker needs it even when the probe found a
+        // problem worth refusing on.
+        self.power_measured = result.power_measured;
         if !status.has_usable_device() {
             let detail = status.warnings.first().cloned().unwrap_or_else(|| {
                 format!(
@@ -842,6 +907,31 @@ impl MinerApp {
         }
     }
 
+    /// Does this machine report the SELECTED GPU's power draw?
+    ///
+    /// `None` until a probe has answered about the vendor now selected. That is
+    /// not the same as "no sensor": the panel has not asked, and a picker that
+    /// warned on a question it never put would be as wrong as one that stayed
+    /// quiet on a question it did.
+    pub(crate) fn selected_gpu_power_measured(&self) -> Option<bool> {
+        let vendor = profile_vendor(self.gpu_presets[self.gpu_idx].profile);
+        match self.power_measured {
+            Some((probed, measured)) if probed == vendor => Some(measured),
+            _ => None,
+        }
+    }
+
+    /// Is CUDA the backend this panel would actually write?
+    ///
+    /// The same three conditions `write_poworker_config` applies, so the button
+    /// and the file can never disagree: a stale `use_cuda` on an AMD preset is
+    /// written as `false` and must not be reported here as CUDA.
+    pub(crate) fn cuda_backend_selected(&self) -> bool {
+        let gpu = &self.gpu_presets[self.gpu_idx];
+        self.mining_kind == MiningKind::Hac
+            && config::cuda_backend_selected(self.use_cuda, gpu.slug, gpu.profile)
+    }
+
     fn run_benchmark(&mut self) {
         let t = self.t();
         if self.mining_settings_locked() {
@@ -853,6 +943,14 @@ impl MinerApp {
         }
         if self.gpu_presets[self.gpu_idx].slug == "none" {
             self.status_msg = t.no_gpu.to_string();
+            return;
+        }
+        // Refused here rather than spent: with CUDA selected the panel writes
+        // `use_cuda = true` / `use_opencl = false`, poworker's tuner refuses that
+        // config, and every second of the wait and the settings rollback that
+        // followed bought nothing. The button says the same sentence.
+        if self.cuda_backend_selected() {
+            self.status_msg = t.autotune_cuda_unsupported.to_string();
             return;
         }
         self.request_opencl_probe(OpenClAction::AutoTune);

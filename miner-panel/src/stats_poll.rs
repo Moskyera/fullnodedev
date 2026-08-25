@@ -68,6 +68,32 @@ pub fn live_gpu_temp_c(stats: &MiningStatsSnapshot, now_ms: u64) -> Option<f32> 
         .filter(|c| c.is_finite() && *c > 0.0 && *c < 120.0)
 }
 
+/// The GPU board power the panel is allowed to call a measurement, in watts.
+///
+/// `None` means no card measured it, and the panel then shows the worker's
+/// configured estimate LABELLED as an estimate. It is never a zero and never the
+/// last number a dead worker left behind, on exactly the rule the temperature
+/// above follows, and for a sharper reason: a stale watt figure is a stale
+/// electricity bill, and a zero one is a rig that appears to run for free.
+pub fn live_gpu_board_power_w(stats: &MiningStatsSnapshot, now_ms: u64) -> Option<f32> {
+    if !snapshot_is_live(stats, now_ms) {
+        return None;
+    }
+    stats
+        .gpu_board_power_w
+        .filter(|w| w.is_finite() && *w > 0.0 && *w < 100_000.0)
+}
+
+/// Whether the whole `watts` figure in this snapshot is a measurement.
+///
+/// The worker decides this, not the panel: only the worker knows whether a CPU
+/// assist estimate was mixed into the total. The panel additionally refuses to
+/// call a stale snapshot measured, because a measurement nobody is taking any
+/// more is not one.
+pub fn watts_are_measured(stats: &MiningStatsSnapshot, now_ms: u64) -> bool {
+    stats.watts_measured && live_gpu_board_power_w(stats, now_ms).is_some()
+}
+
 /// The OOM clamp in force, or `None` when nothing was clamped.
 ///
 /// `oom_allowed_work_groups` is a COUNT of what the OOM fallback allows, not a
@@ -1368,6 +1394,77 @@ mod tests {
             now
         ));
         assert!(snapshot_is_live(&snapshot_at(now - 1, Some(60.0)), now));
+    }
+
+    fn power_snapshot_at(
+        taken_at_ms: u64,
+        watts: Option<f32>,
+        measured: bool,
+    ) -> MiningStatsSnapshot {
+        MiningStatsSnapshot {
+            gpu_board_power_w: watts,
+            watts_measured: measured,
+            updated_unix_ms: taken_at_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_power_reading_the_worker_stopped_refreshing_is_not_drawn_as_current() {
+        // The same failure as the stale temperature, but this one puts a number
+        // on an electricity bill: a worker that died an hour ago must not still
+        // be shown as measuring 256 W.
+        let now = 1_800_000_000_000u64;
+        let stale = STATS_STALE_AFTER.as_millis() as u64;
+        assert_eq!(
+            live_gpu_board_power_w(&power_snapshot_at(now - 1_000, Some(256.0), true), now),
+            Some(256.0)
+        );
+        assert_eq!(
+            live_gpu_board_power_w(&power_snapshot_at(now - stale - 1, Some(256.0), true), now),
+            None
+        );
+        // And with the reading gone, the total stops being called a measurement.
+        assert!(!watts_are_measured(
+            &power_snapshot_at(now - stale - 1, Some(256.0), true),
+            now
+        ));
+    }
+
+    #[test]
+    fn an_absent_or_impossible_power_stays_absent_and_never_becomes_zero() {
+        let now = 1_800_000_000_000u64;
+        assert_eq!(
+            live_gpu_board_power_w(&power_snapshot_at(now, None, false), now),
+            None
+        );
+        for impossible in [0.0, -30.0, f32::NAN, f32::INFINITY, 100_000.0] {
+            assert_eq!(
+                live_gpu_board_power_w(&power_snapshot_at(now, Some(impossible), true), now),
+                None,
+                "{impossible} is not a board draw"
+            );
+        }
+    }
+
+    #[test]
+    fn a_total_the_worker_would_not_call_measured_is_not_relabelled_here() {
+        // A measured card plus CPU assist: the reading is shown, the TOTAL is
+        // still an estimate, and the panel does not get to promote it.
+        let now = 1_800_000_000_000u64;
+        let mixed = power_snapshot_at(now, Some(256.0), false);
+        assert_eq!(live_gpu_board_power_w(&mixed, now), Some(256.0));
+        assert!(!watts_are_measured(&mixed, now));
+        // And a worker claiming a measured total without a reading behind it is
+        // not believed either.
+        assert!(!watts_are_measured(
+            &power_snapshot_at(now, None, true),
+            now
+        ));
+        assert!(watts_are_measured(
+            &power_snapshot_at(now, Some(256.0), true),
+            now
+        ));
     }
 
     #[test]

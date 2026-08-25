@@ -1,6 +1,7 @@
 # Hacash fullnode, as the always-on half of an HBIT pool box.
 #
-# Install to /etc/systemd/system/hacash-node.service (deploy/install.sh does it).
+# Install to /etc/systemd/system/hacash-node.service. deploy/README.md, section
+# "systemd", is the command list that puts every file where this unit expects it.
 # Every path here is absolute on purpose: a service manager gives a process no
 # terminal, no login shell and no working directory of its own.
 #

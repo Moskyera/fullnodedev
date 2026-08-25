@@ -29,6 +29,10 @@ impl TransportAdapter {
         self.p2p.all_peer_prints()
     }
 
+    pub(super) fn peer_connectivity(&self) -> PeerConnectivity {
+        self.p2p.peer_connectivity()
+    }
+
     pub(super) fn exit(&self) {
         self.p2p.exit();
     }
@@ -37,16 +41,36 @@ impl TransportAdapter {
 pub(crate) async fn broadcast_unaware(p2p: &P2PManage, key: &KnowKey, ty: u16, body: Vec<u8>) {
     let mut resps = vec![];
     let peers = vec![p2p.backbones(), p2p.offshoots()].concat();
+    let candidates = peers.len();
     for peer in peers {
         if !peer.knows.check(key) {
             peer.knows.add(key.clone());
             resps.push(peer);
         }
     }
+    // A transaction accepted into the local pool and never seen again by the
+    // network gives an operator nothing to look at: the submit returns ok, the
+    // pool holds it, and whether a single byte left this process is invisible.
+    // Three transactions died that way in one afternoon here. Count what was
+    // considered, what was selected, and what the writer actually took, because
+    // the send result below is deliberately discarded and a silent failure at
+    // that line is indistinguishable from success.
+    let selected = resps.len();
     let msgbody = vec![ty.to_be_bytes().to_vec(), body].concat();
     let msgbuf = tcp_create_msg(MSG_CUSTOMER, msgbody);
+    let mut sent = 0usize;
+    let mut failed = 0usize;
     for peer in resps {
-        let _ = peer.send(&msgbuf).await;
+        match peer.send(&msgbuf).await {
+            Ok(()) => sent += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    if ty == MSG_TX_SUBMIT {
+        println!(
+            "[P2P] tx relay: {} peers considered, {} selected, {} sent, {} failed",
+            candidates, selected, sent, failed
+        );
     }
 }
 
@@ -195,6 +219,25 @@ pub(crate) async fn do_handle_pmsg(
         );
     }
     loop {
+        // `notify_waiters` wakes only whoever is parked at that instant and
+        // stores no permit, so the writer dying while this loop is busy
+        // handling a message loses the notification for good. The reader then
+        // runs forever against a peer it can never send to: the peer stays in
+        // the tables, keeps a slot, keeps delivering blocks, and looks entirely
+        // healthy, so the connection manager never re-dials it.
+        //
+        // That is how this node came to hold three transactions in its pool for
+        // an afternoon while the network never saw one of them. Checking the
+        // flag as well as the notification closes the race in the direction
+        // that matters: a peer we cannot speak to is not a peer, and dropping
+        // it here is what lets a working connection replace it.
+        if peer.is_writer_closed() {
+            println!(
+                "[P2P] dropping {}: its writer is gone, so this node cannot send to it",
+                peer.nick()
+            );
+            break;
+        }
         let rdres = tokio::select! {
             _ = peer.close_notify.notified() => {
                 break

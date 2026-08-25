@@ -277,7 +277,8 @@ impl OpenclGpuHandle {
                         self.consecutive_errors.store(0, Relaxed);
                         wlogerr!(
                             "[OpenCL] Rebuilt GPU context (errors={}, work_groups={})",
-                            n, rebuild_wg
+                            n,
+                            rebuild_wg
                         );
                     }
                     Err(e) => wlogerr!("[OpenCL] Context rebuild failed: {}", e),
@@ -348,7 +349,8 @@ impl OpenclGpuHandle {
                 }
                 wlogerr!(
                     "[OpenCL] work_groups ramp-up rebuild failed, staying at {}: {}",
-                    capped, e
+                    capped,
+                    e
                 );
             }
         }

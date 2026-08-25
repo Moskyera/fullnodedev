@@ -124,6 +124,17 @@ pub fn install_once(registry: ProtocolSetup) {
         .unwrap_or_else(|_| panic!("protocol setup already installed"));
 }
 
+/// Install the global setup only if nothing has claimed it yet, reporting
+/// whether this call was the one that installed it.
+///
+/// [`install_once`] stays exactly as strict as it was: a second installer there
+/// is still a panic. This exists for test harnesses that share a process with
+/// another component that also installs a setup, where "somebody already did
+/// it" is the expected outcome rather than a bug.
+pub fn try_install_once(registry: ProtocolSetup) -> bool {
+    GLOBAL_SETUP_REGISTRY.set(Arc::new(registry)).is_ok()
+}
+
 pub fn install_test_scope(registry: ProtocolSetup) -> TestSetupScopeGuard {
     let old = SCOPED_SETUP_REGISTRY.with(|cell| cell.replace(Some(Arc::new(registry))));
     TestSetupScopeGuard { old }

@@ -156,7 +156,11 @@ fn print_milestones(ms: &[(u32, u64, u64)], want: u32) {
     }
     println!("\nfirst sighting of each bit level:");
     for (bits, secs, hei) in ms {
-        let mark = if *bits >= want { "  <- pool servable" } else { "" };
+        let mark = if *bits >= want {
+            "  <- pool servable"
+        } else {
+            ""
+        };
         println!("  {bits:>2} bits  at {secs:>6}s  height {hei}{mark}");
     }
 }

@@ -130,8 +130,29 @@ impl Peer {
             while let Some(cmd) = writer_rx.recv().await {
                 match cmd {
                     PeerWriterCmd::Send(buf) => {
-                        if tcp_send(&mut write_half, &buf).await.is_err() {
+                        // One failed write retires this peer's writer for the
+                        // rest of the connection's life, while its reader keeps
+                        // running on the other half of the socket. The node then
+                        // downloads blocks and transactions perfectly and can
+                        // never send anything to that peer again.
+                        //
+                        // Nothing said so. `Peer::send` returns "peer may be
+                        // closed" and the broadcast path discarded that result
+                        // with `let _ =`, so a node could hold a transaction in
+                        // its pool for an hour, look completely healthy, and be
+                        // mute to the whole network. That happened here three
+                        // times before anybody could see it.
+                        //
+                        // Still retire the writer: a half-open socket is not
+                        // worth retrying blindly. But say so once, with the peer
+                        // named, so the silence has a first line.
+                        if let Err(error) = tcp_send(&mut write_half, &buf).await {
                             peer.mark_writer_closed();
+                            println!(
+                                "[P2P] writer retired for {}: {}. This node can no longer SEND to that peer, though it will keep receiving from it.",
+                                peer.nick(),
+                                error
+                            );
                             break;
                         }
                     }

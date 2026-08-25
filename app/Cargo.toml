@@ -10,6 +10,7 @@ field          = {path = "../field"}
 basis          = {path = "../basis"}
 protocol       = {path = "../protocol"}
 mint           = {path = "../mint"}
+vm             = {path = "../vm"}
 hex = "0.4.3"
 axum = "0.7.9"
 serde = { version = "1.0.215", features = ["derive"] }

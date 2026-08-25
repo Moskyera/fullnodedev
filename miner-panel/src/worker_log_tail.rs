@@ -517,7 +517,10 @@ mod tests {
             record_piped(&format!("[Mining] batch {i}"));
         }
         assert_eq!(line_count(), MAX_LINES);
-        assert_eq!(recent(1)[0].text, format!("[Mining] batch {}", MAX_LINES + 24));
+        assert_eq!(
+            recent(1)[0].text,
+            format!("[Mining] batch {}", MAX_LINES + 24)
+        );
     }
 
     #[test]

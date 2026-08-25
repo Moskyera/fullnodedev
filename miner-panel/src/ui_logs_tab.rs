@@ -75,7 +75,11 @@ impl MinerApp {
                     .color(colors::TEXT),
             );
             ui.add_space(2.0);
-            ui.label(egui::RichText::new(l.sub).size(12.0).color(colors::TEXT_MUTED));
+            ui.label(
+                egui::RichText::new(l.sub)
+                    .size(12.0)
+                    .color(colors::TEXT_MUTED),
+            );
         });
         ui.add_space(16.0);
 
@@ -209,7 +213,10 @@ mod tests {
         assert_eq!(stamp_column_width(&piped), 0.0);
 
         // One stamped line among many is enough to line the rest up under it.
-        let mixed = [line("", "banner"), line("2026-07-29 14:03:11", "[Mining] x")];
+        let mixed = [
+            line("", "banner"),
+            line("2026-07-29 14:03:11", "[Mining] x"),
+        ];
         assert_eq!(stamp_column_width(&mixed), STAMP_W);
 
         assert_eq!(stamp_column_width(&[]), 0.0);

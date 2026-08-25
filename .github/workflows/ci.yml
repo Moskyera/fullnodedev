@@ -74,6 +74,27 @@ jobs:
           bash scripts/mining-amd/install-configs.sh --force
           cmp scripts/mining-amd/poworker.amd.ini.example target/release/poworker.config.ini
 
+      # The crate that holds the pool wallet and signs the payouts. It was built
+      # for the first time at TAG time, in release.yml, so every defect in it had
+      # to be found by a human reading it. Its own suite covers the money rules:
+      # the coinbase hold-back, the payout verdicts, the chain-identity gate, the
+      # refusal to run on an unreadable ledger, and the deployment files.
+      - name: Build and test the HBIT payout pool
+        run: |
+          cargo build --locked --release -p hbit-pool
+          cargo test --locked -p hbit-pool
+
+      # --no-deps is load-bearing, not tidiness. Clippy lints path dependencies
+      # by default, and `-p hbit-pool` alone reports 55 findings from `field` and
+      # `sys` and 0 from this crate - including one deny-by-default lint
+      # (inherent_to_string_shadow_display on Amount) that fails the run outright.
+      # Those are consensus crates: fixing that lint would remove a method used
+      # across the tree and change what Amount renders, which is not something a
+      # pool change may do. --no-deps lints exactly the crate that signs payouts,
+      # which is clean at -D warnings and will not go quietly red.
+      - name: Lint the payout pool
+        run: cargo clippy --locked --no-deps -p hbit-pool --all-targets -- -D warnings
+
       - name: Build and test miner panel
         run: |
           cargo build --locked --release -p miner-panel

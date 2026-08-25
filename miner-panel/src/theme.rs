@@ -103,7 +103,6 @@ pub fn setup_theme(ctx: &egui::Context) {
     v.widgets.open.bg_stroke = Stroke::new(1.0, BORDER_ACCENT);
     v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
 
-
     v.slider_trailing_fill = true;
     // `selectable_label` paints the fill from `selection.bg_fill` and the TEXT
     // from `selection.stroke`. A mid-amber fill under mid-amber text was the

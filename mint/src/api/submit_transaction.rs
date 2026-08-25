@@ -1,4 +1,34 @@
 fn submit_transaction(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
+    submit_transaction_impl(ctx, req, true, |_| Ok(()))
+}
+
+/// Submit a transaction only after a caller-owned admission check succeeds.
+///
+/// The check runs synchronously in this request, after canonical transaction
+/// parsing and size/fee validation, immediately before the node is asked to
+/// admit the transaction. This restricted entry point deliberately disables
+/// the asynchronous and txpool-only query switches so its response always
+/// reflects the node's real admission result.
+pub fn submit_transaction_with_pre_admission_check<F>(
+    ctx: &ApiExecCtx,
+    req: ApiRequest,
+    pre_admission: F,
+) -> ApiResponse
+where
+    F: FnOnce(&ApiExecCtx) -> Rerr,
+{
+    submit_transaction_impl(ctx, req, false, pre_admission)
+}
+
+fn submit_transaction_impl<F>(
+    ctx: &ApiExecCtx,
+    req: ApiRequest,
+    allow_submission_switches: bool,
+    pre_admission: F,
+) -> ApiResponse
+where
+    F: FnOnce(&ApiExecCtx) -> Rerr,
+{
     let engcnf = ctx.engine.config();
     let Ok(bddts) = body_data_may_hex(&req) else {
         return api_error("transaction body invalid");
@@ -40,8 +70,11 @@ fn submit_transaction(ctx: &ApiExecCtx, req: ApiRequest) -> ApiResponse {
     // confirm. Wait for the node's real answer, exactly as /submit/miner/success
     // already does for blocks. `async=true` keeps the old fire-and-forget behaviour
     // for callers that do not read the result.
-    let is_async = q_bool(&req, "async", false);
-    let only_insert_txpool = q_bool(&req, "only_insert_txpool", false);
+    let is_async = allow_submission_switches && q_bool(&req, "async", false);
+    let only_insert_txpool = allow_submission_switches && q_bool(&req, "only_insert_txpool", false);
+    if let Err(error) = pre_admission(ctx) {
+        return api_error(&error);
+    }
     if let Err(e) = ctx
         .hnoder
         .submit_transaction(&txpkg, is_async, only_insert_txpool)
@@ -172,6 +205,35 @@ mod submit_transaction_ack_tests {
         (out, seen)
     }
 
+    fn call_checked_submit(
+        query: Vec<(&str, &str)>,
+        admission: Rerr,
+    ) -> (Value, Option<bool>) {
+        let engine: Arc<dyn Engine> = Arc::new(AckEngine { cnf: test_conf() });
+        let noder = Arc::new(AckNoder {
+            engine: engine.clone(),
+            seen_async: Mutex::new(None),
+        });
+        let ctx = ApiExecCtx {
+            engine,
+            hnoder: noder.clone(),
+            launch_time: 0,
+            miner_worker_notice_count: Arc::default(),
+        };
+        let req = ApiRequest {
+            query: query
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            headers: HashMap::new(),
+            body: tx_body(),
+        };
+        let resp = submit_transaction_with_pre_admission_check(&ctx, req, |_| admission);
+        let out: Value = serde_json::from_slice(&resp.body).unwrap();
+        let seen = *noder.seen_async.lock().unwrap();
+        (out, seen)
+    }
+
     #[test]
     fn a_node_rejection_is_reported_instead_of_a_bogus_ret_0() {
         let _setup = scoped_protocol_setup();
@@ -188,5 +250,27 @@ mod submit_transaction_ack_tests {
         let (out, seen_async) = call_submit(vec![("async", "true")]);
         assert_eq!(seen_async, Some(true));
         assert_eq!(out["ret"], json!(0));
+    }
+
+    #[test]
+    fn checked_submit_rejects_before_the_node_can_admit_the_transaction() {
+        let _setup = scoped_protocol_setup();
+        let (out, seen_async) =
+            call_checked_submit(vec![], Err("HPAY network binding mismatch".into()));
+        assert_eq!(seen_async, None);
+        assert_eq!(out["ret"], json!(1));
+        assert_eq!(out["err"], json!("HPAY network binding mismatch"));
+    }
+
+    #[test]
+    fn checked_submit_is_always_synchronous_even_if_switches_are_supplied() {
+        let _setup = scoped_protocol_setup();
+        let (out, seen_async) = call_checked_submit(
+            vec![("async", "true"), ("only_insert_txpool", "true")],
+            Ok(()),
+        );
+        assert_eq!(seen_async, Some(false));
+        assert_eq!(out["ret"], json!(1));
+        assert_eq!(out["err"], json!("tx fee purity too low"));
     }
 }

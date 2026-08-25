@@ -1,0 +1,48 @@
+{
+  "schema": "hpay-hvm-channel-exit-manifest/1",
+  "contract_name": "HPAYChannelExitV1",
+  "protocol_domain": "HPAY/HVM-CHANNEL/V1",
+  "settlement_profile": "hpay-hvm-channel-v1",
+  "source_file": "hpay_channel_exit_v1.fitsh",
+  "source_sha256": "c0a430eb9769d1d506641c379bb8aaf708c7bac7d03694b60a4be03fd001dd06",
+  "bytecode_sha3": "11a2efc27a0c951bbc6977186eb58bd076dd331a785f3c57242cf54a72238349",
+  "required_action_kinds": [40, 41, 44],
+  "initial_rent_periods": 100,
+  "maximum_renewal_step_periods": 5000,
+  "funding_model": {
+    "left_deposit": "positive",
+    "right_hub_deposit": "exactly_zero"
+  },
+  "storage_keys": [
+    "status",
+    "network",
+    "channel_id",
+    "reuse",
+    "left",
+    "right",
+    "left_deposit",
+    "right_deposit",
+    "left_paid",
+    "right_paid",
+    "total",
+    "serial",
+    "left_balance",
+    "right_balance",
+    "challenge_blocks",
+    "deadline",
+    "left_claimed",
+    "right_claimed"
+  ],
+  "lease_policy": {
+    "permissionless_renewal": true,
+    "must_renew_every_storage_key": true,
+    "production_watchtower_required": true
+  },
+  "mainnet_deployment": {
+    "enabled": false,
+    "contract_address": null,
+    "deployment_tx_hash": null,
+    "deployment_height": null,
+    "independently_verified": false
+  }
+}

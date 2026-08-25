@@ -133,12 +133,14 @@ exit /b 0
 :write_default_diaworker_ini
 (
     echo connect = 127.0.0.1:8080
-    echo supervene = 4
+    echo ; 0 = fit this machine: all logical CPUs but two. A number is obeyed exactly.
+    echo supervene = 0
     echo.
     echo [efficiency]
     echo mode = profit
     echo cpu_watts_per_thread = 8
-    echo dynamic_supervene = true
+    echo ; HACD has no GPU, so there is no GPU/CPU ratio to rebalance against.
+    echo dynamic_supervene = false
     echo supervene_min = 1
     echo supervene_max = 0
     echo benchmark_seconds = 0

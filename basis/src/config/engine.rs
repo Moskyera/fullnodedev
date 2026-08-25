@@ -1,15 +1,15 @@
-
-
-
-
-
 /// Strict variant of `ini_must_u64` for the keys where silently falling back to the default
 /// picks the wrong chain or the wrong limit. `ini_must_u64` cannot tell "key absent" from
 /// "key present but unparseable" and returns the default for both, so a typo like
 /// `chain_id = 5abc` would resolve to 0, which is mainnet, and the node would run mainnet
 /// rules while the operator believes it is on a side chain. An absent or empty value still
 /// takes the default; anything present but not a number is a hard startup failure.
-fn engine_ini_u64_strict(sec: &HashMap<String, Option<String>>, sec_name: &str, key: &str, dv: u64) -> u64 {
+fn engine_ini_u64_strict(
+    sec: &HashMap<String, Option<String>>,
+    sec_name: &str,
+    key: &str,
+    dv: u64,
+) -> u64 {
     let Some(raw) = sec.get(key).and_then(|v| v.as_deref()) else {
         return dv;
     };
@@ -32,7 +32,6 @@ fn engine_ini_u64_strict(sec: &HashMap<String, Option<String>>, sec_name: &str, 
     }
 }
 
-
 #[derive(Clone)]
 pub struct EngineConf {
     pub max_block_txs: usize,
@@ -40,6 +39,13 @@ pub struct EngineConf {
     pub max_tx_size: usize,
     pub max_tx_actions: usize,
     pub chain_id: u32, // sub chain id
+    /// Optional HPAY capability identity for an explicitly configured private
+    /// development chain. Empty on mainnet and on unidentified side chains.
+    pub network_kind: String,
+    pub node_profile_id: String,
+    /// Optional public address whose confirmed Local Pilot balance is used as
+    /// one input to the fail-closed transaction-readiness proof.
+    pub pilot_funding_address: Option<Address>,
     pub unstable_block: u64, // The number of blocks that are likely to fall back from the fork
     pub fast_sync: bool,
     pub sync_maxh: u64, // sync max height, limit
@@ -59,7 +65,7 @@ pub struct EngineConf {
     pub diamond_form: bool,
     pub recent_blocks: bool,
     pub average_fee_purity: bool,
-    pub lowest_fee_purity: u64, 
+    pub lowest_fee_purity: u64,
     // hac miner
     pub miner_enable: bool,
     pub miner_reward_address: Address,
@@ -68,8 +74,8 @@ pub struct EngineConf {
     pub dmer_enable: bool,
     pub dmer_reward_address: Address,
     pub dmer_bid_account: Account,
-    pub dmer_bid_min:  Amount,
-    pub dmer_bid_max:  Amount,
+    pub dmer_bid_min: Amount,
+    pub dmer_bid_max: Amount,
     pub dmer_bid_step: Amount,
     // tx pool
     pub txpool_maxs: Vec<usize>,
@@ -78,9 +84,7 @@ pub struct EngineConf {
     pub contract_cache_size: f64,
 }
 
-
 impl EngineConf {
-
     pub fn is_open_miner(&self) -> bool {
         self.miner_enable || self.dmer_enable
     }
@@ -94,14 +98,12 @@ impl EngineConf {
     // otherwise keep zero-address semantics.
     pub fn external_exec_author(&self) -> Address {
         if self.miner_enable && self.miner_reward_address != Address::default() {
-            return self.miner_reward_address
+            return self.miner_reward_address;
         }
         Address::default()
     }
-    
-    pub fn new(ini: &IniObj) -> EngineConf {
-        
 
+    pub fn new(ini: &IniObj) -> EngineConf {
         // datadir
         let data_dir = get_mainnet_data_dir(ini);
 
@@ -112,12 +114,15 @@ impl EngineConf {
         // fee_purity is now per-byte: 1:244 = 1000000:238, purity = 1000000 / 166 ≈ 6024
         const LOWEST_FEE_PURITY: u64 = 10000_00 / 166; // 6024
 
-        let mut cnf = EngineConf{
+        let mut cnf = EngineConf {
             max_block_txs: 1000,
-            max_block_size: 1024*1024*1, // 1MB
-            max_tx_size: 1024 * 16, // 16kb
-            max_tx_actions: 200, // 200
+            max_block_size: 1024 * 1024 * 1, // 1MB
+            max_tx_size: 1024 * 16,          // 16kb
+            max_tx_actions: 200,             // 200
             chain_id: 0,
+            network_kind: String::new(),
+            node_profile_id: String::new(),
+            pilot_funding_address: None,
             unstable_block: 4, // 4 block
             fast_sync: false,
             sync_maxh: 0,
@@ -145,8 +150,8 @@ impl EngineConf {
             dmer_enable: false,
             dmer_reward_address: Address::default(),
             dmer_bid_account: Account::create_by_password("123456").unwrap(),
-            dmer_bid_min:  Amount::small_mei(1),
-            dmer_bid_max:  Amount::small_mei(31),
+            dmer_bid_min: Amount::small_mei(1),
+            dmer_bid_max: Amount::small_mei(31),
             dmer_bid_step: Amount::small(5, 247),
             // tx pool
             txpool_maxs: Vec::default(),
@@ -155,8 +160,12 @@ impl EngineConf {
         };
         // setup lowest_fee
         if ini_must(sec_server, "lowest_fee", "").trim().len() > 0 {
-            let lfepr = ini_must_amount_required(sec_server, "server", "lowest_fee").compress(2, AmtCpr::Grow)
-                .unwrap().to_238_u64().unwrap() / 166; //  =6024, simple hac trs size
+            let lfepr = ini_must_amount_required(sec_server, "server", "lowest_fee")
+                .compress(2, AmtCpr::Grow)
+                .unwrap()
+                .to_238_u64()
+                .unwrap()
+                / 166; //  =6024, simple hac trs size
             cnf.lowest_fee_purity = lfepr;
             println!("[Config] node accepted lowest fee purity {}.", lfepr);
         }
@@ -169,12 +178,49 @@ impl EngineConf {
         // checked: `as u32` alone would fold 4294967296 back to 0, which is mainnet.
         let chain_id = engine_ini_u64_strict(sec_mint, "mint", "chain_id", 0);
         if chain_id > u32::MAX as u64 {
-            panic!("[Config Error] [mint] chain_id {} is out of range, it must be between 0 and {}.",
-                chain_id, u32::MAX)
+            panic!(
+                "[Config Error] [mint] chain_id {} is out of range, it must be between 0 and {}.",
+                chain_id,
+                u32::MAX
+            )
         }
         cnf.chain_id = chain_id as u32;
+        cnf.network_kind = ini_must_maxlen(sec_mint, "network_kind", "", 32)
+            .trim()
+            .to_owned();
+        cnf.node_profile_id = ini_must_maxlen(sec_mint, "node_profile_id", "", 64)
+            .trim()
+            .to_owned();
+        if cnf.chain_id == 0 && (!cnf.network_kind.is_empty() || !cnf.node_profile_id.is_empty()) {
+            panic!("[Config Error] mainnet must not declare a private network identity")
+        }
+        if cnf.network_kind.is_empty() != cnf.node_profile_id.is_empty() {
+            panic!("[Config Error] network_kind and node_profile_id must be configured together")
+        }
+        if !cnf.network_kind.is_empty()
+            && (cnf.chain_id != 7
+                || cnf.network_kind != "local_pilot_v1"
+                || cnf.node_profile_id != "hpay-local-pilot-chain-v1")
+        {
+            panic!("[Config Error] unsupported private network identity")
+        }
+        let pilot_funding_address = ini_must(sec_mint, "pilot_funding_address", "")
+            .trim()
+            .to_owned();
+        if !pilot_funding_address.is_empty() {
+            if cnf.network_kind != "local_pilot_v1" {
+                panic!("[Config Error] pilot_funding_address requires local_pilot_v1")
+            }
+            let address = Address::from_readable(&pilot_funding_address)
+                .unwrap_or_else(|_| panic!("[Config Error] pilot_funding_address is invalid"));
+            if !address.is_privakey() || address.is_privakey_unknown() {
+                panic!("[Config Error] pilot_funding_address must be a controlled PRIVAKEY address")
+            }
+            cnf.pilot_funding_address = Some(address);
+        }
         cnf.sync_maxh = engine_ini_u64_strict(sec_mint, "mint", "height_max", 0);
-        cnf.dev_count_switch = engine_ini_u64_strict(sec_mint, "mint", "dev_count_switch", 0) as usize;
+        cnf.dev_count_switch =
+            engine_ini_u64_strict(sec_mint, "mint", "dev_count_switch", 0) as usize;
         cnf.show_miner_name = ini_must_bool(sec_mint, "show_miner_name", false);
 
         let sec_vm = &ini_section(ini, "vm");
@@ -189,12 +235,18 @@ impl EngineConf {
         if cnf.miner_enable {
             cnf.miner_reward_address = ini_must_address_required(sec_miner, "miner", "reward");
             if !cnf.miner_reward_address.is_privakey() {
-                panic!("miner reward address {} must be PRIVAKEY type but got version {}",
-                    cnf.miner_reward_address.to_readable(), cnf.miner_reward_address.version())
+                panic!(
+                    "miner reward address {} must be PRIVAKEY type but got version {}",
+                    cnf.miner_reward_address.to_readable(),
+                    cnf.miner_reward_address.version()
+                )
             }
             let msg = ini_must_maxlen(sec_miner, "message", "", 16);
-            let msgapp = vec![' ' as u8].repeat(16-msg.len());
-            let msg: [u8; 16] = vec![msg.as_bytes().to_vec(), msgapp].concat().try_into().unwrap();
+            let msgapp = vec![' ' as u8].repeat(16 - msg.len());
+            let msg: [u8; 16] = vec![msg.as_bytes().to_vec(), msgapp]
+                .concat()
+                .try_into()
+                .unwrap();
             cnf.miner_message = Fixed16::from_readable(&msg).unwrap();
         }
 
@@ -204,13 +256,22 @@ impl EngineConf {
         if cnf.dmer_enable {
             cnf.dmer_reward_address = ini_must_address_required(sec_dmer, "diamondminer", "reward");
             if !cnf.dmer_reward_address.is_privakey() {
-                panic!("diamond miner reward address {} must be PRIVAKEY type but got version {}",
-                    cnf.dmer_reward_address.to_readable(), cnf.dmer_reward_address.version())
+                panic!(
+                    "diamond miner reward address {} must be PRIVAKEY type but got version {}",
+                    cnf.dmer_reward_address.to_readable(),
+                    cnf.dmer_reward_address.version()
+                )
             }
             cnf.dmer_bid_account = ini_must_account_required(sec_dmer, "bid_password");
-            cnf.dmer_bid_min =  ini_must_amount_required(sec_dmer, "diamondminer", "bid_min").compress(2, AmtCpr::Grow).unwrap();
-            cnf.dmer_bid_max =  ini_must_amount_required(sec_dmer, "diamondminer", "bid_max").compress(2, AmtCpr::Grow).unwrap();
-            cnf.dmer_bid_step = ini_must_amount_required(sec_dmer, "diamondminer", "bid_step").compress(2, AmtCpr::Grow).unwrap();
+            cnf.dmer_bid_min = ini_must_amount_required(sec_dmer, "diamondminer", "bid_min")
+                .compress(2, AmtCpr::Grow)
+                .unwrap();
+            cnf.dmer_bid_max = ini_must_amount_required(sec_dmer, "diamondminer", "bid_max")
+                .compress(2, AmtCpr::Grow)
+                .unwrap();
+            cnf.dmer_bid_step = ini_must_amount_required(sec_dmer, "diamondminer", "bid_step")
+                .compress(2, AmtCpr::Grow)
+                .unwrap();
         }
 
         // tx pool
@@ -219,12 +280,17 @@ impl EngineConf {
         // node's pool from 2000 to 100 slots whenever the key was simply absent.
         let sec_txpool = &ini_section(ini, "txpool");
         let txpool_maxs = ini_must(sec_txpool, "maxs", "").replace(" ", "");
-        cnf.txpool_maxs = txpool_maxs.split(",").filter(|a| !a.is_empty()).map(|a|{
-            match a.parse::<usize>() {
+        cnf.txpool_maxs = txpool_maxs
+            .split(",")
+            .filter(|a| !a.is_empty())
+            .map(|a| match a.parse::<usize>() {
                 Ok(n) => n,
-                _ => panic!("[Config Error] [txpool] maxs entry {:?} is not a valid number.", a),
-            }
-        }).collect();
+                _ => panic!(
+                    "[Config Error] [txpool] maxs entry {:?} is not a valid number.",
+                    a
+                ),
+            })
+            .collect();
 
         // vm contract cache (performance-only), unit: MB
         let sec_vm = &ini_section(ini, "vm");
@@ -233,7 +299,6 @@ impl EngineConf {
         // ok
         cnf
     }
-    
 }
 
 #[cfg(test)]
@@ -290,11 +355,17 @@ mod tests {
             "diamondminer".to_owned(),
             HashMap::from([
                 ("enable".to_owned(), Some("true".to_owned())),
-                ("reward".to_owned(), Some("1MzNY1oA3kfgYi75zquj3SRUPYztzXHzK9".to_owned())),
+                (
+                    "reward".to_owned(),
+                    Some("1MzNY1oA3kfgYi75zquj3SRUPYztzXHzK9".to_owned()),
+                ),
             ]),
         );
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-        assert!(res.is_err(), "an unset bid_password must not build a spending account");
+        assert!(
+            res.is_err(),
+            "an unset bid_password must not build a spending account"
+        );
     }
 
     #[test]
@@ -309,7 +380,10 @@ mod tests {
             ]),
         );
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-        assert!(res.is_err(), "a non PRIVAKEY miner reward must be rejected at config load");
+        assert!(
+            res.is_err(),
+            "a non PRIVAKEY miner reward must be rejected at config load"
+        );
     }
 
     fn ini_of(section: &str, pairs: &[(&str, Option<&str>)]) -> IniObj {
@@ -339,20 +413,24 @@ mod tests {
             assert!(
                 res.is_err(),
                 "reward {:?} must stop startup, never mine the coinbase to {}",
-                reward, OLD_DEFAULT_REWARD
+                reward,
+                OLD_DEFAULT_REWARD
             );
         }
     }
 
     #[test]
     fn diamond_miner_refuses_to_start_without_a_reward_address() {
-        let ini = ini_of("diamondminer", &[
-            ("enable", Some("true")),
-            ("bid_password", Some("a-real-wallet-password")),
-            ("bid_min", Some("1")),
-            ("bid_max", Some("2")),
-            ("bid_step", Some("1:244")),
-        ]);
+        let ini = ini_of(
+            "diamondminer",
+            &[
+                ("enable", Some("true")),
+                ("bid_password", Some("a-real-wallet-password")),
+                ("bid_min", Some("1")),
+                ("bid_max", Some("2")),
+                ("bid_step", Some("1:244")),
+            ],
+        );
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
         assert!(
             res.is_err(),
@@ -376,8 +454,11 @@ mod tests {
         assert_eq!(cnf.dmer_enable, true);
         // dropping any single bid amount must stop startup instead of bidding a placeholder
         for missing in ["bid_min", "bid_max", "bid_step"] {
-            let pairs: Vec<(&str, Option<&str>)> =
-                full.iter().filter(|(k, _)| *k != missing).cloned().collect();
+            let pairs: Vec<(&str, Option<&str>)> = full
+                .iter()
+                .filter(|(k, _)| *k != missing)
+                .cloned()
+                .collect();
             let ini = ini_of("diamondminer", &pairs);
             let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
             assert!(res.is_err(), "a missing {} must stop startup", missing);
@@ -388,7 +469,10 @@ mod tests {
     fn unparseable_chain_id_must_not_silently_become_mainnet() {
         let ini = ini_of("mint", &[("chain_id", Some("5abc"))]);
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-        assert!(res.is_err(), "a typo in chain_id must not run mainnet rules by accident");
+        assert!(
+            res.is_err(),
+            "a typo in chain_id must not run mainnet rules by accident"
+        );
     }
 
     #[test]
@@ -396,7 +480,10 @@ mod tests {
         // 4294967296 folds back to 0 = mainnet under a bare `as u32`
         let ini = ini_of("mint", &[("chain_id", Some("4294967296"))]);
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-        assert!(res.is_err(), "an out of range chain_id must not wrap around to mainnet");
+        assert!(
+            res.is_err(),
+            "an out of range chain_id must not wrap around to mainnet"
+        );
     }
 
     #[test]
@@ -414,6 +501,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_local_pilot_identity_is_exact_and_non_mainnet() {
+        let cnf = EngineConf::new(&ini_of(
+            "mint",
+            &[
+                ("chain_id", Some("7")),
+                ("network_kind", Some("local_pilot_v1")),
+                ("node_profile_id", Some("hpay-local-pilot-chain-v1")),
+            ],
+        ));
+        assert!(!cnf.is_mainnet());
+        assert_eq!(cnf.network_kind, "local_pilot_v1");
+        assert_eq!(cnf.node_profile_id, "hpay-local-pilot-chain-v1");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported private network identity")]
+    fn local_pilot_label_cannot_be_attached_to_another_chain_id() {
+        let _ = EngineConf::new(&ini_of(
+            "mint",
+            &[
+                ("chain_id", Some("8")),
+                ("network_kind", Some("local_pilot_v1")),
+                ("node_profile_id", Some("hpay-local-pilot-chain-v1")),
+            ],
+        ));
+    }
+
+    #[test]
     fn unparseable_mint_and_vm_numbers_are_rejected() {
         let cases: [(&str, &str); 3] = [
             ("mint", "height_max"),
@@ -423,13 +538,21 @@ mod tests {
         for (section, key) in cases {
             let ini = ini_of(section, &[(key, Some("12x"))]);
             let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-            assert!(res.is_err(), "[{}] {} = 12x must not fall back to the default", section, key);
+            assert!(
+                res.is_err(),
+                "[{}] {} = 12x must not fall back to the default",
+                section,
+                key
+            );
         }
     }
 
     #[test]
     fn txpool_maxs_stays_empty_when_unset_so_callers_keep_their_own_limits() {
-        assert_eq!(EngineConf::new(&IniObj::new()).txpool_maxs, Vec::<usize>::new());
+        assert_eq!(
+            EngineConf::new(&IniObj::new()).txpool_maxs,
+            Vec::<usize>::new()
+        );
         assert_eq!(
             EngineConf::new(&ini_of("txpool", &[("maxs", Some("  "))])).txpool_maxs,
             Vec::<usize>::new()
@@ -445,6 +568,9 @@ mod tests {
         assert_eq!(cnf.txpool_maxs, vec![2000usize, 100usize]);
         let ini = ini_of("txpool", &[("maxs", Some("2000,lots"))]);
         let res = std::panic::catch_unwind(|| EngineConf::new(&ini));
-        assert!(res.is_err(), "a malformed txpool limit must be reported, not defaulted");
+        assert!(
+            res.is_err(),
+            "a malformed txpool limit must be reported, not defaulted"
+        );
     }
 }

@@ -9,6 +9,7 @@ use tokio::io::*;
 use tokio::net::*;
 
 use basis::config::NodeConf;
+use basis::interface::PeerConnectivity;
 use sys::{self, *};
 
 use super::handler::*;

@@ -83,7 +83,12 @@ pub fn ensure_standard_protocol_setup_for_tests(
             mint::setup::register_protocol_extensions(&mut setup);
             setup
         };
-        protocol::setup::install_once(setup);
+        // Another component in this process may already have installed the
+        // global setup - the wallet crate does, for instance. The scoped
+        // thread-local setup installed just below is what these tests actually
+        // execute against, and `current_setup` prefers it, so losing the race
+        // for the global slot is not an error.
+        protocol::setup::try_install_once(setup);
     });
 
     let scoped = if include_vm_extensions {

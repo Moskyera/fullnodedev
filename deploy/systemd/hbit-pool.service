@@ -1,6 +1,7 @@
 # HBIT mining pool: serves work to other people's miners and pays them.
 #
-# Install to /etc/systemd/system/hbit-pool.service (deploy/install.sh does it).
+# Install to /etc/systemd/system/hbit-pool.service. deploy/README.md, section
+# "systemd", is the command list that puts every file where this unit expects it.
 #
 # THIS SERVICE HOLDS A WALLET THAT OWES REAL MONEY TO REAL PEOPLE. Read the two
 # rules before you edit it:
@@ -43,7 +44,7 @@ ExecStartPre=/opt/hbit/bin/hbit-wait-for-node.sh http://127.0.0.1:8080 3600
 # node | wallet file | listen | share_bits | chain
 # 0.0.0.0:9777 is the public face of the pool and the ONLY port that belongs on
 # the internet. See the firewall section of POOL-OPERATOR.md.
-ExecStart=/opt/hbit/bin/hbit-pool-server http://127.0.0.1:8080 /var/lib/hbit/pool/pool-wallet.key 0.0.0.0:9777 24 mainnet
+ExecStart=/opt/hbit/bin/hbit-pool-server http://127.0.0.1:8080 /var/lib/hbit/pool/pool-wallet.key 0.0.0.0:9777 20 mainnet
 Restart=always
 RestartSec=30s
 # Must be larger than the ExecStartPre bound above, or systemd would kill the

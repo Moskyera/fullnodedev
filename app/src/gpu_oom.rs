@@ -85,7 +85,9 @@ impl GpuOomState {
         if next < cur {
             wlogerr!(
                 "[efficiency] OpenCL error - reducing work_groups {} -> {} (floor={})",
-                cur, next, floor
+                cur,
+                next,
+                floor
             );
             self.effective_workgroups.store(next, Relaxed);
             self.oom_reduced.store(true, Relaxed);
@@ -153,7 +155,9 @@ impl GpuOomState {
             }
             wlogln!(
                 "[efficiency] GPU stable for {} batches - raising work_groups {} -> {}",
-                n, cur, next
+                n,
+                cur,
+                next
             );
         }
     }

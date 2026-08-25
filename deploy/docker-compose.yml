@@ -38,10 +38,28 @@ services:
     # internet, which is the single worst mistake available on this box.
     expose:
       - "8080"
+    environment:
+      # Not read by the node - it takes api_token from hacash.config.ini. This is
+      # here only so the healthcheck below can present the same token, and so
+      # compose refuses to start the stack when the operator has not set one.
+      HBIT_NODE_API_TOKEN: ${HBIT_NODE_API_TOKEN:?set HBIT_NODE_API_TOKEN to the same value as api_token in node/hacash.config.ini}
     healthcheck:
       # Answering /query/latest is the honest test: the process being alive says
       # nothing about whether it can serve the pool.
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/query/latest"]
+      #
+      # The token is required. `require_api_token` in server/src/server/server.rs
+      # returns 401 for a request without it and makes NO exception for
+      # loopback, so an unauthenticated healthcheck would fail for ever, the
+      # pool's `service_healthy` condition would never be met, and the stack
+      # would sit there looking like a slow sync.
+      #
+      # CMD-SHELL and not CMD: the exec form does no variable expansion. The
+      # doubled $$ is compose's escape, so the container's shell sees $HBIT_...
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H \"x-api-token: $$HBIT_NODE_API_TOKEN\" http://127.0.0.1:8080/query/latest",
+        ]
       interval: 15s
       timeout: 5s
       retries: 20
@@ -95,6 +113,14 @@ services:
       # docker inspect and in any process listing inside the container; a file
       # mounted read only does not.
       HBIT_WALLET_PASSWORD_FILE: /run/secrets/hbit_wallet_passphrase
+      # The node's [server] api_token, which MUST match node/hacash.config.ini.
+      # The node refuses to serve its API at all on a non-loopback bind with an
+      # empty token, and this pool reaches it across the compose network, so
+      # without this pair the node never listens and the pool never starts.
+      #
+      # Set it on the host and let compose pass it through, so the real value
+      # is not committed:  export HBIT_NODE_API_TOKEN=...
+      HBIT_NODE_API_TOKEN: ${HBIT_NODE_API_TOKEN:?set HBIT_NODE_API_TOKEN to the same value as api_token in node/hacash.config.ini}
     secrets:
       - hbit_wallet_passphrase
     volumes:

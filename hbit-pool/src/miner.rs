@@ -157,7 +157,7 @@ fn main() {
                     // five minutes, which is tens of gigabytes of pointless disk
                     // wear a day. Rejections and faults still print every time,
                     // because those are the ones an operator needs to see.
-                    if found <= ACCEPT_LOG_FIRST || found % ACCEPT_LOG_EVERY == 0 {
+                    if found <= ACCEPT_LOG_FIRST || found.is_multiple_of(ACCEPT_LOG_EVERY) {
                         println!("height={height} nonce={nonce} accepted (total {found}) -> {r}");
                     }
                     continue;

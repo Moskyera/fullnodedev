@@ -221,7 +221,9 @@ pub fn initialize_opencl(
         if !quiet && compute_units > 0 {
             wlogln!(
                 "[OpenCL] CU={} tuned work_groups={} (config {})",
-                compute_units, wg, workgroups
+                compute_units,
+                wg,
+                workgroups
             );
         }
         if vram_bytes > 0 {
@@ -270,7 +272,10 @@ pub fn initialize_opencl(
         if capped < wg && !quiet {
             wlogln!(
                 "[OpenCL] {}: work_groups {} -> {} ({} AMD platform(s))",
-                slug, wg, capped, amd_plat_count
+                slug,
+                wg,
+                capped,
+                amd_plat_count
             );
             wg = capped;
         } else if capped < wg {
@@ -396,13 +401,15 @@ pub fn initialize_opencl(
                 if e.contains("integrity self-test") {
                     wlogerr!(
                         "[efficiency] Skipping device {}: GPU hash integrity self-test failed (not a VRAM issue): {}",
-                        device_id, e
+                        device_id,
+                        e
                     );
                     continue;
                 }
                 wlogerr!(
                     "[efficiency] OpenCL buffer init failed at work_groups={}: {}",
-                    wg, e
+                    wg,
+                    e
                 );
                 let mut built = false;
                 let wg_floor = arch_limits.init_buffer_floor_wg;

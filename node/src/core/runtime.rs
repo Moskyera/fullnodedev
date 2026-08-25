@@ -82,6 +82,10 @@ impl NodeRuntime {
         self.transport.peer_prints()
     }
 
+    pub fn peer_connectivity(&self) -> PeerConnectivity {
+        self.transport.peer_connectivity()
+    }
+
     pub fn running_task_count(&self) -> usize {
         self.tasks.running()
     }
